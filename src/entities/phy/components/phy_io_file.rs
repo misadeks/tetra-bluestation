@@ -11,7 +11,7 @@ pub enum PhyIoFileMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PhyIoFileEofBehavior {
     Stop,
-    Loop,
+    Repeat,
 }
 
 #[derive(Debug)]
@@ -95,7 +95,7 @@ impl PhyIoFile {
                         PhyIoFileEofBehavior::Stop => {
                             return Err(PhyIoError::Eof);
                         }
-                        PhyIoFileEofBehavior::Loop => {
+                        PhyIoFileEofBehavior::Repeat => {
                             // Seek back to beginning and continue reading
                             self.file.seek(SeekFrom::Start(0))?;
                             
@@ -104,7 +104,7 @@ impl PhyIoFile {
                             // block and start fresh from the beginning.
                             if bytes_read > 0 {
                                 bytes_read = 0;
-                                tracing::debug!("Discarding partial block at EOF, looping to start");
+                                tracing::debug!("Discarding partial block at EOF, repeating from start");
                             }
                         }
                     }
@@ -232,7 +232,7 @@ mod tests {
     fn test_eof_loop_behavior() {
         let (_filename, path) = create_temp_file(&[1u8, 2, 3, 4]);
 
-        let mut reader = PhyIoFile::new(&path, PhyIoFileMode::Read, PhyIoFileEofBehavior::Loop).unwrap();
+        let mut reader = PhyIoFile::new(&path, PhyIoFileMode::Read, PhyIoFileEofBehavior::Repeat).unwrap();
         let mut buffer = [0u8; 4];
         
         // First read
@@ -255,7 +255,7 @@ mod tests {
     fn test_partial_block_loop() {
         let (_filename, path) = create_temp_file(&[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
-        let mut reader = PhyIoFile::new(&path, PhyIoFileMode::Read, PhyIoFileEofBehavior::Loop).unwrap();
+        let mut reader = PhyIoFile::new(&path, PhyIoFileMode::Read, PhyIoFileEofBehavior::Repeat).unwrap();
         let mut buffer = [0u8; 8];
         
         // First read gets first 8 bytes

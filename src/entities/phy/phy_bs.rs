@@ -2,6 +2,7 @@
 use std::panic;
 use crate::config::config::SharedConfig;
 use crate::common::messagerouter::MessageQueue;
+use crate::entities::phy::components::train_consts::TIMESLOT_TYPE4_BITS;
 use crate::saps::sapmsg::{SapMsg, SapMsgInner};
 use crate::saps::tp::TpUnitdataInd;
 use crate::common::bitbuffer::BitBuffer;
@@ -15,6 +16,7 @@ use crate::entities::TetraEntityTrait;
 use crate::entities::umac::subcomp::bs_channel_scheduler::MACSCHED_TX_AHEAD;
 
 use super::traits::rxtx_dev::{RxTxDev, TxSlotBits};
+use super::components::phy_io_file::PhyIoFile;
 
 const RX_BUF_SIZE: usize = 2048*4;
 const MAX_RXBLOCK_SIZE: usize = 2048;
@@ -25,6 +27,11 @@ pub struct PhyBs<D: RxTxDev> {
     self_component: TetraEntity,
     config: SharedConfig,
 
+    dl_input_file: Option<PhyIoFile>,
+    dl_output_file: Option<PhyIoFile>,
+    ul_input_file: Option<PhyIoFile>,
+    ul_output_file: Option<PhyIoFile>,
+
     /// RX/TX device
     rxtxdev: D,
 }
@@ -34,8 +41,19 @@ impl <D: RxTxDev>PhyBs<D> {
         Self {
             self_component: TetraEntity::Phy,
             config,
+            dl_input_file: None,
+            dl_output_file: None,
+            ul_input_file: None,
+            ul_output_file: None,
             rxtxdev,
         }
+    }
+
+    pub fn set_io_files(&mut self, dl_input_file: Option<PhyIoFile>, dl_output_file: Option<PhyIoFile>, ul_input_file: Option<PhyIoFile>, ul_output_file: Option<PhyIoFile>) {
+        self.dl_input_file = dl_input_file;
+        self.dl_output_file = dl_output_file;
+        self.ul_input_file = ul_input_file;
+        self.ul_output_file = ul_output_file;
     }
 
     fn send_rxblock_to_lmac(queue: &mut MessageQueue, train_type: TrainingSequence, burst_type: BurstType, block_type: PhyBlockType, block_num: PhyBlockNum, bits: BitBuffer) {
@@ -116,51 +134,70 @@ impl <D: RxTxDev>PhyBs<D> {
         
         let SapMsgInner::TpUnitdataReq(prim) = message.msg else {panic!()};
 
-        // Convert BBK to bitarr
-        assert!(prim.bbk.is_some());
-        let mut bbk = [0u8; 30];
-        prim.bbk.unwrap().to_bitarr(&mut bbk);
-
-        // Build NDB or SDB burst
-        let burst = match prim.burst_type {
-            BurstType::SDB => {
-                // SDB burst
-                assert!(prim.train_type == TrainingSequence::SyncTrainSeq);
-                assert!(prim.blk1.is_some() && prim.blk2.is_some());
-                
-                let mut blk1 = [0u8; 120];
-                let mut blk2 = [0u8; 216];
-                prim.blk1.unwrap().to_bitarr(&mut blk1); // Guaranteed for SDB
-                prim.blk2.unwrap().to_bitarr(&mut blk2); // Guaranteed for SDB
-
-                build_sdb(&blk1, &bbk, &blk2)
+        // Generate block (from file or from LMAC data)
+        let mut burst = [0u8; TIMESLOT_TYPE4_BITS];
+        if let Some(dl_input_file) = &mut self.dl_input_file {
+            
+            // Code for testing mode, when replaying from DL input file
+            if let Err(e) = dl_input_file.read_block(&mut burst) {
+                panic!("DL input file error: {:?}", e);
             }
-            BurstType::NDB => {
+            
+        } else {
 
-                let mut blk1 = [0u8; 216];
-                let mut blk2 = [0u8; 216];
+            // We received data from LMAC, convert BBK block to bitarr
+            assert!(prim.bbk.is_some());
+            let mut bbk = [0u8; 30];
+            prim.bbk.unwrap().to_bitarr(&mut bbk);
 
-                match prim.train_type{
-                    TrainingSequence::NormalTrainSeq1 => {
-                        // Single large block
-                        assert!(prim.blk1.is_some() && prim.blk2.is_none());
-                        let mut blk1_src = prim.blk1.unwrap(); // Guaranteed for NDB
-                        blk1_src.to_bitarr(&mut blk1);
-                        blk1_src.to_bitarr(&mut blk2);
-                    }
-                    TrainingSequence::NormalTrainSeq2 => {
-                        // Two half slots
-                        assert!(prim.blk1.is_some() && prim.blk2.is_some());
-                        prim.blk1.unwrap().to_bitarr(&mut blk1); // Guaranteed for NDB
-                        prim.blk2.unwrap().to_bitarr(&mut blk2); // Guaranteed for NDB trainseq 2
-                    }
-                    _ => panic!("Unsupported training sequence for NDB burst")
+            // Build NDB or SDB burst
+            burst = match prim.burst_type {
+                BurstType::SDB => {
+                    // SDB burst
+                    assert!(prim.train_type == TrainingSequence::SyncTrainSeq);
+                    assert!(prim.blk1.is_some() && prim.blk2.is_some());
+                    
+                    let mut blk1 = [0u8; 120];
+                    let mut blk2 = [0u8; 216];
+                    prim.blk1.unwrap().to_bitarr(&mut blk1); // Guaranteed for SDB
+                    prim.blk2.unwrap().to_bitarr(&mut blk2); // Guaranteed for SDB
+
+                    build_sdb(&blk1, &bbk, &blk2)
                 }
+                BurstType::NDB => {
 
-                build_ndb(prim.train_type, &blk1, &bbk, &blk2)
+                    let mut blk1 = [0u8; 216];
+                    let mut blk2 = [0u8; 216];
+
+                    match prim.train_type{
+                        TrainingSequence::NormalTrainSeq1 => {
+                            // Single large block
+                            assert!(prim.blk1.is_some() && prim.blk2.is_none());
+                            let mut blk1_src = prim.blk1.unwrap(); // Guaranteed for NDB
+                            blk1_src.to_bitarr(&mut blk1);
+                            blk1_src.to_bitarr(&mut blk2);
+                        }
+                        TrainingSequence::NormalTrainSeq2 => {
+                            // Two half slots
+                            assert!(prim.blk1.is_some() && prim.blk2.is_some());
+                            prim.blk1.unwrap().to_bitarr(&mut blk1); // Guaranteed for NDB
+                            prim.blk2.unwrap().to_bitarr(&mut blk2); // Guaranteed for NDB trainseq 2
+                        }
+                        _ => panic!("Unsupported training sequence for NDB burst")
+                    }
+
+                    build_ndb(prim.train_type, &blk1, &bbk, &blk2)
+                }
+                _ => panic!()
+            };
+        }
+
+        // Code for testing mode, when capturing all DL output to file
+        if let Some(dl_output_file) = &mut self.dl_output_file {
+            if let Err(e) = dl_output_file.write_block(&mut burst) {
+                panic!("DL output file error: {:?}", e);
             }
-            _ => panic!()
-        };
+        } 
 
         // Prepare the TX slot for the tx device
         let tx_slot: [TxSlotBits; 1] = [TxSlotBits {
@@ -172,7 +209,6 @@ impl <D: RxTxDev>PhyBs<D> {
         // Transmit slot and receive rx data (if any trainseq was found)
         // This function is blocking and the source of timing sync in the whole stack
         let rx = self.rxtxdev.rxtx_timeslot(&tx_slot).expect("Got error from rxtx_timeslot");
-        // tracing::trace!("rx: {:?}", rx);
         
         // Process received slot (either full, subslot1 or subslot2)
         // In exceptional cases, we might receive multiple slots (multiple possible detected bursts in one timeslot)
