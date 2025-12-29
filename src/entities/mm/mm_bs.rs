@@ -69,15 +69,27 @@ impl MmBs {
             }
         };
 
-        if pdu.location_update_type != 3 { 
-            unimplemented_log!("Location update type {} not implemented", pdu.location_update_type);
-            return;
-        }
-
         let ssi = prim.received_address.ssi;
-        self.clients.register(ssi, true);
+
+        let location_update_accept_type = match pdu.location_update_type {
+            0 => {
+                if !self.clients.is_known(ssi) {
+                    tracing::debug!("Roaming update for unknown MS {}, registering", ssi);
+                    self.clients.register(ssi, true);
+                }
+                MmLocationUpdateAcceptType::RoamingLocationUpdating
+            },
+            3 => {
+                self.clients.register(ssi, true);
+                MmLocationUpdateAcceptType::ItsiAttach
+            },
+            _ => {
+                unimplemented_log!("Location update type {} not implemented", pdu.location_update_type);
+                return;
+            }
+        };
         let pdu_response = DLocationUpdateAccept {
-            location_update_accept_type: MmLocationUpdateAcceptType::ItsiAttach,
+            location_update_accept_type,
             ssi: Some(ssi as u64),
             address_extension: None,
             subscriber_class: None,
