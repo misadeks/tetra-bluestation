@@ -564,14 +564,48 @@ impl BsChannelScheduler {
 
                 match ts.t {
                     1 => {
-                        // MCCH, always send CommonControl + CommonAndAssigned
+
+                        // STRATEGY 1, always send UL CommonAndAssigned
+                        // This seems to cause problems with Motorola, which may refuse random access on anything but CommonOnly
+                        // Yields something like: 01000010000100
+                        // aach.dl_usage = AccessAssignDlUsage::CommonControl;
+                        // aach.ul_usage = AccessAssignUlUsage::CommonAndAssigned;
+                        // // f1 gets populated with DL Unallocated marker
+                        // aach.f2_af = Some(AccessField{
+                        //     access_code: 0,
+                        //     base_frame_len: 4,
+                        // });
+                        // END LEGACY STRATEGY 1
+
+                        // STRATEGY 2, always send UL CommonOnly | AssignedOnly
+                        // This is harder since we need to check whether we currently have a grant on the uplink
+                        // We try to imitate MBTS which outputs 00 001010 001010
                         aach.dl_usage = AccessAssignDlUsage::CommonControl;
-                        aach.ul_usage = AccessAssignUlUsage::CommonAndAssigned;
-                        // f1 gets populated with DL Unallocated marker
-                        aach.f2_af = Some(AccessField{
-                            access_code: 0,
-                            base_frame_len: 4,
-                        });
+                        aach.ul_usage = self.ul_get_usage(ts);
+                        // Set access fields based on usage
+                        match aach.ul_usage {
+                            AccessAssignUlUsage::CommonOnly => {
+                                aach.f1_af1 = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                                aach.f2_af2 = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+
+                            },
+                            AccessAssignUlUsage::CommonAndAssigned | 
+                            AccessAssignUlUsage::AssignedOnly => {
+                                aach.f2_af = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                            },
+                            _ => { 
+                                // Traffic or unallocated; no AccessFields
+                            }
+                        }
                     },
                     2..=4 => {
                         // Additional channels, unallocated except we sent a chanalloc
@@ -885,6 +919,12 @@ mod tests {
         let grant1 = sched.ul_process_cap_req(1, addr, &resreq);
         tracing::info!("grant1: {:?}", grant1);
         assert!(grant1.is_some(), "ul_process_cap_req should return Some, but got None");
+
+        let u1 = sched.ul_get_usage(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        let u2 = sched.ul_get_usage(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        let u3 = sched.ul_get_usage(TdmaTime { t: 1, f: 3, m: 1, h: 0 });
+        tracing::info!("usage ts 1/2/3: {:?}/{:?}/{:?}", u1, u2, u3);
+
         let cap_alloc1 = grant1.unwrap().capacity_allocation;
         assert_eq!(cap_alloc1, BasicSlotgrantCapAlloc::FirstSubslotGranted, "ul_process_cap_req should return FirstSubslotGranted, but got {:?}", cap_alloc1);
         let grant2 = sched.ul_process_cap_req(1, addr, &resreq);
@@ -892,6 +932,12 @@ mod tests {
         assert!(grant2.is_some(), "ul_process_cap_req should return Some, but got None");
         let cap_alloc2 = grant2.unwrap().capacity_allocation;
         assert_eq!(cap_alloc2, BasicSlotgrantCapAlloc::SecondSubslotGranted, "ul_process_cap_req should return SecondSubslotGranted, but got {:?}", cap_alloc2);
+
+        let u1 = sched.ul_get_usage(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        let u2 = sched.ul_get_usage(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        let u3 = sched.ul_get_usage(TdmaTime { t: 1, f: 3, m: 1, h: 0 });
+        tracing::info!("usage ts 1/2/3: {:?}/{:?}/{:?}", u1, u2, u3);
+
     }
 
     #[test] 
@@ -903,6 +949,12 @@ mod tests {
         sched.dump_ul_schedule(true);
         let grant1 = sched.ul_process_cap_req(1, addr, &resreq1);
         tracing::info!("grant1: {:?}", grant1);
+        
+        let u1 = sched.ul_get_usage(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        let u2 = sched.ul_get_usage(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        let u3 = sched.ul_get_usage(TdmaTime { t: 1, f: 3, m: 1, h: 0 });
+        tracing::info!("usage ts 1/2/3: {:?}/{:?}/{:?}", u1, u2, u3);
+
         assert!(grant1.is_some());
         let cap_alloc1 = grant1.unwrap().capacity_allocation;
         assert_eq!(cap_alloc1, BasicSlotgrantCapAlloc::FirstSubslotGranted);
@@ -912,6 +964,11 @@ mod tests {
         let Some(grant2) = sched.ul_process_cap_req(1, addr, &resreq2) else { panic!() };
         tracing::info!("grant2: {:?}", grant2);
         sched.dump_ul_schedule(true);
+        
+        let u1 = sched.ul_get_usage(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        let u2 = sched.ul_get_usage(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        let u3 = sched.ul_get_usage(TdmaTime { t: 1, f: 3, m: 1, h: 0 });
+        tracing::info!("usage ts 1/2/3: {:?}/{:?}/{:?}", u1, u2, u3);
 
         assert_eq!(grant2.capacity_allocation, BasicSlotgrantCapAlloc::Grant3Slots);
         assert_eq!(grant2.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
