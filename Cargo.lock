@@ -692,6 +692,7 @@ dependencies = [
  "crossbeam-channel",
  "num",
  "num-complex",
+ "once_cell",
  "rand",
  "rustfft",
  "serde",

@@ -1,4 +1,8 @@
 use crate::common::address::TetraAddress;
+use crate::common::address::SsiType;
+use crate::common::ms_route_registry::{self, MsRoute};
+use crate::saps::lcmc::LcmcMleUnitdataReq;
+use crate::saps::tla::TlaTlUnitdataReqBl;
 use crate::common::messagerouter::MessageQueue;
 use crate::saps::lcmc::LcmcMleUnitdataInd;
 use crate::saps::lmm::LmmMleUnitdataInd;
@@ -97,6 +101,13 @@ impl Mle {
             return;
         };
 
+        // Learn/refresh routing for this MS (used for DL delivery)
+        ms_route_registry::upsert(
+            prim.main_address.ssi,
+            MsRoute { endpoint_id: prim.endpoint_id as i32, link_id: prim.link_id as i32, addr: prim.main_address },
+        );
+
+
         // Dispatch to appropriate component (or to self if for MLE)
         match pdu_type {
             MleProtocolDiscriminator::Mm => {
@@ -120,8 +131,8 @@ impl Mle {
                     sdu,
                     handle: 0, // TODO FIXME
                     received_tetra_address: prim.main_address,
-                    endpoint_id: 0, // TODO FIXME
-                    link_id: 0, // TODO FIXME,
+                    endpoint_id: prim.endpoint_id,
+                    link_id: prim.link_id,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None, // TODO FIXME
                 };
@@ -137,8 +148,8 @@ impl Mle {
             MleProtocolDiscriminator::Sndcp => {
                 let m = LtpdMleUnitdataInd{ 
                     sdu,
-                    endpoint_id: 0, // TODO FIXME
-                    link_id: 0, // TODO FIXME,
+                    endpoint_id: prim.endpoint_id,
+                    link_id: prim.link_id,
                     received_tetra_address: prim.main_address,
                     // received_address_type: 0,
                     chan_change_resp_req: false, // TODO FIXME
@@ -184,6 +195,13 @@ impl Mle {
             return;
         };
 
+        // Learn/refresh routing for this MS (used for DL delivery)
+        ms_route_registry::upsert(
+            prim.main_address.ssi,
+            MsRoute { endpoint_id: prim.endpoint_id as i32, link_id: prim.link_id as i32, addr: prim.main_address },
+        );
+
+
         // Dispatch to appropriate component (or to self if for MLE)
         match pdu_type {
             MleProtocolDiscriminator::Mm => {
@@ -206,9 +224,9 @@ impl Mle {
                 let m = LcmcMleUnitdataInd{ 
                     sdu,
                     handle: 0, // TODO FIXME
-                    endpoint_id: 0, // TODO FIXME
-                    link_id: 0, // TODO FIXME,
-                    received_tetra_address: TetraAddress::default(), // TODO FIXME
+                    endpoint_id: prim.endpoint_id,
+                    link_id: prim.link_id,
+                    received_tetra_address: prim.main_address,
                     // received_address_type: 0,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None, // TODO FIXME
@@ -225,8 +243,8 @@ impl Mle {
             MleProtocolDiscriminator::Sndcp => {
                 let m = LtpdMleUnitdataInd{ 
                     sdu,
-                    endpoint_id: 0, // TODO FIXME
-                    link_id: 0, // TODO FIXME,
+                    endpoint_id: prim.endpoint_id,
+                    link_id: prim.link_id,
                     received_tetra_address: prim.main_address,
                     // received_address_type: 0,
                     chan_change_resp_req: false, // TODO FIXME
@@ -447,15 +465,55 @@ impl Mle {
         // }
     }
 
-    fn rx_lcmc_prim(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_lcmc_prim(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_lcmc_prim: {:?}", message);
-        unimplemented!("rx_lcmc_prim");
-        // match &message.msg {
-        //     _ => {
-        //         panic!();
-        //     }
-        // }
+
+        match &mut message.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => {
+                // Wrap CMCE SDU with the MLE protocol discriminator (3 bits) and send via TL-UNITDATA.
+                let sdu_len = prim.sdu.get_len();
+                let mut pdu = BitBuffer::new(3 + sdu_len);
+                pdu.write_bits(MleProtocolDiscriminator::Cmce.into_raw(), 3);
+                pdu.copy_bits(&mut prim.sdu, sdu_len);
+                pdu.seek(0);
+
+                let dst_addr = prim.dst_addr;
+
+                let sapmsg = SapMsg {
+                    sap: Sap::TlaSap,
+                    src: self.self_component,
+                    dest: TetraEntity::Llc,
+                    dltime: message.dltime,
+                    msg: SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
+                        address_type: 0,
+                        main_address: dst_addr,
+                        link_id: prim.link_id,
+                        endpoint_id: prim.endpoint_id,
+                        tl_sdu: pdu,
+                        scrambling_code: self.config.config().scrambling_code() as i32,
+                        pdu_prio: prim.pdu_prio as i32,
+                        stealing_permission: prim.stealing_permission,
+                        subscriber_class: 0,
+                        fcs_flag: false,
+                        air_interface_encryption: 0,
+                        data_prio: 0,
+                        packet_data_flag: false,
+                        n_tlsdu_repeats: None,
+                        scheduled_data_status: 0,
+                        max_schedule_interval: None,
+                        data_class_info: None,
+                        req_handle: 0,
+                    }),
+                };
+                queue.push_back(sapmsg);
+            }
+            _ => {
+                tracing::warn!("MLE: unsupported LCMC primitive: {:?}", message.msg);
+            }
+        }
     }
+
+
 }
 
 

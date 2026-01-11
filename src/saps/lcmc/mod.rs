@@ -160,6 +160,9 @@ pub struct LcmcMleUnitdataReq {
     pub handle: Todo,
     pub endpoint_id: Todo,
     pub link_id: Todo,
+    /// NEW: explicit destination address for DL delivery.
+    /// MLE must not infer destination from endpoint/link (often not unique).
+    pub dst_addr: TetraAddress,
     pub layer2service: Todo,
     pub pdu_prio: Todo,
     pub layer2_qos: Todo,

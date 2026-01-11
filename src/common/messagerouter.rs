@@ -94,7 +94,44 @@ impl MessageRouter {
         self.msg_queue.push_back(message);
     }
 
-    pub fn deliver_message(&mut self) {  
+    fn deliver_one_due_or_rotate(&mut self, now: TdmaTime) -> bool {
+        let Some(message) = self.msg_queue.pop_front() else {
+            return false;
+        };
+
+        // If message is in the future, rotate it to the back and do NOT deliver.
+        if message.dltime.diff(now) > 0 {
+            self.msg_queue.push_back(message);
+            return false;
+        }
+
+        tracing::debug!(
+        "deliver_message: got {:?}: {:?} -> {:?} (dltime={}, now={})",
+        message.get_sap(),
+        message.get_source(),
+        message.get_dest(),
+        message.dltime,
+        now
+    );
+
+        let dest = message.get_dest();
+        if let Some(entity) = self.entities.get_mut(dest) {
+            entity.rx_prim(&mut self.msg_queue, message);
+        } else {
+            tracing::warn!(
+            "deliver_message: entity {:?} not found for {:?}: {:?} -> {:?}",
+            dest,
+            message.get_sap(),
+            message.get_source(),
+            message.get_dest()
+        );
+        }
+
+        true
+    }
+
+
+    pub fn deliver_message(&mut self) {
 
         let message = self.msg_queue.pop_front();
         if let Some(message) = message {
@@ -110,14 +147,42 @@ impl MessageRouter {
             } else {
                 tracing::warn!("deliver_message: entity {:?} not found for {:?}: {:?} -> {:?}", dest, message.get_sap(), message.get_source(), message.get_dest());
             }
-        } 
+        }
     }
 
     pub fn deliver_all_messages(&mut self) {
-        while !self.msg_queue.messages.is_empty() {
-            self.deliver_message();
+        // If we don't have a TDMA time (MS/monitor mode), keep old behavior.
+        let Some(now) = self.ts else {
+            while !self.msg_queue.messages.is_empty() {
+                self.deliver_message();
+            }
+            return;
+        };
+
+        // Deliver only messages that are due now.
+        // Do multiple passes because delivering one message may enqueue more "due now" messages.
+        loop {
+            let n = self.msg_queue.messages.len();
+            if n == 0 {
+                break;
+            }
+
+            let mut progressed = false;
+
+            for _ in 0..n {
+                // Either delivers a due message, or rotates a future message to the back
+                if self.deliver_one_due_or_rotate(now) {
+                    progressed = true;
+                }
+            }
+
+            // If in a whole pass we delivered nothing, everything remaining is in the future.
+            if !progressed {
+                break;
+            }
         }
     }
+
 
     pub fn get_msgqueue_len(&self) -> usize {
         self.msg_queue.messages.len()
@@ -181,29 +246,21 @@ impl MessageRouter {
 
 
     /// Runs the full stack either forever or for a specified number of ticks.
-    pub fn run_stack(&mut self, num_ticks: Option<usize>) {
-        
-        let mut ticks: usize = 0;
+    pub fn run_stack(&mut self, num_ticks: Option<u64>) {
+        let mut ticks: u64 = 0;
 
         loop {
-            // Send tick_start event
             self.tick_all();
-            
-            // Deliver messages until queue empty
-            while self.get_msgqueue_len() > 0{
-                self.deliver_all_messages();
-            }
-
-            // Send tick_end event and process final messages
+            self.deliver_all_messages();
             self.tick_end();
-            
-            // Check if we should stop
+
             ticks += 1;
-            if let Some(num_ticks) = num_ticks {
-                if ticks >= num_ticks {
+            if let Some(n) = num_ticks {
+                if ticks >= n {
                     break;
                 }
             }
         }
     }
+
 }

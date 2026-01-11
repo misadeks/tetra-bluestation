@@ -8,3 +8,5 @@ pub mod tetra_entities;
 pub mod messagerouter;
 pub mod freqs;
 pub mod pdu_parse_error;
+pub mod group_registry;
+pub mod ms_route_registry;

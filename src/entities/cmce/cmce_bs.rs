@@ -1,5 +1,6 @@
 use crate::config::stack_config::SharedConfig;
 use crate::common::messagerouter::MessageQueue;
+use crate::common::ms_route_registry::{self, MsRoute};
 use crate::entities::cmce::enums::cmce_pdu_type_ul::CmcePduTypeUl;
 use crate::saps::sapmsg::{SapMsg, SapMsgInner};
 use crate::common::tetra_entities::TetraEntity;
@@ -44,31 +45,31 @@ impl CmceBs {
         };
 
         match pdu_type {
-            CmcePduTypeUl::UAlert => 
+            CmcePduTypeUl::UAlert =>
                 unimplemented_log!("UAlert"),
-            CmcePduTypeUl::UConnect => 
+            CmcePduTypeUl::UConnect =>
                 unimplemented_log!("UConnect"),
-            CmcePduTypeUl::UDisconnect => 
+            CmcePduTypeUl::UDisconnect =>
                 unimplemented_log!("UDisconnect"),
-            CmcePduTypeUl::UInfo => 
+            CmcePduTypeUl::UInfo =>
                 unimplemented_log!("UInfo"),
-            CmcePduTypeUl::URelease => 
+            CmcePduTypeUl::URelease =>
                 unimplemented_log!("URelease"),
-            CmcePduTypeUl::USetup => 
+            CmcePduTypeUl::USetup =>
                 unimplemented_log!("USetup"),
-            CmcePduTypeUl::UStatus => 
-                unimplemented_log!("UStatus"),
-            CmcePduTypeUl::UTxCeased => 
+            CmcePduTypeUl::UStatus =>
+                self.sds.route_rf_deliver(_queue, message),
+            CmcePduTypeUl::UTxCeased =>
                 unimplemented_log!("UTxCeased"),
-            CmcePduTypeUl::UTxDemand => 
+            CmcePduTypeUl::UTxDemand =>
                 unimplemented_log!("UTxDemand"),
-            CmcePduTypeUl::UCallRestore => 
+            CmcePduTypeUl::UCallRestore =>
                 unimplemented_log!("UCallRestore"),
-            CmcePduTypeUl::USdsData => 
-                unimplemented_log!("USdsData"),
-            CmcePduTypeUl::UFacility => 
+            CmcePduTypeUl::USdsData =>
+                self.sds.route_rf_deliver(_queue, message),
+            CmcePduTypeUl::UFacility =>
                 unimplemented_log!("UFacility"),
-            CmcePduTypeUl::CmceFunctionNotSupported => 
+            CmcePduTypeUl::CmceFunctionNotSupported =>
                 unimplemented_log!("CmceFunctionNotSupported"),
         };
     }

@@ -113,11 +113,81 @@ impl Llc {
         }
     }
 
-    fn rx_tla_tlunitdata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_tla_tlunitdata_req_bl(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tlunitdata_req_bl");
-        let SapMsgInner::TlaTlUnitdataReqBl(_prim) = message.msg else { panic!() };
+        let SapMsgInner::TlaTlUnitdataReqBl(mut prim) = message.msg else { panic!() };
 
-        unimplemented_log!("rx_tla_tlunitdata_req_bl");
+        // If an ack still needs to be sent, get the relevant expected sequence number
+        let out_ack_n = self.get_out_ack_n_if_any(message.dltime.t, prim.main_address);
+
+        // UNITDATA is unconfirmed: do NOT call expect_ack()
+        // Choose a constant ns value (0). Receiver should ignore ns for pure UNITDATA.
+        let ns: u8 = 0;
+
+        // Construct PDU, write header
+        let mut pdu_buf = BitBuffer::new_autoexpand(32);
+
+        if let Some(out_ack_n) = out_ack_n {
+            // Piggyback ACK using BL-ADATA (with or without FCS)
+            let pdu = BlAdata {
+                has_fcs: prim.fcs_flag,
+                nr: out_ack_n,
+                ns,
+            };
+            pdu.to_bitbuf(&mut pdu_buf);
+
+            // Append SDU
+            let sdu_len = prim.tl_sdu.get_len_remaining();
+            pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
+
+            if prim.fcs_flag {
+                let fcs = crate::entities::llc::components::fcs::compute_fcs(&pdu_buf, 0, pdu_buf.get_len());
+                pdu_buf.write_bits(fcs as u64, 32);
+            }
+
+            pdu_buf.seek(0);
+            tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
+        } else {
+            let pdu = BlData {
+                has_fcs: prim.fcs_flag,
+                ns,
+            };
+            pdu.to_bitbuf(&mut pdu_buf);
+
+            // Append SDU
+            let sdu_len = prim.tl_sdu.get_len_remaining();
+            pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
+
+            // Append FCS32 if requested
+            if prim.fcs_flag {
+                let fcs = crate::entities::llc::components::fcs::compute_fcs(&pdu_buf, 0, pdu_buf.get_len());
+                pdu_buf.write_bits(fcs as u64, 32);
+            }
+
+            pdu_buf.seek(0);
+            tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
+        }
+
+        // Hand to UMAC (scheduler will place it on MCCH/TN=1 as usual)
+        let sapmsg = SapMsg {
+            sap: Sap::TmaSap,
+            src: self.entity(),
+            dest: TetraEntity::Umac,
+            dltime: message.dltime,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: prim.req_handle,
+                pdu: pdu_buf,
+                main_address: prim.main_address,
+                scrambling_code: prim.scrambling_code as u32,
+                endpoint_id: prim.endpoint_id,
+                stealing_permission: prim.stealing_permission,
+                subscriber_class: prim.subscriber_class,
+                air_interface_encryption: Option::from(prim.air_interface_encryption),
+                stealing_repeats_flag: Option::from(false),
+                data_category: prim.data_class_info,
+            }),
+        };
+        queue.push_back(sapmsg);
     }
 
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
@@ -140,7 +210,7 @@ impl Llc {
             let pdu = BlAdata {
                 has_fcs: prim.fcs_flag,
                 nr: out_ack_n,
-                ns: expected_in_ack_n, 
+                ns: expected_in_ack_n,
             };
             pdu.to_bitbuf(&mut pdu_buf);
             // Append SDU
@@ -161,7 +231,7 @@ impl Llc {
             pdu_buf.seek(0);
             tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
         }
-        
+
 
         // TODO FIXME:
         // According to the spec we should issue a TL-REPORT to the upper layer
