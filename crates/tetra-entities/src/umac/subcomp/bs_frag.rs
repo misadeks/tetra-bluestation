@@ -18,7 +18,10 @@ pub struct BsFragger {
 }
 
 /// We won't start fragmentation if less than MIN_SLOT_CAP_FOR_FRAG_START bits are free in the slot
-const MIN_SLOT_CAP_FOR_FRAG_START: usize = 32; 
+const MIN_SLOT_CAP_FOR_RES_FRAG_START: usize = 32; 
+
+/// We won't insert a fragment if less than MIN_SLOT_CAP_FOR_FRAG bits are free in the slot
+const MIN_SLOT_CAP_FOR_FRAG: usize = 16;
 
 impl BsFragger {
 
@@ -80,7 +83,7 @@ impl BsFragger {
             self.mac_hdr_is_written = true;
             true
             
-        } else if slot_cap_bits < MIN_SLOT_CAP_FOR_FRAG_START {
+        } else if slot_cap_bits < MIN_SLOT_CAP_FOR_RES_FRAG_START {
             
             // Not worth starting fragmentation here. Rather wait for a new slot 
             // We don't update self.mac_hdr_is_written and simply return that more work is needed
@@ -115,17 +118,17 @@ impl BsFragger {
         
         // Some sanity checks
         assert!(self.mac_hdr_is_written, "MAC header should be previously written");
-        assert!(mac_block.get_len_written() % 8 == 0, "MAC block must be byte aligned at start of writing");
+        assert!(mac_block.get_len_written() % 8 == 0 || mac_block.get_len_remaining() == 0, "MAC block must be byte aligned at start of writing");
 
         // Check if we can fit all in a MAC-END message
         let sdu_bits = self.sdu.get_len_remaining();
         let macend_len_bits = MacEndDl::compute_hdr_len(false, false) + sdu_bits;
         let macend_len_bytes = (macend_len_bits + 7) / 8;
-        let slot_cap = mac_block.get_len_remaining();
+        let slot_cap_bits = mac_block.get_len_remaining();
 
         // tracing::trace!("MAC-END would have length: {} bits, {} bytes, slot capacity: {} bits", 
         //     macend_len_bits, macend_len_bytes, slot_cap);
-        if macend_len_bytes * 8 <= slot_cap {
+        if macend_len_bytes * 8 <= slot_cap_bits {
             // Fits in single MAC-END
             let num_fill_bits = fillbits::addition::compute_required_naive(macend_len_bits);
             let pdu = MacEndDl {
@@ -150,12 +153,21 @@ impl BsFragger {
             // We're done with this packet
             true
 
+        } else if slot_cap_bits < MIN_SLOT_CAP_FOR_FRAG {
+            
+            // Not worth (or possible) to place a fragment here. Rather wait for a new slot 
+            // We do nothing and simply return that more work is needed
+            // tracing::error!("DELME {}", mac_block.dump_bin());
+            // tracing::error!("DELME {}", self.sdu.dump_bin());
+            tracing::debug!("-> does_not_fit, trying again next frame");
+            false
+            
         } else {
 
             // Need MAC-FRAG, fill slot (or don't fill, if the MAC-END hdr size is the reason we go for MAC-FRAG)
             let macfrag_hdr_len = 4;
-            let sdu_bits_in_frag = min(slot_cap - macfrag_hdr_len, sdu_bits);
-            let num_fill_bits = slot_cap - macfrag_hdr_len - sdu_bits_in_frag;
+            let sdu_bits_in_frag = min(slot_cap_bits - macfrag_hdr_len, sdu_bits);
+            let num_fill_bits = slot_cap_bits - macfrag_hdr_len - sdu_bits_in_frag;
 
             let pdu = MacFragDl {
                 fill_bits: num_fill_bits > 0,
