@@ -8,6 +8,7 @@ use crate::saps::tmv::enums::logical_chans::LogicalChannel;
 use crate::saps::tma::TmaUnitdataInd;
 
 use crate::common::bitbuffer::BitBuffer;
+use crate::common::online;
 use crate::common::tdma_time::TdmaTime;
 
 use crate::common::tetra_common::{Sap, Todo};
@@ -68,30 +69,24 @@ pub struct UmacBs {
 impl UmacBs {
     pub fn new(config: SharedConfig) -> Self {
 
-        let mut ret = Self { 
+        let scrambling_code = config.config().scrambling_code();
+        let precomps = Self::generate_precomps(&config);
+        Self { 
             self_component: TetraEntity::Umac,
             config,
             endpoint_id: 0, 
             defrag: MacDefrag::new(),
             event_label_store: EventLabelStore::new(),
-            channel_scheduler: BsChannelScheduler::new(),
-            // ulrx_scheduler: UlScheduler::new(),
-        };
-
-        if ret.config.config().stack_mode == StackMode::Bs {
-            // Precompute various frequently transmitted messages
-            ret.initialize_scheduler();
-        } 
-
-        ret
+            channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
+        }
     }
 
     /// Precomputes SYNC, SYSINFO messages (and subfield variants) for faster TX msg building
     /// Precomputed PDUs are passed to scheduler
     /// Needs to be re-invoked if any network parameter changes
-    pub fn initialize_scheduler(&mut self) {
+    pub fn generate_precomps(config: &SharedConfig) -> PrecomputedUmacPdus{
 
-        let c = self.config.config();
+        let c = config.config();
 
         // TODO FIXME make more/all parameters configurable
         let ext_services = SysinfoExtendedServices {
@@ -129,7 +124,7 @@ impl UmacBs {
             ms_txpwr_max_cell: 5,
             rxlev_access_min: 3,
             access_parameter: 7,
-            radio_dl_timeout: 15,
+            radio_dl_timeout: 3,
             cck_id: None,
             hyperframe_number: Some(0),
             option_field: SysinfoOptFieldFlag::DefaultDefForAccCodeA,
@@ -193,16 +188,13 @@ impl UmacBs {
             late_entry_supported: true,
         };
 
-        let precomps = PrecomputedUmacPdus {
+        PrecomputedUmacPdus {
             mac_sysinfo1: sysinfo1,
             mac_sysinfo2: sysinfo2,
             mle_sysinfo: mle_sysinfo_pdu,        
             mac_sync: mac_sync_pdu,
             mle_sync: mle_sync_pdu,
-        }; 
-        
-        self.channel_scheduler.set_scrambling_code(c.scrambling_code());
-        self.channel_scheduler.set_precomputed_msgs(precomps);
+        }
     }
 
     fn rx_tmv_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -651,6 +643,10 @@ impl UmacBs {
             addr
         } else { panic!() };
 
+        // Best-effort online tracking: any MAC access implies the SSI is active.
+        online::record_seen(addr.ssi);
+
+
         // Compute len and extract flags        
         let mut pdu_len_bits;
         if let Some(length_ind) = pdu.length_ind {
@@ -1075,16 +1071,19 @@ impl UmacBs {
     }
 
     fn rx_ul_tma_unitdata_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
-        tracing::trace!("rx_ul_tma_unitdata_req: {:?}", message);
-        let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
-
-        // Build a MAC-RESOURCE for SCH/F
-        let pdu = MacResource {
-            fill_bits: true,
+        tracing::trace!("rx_ul_tma_unitdata_req");
+        
+        // Extract sdu
+        let SapMsgInner::TmaUnitdataReq(prim) = message.msg else {panic!()};
+        let sdu = prim.pdu;
+        
+        // Build MAC-RESOURCE optimistically (as if it would always fit in one slot)
+        let mut pdu = MacResource {
+            fill_bits: false, // Updated later
             pos_of_grant: 0,
-            encryption_mode: 0,
-            random_access_flag: true,
-            length_ind: 0,
+            encryption_mode: 0, 
+            random_access_flag: true, // TODO FIXME we just always ack a random access
+            length_ind: 0, // Updated later
             addr: Some(prim.main_address),
             event_label: None,
             usage_marker: None,
@@ -1092,11 +1091,12 @@ impl UmacBs {
             slot_granting_element: None,
             chan_alloc_element: None,
         };
+        pdu.update_len_and_fill_ind(sdu.get_len());
 
-        // ✅ BS control channel: schedule ALL DL user data on TS1 (SCH/F)
-        self.channel_scheduler.dl_enqueue_tma(1, pdu, prim.pdu);
+        // Add to scheduler, who will handle scheduling and fragmentation (if required)
+        let ul_time = message.dltime.add_timeslots(-2);
+        self.channel_scheduler.dl_enqueue_tma(ul_time.t, pdu, sdu);
     }
-
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tma_prim");

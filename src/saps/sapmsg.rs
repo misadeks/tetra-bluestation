@@ -14,6 +14,8 @@ use super::tlmc::*;
 use super::tma::*;
 use super::tmv::*;
 use super::tp::*;
+use super::tnsds::*;
+use super::dgna::*;
 
 
 pub trait SapMsgT: Any + Send {
@@ -85,6 +87,13 @@ pub enum SapMsgInner {
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),
     LcmcMleUnitdataReq(LcmcMleUnitdataReq),
 
+    // TN-SDS-SAP (User/CMCE)
+    TnsdsUnitdataReq(TnsdsUnitdataReq),
+    TnsdsUnitdataInd(TnsdsUnitdataInd),
+
+    // Internal UI -> MM request (DGNA)
+    DgnaSetReq(DgnaSetReq),
+
     // LTPD-SAP (MLE-LTPD)
     LtpdMleUnitdataInd(LtpdMleUnitdataInd)
 }
@@ -109,10 +118,12 @@ impl Display for SapMsgInner {
             SapMsgInner::TlmbSyncInd(_) => write!(f, "TmbSyncInd"),
             SapMsgInner::TlmbSysinfoInd(_) => write!(f, "TmbSysinfoInd"),
 
+            SapMsgInner::DgnaSetReq(_) => write!(f, "DgnaSetReq"),
+
             // TLB-SAP
             // SapMsgInner::TlbTlSyncInd(_) => write!(f, "TlbTlSyncInd"),
             // SapMsgInner::TlbTlSysinfoInd(_) => write!(f, "TlbTlSysinfoInd"),
-            _ => panic!("Unknown SapMsgInner type"),
+            _ => write!(f, "SapMsgInner"),
         }
     }
 }

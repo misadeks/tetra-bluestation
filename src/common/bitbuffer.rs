@@ -4,6 +4,7 @@ use crate::common::pdu_parse_error::PduParseErr;
 
 
 
+#[derive(Clone)]
 pub struct BitBuffer {
     buffer: Vec<u8>,
     start: usize,       // bits before this are out of window
@@ -195,7 +196,25 @@ impl BitBuffer {
     }
 
     /// Similar to read_bits, but returns a ParseError::BufferEnded with the given error_string if not enough bits are available.
-    pub fn read_field(&mut self, num_bits: usize, error_string: &'static str) -> Result<u64, PduParseErr> {
+
+
+/// Reads `num_bits` bits from the current position into a new BitBuffer and advances the cursor.
+///
+/// This is primarily used for protocol fields which carry variable-length bit payloads (e.g. SDS Type-4).
+pub fn read_bitbuffer(&mut self, num_bits: usize, field: &'static str) -> Result<BitBuffer, PduParseErr> {
+    if self.get_len_remaining() < num_bits {
+        return Err(PduParseErr::BufferEnded { field: Some(field) });
+    }
+    let mut out = BitBuffer::new(num_bits);
+    for _ in 0..num_bits {
+                let b = self.read_bit().ok_or(PduParseErr::BufferEnded { field: Some(field) })?;
+        out.write_bit(b);
+    }
+    out.seek(0);
+    Ok(out)
+}
+
+pub fn read_field(&mut self, num_bits: usize, error_string: &'static str) -> Result<u64, PduParseErr> {
         self.read_bits(num_bits).ok_or(PduParseErr::BufferEnded { field: Some(error_string) })
     }
 

@@ -5,6 +5,7 @@ use crate::common::bitbuffer::BitBuffer;
 
 
 
+#[derive(Debug)]
 pub struct DlFragger {
     resource: MacResource,
     machdr_is_written: bool,
@@ -39,9 +40,8 @@ impl DlFragger {
         if macres_len_bytes * 8 <= slot_cap {
             // Fits in one MAC-RESOURCE
             self.resource.length_ind = macres_len_bytes as u8;
-            self.resource.fill_bits = macres_len % 8 != 0;
-
-            let num_fill_bits = 8 - (macres_len % 8) % 8;
+            let num_fill_bits = (8 - (macres_len % 8)) % 8;
+            self.resource.fill_bits = num_fill_bits != 0;
             let sdu_bits = self.sdu.get_len_remaining();
 
 
@@ -96,7 +96,7 @@ impl DlFragger {
         
         if macend_len_bytes * 8 <= slot_cap {
             // Fits in single MAC-END
-            let num_fill_bits = 8 - (macend_len_bits % 8) % 8;
+            let num_fill_bits = (8 - (macend_len_bits % 8)) % 8;
             let pdu = MacEndDl {
                 fill_bits: num_fill_bits > 0,
                 pos_of_grant: 0, 

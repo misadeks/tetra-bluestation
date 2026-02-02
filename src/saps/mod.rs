@@ -18,3 +18,8 @@ pub mod tle;
 pub mod lmm;
 pub mod lcmc;
 pub mod ltpd; 
+
+pub mod tnsds;
+
+// Internal UI -> MM message for DGNA control
+pub mod dgna;

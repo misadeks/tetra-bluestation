@@ -60,22 +60,34 @@ impl MmClientMgr {
         self.clients.contains_key(&issi)
     }
 
-    /// Registers a fresh state for a client, based on ssi
-    /// If client is already registered, previous state is discarded. 
-    pub fn register_client(&mut self, issi: u32, attached: bool) -> Result <bool, ClientMgrErr> {
-        
+    /// Registers or updates a client.
+    ///
+    /// IMPORTANT: If the client already exists, this function **must not** discard the previous
+    /// state, otherwise the stored DGNA group list gets cleared.
+    pub fn register_client(&mut self, issi: u32, attached: bool) -> Result<bool, ClientMgrErr> {
         if !is_individual(issi) {
             return Err(ClientMgrErr::IssiInGroupRange { issi });
-        };
-        
-        // discard previous state if any
-        self.clients.remove(&issi); 
-        
-        // Create and insert new client state
+        }
+
+        // If client already exists, only update the state and keep groups.
+        if let Some(client) = self.clients.get_mut(&issi) {
+            let old_state = client.state;
+            client.state = if attached { MmClientState::Attached } else { MmClientState::Unknown };
+            tracing::debug!(
+                "register_client: update existing issi={} state {:?} -> {:?} groups={:?}",
+                issi,
+                old_state,
+                client.state,
+                client.groups
+            );
+            return Ok(true);
+        }
+
+        // Create new client entry.
         let mut elem = MmClientProperties::new(issi);
         elem.state = if attached { MmClientState::Attached } else { MmClientState::Unknown };
         self.clients.insert(issi, elem);
-        
+        tracing::debug!("register_client: new issi={} state={:?}", issi, if attached { MmClientState::Attached } else { MmClientState::Unknown });
         Ok(true)
     }
 
@@ -87,7 +99,9 @@ impl MmClientMgr {
     /// Detaches all groups from a client
     pub fn client_detach_all_groups(&mut self, issi: u32) -> Result<bool, ClientMgrErr> {
         if let Some(client) = self.clients.get_mut(&issi) {
+            let old_groups: Vec<u32> = client.groups.iter().copied().collect();
             client.groups.clear();
+            tracing::debug!("client_detach_all_groups: issi={} cleared {:?}", issi, old_groups);
             Ok(true)
         } else {
             Err(ClientMgrErr::ClientNotFound { issi })
@@ -110,10 +124,13 @@ impl MmClientMgr {
 
         if let Some(client) = self.clients.get_mut(&issi) {
             if do_attach {
-                client.groups.insert(gssi);
+                let was_new = client.groups.insert(gssi);
+                tracing::debug!("client_group_attach: issi={} attach gssi={} ({})", issi, gssi, if was_new { "new" } else { "existing" });
             } else {
-                client.groups.remove(&gssi);
+                let was_present = client.groups.remove(&gssi);
+                tracing::debug!("client_group_attach: issi={} detach gssi={} ({})", issi, gssi, if was_present { "removed" } else { "not_present" });
             }
+            tracing::debug!("client_group_attach: issi={} groups_now={:?}", issi, client.groups);
             Ok(true)
         } else {
             Err(ClientMgrErr::ClientNotFound { issi })

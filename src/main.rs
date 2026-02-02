@@ -6,8 +6,7 @@ mod config;
 mod common;
 mod entities;
 mod saps;
-mod gateway;
-
+ 
 use clap::Parser;
 
 use common::debug::setup_logging_default;
@@ -24,6 +23,9 @@ use crate::entities::mm::mm_bs::MmBs;
 use crate::entities::phy::phy_bs::PhyBs;
 use crate::entities::llc::llc_bs_ms::Llc;
 use crate::entities::umac::umac_bs::UmacBs;
+use crate::entities::pei_at::PeiAt;
+use crate::entities::cmd_server::CmdServer;
+use crate::entities::http_ui::HttpUi;
 
 /// Load configuration file
 fn load_config_from_toml(cfg_path: &str) -> SharedConfig {
@@ -41,9 +43,6 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> MessageRouter {
 
     let mut router = MessageRouter::new(cfg.clone());
 
-    let gw = crate::gateway::spawn_gateway(([0,0,0,0], 8090).into());
-    router.attach_gateway(gw.tx_rx, gw.events);
-    
     // Add suitable Phy component based on PhyIo type
     match cfg.config().phy_io.backend {
         PhyBackend::SoapySdr => {
@@ -64,6 +63,9 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> MessageRouter {
     let mm = MmBs::new(cfg.clone());
     let sndcp = Sndcp::new(cfg.clone());
     let cmce = CmceBs::new(cfg.clone());
+    let pei_at = PeiAt::new();
+    let cmd_server = CmdServer::new();
+    let http_ui = HttpUi::new();
     router.register_entity(Box::new(lmac));
     router.register_entity(Box::new(umac));
     router.register_entity(Box::new(llc));
@@ -71,6 +73,9 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> MessageRouter {
     router.register_entity(Box::new(mm));
     router.register_entity(Box::new(sndcp));
     router.register_entity(Box::new(cmce));
+    router.register_entity(Box::new(pei_at));
+    router.register_entity(Box::new(cmd_server));
+    router.register_entity(Box::new(http_ui));
     
     // Init network time
     router.set_dl_time(TdmaTime::default());

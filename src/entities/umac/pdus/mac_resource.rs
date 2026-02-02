@@ -49,8 +49,23 @@ pub struct MacResource {
     pub chan_alloc_element: Option<ChanAllocElement>,
 }
 
-
 impl MacResource {
+    pub fn null_pdu() -> Self {
+        MacResource {
+            fill_bits: false,
+            pos_of_grant: 0,
+            encryption_mode: 0,
+            random_access_flag: false,
+            length_ind: 2,
+            addr: None,
+            event_label: None,
+            usage_marker: None,
+            power_control_element: None,
+            slot_granting_element: None,
+            chan_alloc_element: None,
+        }
+    }
+
     pub fn from_bitbuf(buf: &mut BitBuffer) -> Result<Self, PduParseErr> {
         let mut s = MacResource {
             fill_bits: false,

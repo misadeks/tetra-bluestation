@@ -8,6 +8,7 @@ pub enum PduParseErr {
     InvalidValue{ field: &'static str, value: u64 },
     InconsistentLength { expected: usize, found: usize },
     Inconsistency { field: &'static str, reason: &'static str },
+    ValueOutOfRange { field: &'static str, value: u64, bits: usize, max: u64 },
     NotImplemented { field: Option<&'static str> },
 }
 

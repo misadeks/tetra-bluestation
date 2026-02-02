@@ -90,30 +90,10 @@ impl USdsData {
             Some(buffer.read_field(11, "length_indicator")?) 
         } else { None };
         // Conditional
-        // SDTI=3 => Length indicator (11 bits) followed by User Defined Data-4 with that length.
-        // NOTE: SDTI=3 is where SDS-TL is carried; size can be 0..2047 bits :contentReference[oaicite:3]{index=3}.
         let user_defined_data_4 = if short_data_type_identifier == 3 {
-            let len_bits = length_indicator.unwrap_or(0) as usize;
-
-            if len_bits > buffer.get_len_remaining() {
-                return Err(PduParseErr::BufferEnded { field: Some("user_defined_data_4") });
-            }
-
-            let mut ud4 = BitBuffer::new_autoexpand(len_bits);
-            let mut remaining = len_bits;
-            while remaining > 0 {
-                let chunk = core::cmp::min(remaining, 64);
-                let v = buffer
-                    .read_bits(chunk)
-                    .ok_or(PduParseErr::BufferEnded { field: Some("user_defined_data_4") })?;
-                ud4.write_bits(v, chunk);
-                remaining -= chunk;
-            }
-            ud4.seek(0);
-            Some(ud4)
-        } else {
-            None
-        };
+            let li = length_indicator.ok_or(PduParseErr::FieldNotPresent { field: Some("length_indicator") })? as usize;
+            Some(buffer.read_bitbuffer(li, "user_defined_data_4")?)
+        } else { None };
 
         // obit designates presence of any further type2, type3 or type4 fields
         let mut obit = delimiters::read_obit(buffer)?;
@@ -182,28 +162,15 @@ impl USdsData {
         if let Some(ref value) = self.user_defined_data_3 {
             buffer.write_bits(*value, 64);
         }
+        // Conditional
         if self.short_data_type_identifier == 3 {
-            let ud4 = self
-                .user_defined_data_4
-                .as_ref()
-                .ok_or(PduParseErr::FieldNotPresent { field: Some("user_defined_data_4") })?;
-
-            let actual_len_bits = ud4.get_len();
-            let len_bits = self
-                .length_indicator
-                .map(|v| v as usize)
-                .unwrap_or(actual_len_bits);
-
-            if len_bits != actual_len_bits {
-                return Err(PduParseErr::InconsistentLength {
-                    expected: len_bits,
-                    found: actual_len_bits,
-                });
-            }
-
-            buffer.write_bits(len_bits as u64, 11);
-            let mut tmp = BitBuffer::from_bitbuffer(ud4);
-            buffer.copy_bits(&mut tmp, len_bits);
+            let li = self.user_defined_data_4.as_ref().map(|b| b.get_len()).unwrap_or(0) as u64;
+            buffer.write_bits(li, 11);
+        }
+        // Conditional
+        if let Some(ref value) = self.user_defined_data_4 {
+            let mut tmp = BitBuffer::from_bitbuffer(value);
+            buffer.copy_bits(&mut tmp, value.get_len());
         }
 
         // Check if any optional field present and place o-bit

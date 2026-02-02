@@ -6,10 +6,6 @@ use crate::common::tdma_time::TdmaTime;
 use crate::common::tetra_entities::TetraEntity;
 use crate::entities::TetraEntityTrait;
 
-use crossbeam_channel::Receiver;
-use tokio::sync::broadcast;
-use crate::gateway::{TxRequest, GatewayEvent};
-
 
 #[derive(Default)]
 pub enum MessagePrio {
@@ -62,8 +58,6 @@ pub struct MessageRouter {
     /// For Bs mode, this is always available
     /// For Ms/Mon mode, it is recovered from a received SYNC frame and communicated in a different way
     ts: Option<TdmaTime>,
-    gateway_rx: Option<Receiver<TxRequest>>,
-    gateway_events: Option<broadcast::Sender<GatewayEvent>>,
 }
 
 
@@ -76,8 +70,6 @@ impl MessageRouter {
             },
             config,
             ts: None,
-            gateway_rx: None,
-            gateway_events: None,
         }
     }
 
@@ -102,44 +94,7 @@ impl MessageRouter {
         self.msg_queue.push_back(message);
     }
 
-    fn deliver_one_due_or_rotate(&mut self, now: TdmaTime) -> bool {
-        let Some(message) = self.msg_queue.pop_front() else {
-            return false;
-        };
-
-        // If message is in the future, rotate it to the back and do NOT deliver.
-        if message.dltime.diff(now) > 0 {
-            self.msg_queue.push_back(message);
-            return false;
-        }
-
-        tracing::debug!(
-        "deliver_message: got {:?}: {:?} -> {:?} (dltime={}, now={})",
-        message.get_sap(),
-        message.get_source(),
-        message.get_dest(),
-        message.dltime,
-        now
-    );
-
-        let dest = message.get_dest();
-        if let Some(entity) = self.entities.get_mut(dest) {
-            entity.rx_prim(&mut self.msg_queue, message);
-        } else {
-            tracing::warn!(
-            "deliver_message: entity {:?} not found for {:?}: {:?} -> {:?}",
-            dest,
-            message.get_sap(),
-            message.get_source(),
-            message.get_dest()
-        );
-        }
-
-        true
-    }
-
-
-    pub fn deliver_message(&mut self) {
+    pub fn deliver_message(&mut self) {  
 
         let message = self.msg_queue.pop_front();
         if let Some(message) = message {
@@ -155,42 +110,14 @@ impl MessageRouter {
             } else {
                 tracing::warn!("deliver_message: entity {:?} not found for {:?}: {:?} -> {:?}", dest, message.get_sap(), message.get_source(), message.get_dest());
             }
-        }
+        } 
     }
 
     pub fn deliver_all_messages(&mut self) {
-        // If we don't have a TDMA time (MS/monitor mode), keep old behavior.
-        let Some(now) = self.ts else {
-            while !self.msg_queue.messages.is_empty() {
-                self.deliver_message();
-            }
-            return;
-        };
-
-        // Deliver only messages that are due now.
-        // Do multiple passes because delivering one message may enqueue more "due now" messages.
-        loop {
-            let n = self.msg_queue.messages.len();
-            if n == 0 {
-                break;
-            }
-
-            let mut progressed = false;
-
-            for _ in 0..n {
-                // Either delivers a due message, or rotates a future message to the back
-                if self.deliver_one_due_or_rotate(now) {
-                    progressed = true;
-                }
-            }
-
-            // If in a whole pass we delivered nothing, everything remaining is in the future.
-            if !progressed {
-                break;
-            }
+        while !self.msg_queue.messages.is_empty() {
+            self.deliver_message();
         }
     }
-
 
     pub fn get_msgqueue_len(&self) -> usize {
         self.msg_queue.messages.len()
@@ -205,10 +132,7 @@ impl MessageRouter {
         } else {
             tracing::info!("---------------------------- tick ----------------------------");
         }
-
-        self.pump_gateway_tx();
-
-
+        
         // Call tick on all entities
         for entity in self.entities.values_mut() {
             entity.tick_start(&mut self.msg_queue, self.ts);
@@ -255,72 +179,31 @@ impl MessageRouter {
         }
     }
 
-    pub fn attach_gateway(
-        &mut self,
-        rx: Receiver<TxRequest>,
-        events: broadcast::Sender<GatewayEvent>,
-    ) {
-        self.gateway_rx = Some(rx);
-        self.gateway_events = Some(events);
-    }
-
-    fn pump_gateway_tx(&mut self) {
-        let Some(now) = self.ts else { return; };
-
-        // 1) Drain RX into a local vector WITHOUT calling any &mut self methods
-        let mut drained: Vec<TxRequest> = Vec::new();
-        if let Some(rx) = self.gateway_rx.as_ref() {
-            drained.extend(rx.try_iter());
-        }
-
-        if drained.is_empty() {
-            return;
-        }
-
-        // 2) Now we can freely mutate self while processing drained requests
-        for req in drained {
-            match crate::gateway::send::inject_text_sds(now, req.dst_ssi, &req.text) {
-                Ok(msg) => {
-                    self.submit_message(msg);
-
-                    if let Some(events) = self.gateway_events.as_ref() {
-                        let _ = events.send(GatewayEvent::TxQueued {
-                            dst_ssi: req.dst_ssi,
-                            text: req.text.clone(),
-                        });
-                    }
-                }
-                Err(e) => {
-                    if let Some(events) = self.gateway_events.as_ref() {
-                        let _ = events.send(GatewayEvent::TxFailed {
-                            dst_ssi: req.dst_ssi,
-                            reason: e.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-
-
 
     /// Runs the full stack either forever or for a specified number of ticks.
-    pub fn run_stack(&mut self, num_ticks: Option<u64>) {
-        let mut ticks: u64 = 0;
+    pub fn run_stack(&mut self, num_ticks: Option<usize>) {
+        
+        let mut ticks: usize = 0;
 
         loop {
+            // Send tick_start event
             self.tick_all();
-            self.deliver_all_messages();
-            self.tick_end();
+            
+            // Deliver messages until queue empty
+            while self.get_msgqueue_len() > 0{
+                self.deliver_all_messages();
+            }
 
+            // Send tick_end event and process final messages
+            self.tick_end();
+            
+            // Check if we should stop
             ticks += 1;
-            if let Some(n) = num_ticks {
-                if ticks >= n {
+            if let Some(num_ticks) = num_ticks {
+                if ticks >= num_ticks {
                     break;
                 }
             }
         }
     }
-
 }

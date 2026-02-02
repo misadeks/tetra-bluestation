@@ -22,3 +22,9 @@ pub trait TetraEntityTrait: Send + AsAny {
     fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: Option<TdmaTime>) { }
     fn tick_end(&mut self, _queue: &mut MessageQueue, _ts: Option<TdmaTime>) -> bool { false }
 }
+
+pub mod pei_at;
+
+pub mod cmd_server;
+
+pub mod http_ui;

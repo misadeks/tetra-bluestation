@@ -17,4 +17,10 @@ pub enum TetraEntity {
     Cmce,
     /// SubNetwork Dependent Convergence Protocol
     Sndcp,
+    /// PEI/AT serial interface (non-ETSI entity)
+    PeiAt,
+    /// External command server (non-ETSI entity)
+    CmdServer,
+    /// HTTP UI bridge (non-ETSI entity)
+    HttpUi,
 }
