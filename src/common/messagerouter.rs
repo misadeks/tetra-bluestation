@@ -6,6 +6,10 @@ use crate::common::tdma_time::TdmaTime;
 use crate::common::tetra_entities::TetraEntity;
 use crate::entities::TetraEntityTrait;
 
+use crossbeam_channel::Receiver;
+use tokio::sync::broadcast;
+use crate::gateway::{TxRequest, GatewayEvent};
+
 
 #[derive(Default)]
 pub enum MessagePrio {
@@ -58,6 +62,8 @@ pub struct MessageRouter {
     /// For Bs mode, this is always available
     /// For Ms/Mon mode, it is recovered from a received SYNC frame and communicated in a different way
     ts: Option<TdmaTime>,
+    gateway_rx: Option<Receiver<TxRequest>>,
+    gateway_events: Option<broadcast::Sender<GatewayEvent>>,
 }
 
 
@@ -70,6 +76,8 @@ impl MessageRouter {
             },
             config,
             ts: None,
+            gateway_rx: None,
+            gateway_events: None,
         }
     }
 
@@ -197,7 +205,10 @@ impl MessageRouter {
         } else {
             tracing::info!("---------------------------- tick ----------------------------");
         }
-        
+
+        self.pump_gateway_tx();
+
+
         // Call tick on all entities
         for entity in self.entities.values_mut() {
             entity.tick_start(&mut self.msg_queue, self.ts);
@@ -243,6 +254,55 @@ impl MessageRouter {
             self.ts = Some(ts.add_timeslots(1));
         }
     }
+
+    pub fn attach_gateway(
+        &mut self,
+        rx: Receiver<TxRequest>,
+        events: broadcast::Sender<GatewayEvent>,
+    ) {
+        self.gateway_rx = Some(rx);
+        self.gateway_events = Some(events);
+    }
+
+    fn pump_gateway_tx(&mut self) {
+        let Some(now) = self.ts else { return; };
+
+        // 1) Drain RX into a local vector WITHOUT calling any &mut self methods
+        let mut drained: Vec<TxRequest> = Vec::new();
+        if let Some(rx) = self.gateway_rx.as_ref() {
+            drained.extend(rx.try_iter());
+        }
+
+        if drained.is_empty() {
+            return;
+        }
+
+        // 2) Now we can freely mutate self while processing drained requests
+        for req in drained {
+            match crate::gateway::send::inject_text_sds(now, req.dst_ssi, &req.text) {
+                Ok(msg) => {
+                    self.submit_message(msg);
+
+                    if let Some(events) = self.gateway_events.as_ref() {
+                        let _ = events.send(GatewayEvent::TxQueued {
+                            dst_ssi: req.dst_ssi,
+                            text: req.text.clone(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    if let Some(events) = self.gateway_events.as_ref() {
+                        let _ = events.send(GatewayEvent::TxFailed {
+                            dst_ssi: req.dst_ssi,
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+
 
 
     /// Runs the full stack either forever or for a specified number of ticks.

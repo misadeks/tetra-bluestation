@@ -16,6 +16,7 @@ use crate::{
 };
 use crate::common::tdma_time::TdmaTime;
 use crate::entities::cmce::subentities::sds_tl::SdsReport;
+use crate::gateway::send::dl_time_on_ts1;
 
 const SDS_TL_DELIVERY_DEST_NOT_REACHABLE_FAILED: u8 = 0x5A; // 01011010b
 
@@ -40,6 +41,7 @@ impl SdsSubentity {
         };
 
         let dst_addr = TetraAddress { encrypted: false, ssi_type: SsiType::Ssi, ssi: dst_ssi };
+        // let dl_time = dl_time_on_ts1(dl_time, 16);
 
         queue.push_back(SapMsg::new(
             Sap::LcmcSap,

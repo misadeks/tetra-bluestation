@@ -17,6 +17,12 @@ clap = { version = "4.5.53", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 crossbeam-channel = "0.5"
 
+axum = { version = "0.7", features = ["json", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+tower-http = { version = "0.5", features = ["cors"] }
+anyhow = "1"
+
 # By default, we disable the lowest tracing events for performance
 # Remove the release_max_level feature to enable all tracing debug levels in release builds
 tracing = { version = "0.1.41", features = ["std"] }

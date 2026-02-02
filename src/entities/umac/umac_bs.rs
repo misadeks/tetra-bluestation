@@ -1075,19 +1075,16 @@ impl UmacBs {
     }
 
     fn rx_ul_tma_unitdata_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
-        tracing::trace!("rx_ul_tma_unitdata_req");
-        
-        // Extract sdu
-        let SapMsgInner::TmaUnitdataReq(prim) = message.msg else {panic!()};
-        let sdu = prim.pdu;
-        
-        // Build MAC-RESOURCE optimistically (as if it would always fit in one slot)
-        let mut pdu = MacResource {
-            fill_bits: false, // Updated later
+        tracing::trace!("rx_ul_tma_unitdata_req: {:?}", message);
+        let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
+
+        // Build a MAC-RESOURCE for SCH/F
+        let pdu = MacResource {
+            fill_bits: true,
             pos_of_grant: 0,
-            encryption_mode: 0, 
-            random_access_flag: true, // TODO FIXME we just always ack a random access
-            length_ind: 0, // Updated later
+            encryption_mode: 0,
+            random_access_flag: true,
+            length_ind: 0,
             addr: Some(prim.main_address),
             event_label: None,
             usage_marker: None,
@@ -1095,12 +1092,11 @@ impl UmacBs {
             slot_granting_element: None,
             chan_alloc_element: None,
         };
-        pdu.update_len_and_fill_ind(sdu.get_len());
 
-        // Add to scheduler, who will handle scheduling and fragmentation (if required)
-        let ul_time = message.dltime.add_timeslots(-2);
-        self.channel_scheduler.dl_enqueue_tma(ul_time.t, pdu, sdu);
+        // ✅ BS control channel: schedule ALL DL user data on TS1 (SCH/F)
+        self.channel_scheduler.dl_enqueue_tma(1, pdu, prim.pdu);
     }
+
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tma_prim");

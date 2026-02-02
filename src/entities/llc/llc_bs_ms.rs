@@ -254,7 +254,7 @@ impl Llc {
                 stealing_repeats_flag: prim.stealing_repeats_flag,
                 data_category: prim.data_class_info
             })
-        };        
+        };
         queue.push_back(sapmsg);
     }
 

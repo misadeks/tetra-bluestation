@@ -6,7 +6,8 @@ mod config;
 mod common;
 mod entities;
 mod saps;
- 
+mod gateway;
+
 use clap::Parser;
 
 use common::debug::setup_logging_default;
@@ -40,6 +41,9 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> MessageRouter {
 
     let mut router = MessageRouter::new(cfg.clone());
 
+    let gw = crate::gateway::spawn_gateway(([0,0,0,0], 8090).into());
+    router.attach_gateway(gw.tx_rx, gw.events);
+    
     // Add suitable Phy component based on PhyIo type
     match cfg.config().phy_io.backend {
         PhyBackend::SoapySdr => {
