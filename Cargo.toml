@@ -18,6 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 crossbeam-channel = "0.5"
 serialport = { version = "4.4", default-features = false }
 anyhow = "1.0"
+libc = "0.2"
 
 # By default, we disable the lowest tracing events for performance
 # Remove the release_max_level feature to enable all tracing debug levels in release builds

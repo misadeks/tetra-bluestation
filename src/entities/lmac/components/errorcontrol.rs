@@ -17,7 +17,7 @@ use crate::saps::tp::TpUnitdataInd;
 pub fn encode_cp(mut prim: TmvUnitdataReq) -> BitBuffer {
 
     let lchan = prim.logical_channel;
-    assert!(lchan.is_control_channel() && lchan != LogicalChannel::Aach);
+    assert!((lchan.is_control_channel() || lchan.is_traffic()) && lchan != LogicalChannel::Aach);
 
     let params = errorcontrol_params::get_params(lchan);
 
@@ -71,7 +71,7 @@ pub fn encode_cp(mut prim: TmvUnitdataReq) -> BitBuffer {
 /// bool is true if CRC check was successful
 pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code: Option<u32>) -> (Option<BitBuffer>, bool) {
 
-    assert!(lchan.is_control_channel() && lchan != LogicalChannel::Aach);
+    assert!((lchan.is_control_channel() || lchan.is_traffic()) && lchan != LogicalChannel::Aach);
 
     // Various intermediate buffers, needed for decoding stages
     // We allocate the largest block we may possibly need
@@ -80,8 +80,18 @@ pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code
     let mut type3dp_arr = [0xFFu8; 432*4];
     let mut type2_arr = [0u8; 432];
 
-    // Fetch decoding parameters for this logical channel type
-    let params = errorcontrol_params::get_params(lchan);
+    // Fetch decoding parameters for this logical channel type.
+    // For traffic channels, infer half-slot vs full-slot from available bits.
+    let available_bits = prim.block.get_len_remaining();
+    let mut params = errorcontrol_params::get_params(lchan);
+    if lchan.is_traffic() && available_bits == errorcontrol_params::SCH_HD_PARAMS.type345_bits {
+        params = &errorcontrol_params::SCH_HD_PARAMS;
+        tracing::debug!(
+            "decode_cp {:?}: using SCH/HD params for half-slot traffic ({} bits)",
+            lchan,
+            available_bits
+        );
+    }
     
     let mut type5 = prim.block;
     tracing::trace!("decode_cp {:?} type5: {:?}", lchan, type5.dump_bin());
@@ -102,7 +112,18 @@ pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code
     tracing::trace!("decode_cp {:?} type4: {:?}", lchan, type4.dump_bin());
 
     // De-interleaving, type4 -> type3
-    type4.to_bitarr(&mut type4_arr[0..params.type345_bits]);
+    let needed_bits = params.type345_bits;
+    let available_bits = type4.get_len_remaining();
+    if available_bits < needed_bits {
+        tracing::warn!(
+            "decode_cp {:?}: insufficient bits (have {}, need {})",
+            lchan,
+            available_bits,
+            needed_bits
+        );
+        return (None, false);
+    }
+    type4.to_bitarr(&mut type4_arr[0..needed_bits]);
     interleaver::block_deinterleave(params.type345_bits, params.interleave_a, &type4_arr, &mut type3_arr);
     tracing::trace!("decode_cp {:?} type3: {:?}", lchan, BitBuffer::from_bitarr(&type3_arr[0..params.type345_bits]).dump_bin());
 

@@ -314,8 +314,8 @@ impl MacResource {
             ret += 8 
         };
         ret += 1;
-        if self.chan_alloc_element.is_some() { 
-            unimplemented!() 
+        if let Some(v) = &self.chan_alloc_element { 
+            ret += v.bit_len();
         };
 
         ret

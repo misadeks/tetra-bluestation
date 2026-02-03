@@ -95,7 +95,8 @@ pub enum SapMsgInner {
     DgnaSetReq(DgnaSetReq),
 
     // LTPD-SAP (MLE-LTPD)
-    LtpdMleUnitdataInd(LtpdMleUnitdataInd)
+    LtpdMleUnitdataInd(LtpdMleUnitdataInd),
+    LtpdMleUnitdataReq(LtpdMleUnitdataReq)
 }
 
 impl Display for SapMsgInner {
@@ -119,6 +120,8 @@ impl Display for SapMsgInner {
             SapMsgInner::TlmbSysinfoInd(_) => write!(f, "TmbSysinfoInd"),
 
             SapMsgInner::DgnaSetReq(_) => write!(f, "DgnaSetReq"),
+            SapMsgInner::LtpdMleUnitdataInd(_) => write!(f, "LtpdMleUnitdataInd"),
+            SapMsgInner::LtpdMleUnitdataReq(_) => write!(f, "LtpdMleUnitdataReq"),
 
             // TLB-SAP
             // SapMsgInner::TlbTlSyncInd(_) => write!(f, "TlbTlSyncInd"),

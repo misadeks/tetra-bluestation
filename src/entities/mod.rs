@@ -28,3 +28,5 @@ pub mod pei_at;
 pub mod cmd_server;
 
 pub mod http_ui;
+
+pub mod wap_gateway;

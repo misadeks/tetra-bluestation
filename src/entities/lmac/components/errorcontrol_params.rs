@@ -47,6 +47,16 @@ pub const SCH_F_PARAMS: ErrorControlParams = ErrorControlParams {
     have_crc16:   true,
 };
 
+/// Placeholder parameters for traffic channels (TCH).
+/// TODO: Verify per-channel coding/interleaving for PDCH/traffic against spec.
+pub const TCH_F_PARAMS: ErrorControlParams = ErrorControlParams {
+    type345_bits: 432,
+    type2_bits:   288,
+    type1_bits:   268,
+    interleave_a: 103,
+    have_crc16:   true,
+};
+
 /// Parameters for the SCH/HU (half slot uplink, Control Uplink Burst) channel
 pub const SCH_HU_PARAMS: ErrorControlParams = ErrorControlParams {
     type345_bits: 168,
@@ -78,13 +88,12 @@ pub fn get_params(lchan: LogicalChannel) -> &'static ErrorControlParams {
             &SCH_HU_PARAMS
         }
         
-        LogicalChannel::TchS => unimplemented!(),
-        LogicalChannel::Tch24 => unimplemented!(),
-        LogicalChannel::Tch48 => unimplemented!(),
-        LogicalChannel::Tch72 => unimplemented!(),
+        LogicalChannel::TchS => &TCH_F_PARAMS,
+        LogicalChannel::Tch24 => &TCH_F_PARAMS,
+        LogicalChannel::Tch48 => &TCH_F_PARAMS,
+        LogicalChannel::Tch72 => &TCH_F_PARAMS,
 
         LogicalChannel::Blch => unimplemented!(),
         LogicalChannel::Clch => unimplemented!(),
     }
 }
-

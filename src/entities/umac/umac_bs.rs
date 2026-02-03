@@ -1,9 +1,9 @@
 use std::panic;
-
 use crate::common::freqs::FreqInfo;
 use crate::common::messagerouter::MessageQueue;
 
 use crate::saps::tmv::enums::logical_chans::LogicalChannel;
+use crate::saps::tmv::TmvConfigureReq;
 
 use crate::saps::tma::TmaUnitdataInd;
 
@@ -24,6 +24,7 @@ use crate::entities::umac::enums::mac_pdu_type::MacPduType;
 use crate::entities::umac::enums::sysinfo_opt_field_flag::SysinfoOptFieldFlag;
 use crate::entities::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
 use crate::entities::umac::fields::sysinfo_ext_services::SysinfoExtendedServices;
+use crate::entities::umac::fields::channel_allocation::ChanAllocElement;
 use crate::entities::umac::pdus::access_define::AccessDefine;
 use crate::entities::umac::pdus::mac_access::MacAccess;
 use crate::entities::umac::pdus::mac_data::MacData;
@@ -46,6 +47,17 @@ use super::subcomp::defrag::MacDefrag;
 /// This constant determines how many timeslots in the future we submit for
 /// This indirectly controls the size of the TX buffer in the SDR. 
 const DLTX_SUBMIT_DELTA: usize = 4*4;
+
+// Hardcoded packet-data channel allocation knobs (Motorola-focused).
+// Adjust these constants if you want to try other combinations.
+const PDP_PACKET_TS: u8 = 1;
+const PDP_ALLOC_TYPE: u8 = 0;
+const PDP_ULDL_ASSIGNED: u8 = 3;
+const PDP_CLCH_PERMISSION: bool = true;
+const PDP_MON_PATTERN: u8 = 1;
+const PDP_MON_PATTERN18: u8 = 0;
+const PDP_USE_USAGE_MARKER: Option<u8> = None; // e.g. Some(1) to force PDCH semantics
+const PDP_UL_TRAFFIC: bool = false;
 
 pub struct UmacBs {
 
@@ -163,10 +175,12 @@ impl UmacBs {
                 migration: c.cell.migration,
                 system_wide_services: c.cell.system_wide_services,
                 voice_service: true,
-                circuit_mode_data_service: false,
-                sndcp_service: false,
+                circuit_mode_data_service: true,
+                // sndcp_service: c.cell.sndcp_service,
+                // TODO: remove
+                sndcp_service: true,
                 aie_service: false,
-                advanced_link: false,
+                advanced_link: true,
             }
         };
 
@@ -209,6 +223,34 @@ impl UmacBs {
         }
     }
 
+    fn select_packet_ts(&self) -> u8 {
+        PDP_PACKET_TS
+    }
+
+    fn build_chan_alloc_element(&self, ts: u8) -> ChanAllocElement {
+        let c = self.config.config();
+        let ext_offset = FreqInfo::freq_offset_hz_to_id(c.cell.freq_offset_hz).unwrap_or(0);
+        let frame18_mon_pattern = if PDP_MON_PATTERN == 0 {
+            Some(PDP_MON_PATTERN18)
+        } else {
+            None
+        };
+        ChanAllocElement {
+            alloc_type: PDP_ALLOC_TYPE,
+            ts_assigned: ts,
+            ul_dl_assigned: PDP_ULDL_ASSIGNED,
+            clch_permission: PDP_CLCH_PERMISSION,
+            cell_change_flag: false,
+            carrier_num: c.cell.main_carrier,
+            ext_freq_band: Some(c.cell.freq_band),
+            ext_offset: Some(ext_offset),
+            ext_duplex_spacing: Some(c.cell.duplex_spacing_id),
+            ext_reverse_operation: Some(c.cell.reverse_operation),
+            mon_pattern: PDP_MON_PATTERN,
+            frame18_mon_pattern,
+        }
+    }
+
     pub fn rx_tmv_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tmv_unitdata_ind");
         
@@ -217,6 +259,10 @@ impl UmacBs {
         match prim.logical_channel {
             LogicalChannel::Stch | 
             LogicalChannel::SchF| 
+            LogicalChannel::TchS |
+            LogicalChannel::Tch24 |
+            LogicalChannel::Tch48 |
+            LogicalChannel::Tch72 |
             LogicalChannel::SchHu => {
                 tracing::trace!("rx_tmv_unitdata_ind: {:?}", prim.logical_channel);
                 self.rx_tmv_sch(queue, message);
@@ -245,7 +291,11 @@ impl UmacBs {
             // Clause 21.4.1; handling differs between SCH_HU and others
             match lchan {
                 LogicalChannel::SchF |
-                LogicalChannel::Stch => {
+                LogicalChannel::Stch |
+                LogicalChannel::TchS |
+                LogicalChannel::Tch24 |
+                LogicalChannel::Tch48 |
+                LogicalChannel::Tch72 => {
                     // First two bits are MAC PDU type
                     let Ok(pdu_type) = MacPduType::try_from(bits >> 1) else {
                         tracing::warn!("invalid pdu type: {}", bits >> 1);
@@ -1026,14 +1076,14 @@ impl UmacBs {
 
     
     /// TMD-SAP MAC-U-SIGNAL
-    fn rx_ul_mac_u_signal(&self, _queue: &mut MessageQueue, message: &mut SapMsg) {
+    fn rx_ul_mac_u_signal(&mut self, _queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_ul_mac_u_signal");
         // let SapMsgInner::TmvUnitdataInd(inner) = &mut message.msg else {panic!()};
         
         // Extract sdu and parse pdu
         let SapMsgInner::TmaUnitdataReq(prim) = &mut message.msg else {panic!()};
 
-        let _pdu = match MacUSignal::from_bitbuf(&mut prim.pdu) {
+        let pdu = match MacUSignal::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
                 pdu
@@ -1043,18 +1093,20 @@ impl UmacBs {
                 return;
             }
         };
-        
-        unimplemented!();   
+        tracing::debug!(
+            "rx_ul_mac_u_signal: second_half_stolen={}",
+            pdu.second_half_stolen
+        );
     }
 
     /// TMA-SAP MAC-U-BLCK
-    fn rx_ul_mac_u_blck(&self, _queue: &mut MessageQueue, message: &mut SapMsg) {
+    fn rx_ul_mac_u_blck(&mut self, _queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_ul_mac_u_blck");
         
         // Extract sdu and parse pdu
         let SapMsgInner::TmaUnitdataReq(prim) = &mut message.msg else {panic!()};
 
-        let _pdu = match MacUBlck::from_bitbuf(&mut prim.pdu) {
+        let pdu = match MacUBlck::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
                 pdu
@@ -1065,9 +1117,27 @@ impl UmacBs {
             }
         };
 
-        // Handle reservation if present
-        // TODO implement slightly different handling since enum is not the same. 
-        unimplemented!();
+        let addr = prim.main_address;
+        let ul_time = message.dltime.add_timeslots(-2);
+
+        // Handle reservation if present. Values 14/15 are special in MAC-U-BLCK; ignore them for now.
+        let res_req = match pdu.reservation_req {
+            0..=13 => crate::entities::umac::enums::reservation_requirement::ReservationRequirement::try_from(
+                pdu.reservation_req as u64,
+            )
+            .ok(),
+            14 | 15 => None,
+            _ => None,
+        };
+
+        if let Some(res_req) = res_req {
+            let grant = self.channel_scheduler.ul_process_cap_req(ul_time.t, addr, &res_req);
+            if let Some(grant) = grant {
+                self.channel_scheduler.dl_enqueue_grant(ul_time.t, addr, grant);
+            } else {
+                tracing::warn!("rx_ul_mac_u_blck: No grant for reservation request {:?}", res_req);
+            }
+        }
     }
 
     fn rx_ul_tma_unitdata_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
@@ -1076,6 +1146,7 @@ impl UmacBs {
         // Extract sdu
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else {panic!()};
         let sdu = prim.pdu;
+        let sdu_len = sdu.get_len();
         
         // Build MAC-RESOURCE optimistically (as if it would always fit in one slot)
         let mut pdu = MacResource {
@@ -1091,11 +1162,32 @@ impl UmacBs {
             slot_granting_element: None,
             chan_alloc_element: None,
         };
-        pdu.update_len_and_fill_ind(sdu.get_len());
 
         // Add to scheduler, who will handle scheduling and fragmentation (if required)
         let ul_time = message.dltime.add_timeslots(-2);
-        self.channel_scheduler.dl_enqueue_tma(ul_time.t, pdu, sdu);
+        let mut sched_ts = ul_time.t;
+        if prim.data_category == Some(0) {
+            let assigned_ts = self.select_packet_ts();
+            self.channel_scheduler.set_packet_ts_active(assigned_ts);
+            // Packet data uses assigned control unless a traffic usage marker is set.
+            // Keep usage_marker unset so the MS treats the assigned slot as SCH/F.
+            if let Some(marker) = PDP_USE_USAGE_MARKER {
+                pdu.usage_marker = Some(marker);
+                tracing::debug!("packet data: usage_marker={}", marker);
+            }
+            pdu.chan_alloc_element = Some(self.build_chan_alloc_element(assigned_ts));
+            if sdu_len > 0 {
+                sched_ts = assigned_ts;
+            }
+            tracing::debug!(
+                "packet data DL: assigned_ts={} sched_ts={} sdu_bits={}",
+                assigned_ts,
+                sched_ts,
+                sdu_len
+            );
+        }
+        pdu.update_len_and_fill_ind(sdu_len);
+        self.channel_scheduler.dl_enqueue_tma(sched_ts, pdu, sdu);
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -1185,6 +1277,38 @@ impl TetraEntityTrait for UmacBs {
 
             // Collect/construct traffic that should be sent down to the LMAC
             let elem = self.channel_scheduler.finalize_ts_for_tick();
+            let mut is_traffic = elem
+                .blk1
+                .as_ref()
+                .map(|b| b.logical_channel.is_traffic() || b.logical_channel == LogicalChannel::Stch)
+                .unwrap_or(false)
+                || elem
+                    .blk2
+                    .as_ref()
+                    .map(|b| b.logical_channel.is_traffic() || b.logical_channel == LogicalChannel::Stch)
+                    .unwrap_or(false);
+            // Optional: treat the assigned packet timeslot as traffic for UL decoding.
+            if PDP_UL_TRAFFIC && self.channel_scheduler.packet_ts_is_active(ts.t) {
+                is_traffic = true;
+            }
+            let second_half_stolen = elem.blk2.as_ref().map(|b| {
+                b.logical_channel == LogicalChannel::Stch
+            }).unwrap_or(false);
+            let c = SapMsg {
+                sap: Sap::TmvSap,
+                src: self.self_component,
+                dest: TetraEntity::Lmac,
+                dltime: ts,
+                msg: SapMsgInner::TmvConfigureReq(
+                    TmvConfigureReq {
+                        time: Some(ts),
+                        is_traffic: Some(is_traffic),
+                        second_half_stolen: Some(second_half_stolen),
+                        ..Default::default()
+                    }
+                )
+            };
+            queue.push_back(c);
             let s = SapMsg{
                 sap: Sap::TmvSap,
                 src: self.self_component,

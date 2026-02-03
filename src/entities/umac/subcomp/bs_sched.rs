@@ -38,6 +38,8 @@ pub struct BsChannelScheduler {
     precomps: PrecomputedUmacPdus,
     pub dltx_queues: [Vec<DlSchedElem>; 4],
     sched: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4],
+    packet_ts: u8,
+    packet_ts_active: bool,
 }
 
 #[derive(Debug)]
@@ -76,6 +78,8 @@ impl BsChannelScheduler {
             precomps,
             dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             sched: EMPTY_SCHED,
+            packet_ts: 2,
+            packet_ts_active: false,
         }
     }
 
@@ -100,6 +104,17 @@ impl BsChannelScheduler {
     pub fn set_dl_time(&mut self, new_ts: TdmaTime) {
         self.cur_ts = new_ts;
         self.purge_schedule();
+    }
+
+    pub fn set_packet_ts_active(&mut self, ts: u8) {
+        if (2..=4).contains(&ts) {
+            self.packet_ts = ts;
+            self.packet_ts_active = true;
+        }
+    }
+
+    pub fn packet_ts_is_active(&self, ts: u8) -> bool {
+        self.packet_ts_active && self.packet_ts == ts
     }
 
     pub fn ts_to_sched_index(&self, ts: &TdmaTime) -> usize {
@@ -254,10 +269,10 @@ impl BsChannelScheduler {
 
     /// Registers that we should transmit a MAC-RESOURCE or similar with a grant, somewhere this tick
     pub fn dl_enqueue_grant(&mut self, timeslot: u8, addr: TetraAddress, grant: BasicSlotgrant) {
-        let ts = if timeslot == 1 {
-            1
+        let ts = if (1..=4).contains(&timeslot) {
+            timeslot
         } else {
-            tracing::warn!("dl_enqueue_grant: TS{} not supported yet; enqueueing on TS1", timeslot);
+            tracing::warn!("dl_enqueue_grant: invalid TS{}; enqueueing on TS1", timeslot);
             1
         };
         tracing::debug!("dl_enqueue_grant: ts {} enqueueing PDU {:?} for addr {}", ts, grant, addr);
@@ -267,16 +282,11 @@ impl BsChannelScheduler {
 
     pub fn dl_enqueue_random_access_ack(&mut self, timeslot: u8, addr: TetraAddress) {
 
-        let ts = if timeslot == 1 {
-
-            1
-
+        let ts = if (1..=4).contains(&timeslot) {
+            timeslot
         } else {
-
-            tracing::warn!("dl_enqueue_random_access_ack: TS{} not supported yet; enqueueing on TS1", timeslot);
-
+            tracing::warn!("dl_enqueue_random_access_ack: invalid TS{}; enqueueing on TS1", timeslot);
             1
-
         };
 
         tracing::debug!("dl_enqueue_random_access_ack: ts {} enqueueing random access acknowledgementfor addr {}", ts, addr);
@@ -288,17 +298,11 @@ impl BsChannelScheduler {
     }
 
     pub fn dl_enqueue_tma(&mut self, timeslot: u8, pdu: MacResource, sdu: BitBuffer) {
-
-        let ts = if timeslot == 1 {
-
-            1
-
+        let ts = if (1..=4).contains(&timeslot) {
+            timeslot
         } else {
-
-            tracing::warn!("dl_enqueue_tma: TS{} not supported yet; enqueueing on TS1", timeslot);
-
+            tracing::warn!("dl_enqueue_tma: invalid TS{}; enqueueing on TS1", timeslot);
             1
-
         };
 
         tracing::debug!("dl_enqueue_tma: ts {} enqueueing PDU {:?} SDU {}", ts, pdu, sdu.dump_bin());
@@ -528,6 +532,8 @@ impl BsChannelScheduler {
         
         // TODO FIXME allocate only if we have something to put in it
         let mut buf_opt = BitBuffer::new(SCH_F_CAP);
+        let mut has_dl_payload = false;
+        let mut has_chan_alloc = false;
 
         // Integrate all grants and random access acks into resources (either existing or new)
         self.dl_integrate_sched_elems_for_timeslot(ts);
@@ -535,22 +541,9 @@ impl BsChannelScheduler {
         while !self.dltx_queues[ts.t as usize - 1].is_empty() {
             let opt = self.dl_take_prioritized_sched_item(ts);
 
-            if ts.t != 1 && opt.is_some() {
-                // Current scheduler implementation is TS1-focused.
-                // For now, degrade gracefully by redirecting TS>1 scheduled items into TS1 queue.
-                tracing::warn!(
-                    "dl scheduler: TS{} not supported yet; redirecting pending DL items to TS1",
-                    ts.t
-                );
-                if let Some(sched_elem) = opt {
-                    self.dltx_queues[0].push(sched_elem);
-                }
-                let idx = ts.t as usize - 1;
-                if idx < self.dltx_queues.len() {
-                    let moved: Vec<_> = self.dltx_queues[idx].drain(..).collect();
-                    self.dltx_queues[0].extend(moved);
-                }
-break;
+            if ts.t < 1 || ts.t > 4 {
+                tracing::warn!("dl scheduler: invalid TS{}", ts.t);
+                break;
             }
             
             match opt {
@@ -564,7 +557,11 @@ break;
                             // DL SDS (and some other SDUs) may exceed one SCH-F slot. Use the DlFragger
                             // to emit MAC-RESOURCE + (optional) MAC-FRAG/MAC-END sequence across future slots.
                             let mut fragger = DlFragger::new(pdu, sdu);
+                            if fragger.will_emit_resource() && fragger.has_chan_alloc() {
+                                has_chan_alloc = true;
+                            }
                             let done = fragger.get_next_chunk(SCH_F_CAP, &mut buf_opt);
+                            has_dl_payload = has_dl_payload || buf_opt.get_pos() > 0;
                             tracing::debug!("<- finalized (chunk) {}", buf_opt.dump_bin());
                             if !done {
                                 // Put remaining fragments back with high priority.
@@ -575,7 +572,11 @@ break;
                         },
 
                         DlSchedElem::FragBuf(mut fragger) => {
+                            if fragger.will_emit_resource() && fragger.has_chan_alloc() {
+                                has_chan_alloc = true;
+                            }
                             let done = fragger.get_next_chunk(SCH_F_CAP, &mut buf_opt);
+                            has_dl_payload = has_dl_payload || buf_opt.get_pos() > 0;
                             tracing::debug!("<- finalized (frag/end chunk) {}", buf_opt.dump_bin());
                             if !done {
                                 self.dltx_queues[ts.t as usize - 1].insert(0, DlSchedElem::FragBuf(fragger));
@@ -593,6 +594,10 @@ break;
                 }
             }
         }
+
+        if self.packet_ts_is_active(ts.t) {
+            has_chan_alloc = true;
+        }
         
         // Check if any signalling message was put
         let mut elem = if buf_opt.get_pos() == 0 {
@@ -604,10 +609,12 @@ break;
                 bbk: None, // WILL be populated later
             }
         } else {
+            // Signalling (including packet data) is sent on SCH/F.
+            let lchan = LogicalChannel::SchF;
             TmvUnitdataReqSlot {
                 ts,
                 blk1: Some(TmvUnitdataReq {
-                    logical_channel: LogicalChannel::SchF,
+                    logical_channel: lchan,
                     mac_block: buf_opt,
                     scrambling_code: self.scrambling_code,
                 }),
@@ -651,13 +658,13 @@ break;
         if let Some(ref blk1) = elem.blk1 {
             assert!(ts.f != 18, "frame 18 shouldn't have blk1 set");
             if blk1.logical_channel.is_traffic() {
-                unimplemented!("traffic bursts are not implemented yet");
+                tracing::debug!("finalize_ts_for_tick: traffic burst scheduled on {}", ts);
             }
         }
 
         // Construct the BBK block to reflect UL/DL usage
         assert!(elem.bbk.is_none(), "BBK block already set");
-        elem.bbk = Some(self.generate_bbk_block(ts));
+        elem.bbk = Some(self.generate_bbk_block(ts, has_dl_payload, has_chan_alloc));
 
         // tracing::trace!("finalize_ts_for_tick: have {}{}{}",
         //     if elem.bbk.is_some() { "bbk " } else { "" },
@@ -724,7 +731,7 @@ break;
     }
 
 
-    fn generate_bbk_block(&self, ts: TdmaTime) -> TmvUnitdataReq {
+    fn generate_bbk_block(&self, ts: TdmaTime, has_dl_payload: bool, has_chan_alloc: bool) -> TmvUnitdataReq {
 
         // let index = self.ts_to_sched_index(&ts);
         // let sched = &self.sched[ts.t as usize - 1][index];
@@ -768,14 +775,58 @@ break;
                     }
                 },
                 2..=4 => {
-                    // Additional channels, unallocated except we sent a chanalloc.
-                    // Voice MVP placeholder can advertise ONE configured timeslot as Traffic.
+                    // Additional channels. If we scheduled DL signalling here, advertise as control.
                     let v = voice_state::get();
                     if v.enabled && ts.f != 18 && ts.t == v.tch_ts {
                         aach.dl_usage = AccessAssignDlUsage::Traffic(v.tchan);
                         aach.ul_usage = AccessAssignUlUsage::Traffic(v.tchan);
+                    } else if has_chan_alloc {
+                        aach.dl_usage = AccessAssignDlUsage::AssignedControl;
+                        aach.ul_usage = AccessAssignUlUsage::AssignedOnly;
+                        match aach.ul_usage {
+                            AccessAssignUlUsage::CommonOnly => {
+                                aach.f1_af1 = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                                aach.f2_af2 = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                            },
+                            AccessAssignUlUsage::CommonAndAssigned |
+                            AccessAssignUlUsage::AssignedOnly => {
+                                aach.f2_af = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                            },
+                            _ => {}
+                        }
+                    } else if has_dl_payload {
+                        aach.dl_usage = AccessAssignDlUsage::CommonControl;
+                        aach.ul_usage = self.ul_get_usage(ts);
+                        match aach.ul_usage {
+                            AccessAssignUlUsage::CommonOnly => {
+                                aach.f1_af1 = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                                aach.f2_af2 = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                            },
+                            AccessAssignUlUsage::CommonAndAssigned |
+                            AccessAssignUlUsage::AssignedOnly => {
+                                aach.f2_af = Some(AccessField{
+                                    access_code: 0,
+                                    base_frame_len: 4,
+                                });
+                            },
+                            _ => {}
+                        }
                     } else {
-                        // Those are currently unimplemented, so, unallocated it is
                         aach.dl_usage = AccessAssignDlUsage::Unallocated;
                         aach.ul_usage = AccessAssignUlUsage::Unallocated;
                     }
@@ -812,7 +863,18 @@ break;
     } 
 
     fn generate_default_blks(&self, ts: TdmaTime) -> TmvUnitdataReq {
-        
+        if self.packet_ts_is_active(ts.t) {
+            // Keep assigned packet data slot active with a full-slot NULL PDU.
+            let mut buf = BitBuffer::new(SCH_F_CAP);
+            let blk = MacResource::null_pdu();
+            blk.to_bitbuf(&mut buf);
+            return TmvUnitdataReq {
+                logical_channel: LogicalChannel::TchS,
+                mac_block: buf,
+                scrambling_code: self.scrambling_code,
+            };
+        }
+
         match (ts.f, ts.t) {
             (1..=17, 1) => {
                 // Two options: [Blk1: Null | Blk2: SYSINFO] or [Both: Null]
@@ -997,10 +1059,10 @@ mod tests {
                 migration: false,
                 system_wide_services: false,
                 voice_service: true,
-                circuit_mode_data_service: false,
-                sndcp_service: false,
+                circuit_mode_data_service: true,
+                sndcp_service: true,
                 aie_service: false,
-                advanced_link: false,
+                advanced_link: true,
             }
         };
 

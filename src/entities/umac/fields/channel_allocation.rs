@@ -72,6 +72,21 @@ pub struct ChanAllocElement {
 
 
 impl ChanAllocElement {
+    pub fn bit_len(&self) -> usize {
+        let mut len = 2 + 4 + 2 + 1 + 1 + 12 + 1;
+        if self.ext_freq_band.is_some() {
+            len += 4 + 2 + 3 + 1;
+        }
+        len += 2;
+        if self.mon_pattern == 0 {
+            len += 2;
+        }
+        if self.ul_dl_assigned == 0 {
+            unimplemented!("Augmented channel allocation is not implemented");
+        }
+        len
+    }
+
     pub fn from_bitbuf(buf: &mut BitBuffer) -> Result<Self, PduParseErr> {
         let mut s = ChanAllocElement {
             alloc_type: 0,

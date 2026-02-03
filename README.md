@@ -47,6 +47,23 @@ cargo build --release
 chrt 99 ./target/release/tetra-bluestation ./example_bs_config.toml
 ```
 
+## Packet data (SNDCP / WAP)
+The SNDCP entity provides a minimal IPv4 packet-data path (SN-ACTIVATE PDP CONTEXT, SN-UNITDATA, SN-DATA TRANSMIT REQUEST).
+To bridge IP packets to/from an external process, use the UDP bridge:
+
+- `TETRA_PDP_LISTEN` (e.g. `0.0.0.0:49000`) enables the UDP bridge.
+- `TETRA_PDP_PEER` (e.g. `127.0.0.1:49001`) optional fixed peer for uplink.
+- `TETRA_PDP_FRAMED=1` to use a simple 8‑byte header (`ssi`/`endpoint_id`/`link_id`) before the payload.
+- `TETRA_PDP_DEFAULT_SSI` optional default ISSI for downlink if no header is provided.
+- `TETRA_PDP_NSAPI` optional default NSAPI (0‑15).
+- `TETRA_PDP_IP` optional IPv4 address assigned on PDP activation (default `10.0.0.2`).
+TUN bridge is hardcoded to `tetra0` (MTU 1500).
+
+Optional HTTP gateway (WAP 2.0 / HTTP):
+- Enabled by default on port `8081` with a simple HTTP proxy + local test page at `/`.
+
+Without framing, the UDP payload is treated as a raw IP packet (N‑PDU).
+
 ## TETRALIB design
 
 Firstly, the project constists of modules corresponding to all TETRA components as defined in the standard. These are referred to as *entities* and are:

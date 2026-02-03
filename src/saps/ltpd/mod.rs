@@ -197,7 +197,8 @@ pub struct LtpdMleResumeInd {
 
 #[derive(Debug)]
 pub struct LtpdMleUnitdataReq {
-    pub sdu: Todo,
+    pub sdu: BitBuffer,
+    pub address: TetraAddress,
     pub handle: Todo,
     pub layer2service: Todo,
     pub unacked_bl_repetitions: Todo,
@@ -226,4 +227,3 @@ pub struct LtpdMleUnitdataInd {
     pub chan_change_resp_req: bool,
     pub chan_change_handle: Option<Todo>,
 }
-

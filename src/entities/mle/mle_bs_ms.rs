@@ -148,9 +148,9 @@ prim.tl_sdu}
                     chan_change_handle: None, // TODO FIXME
                 };
                 let msg = SapMsg {
-                    sap: Sap::LcmcSap,
+                    sap: Sap::TlpdSap,
                     src: self.self_component,
-                    dest: TetraEntity::Cmce,
+                    dest: TetraEntity::Sndcp,
                     dltime: message.dltime,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
@@ -236,9 +236,9 @@ prim.tl_sdu}
                     chan_change_handle: None, // TODO FIXME
                 };
                 let msg = SapMsg {
-                    sap: Sap::LcmcSap,
+                    sap: Sap::TlpdSap,
                     src: self.self_component,
-                    dest: TetraEntity::Cmce,
+                    dest: TetraEntity::Sndcp,
                     dltime: message.dltime,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
@@ -440,14 +440,53 @@ prim.tl_sdu}
         }
     }
 
-    fn rx_tlpd_prim(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_tlpd_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tlpd_prim: {:?}", message);
-        unimplemented!("rx_tlpd_prim");
-        // match &message.msg {
-        //     _ => {
-        //         panic!();
-        //     }
-        // }
+        if matches!(message.msg, SapMsgInner::LtpdMleUnitdataReq(_)) {
+            self.rx_ltpd_mle_unitdata_req(queue, message);
+        } else {
+            unimplemented_log!("rx_tlpd_prim: unsupported {:?}", message.msg);
+        }
+    }
+
+    fn rx_ltpd_mle_unitdata_req(
+        &mut self,
+        queue: &mut MessageQueue,
+        mut message: SapMsg,
+    ) {
+        tracing::trace!("rx_ltpd_mle_unitdata_req: {:?}", message);
+
+        let SapMsgInner::LtpdMleUnitdataReq(prim) = &mut message.msg else { panic!() };
+
+        let mle_prot_discriminator = MleProtocolDiscriminator::Sndcp;
+        let sdu_len = prim.sdu.get_len();
+        let mut pdu = BitBuffer::new(3 + sdu_len);
+        pdu.write_bits(mle_prot_discriminator.into_raw(), 3);
+        pdu.copy_bits(&mut prim.sdu, sdu_len);
+        pdu.seek(0);
+
+        let sapmsg = SapMsg {
+            sap: Sap::TlaSap,
+            src: self.self_component,
+            dest: TetraEntity::Llc,
+            dltime: message.dltime,
+            msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+                main_address: prim.address,
+                link_id: prim.link_id,
+                endpoint_id: prim.endpoint_id,
+                tl_sdu: pdu,
+                scrambling_code: self.config.config().scrambling_code(),
+                stealing_permission: prim.stealing_permission,
+                subscriber_class: 0,
+                fcs_flag: prim.fcs_flag,
+                air_interface_encryption: None,
+                stealing_repeats_flag: Some(prim.stealing_repeats_flag),
+                data_class_info: Some(prim.data_class_info),
+                req_handle: prim.handle as i32,
+                graceful_degradation: None,
+            }),
+        };
+        queue.push_back(sapmsg);
     }
 
         fn rx_lcmc_mle_unitdata_req(

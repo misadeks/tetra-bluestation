@@ -154,4 +154,12 @@ impl DlFragger {
             self.get_frag_or_end_chunk(slot_cap, dest_buf)
         }
     }
+
+    pub fn has_chan_alloc(&self) -> bool {
+        self.resource.chan_alloc_element.is_some()
+    }
+
+    pub fn will_emit_resource(&self) -> bool {
+        !self.machdr_is_written
+    }
 }
