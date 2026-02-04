@@ -1,9 +1,9 @@
 # Release Notes — Voice MVP (Call Control Handshake)
 
 ## Summary
-This update adds a **minimal CMCE call-control handshake** so we can start iterating on **single-site voice / PTT**.
+This update adds a **minimal CMCE call-control handshake** and an **optional ACELP audio path** so we can start iterating on **single-site voice / PTT**.
 
-This is **control-plane only** (call setup + PTT grant signalling). It does **not** carry or relay speech frames yet.
+Audio requires the ETSI reference codec C sources at build time (compiled by `build.rs`; see Known Limitations).
 
 ## Added
 - **CMCE uplink handling** (`src/entities/cmce/cmce_bs.rs`)
@@ -18,6 +18,11 @@ This is **control-plane only** (call setup + PTT grant signalling). It does **no
   - 14-bit `call_id` allocation
   - called GSSI (assumed)
   - current talker (`tx_owner`)
+- **Audio path (ACELP)**
+  - UL TCH frames decoded to PCM and played to system audio output
+  - Mic PCM encoded to ACELP and injected into DL traffic when available
+  - Uses ETSI reference codec C sources when available (compiled by `build.rs`)
+  - Build with `--features voice-audio` and set `ETSI_CODEC_DIR` (or place sources in `third_party/etsi_codec`)
 
 ## Behaviour Notes
 - The called party in `U-SETUP` is currently treated as a **group (GSSI)**. This matches the "console forces MS into group call" workflow.
@@ -27,7 +32,7 @@ This is **control-plane only** (call setup + PTT grant signalling). It does **no
 - Extra `INFO` logs are printed (caller, called SSI, call_id) to help validate the handshake on Motorola **MTP/MXP/MXM** terminals.
 
 ## Known Limitations
-- No speech payload yet: traffic channel frames are not decoded/encoded and not relayed.
+- Voice audio requires ETSI codec sources (ETSI C-CODE) available at build time.
 - No call release/teardown yet (`U-DISCONNECT` / `U-RELEASE` not handled).
 - Group membership / DGNA state is not used for call authorization in this MVP.
 

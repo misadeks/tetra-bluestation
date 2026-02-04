@@ -1,4 +1,4 @@
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Type4FieldGeneric {
     pub field_id: u64,
     pub len:   usize,
@@ -7,7 +7,7 @@ pub struct Type4FieldGeneric {
     pub data:  u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Type3FieldGeneric {
     pub field_id: u64,
     pub len:   usize,

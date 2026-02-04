@@ -1034,13 +1034,13 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 
   <div class="card">
-    <h2 id="t_voice">Voice MVP (Traffic Slot Placeholder)</h2>
+    <h2 id="t_voice">Voice MVP (Traffic + Audio)</h2>
     <p class="hint" id="t_voice_hint">
-      This is a temporary placeholder to iterate toward single-site voice later.
+      When enabled, the BS will advertise one timeslot as <b>Traffic</b> in AACH and transmit TCH/traffic blocks.
 
-      When enabled, the BS will advertise one timeslot as <b>Traffic</b> in AACH and transmit two STCH blocks (dummy/idle content).
+      If the ETSI ACELP codec sources were available at build time (ETSI_CODEC_DIR), real audio is decoded to the speaker and mic audio is encoded to TCH.
 
-      It does not carry real audio yet.
+      Without the codec, the traffic slot stays idle/dummy.
     </p>
     <div class="row">
       <div>
@@ -1189,8 +1189,8 @@ const I18N = {
     t_dgna_btn_transfer: "轉移",
     t_dgna_refresh: "更新",
 
-    t_voice: "語音 MVP（流量時槽占位）",
-    t_voice_hint: "此功能僅為單站語音的占位/實驗：啟用後基地台會在 AACH 宣告某個 timeslot 為 Traffic，並在該時槽送出兩個 STCH 區塊（idle/dummy）。目前不承載真實語音。",
+    t_voice: "語音 MVP（流量 + 音訊）",
+    t_voice_hint: "啟用後基地台會在 AACH 宣告某個 timeslot 為 Traffic，並在該時槽送出 TCH/traffic 區塊。若建置時已提供 ETSI ACELP codec 原始碼（ETSI_CODEC_DIR），將把語音解碼到喇叭並把麥克風編碼送出；未提供則維持 idle/dummy。",
     t_voice_enable: "啟用",
     t_voice_ts: "Traffic timeslot",
     t_voice_tchan: "Traffic channel number（usage marker）",
@@ -1265,8 +1265,8 @@ const I18N = {
     t_dgna_btn_transfer: "Transfer",
     t_dgna_refresh: "Refresh",
 
-    t_voice: "Voice MVP (Traffic Slot Placeholder)",
-    t_voice_hint: "Temporary placeholder toward single-site voice. When enabled, the BS advertises one timeslot as Traffic (AACH) and transmits two STCH blocks (dummy/idle). No real audio yet.",
+    t_voice: "Voice MVP (Traffic + Audio)",
+    t_voice_hint: "When enabled, the BS advertises one timeslot as Traffic (AACH) and transmits TCH/traffic blocks. If the ETSI ACELP codec sources were available at build time (ETSI_CODEC_DIR), real audio is decoded to the speaker and mic audio is encoded to TCH. Without the codec, the traffic slot stays idle/dummy.",
     t_voice_enable: "Enable",
     t_voice_ts: "Traffic timeslot",
     t_voice_tchan: "Traffic channel number (usage marker)",

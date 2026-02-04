@@ -20,7 +20,7 @@ This is a FOSS TETRA stack aimed at providing an extensible basis for TETRA expe
 ### Not functional / not implemented
 - MS (Mobile Station, radio) and monitoring implementation not fully functional
 - Mle and everything above is a skeleton implementation that has to be extended where needed
-- Voice codec, call setup and calling is not implemented
+- Voice call control is partial; single-site call setup/PTT exists and audio requires ETSI codec sources at build time
 
 
 ## General TETRA design

@@ -8,6 +8,9 @@ use crate::saps::tp::{TpUnitdataInd, TpUnitdataReqSlot};
 use crate::common::tdma_time::TdmaTime;
 use crate::common::tetra_common::Sap;
 use crate::common::tetra_entities::TetraEntity;
+use crate::common::bitbuffer::BitBuffer;
+use crate::common::etsi_codec;
+use crate::common::voice_audio;
 use crate::entities::lmac::components::errorcontrol;
 use crate::entities::lmac::components::scramble::scrambler;
 use crate::entities::TetraEntityTrait;
@@ -59,6 +62,25 @@ pub struct LmacBs {
 }
 
 impl LmacBs {
+    fn normalize_tch_encoded(&self, mut buf: BitBuffer) -> BitBuffer {
+        let target = etsi_codec::TCH_ENCODED_BITS;
+        let len = buf.get_len();
+        if len == target {
+            return buf;
+        }
+        buf.seek(0);
+        let mut out = BitBuffer::new(target);
+        if len * 2 == target {
+            out.copy_bits(&mut buf, len);
+            buf.seek(0);
+            out.copy_bits(&mut buf, len);
+        } else {
+            let copy_len = usize::min(len, target);
+            out.copy_bits(&mut buf, copy_len);
+        }
+        out.seek(0);
+        out
+    }
     pub fn new(config: SharedConfig) -> Self {
 
         // Retrieve initial basic network params from config
@@ -135,8 +157,44 @@ impl LmacBs {
         }
     }
 
-    fn rx_blk_traffic(&mut self, _queue: &mut MessageQueue, _blk: TpUnitdataInd, _lchan: LogicalChannel) {
-        unimplemented_log!("rx_blk_traffic: Traffic channel reception not implemented yet");
+    fn rx_blk_traffic(&mut self, queue: &mut MessageQueue, mut blk: TpUnitdataInd, lchan: LogicalChannel, ul_time: TdmaTime) {
+        let raw_block = blk.block;
+        let (payload, crc_ok) = match etsi_codec::channel_decode_tch(&raw_block, self.scrambling_code) {
+            Ok((decoded, crc_ok)) => (decoded, crc_ok),
+            Err(_) => (raw_block, true),
+        };
+        let len_bits = payload.get_len();
+        let len_bytes = (len_bits + 7) / 8;
+        tracing::info!(
+            "UL TCH rx time={} lchan={:?} burst={:?} train={:?} blknum={:?} len_bits={} len_bytes={} crc_fec={} frame_type=unknown",
+            ul_time,
+            lchan,
+            blk.burst_type,
+            blk.train_type,
+            blk.block_num,
+            len_bits,
+            len_bytes,
+            if crc_ok { "ok" } else { "bad" }
+        );
+
+        let mut payload = payload;
+        payload.seek(0);
+
+        let m = SapMsg {
+            sap: Sap::TmvSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Umac,
+            dltime: ul_time,
+            msg: SapMsgInner::TmvUnitdataInd(
+                TmvUnitdataInd {
+                    pdu: payload,
+                    logical_channel: lchan,
+                    crc_pass: crc_ok,
+                    scrambling_code: self.scrambling_code,
+                }
+            )
+        };
+        queue.push_back(m);
     }
 
     fn rx_blk_cp(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) {
@@ -181,13 +239,42 @@ impl LmacBs {
         
         tracing::debug!("rx_tp_prim: msg {:?}", message);
 
+        let ul_time = message.dltime;
         let SapMsgInner::TpUnitdataInd(prim) = message.msg else { panic!() };
-        let lchan = self.determine_logical_channel_ul(&prim, &self.time, false, false);
+        let burst_is_traffic = voice_audio::is_traffic_ts(ul_time.t);
+        let lchan = self.determine_logical_channel_ul(&prim, &ul_time, burst_is_traffic, false);
+
+        // Heuristic: for uplink NormalTrainSeq2 blocks, treat CRC-failed STCH as TCH
+        // when there is any active call. This helps when timeslot mapping is off and
+        // STCH decoding fails for traffic blocks.
+        if lchan == LogicalChannel::Stch
+            && voice_audio::get_any_call().is_some()
+            && prim.burst_type == BurstType::NUB
+            && prim.train_type == TrainingSequence::NormalTrainSeq2
+        {
+            let prim_for_crc = TpUnitdataInd {
+                train_type: prim.train_type,
+                burst_type: prim.burst_type,
+                block_type: prim.block_type,
+                block_num: prim.block_num,
+                block: prim.block.clone(),
+            };
+            let (_type1, crc_pass) = errorcontrol::decode_cp(lchan, prim_for_crc, Some(self.scrambling_code));
+            if !crc_pass {
+                tracing::info!(
+                    "UL TCH heuristic: STCH CRC failed, treating as TCH time={} blknum={:?}",
+                    ul_time,
+                    prim.block_num
+                );
+                self.rx_blk_traffic(queue, prim, LogicalChannel::TchS, ul_time);
+                return;
+            }
+        }
 
         match lchan {
             LogicalChannel::Clch => {}
             LogicalChannel::TchS | LogicalChannel::Tch24 | LogicalChannel::Tch48 | LogicalChannel::Tch72 => {
-                self.rx_blk_traffic(queue, prim, lchan)
+                self.rx_blk_traffic(queue, prim, lchan, ul_time)
             }
             _ => {
                 self.rx_blk_cp(queue, prim, lchan);
@@ -237,7 +324,7 @@ impl LmacBs {
             // Synchronization Donwlink Burst
             assert!(blk2.is_some());
             (BurstType::SDB, TrainingSequence::SyncTrainSeq)
-        } else if blk1.logical_channel == LogicalChannel::SchF {
+        } else if blk1.logical_channel == LogicalChannel::SchF || (blk1.logical_channel.is_traffic() && blk2.is_none()) {
             // Single full block
             assert!(blk2.is_none());
             (BurstType::NDB, TrainingSequence::NormalTrainSeq1)
@@ -256,9 +343,56 @@ impl LmacBs {
         };
 
         prim_phy.bbk = Some(errorcontrol::encode_aach(bbk.mac_block, bbk.scrambling_code));
-        prim_phy.blk1 = Some(errorcontrol::encode_cp(blk1));
+        if blk1.logical_channel.is_traffic() {
+            let len = blk1.mac_block.get_len();
+            if len == etsi_codec::TCH_ENCODED_BITS {
+                // Pass-through: already encoded
+                prim_phy.blk1 = Some(blk1.mac_block);
+            } else if etsi_codec::available() {
+                let encoded = match etsi_codec::channel_encode_tch(&blk1.mac_block, blk1.scrambling_code) {
+                    Ok(buf) => buf,
+                    Err(_) => {
+                        tracing::warn!("TCH encode failed: falling back to padded traffic");
+                        self.normalize_tch_encoded(blk1.mac_block)
+                    }
+                };
+                prim_phy.blk1 = Some(encoded);
+            } else {
+                tracing::warn!(
+                    "TCH passthrough: expected {} bits, got {}; padding",
+                    etsi_codec::TCH_ENCODED_BITS,
+                    len
+                );
+                prim_phy.blk1 = Some(self.normalize_tch_encoded(blk1.mac_block));
+            }
+        } else {
+            prim_phy.blk1 = Some(errorcontrol::encode_cp(blk1));
+        }
         if let Some(blk2) = blk2 {
-            prim_phy.blk2 = Some(errorcontrol::encode_cp(blk2));
+            if blk2.logical_channel.is_traffic() {
+                let len = blk2.mac_block.get_len();
+                if len == etsi_codec::TCH_ENCODED_BITS {
+                    prim_phy.blk2 = Some(blk2.mac_block);
+                } else if etsi_codec::available() {
+                    let encoded = match etsi_codec::channel_encode_tch(&blk2.mac_block, blk2.scrambling_code) {
+                        Ok(buf) => buf,
+                        Err(_) => {
+                            tracing::warn!("TCH encode failed: falling back to padded traffic");
+                            self.normalize_tch_encoded(blk2.mac_block)
+                        }
+                    };
+                    prim_phy.blk2 = Some(encoded);
+                } else {
+                    tracing::warn!(
+                        "TCH passthrough: expected {} bits, got {}; padding",
+                        etsi_codec::TCH_ENCODED_BITS,
+                        len
+                    );
+                    prim_phy.blk2 = Some(self.normalize_tch_encoded(blk2.mac_block));
+                }
+            } else {
+                prim_phy.blk2 = Some(errorcontrol::encode_cp(blk2));
+            }
         }
 
         // Pass timeslot worth of blocks to Phy

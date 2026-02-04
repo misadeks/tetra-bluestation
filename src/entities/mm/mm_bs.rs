@@ -9,6 +9,7 @@ use crate::common::address::{SsiType, TetraAddress};
 use crate::common::bitbuffer::BitBuffer;
 use crate::common::tdma_time::TdmaTime;
 use crate::common::online;
+use crate::common::group_registry;
 use crate::entities::mm::components::client_state::MmClientMgr;
 use crate::entities::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
 use crate::entities::mm::fields::group_identity_attachment::GroupIdentityAttachment;
@@ -70,6 +71,7 @@ impl MmBs {
             tracing::warn!("Received UItsiDetach for unknown client with SSI: {}", ssi);
             // return;
         };
+        group_registry::detach_all(ssi);
     }
 
     fn rx_u_location_update_demand(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -220,6 +222,7 @@ impl MmBs {
                     return;
                 }
             }
+            group_registry::detach_all(issi);
         }
 
         // Try to attach to requested groups, and retrieve list of accepted GroupIdentityDownlink elements
@@ -521,26 +524,40 @@ impl MmBs {
             if giu.gssi.is_none() || giu.vgssi.is_some() || giu.address_extension.is_some() {
                 unimplemented_log!("Only support GroupIdentityUplink with address_type 0");
                 continue;
-            }   
+            }
 
             let gssi = giu.gssi.unwrap(); // can't fail
-            match self.client_mgr.client_group_attach(issi, gssi, true) {
+            let do_attach = giu.group_identity_detachment_uplink.is_none();
+            match self.client_mgr.client_group_attach(issi, gssi, do_attach) {
                 Ok(_) => {
-                    // We have added the client to this group. Add an entry to the downlink response
-                    let gid = GroupIdentityDownlink {
-                        group_identity_attachment: Some(GroupIdentityAttachment {
-                            group_identity_attachment_lifetime: 3, // re-attach after location update
-                            class_of_usage: giu.class_of_usage.unwrap_or(0),
-                        }),
-                        group_identity_detachment_uplink: None,
-                        gssi: Some(giu.gssi.unwrap()),
-                        address_extension: None,
-                        vgssi: None
-                    };
-                    accepted_groups.push(gid);
+                    if do_attach {
+                        group_registry::attach(issi, gssi);
+                        // We have added the client to this group. Add an entry to the downlink response
+                        let gid = GroupIdentityDownlink {
+                            group_identity_attachment: Some(GroupIdentityAttachment {
+                                group_identity_attachment_lifetime: 3, // re-attach after location update
+                                class_of_usage: giu.class_of_usage.unwrap_or(0),
+                            }),
+                            group_identity_detachment_uplink: None,
+                            gssi: Some(gssi),
+                            address_extension: None,
+                            vgssi: None
+                        };
+                        accepted_groups.push(gid);
+                    } else {
+                        group_registry::detach(issi, gssi);
+                        let gid = GroupIdentityDownlink {
+                            group_identity_attachment: None,
+                            group_identity_detachment_uplink: giu.group_identity_detachment_uplink,
+                            gssi: Some(gssi),
+                            address_extension: None,
+                            vgssi: None
+                        };
+                        accepted_groups.push(gid);
+                    }
                 },
                 Err(e) => {
-                    tracing::warn!("Failed attaching MS {} to group {}: {:?}", issi, gssi, e);
+                    tracing::warn!("Failed updating group attach for MS {} to group {}: {:?}", issi, gssi, e);
                 }
             }
         }

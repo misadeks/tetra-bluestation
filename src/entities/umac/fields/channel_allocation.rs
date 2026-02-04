@@ -72,6 +72,18 @@ pub struct ChanAllocElement {
 
 
 impl ChanAllocElement {
+    pub fn bit_len(&self) -> usize {
+        let mut len = 2 + 4 + 2 + 1 + 1 + 12 + 1; // includes ext_carrier_num_flag
+        if self.ext_freq_band.is_some() {
+            len += 4 + 2 + 3 + 1;
+        }
+        len += 2; // mon_pattern
+        if self.mon_pattern == 0 {
+            len += 2; // frame18_mon_pattern
+        }
+        len
+    }
+
     pub fn from_bitbuf(buf: &mut BitBuffer) -> Result<Self, PduParseErr> {
         let mut s = ChanAllocElement {
             alloc_type: 0,
@@ -155,13 +167,15 @@ impl ChanAllocElement {
         buf.write_bits(self.cell_change_flag as u8 as u64, 1);
         buf.write_bits(self.carrier_num as u64, 12);
         
-        // If freq band supplied, we assume all four fields are there
+        // Extended carrier number flag (always present)
         if let Some(ext_freq_band) = self.ext_freq_band { 
-            buf.write_bits(1, 1); // Extended carrier number flag
+            buf.write_bits(1, 1);
             buf.write_bits(ext_freq_band as u64, 4); 
             buf.write_bits(self.ext_offset.unwrap() as u64, 2);
             buf.write_bits(self.ext_duplex_spacing.unwrap() as u64, 3);
             buf.write_bits(self.ext_reverse_operation.unwrap() as u8 as u64, 1);
+        } else {
+            buf.write_bits(0, 1);
         }
 
         buf.write_bits(self.mon_pattern as u64, 2);

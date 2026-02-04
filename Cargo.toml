@@ -2,6 +2,7 @@
 name = "tetra-bluestation"
 version = "0.2.4"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 as-any = "0.3.2"
@@ -18,9 +19,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 crossbeam-channel = "0.5"
 serialport = { version = "4.4", default-features = false }
 anyhow = "1.0"
+cpal = { version = "0.15.3", optional = true }
+ringbuf = { version = "0.4.8", optional = true }
 
 # By default, we disable the lowest tracing events for performance
 # Remove the release_max_level feature to enable all tracing debug levels in release builds
 tracing = { version = "0.1.41", features = ["std"] }
 tracing-appender = "0.2.4"
 # tracing = { version = "0.1.41", features = ["std"] }
+
+[build-dependencies]
+cc = "1.2.14"
+
+[features]
+voice-audio = ["cpal", "ringbuf"]

@@ -7,6 +7,7 @@ use crate::saps::tp::TpUnitdataInd;
 use crate::common::tdma_time::TdmaTime;
 use crate::common::tetra_common::Sap;
 use crate::common::tetra_entities::TetraEntity;
+use crate::common::etsi_codec;
 use crate::entities::lmac::components::errorcontrol;
 use crate::entities::phy::enums::burst::{PhyBlockNum, PhyBlockType};
 use crate::entities::TetraEntityTrait;
@@ -150,8 +151,50 @@ impl LmacMs {
         }
     }
 
-    fn rx_blk_traffic(&mut self, _queue: &mut MessageQueue, _blk: TpUnitdataInd, _lchan: LogicalChannel) {
-        unimplemented_log!("rx_blk_traffic: Traffic channel reception not implemented yet");
+    fn rx_blk_traffic(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) {
+        let Some(scrambling_code) = self.scrambling_code else {
+            tracing::warn!("rx_blk_traffic: no scrambling code set, need SYNC first");
+            return;
+        };
+
+        let raw_block = blk.block;
+        let (payload, crc_ok) = match etsi_codec::channel_decode_tch(&raw_block, scrambling_code) {
+            Ok((decoded, crc_ok)) => (decoded, crc_ok),
+            Err(_) => (raw_block, true),
+        };
+
+        let len_bits = payload.get_len();
+        let len_bytes = (len_bits + 7) / 8;
+        tracing::info!(
+            "DL TCH rx time={} lchan={:?} burst={:?} train={:?} blknum={:?} len_bits={} len_bytes={} crc_fec={}",
+            self.ts.unwrap_or_default(),
+            lchan,
+            blk.burst_type,
+            blk.train_type,
+            blk.block_num,
+            len_bits,
+            len_bytes,
+            if crc_ok { "ok" } else { "bad" }
+        );
+
+        let mut payload = payload;
+        payload.seek(0);
+
+        let m = SapMsg {
+            sap: Sap::TmvSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Umac,
+            dltime: self.ts.unwrap_or_default(),
+            msg: SapMsgInner::TmvUnitdataInd(
+                TmvUnitdataInd {
+                    pdu: payload,
+                    logical_channel: lchan,
+                    crc_pass: crc_ok,
+                    scrambling_code,
+                }
+            )
+        };
+        queue.push_back(m);
     }
 
     fn rx_blk_cp(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) {

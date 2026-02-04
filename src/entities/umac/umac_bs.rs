@@ -10,6 +10,8 @@ use crate::saps::tma::TmaUnitdataInd;
 use crate::common::bitbuffer::BitBuffer;
 use crate::common::online;
 use crate::common::tdma_time::TdmaTime;
+use crate::common::voice_audio_io;
+use crate::common::etsi_codec;
 
 use crate::common::tetra_common::{Sap, Todo};
 use crate::common::tetra_entities::TetraEntity;
@@ -70,6 +72,7 @@ impl UmacBs {
     pub fn new(config: SharedConfig) -> Self {
 
         let scrambling_code = config.config().scrambling_code();
+        let cell_main_carrier = config.config().cell.main_carrier;
         let precomps = Self::generate_precomps(&config);
         Self { 
             self_component: TetraEntity::Umac,
@@ -77,7 +80,7 @@ impl UmacBs {
             endpoint_id: 0, 
             defrag: MacDefrag::new(),
             event_label_store: EventLabelStore::new(),
-            channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
+            channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps, cell_main_carrier),
         }
     }
 
@@ -221,10 +224,56 @@ impl UmacBs {
                 tracing::trace!("rx_tmv_unitdata_ind: {:?}", prim.logical_channel);
                 self.rx_tmv_sch(queue, message);
             }
+            LogicalChannel::TchS |
+            LogicalChannel::Tch24 |
+            LogicalChannel::Tch48 |
+            LogicalChannel::Tch72 => {
+                self.rx_tmv_tch(queue, message);
+            }
             _ => {
                 panic!("rx_tmv_unitdata_ind: Unknown logical channel {:?}", prim.logical_channel);
             }
         }
+    }
+
+    pub fn rx_tmv_tch(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+        let ul_time = message.dltime;
+        let SapMsgInner::TmvUnitdataInd(prim) = message.msg else { panic!() };
+        let len_bits = prim.pdu.get_len();
+        let len_bytes = (len_bits + 7) / 8;
+        tracing::info!(
+            "UL TCH enqueue time={} lchan={:?} len_bits={} len_bytes={} crc_fec={}",
+            ul_time,
+            prim.logical_channel,
+            len_bits,
+            len_bytes,
+            if prim.crc_pass { "ok" } else { "bad" }
+        );
+
+        let mut buf = prim.pdu;
+        buf.seek(0);
+        let mut sched_crc_ok = prim.crc_pass;
+
+        let mut audio_buf = buf.clone();
+        let mut audio_crc_ok = prim.crc_pass;
+        if etsi_codec::available() && audio_buf.get_len() == etsi_codec::TCH_ENCODED_BITS {
+            match etsi_codec::channel_decode_tch(&audio_buf, prim.scrambling_code) {
+                Ok((decoded, crc_ok)) => {
+                    audio_buf = decoded.clone();
+                    audio_crc_ok = crc_ok;
+                    buf = decoded;
+                    sched_crc_ok = crc_ok;
+                }
+                Err(_) => {
+                    tracing::warn!("VOICE audio: encoded TCH received but ETSI codec unavailable");
+                }
+            }
+        }
+        if etsi_codec::available() && audio_buf.get_len() == etsi_codec::TCH_TYPE1_BITS {
+            voice_audio_io::push_ul_tch(audio_buf, audio_crc_ok);
+        }
+
+        self.channel_scheduler.enqueue_traffic_frame(ul_time, prim.logical_channel, buf, sched_crc_ok);
     }
 
     /// Receive signalling (SCH, or STCH / BNCH)
