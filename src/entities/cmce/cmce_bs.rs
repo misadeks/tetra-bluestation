@@ -65,8 +65,8 @@ pub struct CmceBs {
     next_call_id: u16,
 }
 
-const TX_GRANT_GRANTED: u8 = 1;
-const TX_GRANT_NOT_GRANTED: u8 = 0;
+const TX_GRANT_GRANTED: u8 = 0;
+const TX_GRANT_NOT_GRANTED: u8 = 1;
 const TX_GRANT_QUEUED: u8 = 2;
 const TX_GRANT_GRANTED_TO_ANOTHER: u8 = 3;
 
@@ -123,18 +123,18 @@ impl CmceBs {
     ) {
         let members = group_registry::members(gssi);
         let mut sent_any = false;
-        for ssi in members {
-            if Some(ssi) == exclude_issi {
-                continue;
-            }
-            let dst = TetraAddress { encrypted: false, ssi_type: SsiType::Ssi, ssi };
-            self.tx_lcmc_dl_bits(queue, dltime, dst, link_id, endpoint_id, pdu.clone());
-            sent_any = true;
-        }
-        if !sent_any {
+        // for ssi in members {
+        //     if Some(ssi) == exclude_issi {
+        //         continue;
+        //     }
+        //     let dst = TetraAddress { encrypted: false, ssi_type: SsiType::Ssi, ssi };
+        //     self.tx_lcmc_dl_bits(queue, dltime, dst, link_id, endpoint_id, pdu.clone());
+        //     sent_any = true;
+        // }
+        // if !sent_any {
             let dst_group = TetraAddress { encrypted: false, ssi_type: SsiType::Gssi, ssi: gssi };
             self.tx_lcmc_dl_bits(queue, dltime, dst_group, link_id, endpoint_id, pdu);
-        }
+        // }
     }
 
     fn tx_lcmc_dl_bits(
@@ -576,7 +576,7 @@ impl CmceBs {
                                     call_time_out: 15,
                                     hook_method_selection: us.hook_method_selection,
                                     simplex_duplex_selection: us.simplex_duplex_selection,
-                                    transmission_grant: 0,
+                                    transmission_grant: TX_GRANT_GRANTED,
                                     transmission_request_permission: true,
                                     call_ownership: true,
                                 // Type2 optional fields. For MVP we omit them (assume same as requested).
@@ -598,8 +598,8 @@ impl CmceBs {
                                     hook_method_selection: us.hook_method_selection,
                                     simplex_duplex_selection: us.simplex_duplex_selection,
                                     basic_service_information: us.basic_service_information,
-                                    transmission_grant: TX_GRANT_NOT_GRANTED,
-                                    transmission_request_permission: true,
+                                    transmission_grant: TX_GRANT_GRANTED_TO_ANOTHER,
+                                    transmission_request_permission: false,
                                     call_priority: us.call_priority,
                                     notification_indicator: None,
                                     temporary_address: None,
@@ -612,6 +612,7 @@ impl CmceBs {
                                     proprietary: None,
                                 }.to_bitbuf(b)
                             }) {
+                                tracing::info!("GSSI setup gssi: {:}, caller: {:}", gssi, caller_issi);
                                 self.tx_group_listeners(
                                     queue,
                                     message.dltime,
@@ -631,8 +632,8 @@ impl CmceBs {
                                     hook_method_selection: us.hook_method_selection,
                                     simplex_duplex_selection: us.simplex_duplex_selection,
                                     basic_service_information: us.basic_service_information,
-                                    transmission_grant: TX_GRANT_NOT_GRANTED,
-                                    transmission_request_permission: true,
+                                    transmission_grant: TX_GRANT_GRANTED_TO_ANOTHER,
+                                    transmission_request_permission: false,
                                     call_priority: us.call_priority,
                                     notification_indicator: None,
                                     temporary_address: None,
@@ -677,7 +678,7 @@ impl CmceBs {
                             DConnectAcknowledge {
                                 call_identifier: uc.call_identifier,
                                 call_time_out: 15,
-                                transmission_grant: TX_GRANT_NOT_GRANTED,
+                                transmission_grant: TX_GRANT_GRANTED,
                                 transmission_request_permission: true,
                                 notification_indicator: None,
                                 facility: None,
@@ -700,7 +701,7 @@ impl CmceBs {
                                 DConnectAcknowledge {
                                     call_identifier: uc.call_identifier,
                                     call_time_out: 15,
-                                    transmission_grant: TX_GRANT_NOT_GRANTED,
+                                    transmission_grant: TX_GRANT_GRANTED_TO_ANOTHER,
                                     transmission_request_permission: true,
                                     notification_indicator: None,
                                     facility: None,
@@ -715,7 +716,6 @@ impl CmceBs {
                 ctx.caller_issi,
                 uc.call_identifier
             );
-
                     }
                     Err(e) => tracing::warn!("UConnect parse failed: {:?}", e),
                 }
@@ -857,7 +857,7 @@ impl CmceBs {
                             if let Some(pdu) = self.build_dl_pdu(|b| {
                                 DTxGranted {
                                     call_identifier: ctx.call_id,
-                                    transmission_grant: TX_GRANT_GRANTED,
+                                    transmission_grant: TX_GRANT_GRANTED_TO_ANOTHER,
                                     transmission_request_permission: true,
                                     encryption_control: utx.encryption_control,
                                     reserved: false,
@@ -887,7 +887,7 @@ impl CmceBs {
                                 self.tx_lcmc_dl_pdu(queue, message.dltime, dst, prim.link_id as u16, prim.endpoint_id as u16, |b| {
                                     DTxGranted {
                                         call_identifier: ctx.call_id,
-                                        transmission_grant: TX_GRANT_GRANTED,
+                                        transmission_grant: TX_GRANT_GRANTED_TO_ANOTHER,
                                         transmission_request_permission: true,
                                         encryption_control: utx.encryption_control,
                                         reserved: false,

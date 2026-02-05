@@ -11,6 +11,12 @@ pub struct ChanAllocElement {
     // 2
     pub alloc_type: u8,
     // 4
+    /// "Timeslot assigned" (4-bit bitmap, one bit per timeslot).
+    ///
+    /// ETSI EN 300 392-2 (V2.3.2) clause 23.5.4.3.2 specifies this element as a bit map.
+    /// Example: TS2 => 0b0010 (decimal 2), TS4 => 0b1000 (decimal 8).
+    ///
+    /// NOTE: Older code incorrectly treated this as a 0-based timeslot index (0..3).
     pub ts_assigned: u8,
     // 2
     pub ul_dl_assigned: u8,

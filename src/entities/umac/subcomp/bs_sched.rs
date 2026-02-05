@@ -361,8 +361,7 @@ impl BsChannelScheduler {
                 grant_timeslots
             );
 
-            if self.cur_ts.is_mandatory_clch() {
-                // Not an opportunity; skip
+            if candidate_t.is_mandatory_clch() || candidate_t.f == 18 {
                 continue;
             }
 
@@ -827,14 +826,42 @@ impl BsChannelScheduler {
         });
     }
 
+    fn build_voice_chanalloc_elem(&self, call: &voice_audio::VoiceCall, target_ssi: u32) -> (u8, ChanAllocElement) {
+        let ts_assigned_bitmap: u8 = if (1..=4).contains(&call.tch_ts) { 1u8 << (call.tch_ts - 1) } else { 0 };
+
+        let chan_alloc = ChanAllocElement {
+            alloc_type: 0,
+            ts_assigned: ts_assigned_bitmap,
+            ul_dl_assigned: 3,
+            clch_permission: false,
+            cell_change_flag: false,
+            carrier_num: self.cell_main_carrier,
+            ext_freq_band: None,
+            ext_offset: None,
+            ext_duplex_spacing: None,
+            ext_reverse_operation: None,
+            mon_pattern: 0,
+            frame18_mon_pattern: Some(0),
+        };
+
+        (call.tchan, chan_alloc)
+    }
+
+
     fn build_voice_chanalloc_buf(&self, call: &voice_audio::VoiceCall, target_ssi: u32) -> Option<BitBuffer> {
         let addr = TetraAddress {
             encrypted: false,
             ssi_type: SsiType::Ssi,
             ssi: target_ssi,
         };
-        let ts_assigned_2bit: u8 = call.tch_ts.saturating_sub(1).min(3);
-        if !(1..=4).contains(&call.tch_ts) {
+        // "timeslot assigned" is a 4-bit bitmap (one bit per TS), not a 0-based index.
+        // ETSI EN 300 392-2 V2.3.2 clause 23.5.4.3.2.
+        let ts_assigned_bitmap: u8 = if (1..=4).contains(&call.tch_ts) {
+            1u8 << (call.tch_ts - 1)
+        } else {
+            0
+        };
+        if ts_assigned_bitmap == 0 {
             tracing::warn!(
                 "VOICE chanalloc: unexpected tch_ts={} for call_id={}, expected 1..=4",
                 call.tch_ts,
@@ -849,9 +876,13 @@ impl BsChannelScheduler {
         }
         let chan_alloc = ChanAllocElement {
             alloc_type: 0,
-            ts_assigned: ts_assigned_2bit,
+            ts_assigned: ts_assigned_bitmap,
             ul_dl_assigned: 3,
-            clch_permission: false,
+            // ETSI EN 300 392-2 §23.5.4.3.4: immediate CLCH permission allows the MS
+            // to linearize on the first uplink slot of the allocated channel without
+            // waiting for ACCESS-ASSIGN / frame 18. Many commercial MS rely on this
+            // for fast and reliable TCH uplink start.
+            clch_permission: true,
             cell_change_flag: false,
             carrier_num: self.cell_main_carrier,
             ext_freq_band: None,
@@ -861,10 +892,14 @@ impl BsChannelScheduler {
             mon_pattern: 0,
             frame18_mon_pattern: Some(0),
         };
+        let slot_grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::Grant1Slot,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
+        };
 
         let mut pdu = MacResource {
             fill_bits: false,
-            pos_of_grant: 0,
+            pos_of_grant: 1,
             encryption_mode: 0,
             random_access_flag: false,
             length_ind: 0,
@@ -872,13 +907,14 @@ impl BsChannelScheduler {
             event_label: None,
             usage_marker: Some(call.tchan),
             power_control_element: None,
-            slot_granting_element: None,
+            slot_granting_element: Some(slot_grant),
             chan_alloc_element: Some(chan_alloc),
         };
 
         let num_fill_bits = pdu.update_len_and_fill_ind(0);
         let mut buf = BitBuffer::new(SCH_F_CAP);
         pdu.to_bitbuf(&mut buf);
+        tracing::info!("VOICE chanalloc pdu pre-encode: {:?}", pdu);
         if num_fill_bits > 0 {
             buf.write_bit(1);
             buf.write_zeroes(num_fill_bits - 1);
@@ -1099,7 +1135,8 @@ impl BsChannelScheduler {
                     call.call_id,
                     target_ssi,
                     call.tch_ts,
-                    call.tch_ts.saturating_sub(1),
+                    // "timeslot assigned" is a bitmap; TS2 -> 0b0010.
+                    1u8 << (call.tch_ts.saturating_sub(1)),
                     call.tchan,
                     self.cell_main_carrier,
                     start_time
@@ -1109,6 +1146,37 @@ impl BsChannelScheduler {
                 }
             }
         }
+
+        // if ts.t == 1 && ts.f != 18 {
+        //     if let Some((call, target_ssi)) = voice_audio::next_chanalloc_due(ts) {
+        //         let start_time = self.compute_tch_start(ts, call.tch_ts);
+        //         self.reserve_tch(&call, start_time);
+        //
+        //         let addr = TetraAddress { encrypted: false, ssi_type: SsiType::Ssi, ssi: target_ssi };
+        //         let (tchan, chan_alloc) = self.build_voice_chanalloc_elem(&call, target_ssi);
+        //
+        //         // If a resource already exists for this SSI (e.g. RA ACK), patch it.
+        //         if let Some(DlSchedElem::Resource(pdu, _sdu)) = self.dl_get_scheduled_resource_for_ssi(ts, &addr) {
+        //             pdu.usage_marker = Some(tchan);
+        //             pdu.chan_alloc_element = Some(chan_alloc);
+        //             // keep random_access_flag / slot_granting_element as-is
+        //             pdu.update_len_and_fill_ind(0);
+        //             tracing::info!("VOICE chanalloc merged into existing MAC-RESOURCE for {}", addr);
+        //         } else {
+        //             // Otherwise enqueue a new resource for this SSI with chanalloc.
+        //             let mut pdu = Self::dl_make_minimal_resource(&addr, None, false);
+        //             pdu.usage_marker = Some(tchan);
+        //             pdu.chan_alloc_element = Some(chan_alloc);
+        //             pdu.update_len_and_fill_ind(0);
+        //
+        //             // IMPORTANT: push to front so it wins TS1 SCH/F
+        //             self.dltx_queues[0].insert(0, DlSchedElem::Resource(pdu, BitBuffer::new(0)));
+        //
+        //             tracing::info!("VOICE chanalloc enqueued as new MAC-RESOURCE for {}", addr);
+        //         }
+        //     }
+        // }
+
 
 
         // TODO FIXME allocate only if we have something to put in it
@@ -1234,7 +1302,8 @@ impl BsChannelScheduler {
                         call.call_id,
                         target_ssi,
                         call.tch_ts,
-                        call.tch_ts.saturating_sub(1),
+                        // "timeslot assigned" is a bitmap; TS2 -> 0b0010.
+                        1u8 << (call.tch_ts.saturating_sub(1)),
                         call.tchan,
                         self.cell_main_carrier,
                         start_time
