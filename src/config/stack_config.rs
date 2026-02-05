@@ -158,9 +158,9 @@ impl Default for CfgCellInfo {
             system_wide_services: false,
             voice_service: false,
             circuit_mode_data_service: false,
-            sndcp_service: false,
+            sndcp_service: true,
             aie_service: false,
-            advanced_link: false,
+            advanced_link: true,
 
             system_code: 0,
             colour_code: 0,

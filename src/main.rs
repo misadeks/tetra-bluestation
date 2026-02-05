@@ -42,7 +42,7 @@ fn load_config_from_toml(cfg_path: &str) -> SharedConfig {
 fn build_bs_stack(cfg: &mut SharedConfig) -> MessageRouter {
 
     let mut router = MessageRouter::new(cfg.clone());
-
+    
     // Add suitable Phy component based on PhyIo type
     match cfg.config().phy_io.backend {
         PhyBackend::SoapySdr => {

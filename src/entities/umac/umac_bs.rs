@@ -162,11 +162,11 @@ impl UmacBs {
                 no_minimum_mode: c.cell.no_minimum_mode,
                 migration: c.cell.migration,
                 system_wide_services: c.cell.system_wide_services,
-                voice_service: true,
-                circuit_mode_data_service: false,
-                sndcp_service: false,
-                aie_service: false,
-                advanced_link: false,
+                voice_service: c.cell.voice_service,
+                circuit_mode_data_service: c.cell.circuit_mode_data_service,
+                sndcp_service: c.cell.sndcp_service,
+                aie_service: c.cell.aie_service,
+                advanced_link: c.cell.advanced_link,
             }
         };
 
