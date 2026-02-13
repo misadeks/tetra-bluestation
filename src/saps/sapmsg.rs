@@ -4,7 +4,7 @@ use core::fmt::Display;
 use crate::common::tetra_common::Sap;
 use crate::common::tetra_entities::TetraEntity;
 use crate::common::tdma_time::TdmaTime;
-
+use crate::saps::sn::SnNsapiAllocInd;
 use super::lcmc::*;
 use super::lmm::*;
 use super::ltpd::*;
@@ -95,7 +95,11 @@ pub enum SapMsgInner {
     DgnaSetReq(DgnaSetReq),
 
     // LTPD-SAP (MLE-LTPD)
-    LtpdMleUnitdataInd(LtpdMleUnitdataInd)
+    LtpdMleUnitdataReq(LtpdMleUnitdataReq),
+    LtpdMleUnitdataInd(LtpdMleUnitdataInd),
+
+    // SNDCP
+    SnNsapiAllocInd(SnNsapiAllocInd),
 }
 
 impl Display for SapMsgInner {

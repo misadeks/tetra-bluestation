@@ -23,4 +23,6 @@ pub enum TetraEntity {
     CmdServer,
     /// HTTP UI bridge (non-ETSI entity)
     HttpUi,
+    /// SNDCP sap
+    SnSap,
 }

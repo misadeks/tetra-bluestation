@@ -23,3 +23,4 @@ pub mod tnsds;
 
 // Internal UI -> MM message for DGNA control
 pub mod dgna;
+pub mod sn;

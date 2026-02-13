@@ -37,4 +37,6 @@ pub enum Sap {
 
     /// MLE/SNDCP
     TlpdSap,
+
+    SnSap,
 }

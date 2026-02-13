@@ -140,17 +140,17 @@ prim.tl_sdu}
             MleProtocolDiscriminator::Sndcp => {
                 let m = LtpdMleUnitdataInd{ 
                     sdu,
-                    endpoint_id: 0, // TODO FIXME
-                    link_id: 0, // TODO FIXME,
+                    endpoint_id: prim.endpoint_id, // TODO: map from prim.endpoint_id / advanced link context
+                    link_id: prim.link_id,     // TODO: map from prim.link_id / advanced link context
                     received_tetra_address: prim.main_address,
                     // received_address_type: 0,
-                    chan_change_resp_req: false, // TODO FIXME
-                    chan_change_handle: None, // TODO FIXME
+                    chan_change_resp_req: prim.chan_change_resp_req, // TODO FIXME
+                    chan_change_handle: prim.chan_change_handle, // TODO FIXME
                 };
                 let msg = SapMsg {
-                    sap: Sap::LcmcSap,
+                    sap: Sap::TlpdSap,
                     src: self.self_component,
-                    dest: TetraEntity::Cmce,
+                    dest: TetraEntity::Sndcp,
                     dltime: message.dltime,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
@@ -228,17 +228,17 @@ prim.tl_sdu}
             MleProtocolDiscriminator::Sndcp => {
                 let m = LtpdMleUnitdataInd{ 
                     sdu,
-                    endpoint_id: 0, // TODO FIXME
-                    link_id: 0, // TODO FIXME,
+                    endpoint_id: prim.endpoint_id, // TODO FIXME
+                    link_id: prim.link_id, // TODO FIXME,
                     received_tetra_address: prim.main_address,
                     // received_address_type: 0,
-                    chan_change_resp_req: false, // TODO FIXME
-                    chan_change_handle: None, // TODO FIXME
+                    chan_change_resp_req: prim.chan_change_resp_req, // TODO FIXME
+                    chan_change_handle: prim.chan_change_handle, // TODO FIXME
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
                     src: self.self_component,
-                    dest: TetraEntity::Cmce,
+                    dest: TetraEntity::Sndcp,
                     dltime: message.dltime,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
@@ -440,17 +440,57 @@ prim.tl_sdu}
         }
     }
 
-    fn rx_tlpd_prim(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_tlpd_prim(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlpd_prim: {:?}", message);
-        unimplemented!("rx_tlpd_prim");
-        // match &message.msg {
-        //     _ => {
-        //         panic!();
-        //     }
-        // }
+
+        match &mut message.msg {
+            // SNDCP -> MLE : send an LTPD SDU down to LLC (currently via basic link).
+            SapMsgInner::LtpdMleUnitdataReq(prim) => {
+                let mle_prot_discriminator = MleProtocolDiscriminator::Sndcp;
+                let sdu_len = prim.sdu.get_len();
+
+                let mut pdu = BitBuffer::new(3 + sdu_len);
+                pdu.write_bits(mle_prot_discriminator.into_raw(), 3);
+                pdu.copy_bits(&mut prim.sdu, sdu_len);
+                pdu.seek(0);
+
+                // NOTE: Packet data normally uses Advanced Link (AL).
+                // For now we route via the already-implemented Basic Link path (TlaTlDataReqBl),
+                // just to get correct MLE⇄SNDCP routing and avoid panics/crashes.
+                let sapmsg = SapMsg {
+                    sap: Sap::TlaSap,
+                    src: self.self_component,
+                    dest: TetraEntity::Llc,
+                    dltime: message.dltime,
+                    msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+                        main_address: prim.address,
+                        link_id: prim.link_id,
+                        endpoint_id: prim.endpoint_id,
+                        tl_sdu: pdu,
+                        scrambling_code: self.config.config().scrambling_code(),
+                        stealing_permission: prim.stealing_permission,
+                        subscriber_class: 0,
+                        fcs_flag: prim.fcs_flag,
+                        air_interface_encryption: None,
+                        stealing_repeats_flag: None,
+                        data_class_info: None,
+                        req_handle: prim.handle as i32,
+                        graceful_degradation: None,
+                    }),
+                };
+
+                queue.push_back(sapmsg);
+            }
+
+            // Other LTPD primitives are not wired yet. Don't crash the whole BS; just log.
+            other => {
+                unimplemented_log!("rx_tlpd_prim: unhandled primitive: {:?}", other);
+            }
+        }
     }
 
-        fn rx_lcmc_mle_unitdata_req(
+
+    fn rx_lcmc_mle_unitdata_req(
         &mut self,
         queue: &mut MessageQueue,
         mut message: SapMsg,

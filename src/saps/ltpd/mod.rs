@@ -197,7 +197,8 @@ pub struct LtpdMleResumeInd {
 
 #[derive(Debug)]
 pub struct LtpdMleUnitdataReq {
-    pub sdu: Todo,
+    pub sdu: BitBuffer,
+    pub address: TetraAddress,
     pub handle: Todo,
     pub layer2service: Todo,
     pub unacked_bl_repetitions: Todo,

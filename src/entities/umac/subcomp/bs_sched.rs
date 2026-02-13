@@ -14,6 +14,7 @@ const NULL_PDU_LEN_BITS: usize = 16;
 const SCH_HD_CAP: usize = 124;
 const SCH_F_CAP: usize = 268;
 
+
 #[derive(Debug)]
 pub struct PrecomputedUmacPdus {
     pub mac_sysinfo1: MacSysinfo,
@@ -845,7 +846,7 @@ break;
                 }
             },
             (1..=17, 2..=4) |
-            (18, _) => { 
+            (18, _) => {
                 // SYNC + SYSINFO
                 let mut buf = BitBuffer::new(60);
                 self.precomps.mac_sync.to_bitbuf(&mut buf);
