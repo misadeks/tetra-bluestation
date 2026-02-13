@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::panic;
 
+use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, TdmaTime, TetraAddress, unimplemented_log};
-use crate::{MessageQueue, TetraEntityTrait};
 use tetra_saps::tla::{TlaTlDataIndBl, TlaTlUnitdataIndBl};
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -18,7 +19,7 @@ use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 pub struct AckData {
     pub addr: TetraAddress,
     pub t_start: TdmaTime,
-    pub n: u8
+    pub n: u8,
 }
 
 pub struct Llc {
@@ -27,32 +28,38 @@ pub struct Llc {
     scheduled_out_acks: Vec<AckData>,
     expected_in_acks: Vec<AckData>,
 
-    /// Next sequence number to use for outgoing BL-DATA/BL-ADATA
-    /// TODO FIXME make this a link-specific value
-    next_bl_ack_seq: u8,
+    /// Per-link send sequence variable V(S), keyed by SSI/GSSI address.
+    /// Each link starts at 0 and alternates 0,1,0,1,...
+    link_send_seq: HashMap<u32, u8>,
 }
 
 impl Llc {
     pub fn new(config: SharedConfig) -> Self {
-        Self { 
+        Self {
             dltime: TdmaTime::default(),
             config,
             // bl_links: BlLinkManager::new(),
             scheduled_out_acks: Vec::new(),
             expected_in_acks: Vec::new(),
-            next_bl_ack_seq: 0,
+            link_send_seq: HashMap::new(),
         }
     }
 
     /// Schedule an ACK to be sent at a later time
     pub fn schedule_outgoing_ack(&mut self, t: TdmaTime, addr: TetraAddress, n: u8) {
-        self.scheduled_out_acks.push(AckData{t_start: t, n, addr});
+        self.scheduled_out_acks.push(AckData {
+            t_start: t,
+            n,
+            addr,
+        });
     }
 
     /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number
     fn get_out_ack_n_if_any(&mut self, tn: u8, addr: TetraAddress) -> Option<u8> {
         for i in 0..self.scheduled_out_acks.len() {
-            if self.scheduled_out_acks[i].t_start.t == tn && self.scheduled_out_acks[i].addr.ssi == addr.ssi {
+            if self.scheduled_out_acks[i].t_start.t == tn
+                && self.scheduled_out_acks[i].addr.ssi == addr.ssi
+            {
                 let n = self.scheduled_out_acks[i].n;
                 self.scheduled_out_acks.remove(i);
                 return Some(n);
@@ -61,26 +68,32 @@ impl Llc {
         None
     }
 
-    /// Returns the next sequence number for this link
-    fn get_expected_in_ack_n(&mut self, _tn: u8, _addr: TetraAddress) -> u8 {
-        // unimplemented_log!("get_expected_in_ack_n not implemented on a per-link basis");
-        tracing::debug!("unimplemented: get_expected_in_ack_n not implemented on a per-link basis");
-        self.next_bl_ack_seq ^= 1;
-        self.next_bl_ack_seq ^ 1
+    /// Returns the next send sequence number V(S) for this link, then toggles it.
+    /// Each link independently starts at 0 and alternates 0,1,0,1,...
+    fn get_next_send_seq(&mut self, addr: &TetraAddress) -> u8 {
+        let vs = self.link_send_seq.entry(addr.ssi).or_insert(0);
+        let ns = *vs;
+        *vs ^= 1;
+        ns
     }
 
-    /// Register that we expect an ACK for this link
-    fn expect_ack(&mut self, t: TdmaTime, addr: TetraAddress) -> u8 {
-        let n = self.get_expected_in_ack_n(t.t, addr);
-        self.expected_in_acks.push(AckData{t_start: t, n, addr});
-        n
+    /// Register that we expect an ACK for this link (acknowledged mode only)
+    fn register_expected_ack(&mut self, t: TdmaTime, addr: TetraAddress, n: u8) {
+        self.expected_in_acks.push(AckData {
+            t_start: t,
+            n,
+            addr,
+        });
     }
 
-    fn format_ack_list(ack_list: &Vec<AckData>) -> String{
+    fn format_ack_list(ack_list: &Vec<AckData>) -> String {
         let mut ret = String::new();
         ret.push_str("Expected in acks:\n");
         for ack in ack_list {
-            ret.push_str(&format!("  t: {}, ssi: {}, n: {}\n", ack.t_start.t, ack.addr.ssi, ack.n));
+            ret.push_str(&format!(
+                "  t: {}, ssi: {}, n: {}\n",
+                ack.t_start.t, ack.addr.ssi, ack.n
+            ));
         }
         ret
     }
@@ -88,15 +101,22 @@ impl Llc {
     /// Process incoming ACK. Remove outstanding ACK expectation. We ignore unexpected ones, might be a retransmission
     fn process_incoming_ack(&mut self, tn: u8, addr: TetraAddress, n: u8) {
         for i in 0..self.expected_in_acks.len() {
-            if self.expected_in_acks[i].t_start.t == tn && self.expected_in_acks[i].addr.ssi == addr.ssi {
+            if self.expected_in_acks[i].t_start.t == tn
+                && self.expected_in_acks[i].addr.ssi == addr.ssi
+            {
                 if self.expected_in_acks[i].n != n {
-                    tracing::warn!("Received unexpected ACK for t: {} ssi: {} got n {}, expected {}", tn, addr.ssi, n, self.expected_in_acks[i].n);
+                    tracing::warn!(
+                        "Received unexpected ACK for t: {} ssi: {} got n {}, expected {}",
+                        tn,
+                        addr.ssi,
+                        n,
+                        self.expected_in_acks[i].n
+                    );
                 }
                 self.expected_in_acks.remove(i);
-                return
+                return;
             }
         }
-
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -116,7 +136,9 @@ impl Llc {
 
     fn rx_tla_tlunitdata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tlunitdata_req_bl");
-        let SapMsgInner::TlaTlUnitdataReqBl(_prim) = message.msg else { panic!() };
+        let SapMsgInner::TlaTlUnitdataReqBl(_prim) = message.msg else {
+            panic!()
+        };
 
         unimplemented_log!("rx_tla_tlunitdata_req_bl");
     }
@@ -124,24 +146,26 @@ impl Llc {
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
     fn rx_tla_tldata_req_bl(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tldata_req_bl");
-        let SapMsgInner::TlaTlDataReqBl(mut prim) = message.msg else { panic!() };
+        let SapMsgInner::TlaTlDataReqBl(mut prim) = message.msg else {
+            panic!()
+        };
 
         // If an ack still needs to be sent, get the relevant expected sequence number
         let out_ack_n = self.get_out_ack_n_if_any(message.dltime.t, prim.main_address);
 
-        // Get an ack sequence number for outgoing message
-        let expected_in_ack_n = self.expect_ack(message.dltime, prim.main_address);
+        // Get per-link send sequence number N(S) = V(S), then toggle V(S)
+        let ns = self.get_next_send_seq(&prim.main_address);
 
-        // Construct PDU, write header. Also, register we expect an ACK
+        // Construct PDU, write header
         let mut pdu_buf = BitBuffer::new_autoexpand(32);
 
         // Determine message type and build
         if let Some(out_ack_n) = out_ack_n {
-            // BL-ADATA (with or without FCS)
+            // BL-ADATA (acknowledged, with or without FCS)
             let pdu = BlAdata {
                 has_fcs: prim.fcs_flag,
                 nr: out_ack_n,
-                ns: expected_in_ack_n, 
+                ns,
             };
             pdu.to_bitbuf(&mut pdu_buf);
             // Append SDU
@@ -149,11 +173,13 @@ impl Llc {
             pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
             pdu_buf.seek(0);
             tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
+            // Register that we expect an ACK back (acknowledged mode only)
+            self.register_expected_ack(message.dltime, prim.main_address, ns);
         } else {
-            // BL-DATA (with or without FCS)
+            // BL-DATA (unacknowledged, with or without FCS)
             let pdu = BlData {
                 has_fcs: prim.fcs_flag,
-                ns: expected_in_ack_n,
+                ns,
             };
             pdu.to_bitbuf(&mut pdu_buf);
             // Append SDU
@@ -161,8 +187,9 @@ impl Llc {
             pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
             pdu_buf.seek(0);
             tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
+            // No ACK expected for unacknowledged BL-DATA
         }
-        
+
         // TODO FIXME:
         // According to the spec we should issue a TL-REPORT to the upper layer
         // self.issue_tla_report_ind(queue, TlaReport::ConfirmHandle);
@@ -185,8 +212,8 @@ impl Llc {
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
                 // redundant_transmission: prim.redundant_transmission,
-            })
-        };        
+            }),
+        };
         queue.push_back(sapmsg);
     }
 
@@ -198,9 +225,8 @@ impl Llc {
             }
             SapMsgInner::TlaTlUnitdataReqBl(_) => {
                 self.rx_tla_tlunitdata_req_bl(queue, message);
-
             }
-            _ => panic!()
+            _ => panic!(),
         }
     }
 
@@ -208,17 +234,16 @@ impl Llc {
         tracing::trace!("rx_tma_report_ind, ignoring");
     }
 
-
     /// Clause 20.4.1.1.4 TMA-UNITDATA primitive
     /// TMA-UNITDATA indication: this primitive shall be used by the MAC to deliver a received TM-SDU. This primitive
     /// may also be used with no TM-SDU if the MAC needs to inform the higher layers of a channel allocation received
     /// without an associated TM-SDU.
     fn rx_tma_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tma_unitdata_ind");
-        
+
         // Determine which type of TL-SDU we have
         let pdu_type = if let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg {
-            let Some(pdu) = prim.pdu.as_ref() else { 
+            let Some(pdu) = prim.pdu.as_ref() else {
                 panic!("no pdu");
             };
             let Some(bits) = pdu.peek_bits(4) else {
@@ -231,28 +256,36 @@ impl Llc {
             };
 
             pdu_type
-        } else { panic!(); };
+        } else {
+            panic!();
+        };
 
         // Call handler function
         match pdu_type {
             // All Basic Link types can be handled by the same function
-            LlcPduType::BlAdata | LlcPduType::BlAdataFcs |
-            LlcPduType::BlData | LlcPduType ::BlDataFcs |
-            LlcPduType::BlUdata | LlcPduType::BlUdataFcs |
-            LlcPduType::BlAck | LlcPduType::BlAckFcs => {
+            LlcPduType::BlAdata
+            | LlcPduType::BlAdataFcs
+            | LlcPduType::BlData
+            | LlcPduType::BlDataFcs
+            | LlcPduType::BlUdata
+            | LlcPduType::BlUdataFcs
+            | LlcPduType::BlAck
+            | LlcPduType::BlAckFcs => {
                 self.rx_tma_unitdata_ind_bl(queue, message);
             }
 
-            LlcPduType::AlSetup | 
-            LlcPduType::AlDataAlFinal |
-            LlcPduType::AlAlUdataAlUfinal |
-            LlcPduType::AlAckAlRnr |
-            LlcPduType::AlReconnect |
-            LlcPduType::AlDisc => {
+            LlcPduType::AlSetup
+            | LlcPduType::AlDataAlFinal
+            | LlcPduType::AlAlUdataAlUfinal
+            | LlcPduType::AlAckAlRnr
+            | LlcPduType::AlReconnect
+            | LlcPduType::AlDisc => {
                 unimplemented_log!("LlcPduType Advanced Link: {}", pdu_type);
             }
 
-            _ => { panic!(); }
+            _ => {
+                panic!();
+            }
         }
     }
 
@@ -260,71 +293,68 @@ impl Llc {
         tracing::trace!("rx_tma_unitdata_ind_bl");
 
         // Get header bits (again) and prepare MLE message
-        let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else { panic!(); };
-        let Some(mut pdu) = prim.pdu.take() else { panic!("no pdu"); };
+        let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else {
+            panic!();
+        };
+        let Some(mut pdu) = prim.pdu.take() else {
+            panic!("no pdu");
+        };
         let Some(bits) = pdu.peek_bits(4) else {
             tracing::warn!("insufficient bits: {}", pdu.dump_bin());
             return;
-        };        
+        };
         let Ok(pdu_type) = LlcPduType::try_from(bits) else {
             tracing::warn!("invalid pdu type: {} in {}", bits, pdu.dump_bin());
             return;
         };
 
         let (has_fcs, ns, nr) = match pdu_type {
-            LlcPduType::BlAdata | LlcPduType::BlAdataFcs => {
-                match BlAdata::from_bitbuf(&mut pdu) {
-                    Ok(pdu) => {
-                        tracing::debug!("<- {:?}", pdu);
-                        (pdu.has_fcs, Some(pdu.ns), Some(pdu.nr))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed parsing BlAdata: {:?} {}", e, pdu.dump_bin());
-                        return;
-                    }
-                }         
-            }
+            LlcPduType::BlAdata | LlcPduType::BlAdataFcs => match BlAdata::from_bitbuf(&mut pdu) {
+                Ok(pdu) => {
+                    tracing::debug!("<- {:?}", pdu);
+                    (pdu.has_fcs, Some(pdu.ns), Some(pdu.nr))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed parsing BlAdata: {:?} {}", e, pdu.dump_bin());
+                    return;
+                }
+            },
 
-            LlcPduType::BlData | LlcPduType ::BlDataFcs => {
-                match BlData::from_bitbuf(&mut pdu) {
-                    Ok(pdu) => {
-                        tracing::debug!("<- {:?}", pdu);
-                        (pdu.has_fcs, Some(pdu.ns), None)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed parsing BlData: {:?} {}", e, pdu.dump_bin());
-                        return;
-                    }
+            LlcPduType::BlData | LlcPduType::BlDataFcs => match BlData::from_bitbuf(&mut pdu) {
+                Ok(pdu) => {
+                    tracing::debug!("<- {:?}", pdu);
+                    (pdu.has_fcs, Some(pdu.ns), None)
                 }
-            }
-            LlcPduType::BlAck | LlcPduType::BlAckFcs => {
-                match BlAck::from_bitbuf(&mut pdu) {
-                    Ok(pdu) => {
-                        tracing::debug!("<- {:?}", pdu);
-                        (pdu.has_fcs, None, Some(pdu.nr))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed parsing BlAck: {:?} {}", e, pdu.dump_bin());
-                        return;
-                    }
+                Err(e) => {
+                    tracing::warn!("Failed parsing BlData: {:?} {}", e, pdu.dump_bin());
+                    return;
                 }
-            }
-            LlcPduType::BlUdata | LlcPduType::BlUdataFcs => {
-                match BlUdata::from_bitbuf(&mut pdu) {
-                    Ok(pdu) => {
-                        tracing::debug!("<- {:?}", pdu);
-                        (pdu.has_fcs, None, None)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed parsing BlUdata: {:?} {}", e, pdu.dump_bin());
-                        return;
-                    }
-
+            },
+            LlcPduType::BlAck | LlcPduType::BlAckFcs => match BlAck::from_bitbuf(&mut pdu) {
+                Ok(pdu) => {
+                    tracing::debug!("<- {:?}", pdu);
+                    (pdu.has_fcs, None, Some(pdu.nr))
                 }
+                Err(e) => {
+                    tracing::warn!("Failed parsing BlAck: {:?} {}", e, pdu.dump_bin());
+                    return;
+                }
+            },
+            LlcPduType::BlUdata | LlcPduType::BlUdataFcs => match BlUdata::from_bitbuf(&mut pdu) {
+                Ok(pdu) => {
+                    tracing::debug!("<- {:?}", pdu);
+                    (pdu.has_fcs, None, None)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed parsing BlUdata: {:?} {}", e, pdu.dump_bin());
+                    return;
+                }
+            },
+            _ => {
+                panic!();
             }
-            _ => { panic!(); }
         };
-        
+
         // If FCS is present, check it. If wrong, we bail here
         if has_fcs && !fcs::check_fcs(&pdu) {
             tracing::warn!("FCS check failed");
@@ -352,7 +382,7 @@ impl Llc {
 
         // If unacknowledged data transfer service, we send a TL-UNITDATA indication
         // to MLE. If acknowledged data transfer service, we send a TL-DATA indication
-        
+
         pdu.set_raw_start(pdu.get_raw_pos());
         // tracing::info!("got sdu: {:}", sdu.dump_bin());
         let s = if pdu_type == LlcPduType::BlUdata || pdu_type == LlcPduType::BlUdataFcs {
@@ -364,7 +394,11 @@ impl Llc {
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,
-                tl_sdu: if pdu.get_len_remaining() > 0 { Some(pdu) } else { None },
+                tl_sdu: if pdu.get_len_remaining() > 0 {
+                    Some(pdu)
+                } else {
+                    None
+                },
                 scrambling_code: prim.scrambling_code,
                 fcs_flag: has_fcs,
                 air_interface_encryption: prim.air_interface_encryption,
@@ -373,12 +407,12 @@ impl Llc {
                 chan_info: prim.chan_info,
                 report: None, // TODO FIXME
             };
-            SapMsg{ 
+            SapMsg {
                 sap: Sap::TlaSap,
                 src: TetraEntity::Llc,
                 dest: TetraEntity::Mle,
                 dltime: message.dltime,
-                msg: SapMsgInner::TlaTlUnitdataIndBl(m) 
+                msg: SapMsgInner::TlaTlUnitdataIndBl(m),
             }
         } else {
             // Acknowledged data transfer service
@@ -389,7 +423,11 @@ impl Llc {
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,
-                tl_sdu: if pdu.get_len_remaining() > 0 { Some(pdu) } else { None },
+                tl_sdu: if pdu.get_len_remaining() > 0 {
+                    Some(pdu)
+                } else {
+                    None
+                },
                 scrambling_code: prim.scrambling_code,
                 fcs_flag: has_fcs,
                 air_interface_encryption: prim.air_interface_encryption,
@@ -398,12 +436,12 @@ impl Llc {
                 chan_info: prim.chan_info,
                 req_handle: 0, // TODO FIXME
             };
-            SapMsg{ 
+            SapMsg {
                 sap: Sap::TlaSap,
                 src: TetraEntity::Llc,
                 dest: TetraEntity::Mle,
                 dltime: message.dltime,
-                msg: SapMsgInner::TlaTlDataIndBl(m) 
+                msg: SapMsgInner::TlaTlDataIndBl(m),
             }
         };
 
@@ -412,7 +450,6 @@ impl Llc {
 }
 
 impl TetraEntityTrait for Llc {
-
     fn entity(&self) -> TetraEntity {
         TetraEntity::Llc
     }
@@ -422,9 +459,8 @@ impl TetraEntityTrait for Llc {
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);        
+        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::TmaSap => {
@@ -432,38 +468,35 @@ impl TetraEntityTrait for Llc {
             }
 
             // TMB-SAP and TMC-SAP are skipped and passed straight between MAC and MLE
-            
             Sap::TlaSap => {
                 self.rx_tla_prim(queue, message);
             }
-            _ => panic!()
+            _ => panic!(),
         }
     }
 
-    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) { 
+    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
     }
 
-    fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool{
-        
+    fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         // Check if any unsent ACKs are still here
         // Take oldest element from scheduled_out_acks, and remove it from the list
         let ret = !self.scheduled_out_acks.is_empty();
         while let Some(ack) = self.scheduled_out_acks.first() {
-
             tracing::debug!("tick_end: auto-ack for ssi: {}, n: {}", ack.addr.ssi, ack.n);
-            
+
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
             let pdu = BlAck {
                 has_fcs: false,
-                nr: ack.n
+                nr: ack.n,
             };
             pdu.to_bitbuf(&mut pdu_buf);
             pdu_buf.seek(0);
             tracing::debug!("-> {:?} {}", pdu, pdu_buf.dump_bin());
 
             // We're sending an ACK for a received uplink message, however, we don't have that message here
-            // Since DL is two slots ahead of UL, we will correct that. We now have the dltime for reception 
+            // Since DL is two slots ahead of UL, we will correct that. We now have the dltime for reception
             // of the original message.
             let dltime = self.dltime.add_timeslots(-2);
 
@@ -471,21 +504,21 @@ impl TetraEntityTrait for Llc {
                 sap: Sap::TmaSap,
                 src: TetraEntity::Llc,
                 dest: TetraEntity::Umac,
-                dltime, 
+                dltime,
                 msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
                     req_handle: 0, // TODO FIXME
                     pdu: pdu_buf,
                     main_address: ack.addr,
                     // scrambling_code: self.config.config().scrambling_code(),
-                    endpoint_id: 0, // todo fixme
-                    stealing_permission: false, // TODO FIXME
-                    subscriber_class: 0, // TODO FIXME
+                    endpoint_id: 0,                 // todo fixme
+                    stealing_permission: false,     // TODO FIXME
+                    subscriber_class: 0,            // TODO FIXME
                     air_interface_encryption: None, // TODO FIXME
-                    stealing_repeats_flag: None, // TODO FIXME
-                    data_category: None, // TODO FIXME
-                    chan_alloc: None // TODO FIXME
-                })
-            };        
+                    stealing_repeats_flag: None,    // TODO FIXME
+                    data_category: None,            // TODO FIXME
+                    chan_alloc: None,               // TODO FIXME
+                }),
+            };
             queue.push_back(sapmsg);
             self.scheduled_out_acks.remove(0);
         }

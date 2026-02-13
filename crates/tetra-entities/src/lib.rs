@@ -14,6 +14,8 @@ pub mod umac;
 pub mod network;
 pub mod tnmm_net;
 
+pub mod brew;
+
 // Re-export commonly used items from router
 pub use entity_trait::TetraEntityTrait;
 pub use messagerouter::{MessagePrio, MessageQueue, MessageRouter};

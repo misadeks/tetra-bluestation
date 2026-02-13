@@ -21,4 +21,6 @@ pub enum TetraEntity {
     /// Any U-plane entity. SAP determines routing
     User,
 
+    /// Brew protocol bridge (TetraPack/BrandMeister integration)
+    Brew,
 }

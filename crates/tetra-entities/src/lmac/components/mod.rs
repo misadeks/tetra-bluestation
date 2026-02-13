@@ -7,3 +7,4 @@ pub mod rm3014;
 
 pub mod errorcontrol_params;
 pub mod errorcontrol;
+pub mod tch_reorder;

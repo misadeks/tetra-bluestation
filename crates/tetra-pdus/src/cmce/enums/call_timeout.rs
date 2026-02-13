@@ -9,7 +9,7 @@ pub enum CallTimeout {
     T60s = 3,
     T2m = 4,
     T3m = 5,
-    T4 = 6,
+    T4m = 6,
     T5m = 7,
     T6m = 8,
     T8m = 9,
@@ -31,7 +31,7 @@ impl std::convert::TryFrom<u64> for CallTimeout {
             3 => Ok(CallTimeout::T60s),
             4 => Ok(CallTimeout::T2m),
             5 => Ok(CallTimeout::T3m),
-            6 => Ok(CallTimeout::T4),
+            6 => Ok(CallTimeout::T4m),
             7 => Ok(CallTimeout::T5m),
             8 => Ok(CallTimeout::T6m),
             9 => Ok(CallTimeout::T8m),
@@ -56,7 +56,7 @@ impl CallTimeout {
             CallTimeout::T60s => 3,
             CallTimeout::T2m => 4,
             CallTimeout::T3m => 5,
-            CallTimeout::T4 => 6,
+            CallTimeout::T4m => 6,
             CallTimeout::T5m => 7,
             CallTimeout::T6m => 8,
             CallTimeout::T8m => 9,
@@ -71,7 +71,9 @@ impl CallTimeout {
 }
 
 impl From<CallTimeout> for u64 {
-    fn from(e: CallTimeout) -> Self { e.into_raw() }
+    fn from(e: CallTimeout) -> Self {
+        e.into_raw()
+    }
 }
 
 impl core::fmt::Display for CallTimeout {
@@ -83,7 +85,7 @@ impl core::fmt::Display for CallTimeout {
             CallTimeout::T60s => write!(f, "T60s"),
             CallTimeout::T2m => write!(f, "T2m"),
             CallTimeout::T3m => write!(f, "T3m"),
-            CallTimeout::T4 => write!(f, "T4"),
+            CallTimeout::T4m => write!(f, "T4m"),
             CallTimeout::T5m => write!(f, "T5m"),
             CallTimeout::T6m => write!(f, "T6m"),
             CallTimeout::T8m => write!(f, "T8m"),

@@ -3,6 +3,7 @@ use serde::Deserialize;
 use tetra_core::freqs::FreqInfo;
 
 use super::stack_config_soapy::CfgSoapySdr;
+use crate::timeslot_alloc::TimeslotAllocator;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -184,6 +185,72 @@ fn default_main_carrier() -> u16 {
     1521
 }
 
+/// Brew protocol (TetraPack/BrandMeister) configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct CfgBrew {
+    /// Enable Brew integration
+    #[serde(default)]
+    pub enabled: bool,
+    /// TetraPack server hostname or IP
+    #[serde(default = "default_brew_host")]
+    pub host: String,
+    /// TetraPack server port
+    #[serde(default = "default_brew_port")]
+    pub port: u16,
+    /// Use TLS (wss:// / https://)
+    #[serde(default)]
+    pub tls: bool,
+    /// User-Agent string for authentication
+    #[serde(default = "default_brew_user_agent")]
+    pub user_agent: String,
+    /// Optional username for HTTP Digest auth
+    pub username: Option<String>,
+    /// Optional password for HTTP Digest auth
+    pub password: Option<String>,
+    /// ISSI to register with the TetraPack server
+    #[serde(default)]
+    pub issi: u32,
+    /// GSSIs (group IDs) to affiliate to
+    #[serde(default)]
+    pub groups: Vec<u32>,
+    /// Reconnection delay in seconds
+    #[serde(default = "default_brew_reconnect_delay")]
+    pub reconnect_delay_secs: u64,
+}
+
+fn default_brew_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_brew_port() -> u16 {
+    3000
+}
+
+fn default_brew_user_agent() -> String {
+    "TETRAHS/000001".to_string()
+}
+
+fn default_brew_reconnect_delay() -> u64 {
+    15
+}
+
+impl Default for CfgBrew {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_brew_host(),
+            port: default_brew_port(),
+            tls: false,
+            user_agent: default_brew_user_agent(),
+            username: None,
+            password: None,
+            issi: 0,
+            groups: Vec::new(),
+            reconnect_delay_secs: default_brew_reconnect_delay(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StackConfig {
     #[serde(default = "default_stack_mode")]
@@ -199,6 +266,10 @@ pub struct StackConfig {
 
     #[serde(default)]
     pub cell: CfgCellInfo,
+
+    /// Brew protocol (TetraPack/BrandMeister) configuration
+    #[serde(default)]
+    pub brew: CfgBrew,
 }
 
 fn default_stack_mode() -> StackMode {
@@ -214,6 +285,7 @@ impl StackConfig {
             phy_io: CfgPhyIo::default(),
             net: CfgNetInfo { mcc, mnc },
             cell: CfgCellInfo::default(),
+            brew: CfgBrew::default(),
         }
     }
 
@@ -283,6 +355,7 @@ impl StackConfig {
 #[derive(Default)]
 pub struct StackState {
     pub cell_load_ca: u8,
+    pub timeslot_alloc: TimeslotAllocator,
 }
 
 

@@ -7,7 +7,9 @@
 
 pub mod stack_config;
 pub mod stack_config_soapy;
+pub mod timeslot_alloc;
 pub mod toml_config;
 
 pub use stack_config::*;
+pub use timeslot_alloc::*;
 pub use toml_config::*;

@@ -143,3 +143,34 @@ voice_service = true  # Not yet implemented but may be needed to keep certain MS
 
 # Frame 18 extension support
 # frame_18_ext = false
+
+###############################################################################
+
+# Brew protocol: Connect to TetraPack/BrandMeister server via TETRA Homebrew Protocol.
+# See: https://wiki.tetrapack.online/books/tetra/page/brew
+
+# [brew]
+# enabled = false
+
+# Server address
+# host = "core.tetrapack.online"
+# port = 3003
+
+# Use TLS (wss:// / https://) — required
+# tls = true
+
+# User-Agent for HTTP auth (format: TETRAHS/XXXXXX) — required
+# user_agent = "TETRAHS/012345"
+
+# HTTP Digest auth credentials — required
+# username = "012345"
+# password = "012345"
+
+# ISSI to register with server
+# issi = 012345
+
+# Group IDs (GSSIs) to affiliate — talkgroups this BTS will receive
+# groups = [9, 91]
+
+# Reconnection delay (seconds)
+# reconnect_delay_secs = 15

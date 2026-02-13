@@ -1,30 +1,36 @@
+use tetra_config::{
+    CfgBrew, CfgCellInfo, CfgNetInfo, CfgPhyIo, PhyBackend, SharedConfig, StackConfig, StackMode,
+    StackState,
+};
+use tetra_core::TdmaTime;
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::TdmaTime;
-use tetra_config::{CfgCellInfo, CfgNetInfo, CfgPhyIo, PhyBackend, SharedConfig, StackConfig, StackMode, StackState};
 use tetra_entities::{MessageRouter, TetraEntityTrait};
 use tetra_saps::sapmsg::SapMsg;
 
 // BS imports
 use tetra_entities::cmce::cmce_bs::CmceBs;
 use tetra_entities::cmce::cmce_ms::CmceMs;
-use tetra_entities::mle::mle_bs_ms::Mle;
-use tetra_entities::sndcp::sndcp_bs::Sndcp;
-use tetra_entities::lmac::lmac_bs::LmacBs;
-use tetra_entities::mm::mm_bs::MmBs;
 use tetra_entities::llc::llc_bs_ms::Llc;
+use tetra_entities::lmac::lmac_bs::LmacBs;
+use tetra_entities::mle::mle_bs_ms::Mle;
+use tetra_entities::mm::mm_bs::MmBs;
+use tetra_entities::sndcp::sndcp_bs::Sndcp;
 use tetra_entities::umac::umac_bs::UmacBs;
 
 // MS imports
-use tetra_entities::umac::umac_ms::UmacMs;
 use tetra_entities::lmac::lmac_ms::LmacMs;
+use tetra_entities::umac::umac_ms::UmacMs;
 
 use super::sink::Sink;
 
 /// Creates a default config for testing. It can still be modified as needed
 /// before passing it to the ComponentTest constructor
 pub fn default_test_config(stack_mode: StackMode) -> StackConfig {
-    let net_info = CfgNetInfo { mcc: 204, mnc: 1337 };
+    let net_info = CfgNetInfo {
+        mcc: 204,
+        mnc: 1337,
+    };
     let freq_info = FreqInfo::from_components(4, 1521, 0, false, 4, None).unwrap();
     let mut cell_info = CfgCellInfo::default();
     cell_info.colour_code = 1;
@@ -34,11 +40,11 @@ pub fn default_test_config(stack_mode: StackMode) -> StackConfig {
     cell_info.freq_offset_hz = freq_info.freq_offset_hz;
     cell_info.duplex_spacing_id = freq_info.duplex_spacing_id;
     cell_info.reverse_operation = freq_info.reverse_operation;
-    let mut phy_io = CfgPhyIo::default();      
+    let mut phy_io = CfgPhyIo::default();
 
     // These tests don't support a PHY component, so we set backend to None
     phy_io.backend = PhyBackend::None;
-    
+
     // Put together components and return this proto config
     StackConfig {
         stack_mode,
@@ -46,9 +52,9 @@ pub fn default_test_config(stack_mode: StackMode) -> StackConfig {
         phy_io,
         net: net_info,
         cell: cell_info,
+        brew: CfgBrew::default(),
     }
 }
-
 
 /// Infrastructure for testing TETRA components
 /// Quick setup of all components for end-to-end testing
@@ -62,12 +68,11 @@ pub struct ComponentTest {
 }
 
 impl ComponentTest {
-    
     pub fn new(config: StackConfig, start_dl_time: Option<TdmaTime>) -> Self {
         let shared_config = SharedConfig::from_parts(config, StackState::default());
         let config_clone = shared_config.clone();
         let mut mr = MessageRouter::new(config_clone);
-        
+
         let start_dl_time = start_dl_time.unwrap_or_default();
         mr.set_dl_time(start_dl_time);
 
@@ -78,13 +83,12 @@ impl ComponentTest {
             start_dl_time: start_dl_time,
         }
     }
-    
+
     pub fn get_shared_config(&self) -> SharedConfig {
         self.config.clone()
     }
-    
+
     pub fn populate_entities(&mut self, components: Vec<TetraEntity>, sinks: Vec<TetraEntity>) {
-       
         match self.config.config().stack_mode {
             StackMode::Bs => {
                 self.create_components_bs(components);
@@ -102,12 +106,9 @@ impl ComponentTest {
     }
 
     fn create_components_bs(&mut self, components: Vec<TetraEntity>) {
-
         // Setup the stack with all requested components, performing set-up where needed
         for component in components.iter() {
-            
             match component {
-
                 TetraEntity::Lmac => {
                     let lmac = LmacBs::new(self.config.clone());
                     self.register_entity(lmac);
@@ -115,7 +116,8 @@ impl ComponentTest {
                 TetraEntity::Umac => {
                     let mut umac = UmacBs::new(self.config.clone());
                     // Prepare channel scheduler for next tick_start
-                    umac.channel_scheduler.set_dl_time(self.start_dl_time.add_timeslots(-1));
+                    umac.channel_scheduler
+                        .set_dl_time(self.start_dl_time.add_timeslots(-1));
                     self.router.register_entity(Box::new(umac));
                 }
                 TetraEntity::Llc => {
@@ -146,10 +148,8 @@ impl ComponentTest {
     }
 
     fn create_components_ms(&mut self, components: Vec<TetraEntity>) {
-
         for component in components.iter() {
             match component {
-
                 TetraEntity::Lmac => {
                     let lmac = LmacMs::new(self.config.clone());
                     self.router.register_entity(Box::new(lmac));
@@ -178,12 +178,19 @@ impl ComponentTest {
     }
 
     fn create_sinks(&mut self, sinks: Vec<TetraEntity>) {
-
         // Setup any sinks
         for sink in sinks.iter() {
-            assert!(!self.sinks.contains(sink), "Sink already exists: {:?}", sink);
-            assert!(self.router.get_entity(*sink).is_none(), "Sink already registered as entity: {:?}", sink);
-            
+            assert!(
+                !self.sinks.contains(sink),
+                "Sink already exists: {:?}",
+                sink
+            );
+            assert!(
+                self.router.get_entity(*sink).is_none(),
+                "Sink already registered as entity: {:?}",
+                sink
+            );
+
             self.sinks.push(*sink);
             let sink = Sink::new(*sink);
             self.router.register_entity(Box::new(sink));
@@ -215,7 +222,7 @@ impl ComponentTest {
                     msgs.append(&mut sink_msgs);
                 }
             }
-        }   
+        }
         msgs
     }
 }

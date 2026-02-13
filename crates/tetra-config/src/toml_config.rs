@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, BufReader};
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use serde::Deserialize;
 use toml::Value;
 
-use super::stack_config::{CfgPhyIo, PhyBackend, CfgCellInfo, CfgNetInfo, SharedConfig, StackConfig, StackMode, StackState};
+use super::stack_config::{
+    CfgBrew, CfgCellInfo, CfgNetInfo, CfgPhyIo, PhyBackend, SharedConfig, StackConfig, StackMode,
+    StackState,
+};
 use super::stack_config_soapy::{CfgSoapySdr, LimeSdrCfg, SXceiverCfg, UsrpB2xxCfg};
 
 /// Build `SharedConfig` from a TOML configuration file
@@ -16,32 +19,58 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
     // Various sanity checks
     let expected_config_version = "0.5";
     if !root.config_version.eq(expected_config_version) {
-        return Err(format!("Unrecognized config_version: {}, expect {}", root.config_version, expected_config_version).into());
+        return Err(format!(
+            "Unrecognized config_version: {}, expect {}",
+            root.config_version, expected_config_version
+        )
+        .into());
     }
     if !root.extra.is_empty() {
-        return Err(format!("Unrecognized top-level fields: {:?}", sorted_keys(&root.extra)).into());
+        return Err(format!(
+            "Unrecognized top-level fields: {:?}",
+            sorted_keys(&root.extra)
+        )
+        .into());
     }
     if let Some(ref phy) = root.phy_io {
         if !phy.extra.is_empty() {
-            return Err(format!("Unrecognized fields: phy_io::{:?}", sorted_keys(&phy.extra)).into());
+            return Err(
+                format!("Unrecognized fields: phy_io::{:?}", sorted_keys(&phy.extra)).into(),
+            );
         }
         if let Some(ref soapy) = phy.soapysdr {
             if !soapy.extra.is_empty() {
-                return Err(format!("Unrecognized fields: phy_io.soapysdr::{:?}", sorted_keys(&soapy.extra)).into());
+                return Err(format!(
+                    "Unrecognized fields: phy_io.soapysdr::{:?}",
+                    sorted_keys(&soapy.extra)
+                )
+                .into());
             }
         }
     }
     if !root.net_info.extra.is_empty() {
-        return Err(format!("Unrecognized fields in net_info: {:?}", sorted_keys(&root.net_info.extra)).into());
+        return Err(format!(
+            "Unrecognized fields in net_info: {:?}",
+            sorted_keys(&root.net_info.extra)
+        )
+        .into());
     }
     if let Some(ref ci) = root.cell_info {
         if !ci.extra.is_empty() {
-            return Err(format!("Unrecognized fields in cell_info: {:?}", sorted_keys(&ci.extra)).into());
+            return Err(format!(
+                "Unrecognized fields in cell_info: {:?}",
+                sorted_keys(&ci.extra)
+            )
+            .into());
         }
     }
     if let Some(ref ss) = root.stack_state {
         if !ss.extra.is_empty() {
-            return Err(format!("Unrecognized fields in stack_state: {:?}", sorted_keys(&ss.extra)).into());
+            return Err(format!(
+                "Unrecognized fields in stack_state: {:?}",
+                sorted_keys(&ss.extra)
+            )
+            .into());
         }
     }
 
@@ -50,8 +79,12 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
         stack_mode: root.stack_mode,
         debug_log: root.debug_log,
         phy_io: CfgPhyIo::default(),
-        net: CfgNetInfo { mcc: root.net_info.mcc, mnc: root.net_info.mnc },
+        net: CfgNetInfo {
+            mcc: root.net_info.mcc,
+            mnc: root.net_info.mnc,
+        },
         cell: CfgCellInfo::default(),
+        brew: root.brew.unwrap_or_default(),
     };
 
     // Handle new phy_io structure
@@ -92,19 +125,18 @@ pub fn from_file<P: AsRef<Path>>(path: P) -> Result<SharedConfig, Box<dyn std::e
 
 fn apply_phy_io_patch(dst: &mut CfgPhyIo, src: PhyIoDto) {
     dst.backend = src.backend;
-    
+
     dst.dl_tx_file = src.dl_tx_file;
     dst.ul_rx_file = src.ul_rx_file;
     dst.ul_input_file = src.ul_input_file;
     dst.dl_input_file = src.dl_input_file;
 
-    
     if let Some(soapy_dto) = src.soapysdr {
         let mut soapy_cfg = CfgSoapySdr::default();
         soapy_cfg.ul_freq = soapy_dto.rx_freq;
         soapy_cfg.dl_freq = soapy_dto.tx_freq;
         soapy_cfg.ppm_err = soapy_dto.ppm_err;
-        
+
         // Apply hardware-specific configurations
         if let Some(usrp_dto) = soapy_dto.iocfg_usrpb2xx {
             soapy_cfg.io_cfg.iocfg_usrpb2xx = Some(UsrpB2xxCfg {
@@ -114,7 +146,7 @@ fn apply_phy_io_patch(dst: &mut CfgPhyIo, src: PhyIoDto) {
                 tx_gain_pga: usrp_dto.tx_gain_pga,
             });
         }
-        
+
         if let Some(lime_dto) = soapy_dto.iocfg_limesdr {
             soapy_cfg.io_cfg.iocfg_limesdr = Some(LimeSdrCfg {
                 rx_ant: lime_dto.rx_ant,
@@ -126,7 +158,7 @@ fn apply_phy_io_patch(dst: &mut CfgPhyIo, src: PhyIoDto) {
                 tx_gain_iamp: lime_dto.tx_gain_iamp,
             });
         }
-        
+
         if let Some(sx_dto) = soapy_dto.iocfg_sxceiver {
             soapy_cfg.io_cfg.iocfg_sxceiver = Some(SXceiverCfg {
                 rx_ant: sx_dto.rx_ant,
@@ -137,19 +169,18 @@ fn apply_phy_io_patch(dst: &mut CfgPhyIo, src: PhyIoDto) {
                 tx_gain_mixer: sx_dto.tx_gain_mixer,
             });
         }
-        
+
         dst.soapysdr = Some(soapy_cfg);
     }
 }
 
 fn apply_cell_info_patch(dst: &mut CfgCellInfo, ci: CellInfoDto) {
-
     dst.main_carrier = ci.main_carrier;
     dst.freq_band = ci.freq_band;
     dst.freq_offset_hz = ci.freq_offset;
     dst.duplex_spacing_id = ci.duplex_spacing;
     dst.reverse_operation = ci.reverse_operation;
-    
+
     // Option
     dst.custom_duplex_spacing = ci.custom_duplex_spacing;
 
@@ -233,11 +264,11 @@ struct TomlConfigRoot {
     config_version: String,
     stack_mode: StackMode,
     debug_log: Option<String>,
-    
+
     // New phy_io structure
     #[serde(default)]
     phy_io: Option<PhyIoDto>,
-    
+
     #[serde(default)]
     net_info: NetInfoDto,
 
@@ -246,6 +277,9 @@ struct TomlConfigRoot {
 
     #[serde(default)]
     stack_state: Option<StackStatePatch>,
+
+    #[serde(default)]
+    brew: Option<CfgBrew>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -259,7 +293,7 @@ struct PhyIoDto {
     ul_rx_file: Option<String>,
     ul_input_file: Option<String>,
     dl_input_file: Option<String>,
-    
+
     #[serde(default)]
     pub soapysdr: Option<SoapySdrDto>,
 
@@ -272,13 +306,13 @@ struct SoapySdrDto {
     pub rx_freq: f64,
     pub tx_freq: f64,
     pub ppm_err: Option<f64>,
-    
+
     #[serde(default)]
     pub iocfg_usrpb2xx: Option<UsrpB2xxDto>,
-    
+
     #[serde(default)]
     pub iocfg_limesdr: Option<LimeSdrDto>,
-    
+
     #[serde(default)]
     pub iocfg_sxceiver: Option<SXceiverDto>,
 
@@ -326,7 +360,6 @@ struct NetInfoDto {
 
 #[derive(Default, Deserialize)]
 struct CellInfoDto {
-
     pub main_carrier: u16,
     pub freq_band: u8,
     pub freq_offset: i16,
@@ -335,13 +368,10 @@ struct CellInfoDto {
     pub custom_duplex_spacing: Option<u32>,
 
     pub location_area: u16,
-    
+
     pub neighbor_cell_broadcast: Option<u8>,
     pub cell_load_ca: Option<u8>,
     pub late_entry_supported: Option<bool>,
-
-
-    
 
     pub subscriber_class: Option<u16>,
 

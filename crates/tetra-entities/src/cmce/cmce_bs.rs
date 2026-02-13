@@ -21,10 +21,11 @@ pub struct CmceBs {
 
 impl CmceBs {
     pub fn new(config: SharedConfig) -> Self {
+        let cc_config = config.clone();
         Self { 
             config,
             sds: SdsBsSubentity::new(),
-            cc: CcBsSubentity::new(),
+            cc: CcBsSubentity::new(cc_config),
             ss: SsBsSubentity::new(),
          }
     }
@@ -78,6 +79,7 @@ impl TetraEntityTrait for CmceBs {
     }
 
     fn set_config(&mut self, config: SharedConfig) {
+        self.cc.set_config(config.clone());
         self.config = config;
     }
 
