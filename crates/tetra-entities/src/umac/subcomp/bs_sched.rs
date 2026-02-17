@@ -74,6 +74,11 @@ pub struct BsChannelScheduler {
     ulsched: [[TimeslotSchedule; MACSCHED_NUM_FRAMES]; 4],
 
     circuits: CircuitMgr,
+
+    /// Last transmitted TCH block per timeslot (used for short tail smoothing).
+    last_tch_block: [Option<Vec<u8>>; 4],
+    /// How many times we've repeated last_tch_block while the queue is empty.
+    last_tch_repeats: [u8; 4],
 }
 
 #[derive(Debug)]
@@ -126,6 +131,9 @@ impl BsChannelScheduler {
             dltx_queues: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             ulsched: EMPTY_SCHED,
             circuits: CircuitMgr::new(),
+
+            last_tch_block: std::array::from_fn(|_| None),
+            last_tch_repeats: [0; 4],
         }
     }
 
@@ -718,17 +726,41 @@ impl BsChannelScheduler {
     /// - tch_block: speech/silence (274 bits)
     /// - stch_block: STCH signaling (124 bits) for FACCH stealing (EN 300 392-2, clause 23.5)
     fn dl_build_traffic_block(&mut self, ts: TdmaTime) -> (BitBuffer, Option<BitBuffer>) {
-        // Get speech data or silence
+        // Get speech data, smooth short gaps by repeating last frame a couple of times,
+        // otherwise emit a "safe" idle pattern (all-zero with unused tail bits set).
+        let slot_idx = ts.t as usize - 1;
         let tch_buf = if let Some(block) = self.circuits.take_block(ts.t) {
+            // Keep for potential short tail smoothing
+            self.last_tch_block[slot_idx] = Some(block.clone());
+            self.last_tch_repeats[slot_idx] = 0;
+
             let mut buf = BitBuffer::from_vec(block);
             // Raw ACELP speech (274 bits for TCH/S).
             // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
             buf.set_raw_end(TCH_S_CAP);
             buf
+        } else if let Some(prev) = self.last_tch_block[slot_idx].as_ref() {
+            // Repeat last good frame briefly to avoid end-of-burst artifacts.
+            // 2 repeats ~= 120 ms (with 60 ms frames) which matches the reported "tail" region.
+            if self.last_tch_repeats[slot_idx] < 2 {
+                self.last_tch_repeats[slot_idx] += 1;
+                let mut buf = BitBuffer::from_vec(prev.clone());
+                buf.set_raw_end(TCH_S_CAP);
+                buf
+            } else {
+                let mut idle = vec![0u8; 35];
+                // Set unused tail bits (bits 5..0 of last octet) to 1.
+                idle[34] |= 0x3f;
+                let mut buf = BitBuffer::from_vec(idle);
+                buf.set_raw_end(TCH_S_CAP);
+                buf
+            }
         } else {
-            // No voice data queued — send silence frame (all zeros).
-            // This is normal during hangtime or between voice bursts.
-            BitBuffer::new(TCH_S_CAP)
+            let mut idle = vec![0u8; 35];
+            idle[34] |= 0x3f;
+            let mut buf = BitBuffer::from_vec(idle);
+            buf.set_raw_end(TCH_S_CAP);
+            buf
         };
 
         // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling)

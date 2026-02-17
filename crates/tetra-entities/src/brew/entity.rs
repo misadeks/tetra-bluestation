@@ -130,6 +130,9 @@ pub struct BrewEntity {
     /// Active circuit calls (P2P) from Brew keyed by session UUID
     active_circuit_calls: HashMap<Uuid, ActiveCircuitCall>,
 
+    /// Reverse lookup for circuit calls by allocated timeslot (ts -> uuid)
+    active_circuit_by_ts: HashMap<u8, Uuid>,
+
     /// UL calls being forwarded to TetraPack, keyed by timeslot
     ul_forwarded: HashMap<u8, UlForwardedCall>,
 
@@ -169,6 +172,7 @@ impl BrewEntity {
             command_sender,
             active_calls: HashMap::new(),
             active_circuit_calls: HashMap::new(),
+            active_circuit_by_ts: HashMap::new(),
             hanging_calls: HashMap::new(),
             ul_forwarded: HashMap::new(),
             subscriber_groups: HashMap::new(),
@@ -1013,8 +1017,16 @@ impl BrewEntity {
         _length_bits: u16,
         data: Vec<u8>,
     ) {
-        let Some(call) = self.active_calls.get_mut(&uuid) else {
-            // Voice frame for unknown call — might arrive before GROUP_TX or after GROUP_IDLE
+        // Group calls and circuit calls both deliver voice frames.
+        // Resolve the downlink timeslot from either tracking table.
+        let (ts, frame_count) = if let Some(call) = self.active_calls.get_mut(&uuid) {
+            call.frame_count += 1;
+            (call.ts, call.frame_count)
+        } else if let Some(call) = self.active_circuit_calls.get_mut(&uuid) {
+            call.frame_count += 1;
+            (call.ts, call.frame_count)
+        } else {
+            // Voice frame for unknown call — might arrive before setup or after release
             tracing::trace!(
                 "BrewEntity: voice frame for unknown uuid={} ({} bytes)",
                 uuid,
@@ -1023,13 +1035,11 @@ impl BrewEntity {
             return;
         };
 
-        call.frame_count += 1;
-
         // Log first voice frame per call
-        if call.frame_count == 1 {
+        if frame_count == 1 {
             tracing::info!(
                 "BrewEntity: voice frame #{} uuid={} len={} bytes",
-                call.frame_count,
+                frame_count,
                 uuid,
                 data.len()
             );
@@ -1044,7 +1054,11 @@ impl BrewEntity {
             );
             return;
         }
-        let acelp_data = data[1..].to_vec(); // 35 bytes = 280 bits, of which 274 are ACELP
+        let mut acelp_data = data[1..].to_vec(); // 35 bytes = 280 bits, of which 274 are ACELP
+        if acelp_data.len() == 35 {
+            // Make sure unused tail bits are 1s (helps some decoders / avoids tail artifacts)
+            acelp_data[34] |= 0x3f;
+        }
 
         // Inject ACELP frame into the downlink via TMD SAP
         let tmd_msg = SapMsg {
@@ -1053,7 +1067,7 @@ impl BrewEntity {
             dest: TetraEntity::Umac,
             dltime: self.dltime,
             msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq {
-                ts: call.ts,
+                ts,
                 data: acelp_data,
             }),
         };
@@ -1115,6 +1129,34 @@ impl BrewEntity {
         for (_, h) in hanging {
             self.finalize_call(queue, h.call_id, h.ts, h.dest_gssi);
         }
+
+        // Close all active circuit calls
+        let circuit_calls: Vec<(Uuid, ActiveCircuitCall)> = self.active_circuit_calls.drain().collect();
+        for (uuid, call) in circuit_calls {
+            tracing::info!(
+                "BrewEntity: releasing circuit call on disconnect uuid={} call_id={} ts={}",
+                uuid,
+                call.call_id,
+                call.ts
+            );
+            self.send_d_release_p2p(queue, call.call_id, 0, call.dest_ssi);
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Brew,
+                dest: TetraEntity::Umac,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Dl, call.ts)),
+            });
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Brew,
+                dest: TetraEntity::Umac,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Ul, call.ts)),
+            });
+            self.release_timeslot(call.ts);
+        }
+        self.active_circuit_by_ts.clear();
     }
 }
 
@@ -1246,6 +1288,17 @@ impl BrewEntity {
                 frame_count: 0,
             },
         );
+
+        if let Some(prev) = self.active_circuit_by_ts.insert(ts, uuid) {
+            if prev != uuid {
+                tracing::warn!(
+                    "BrewEntity: active_circuit_by_ts collision: ts={} old_uuid={} new_uuid={}",
+                    ts,
+                    prev,
+                    uuid
+                );
+            }
+        }
     }
 
     fn handle_circuit_call_release(&mut self, queue: &mut MessageQueue, uuid: Uuid, _cause: u8) {
@@ -1277,6 +1330,13 @@ impl BrewEntity {
             msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Ul, call.ts)),
         });
         self.release_timeslot(call.ts);
+
+        // Remove reverse lookup
+        if let Some(cur) = self.active_circuit_by_ts.get(&call.ts).copied() {
+            if cur == uuid {
+                self.active_circuit_by_ts.remove(&call.ts);
+            }
+        }
     }
 
     fn send_d_setup_p2p(
@@ -1546,11 +1606,20 @@ impl BrewEntity {
     /// Handle UL voice data from UMAC. If the timeslot is being forwarded to TetraPack,
     /// convert to STE format and send.
     fn handle_ul_voice(&mut self, ts: u8, acelp_bits: Vec<u8>) {
-        let Some(fwd) = self.ul_forwarded.get_mut(&ts) else {
-            return; // Not forwarded to TetraPack
+        // Determine which Brew session should receive this UL voice frame.
+        // - For group calls: use ul_forwarded (local call forwarding)
+        // - For circuit calls: use active_circuit_by_ts (duplex UL path)
+        let (uuid, _is_group) = if let Some(fwd) = self.ul_forwarded.get_mut(&ts) {
+            fwd.frame_count += 1;
+            (fwd.uuid, true)
+        } else if let Some(uuid) = self.active_circuit_by_ts.get(&ts).copied() {
+            if let Some(call) = self.active_circuit_calls.get_mut(&uuid) {
+                call.frame_count += 1;
+            }
+            (uuid, false)
+        } else {
+            return;
         };
-
-        fwd.frame_count += 1;
 
         // Convert ACELP bits to STE format for TetraPack.
         // Supported inputs:
@@ -1599,7 +1668,7 @@ impl BrewEntity {
         };
 
         let _ = self.command_sender.send(BrewCommand::SendVoiceFrame {
-            uuid: fwd.uuid,
+            uuid,
             length_bits: (ste_data.len() * 8) as u16,
             data: ste_data,
         });

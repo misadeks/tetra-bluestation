@@ -205,8 +205,13 @@ impl LmacBs {
             return;
         };
 
+        // NOTE:
+        // Some decoders will produce an audible "tail" artifact if we forward corrupted ACELP
+        // blocks without any BFI/stealing indication. Until BFI metadata is propagated end-to-end,
+        // drop CRC-failed blocks here to avoid injecting noise.
         if !crc_ok {
-            tracing::trace!("rx_blk_traffic: CRC fail (BFI), still forwarding for concealment");
+            tracing::trace!("rx_blk_traffic: CRC fail (BFI) -> dropping traffic block");
+            return;
         }
 
         // Convert ACELP BitBuffer to Vec<u8> (one bit per byte, 274 bytes)
