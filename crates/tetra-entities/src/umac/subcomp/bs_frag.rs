@@ -57,24 +57,21 @@ impl BsFragger {
         // Compute len of full resource, including sdu and fill bits
         let hdr_len_bits = self.resource.compute_header_len();
         let sdu_len_bits = self.sdu.get_len_remaining();
-        let num_fill_bits = fillbits::addition::compute_required_naive(hdr_len_bits + sdu_len_bits);
-        let total_len_bits = hdr_len_bits + sdu_len_bits + num_fill_bits;
-        let total_len_bytes = total_len_bits / 8;
         let slot_cap_bits = mac_block.get_len_remaining();
 
-        // tracing::error!("hdr_len_bits: {}, sdu_len_bits: {}, num_fill_bits: {}, total_len_bits: {}, slot_cap_bits: {}",
-        //     hdr_len_bits, sdu_len_bits, num_fill_bits, total_len_bits, slot_cap_bits);
+        let num_fill_bits = fillbits::addition::compute_required(hdr_len_bits + sdu_len_bits, slot_cap_bits);
 
-        assert!(
-            total_len_bits % 8 == 0 || total_len_bits == mac_block.get_len_remaining(),
-            "PDU must fill slot or have byte aligned end"
-        );
-
+        let total_len_bits = hdr_len_bits + sdu_len_bits + num_fill_bits;
+        let total_len_bytes = total_len_bits / 8;
+        
         // Check if we can fit all in a single MAC-RESOURCE
         if total_len_bits <= slot_cap_bits {
+
             // Fits in one MAC-RESOURCE
-            // let num_fill_bits = if self.resource.is_null_pdu() { 0 } else { (8 - (sdu_len % 8)) % 8 };
-            // let sdu_bits = self.sdu.get_len_remaining();
+            assert!(
+                total_len_bits % 8 == 0 || total_len_bits == mac_block.get_len_remaining(),
+                "PDU must fill slot or have byte aligned end, got len {} for remaining cap {}", total_len_bits, mac_block.get_len_remaining()
+            );
 
             // Update PDU fields
             self.resource.length_ind = total_len_bytes as u8;
@@ -113,6 +110,7 @@ impl BsFragger {
             // We need to start fragmentation. No fill bits are needed
             self.resource.length_ind = 0b111111; // Start of fragmentation
             self.resource.fill_bits = false;
+            assert!(num_fill_bits == 0, "Got {} fill bits upon frag start", num_fill_bits);
             let sdu_bits = slot_cap_bits - hdr_len_bits;
 
             tracing::debug!(
@@ -128,6 +126,7 @@ impl BsFragger {
 
             self.resource.to_bitbuf(mac_block);
             mac_block.copy_bits(&mut self.sdu, sdu_bits);
+            fillbits::addition::write(mac_block, None);
 
             // More fragments follow
             self.mac_hdr_is_written = true;
@@ -146,10 +145,6 @@ impl BsFragger {
             self.mac_hdr_is_written,
             "MAC header should be previously written"
         );
-        assert!(
-            mac_block.get_len_written() % 8 == 0 || mac_block.get_len_remaining() == 0,
-            "MAC block must be byte aligned at start of writing"
-        );
 
         // Check if we can fit all in a MAC-END message
         let sdu_bits = self.sdu.get_len_remaining();
@@ -161,7 +156,7 @@ impl BsFragger {
         //     macend_len_bits, macend_len_bytes, slot_cap);
         if macend_len_bytes * 8 <= slot_cap_bits {
             // Fits in single MAC-END
-            let num_fill_bits = fillbits::addition::compute_required_naive(macend_len_bits);
+            let num_fill_bits = fillbits::addition::compute_required(macend_len_bits, slot_cap_bits);
             let pdu = MacEndDl {
                 fill_bits: num_fill_bits > 0,
                 pos_of_grant: 0,
@@ -236,6 +231,8 @@ impl BsFragger {
     /// Returns (bool is_done, usize bits_written)
     pub fn get_next_chunk(&mut self, mac_block: &mut BitBuffer) -> bool {
         assert!(!self.done, "all fragments have already been produced");
+        assert!(mac_block.get_len_written() % 8 == 0 || mac_block.get_len_remaining() == 0, "mac_block must be full or byte aligned before writing");
+
         self.done = if !self.mac_hdr_is_written {
             // First chunk, write MAC-RESOURCE
             self.get_resource_chunk(mac_block)

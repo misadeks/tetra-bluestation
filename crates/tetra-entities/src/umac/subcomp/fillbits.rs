@@ -27,11 +27,30 @@ pub mod removal {
 pub mod addition {
     use tetra_core::bitbuffer::BitBuffer;
 
-
-    /// Compute how many fill bits need to be added in order to reach the next byte boundary
+    /// Compute how many fill bits need to be added in order to reach the next byte boundary. 
+    /// Returns 0-7
     #[inline(always)]
-    pub fn compute_required_naive(total_pdu_sdu_len_bits: usize) -> usize {
+    pub fn compute_required_bytealigned(total_pdu_sdu_len_bits: usize) -> usize {
         (8 - total_pdu_sdu_len_bits % 8) % 8
+    }
+
+    /// Compute how many fill bits need to be added in order to:
+    /// - Reach the next byte boundary, if this would not overflow the slot, or:
+    /// - Reach the end of the slot if that occurs after sdu end but before next byte boundary
+    /// - If total_pdu_sdu_len_bits already exceeds slot capacity, returns 0 (no fill bits can be added)
+    pub fn compute_required(total_pdu_sdu_len_bits: usize, dest_cap_left: usize) -> usize {
+        if total_pdu_sdu_len_bits >= dest_cap_left {
+            // No fill bits can be added, slot is already full or overflowing
+            return 0;
+        }
+        let bytealigned_fill_bits = compute_required_bytealigned(total_pdu_sdu_len_bits);
+        if total_pdu_sdu_len_bits + bytealigned_fill_bits <= dest_cap_left {
+            // Simple case; we align to next byte boundary without overflowing the slot
+            return bytealigned_fill_bits;
+        } else {
+            // Adding bytealigned_fill_bits would overflow the slot, so we fill to the end of the slot instead
+            return dest_cap_left - total_pdu_sdu_len_bits;
+        }
     }
 
     /// Zeroes all bits behind the current position to end of window, preceded by a 1
