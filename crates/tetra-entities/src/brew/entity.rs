@@ -61,6 +61,20 @@ struct ActiveCall {
     frame_count: u64,
 }
 
+/// Active circuit (P2P) call tracking
+#[derive(Debug)]
+struct ActiveCircuitCall {
+    uuid: Uuid,
+    call_id: u16,
+    ts: u8,
+    usage: u8,
+    source_issi: u32,
+    dest_ssi: u32,
+    duplex: bool,
+    frame_count: u64,
+}
+
+
 /// Group call in hangtime with circuit still allocated.
 #[derive(Debug)]
 struct HangingCall {
@@ -113,6 +127,9 @@ pub struct BrewEntity {
     /// new speaker or timeout. Only one hanging call per GSSI.
     hanging_calls: HashMap<u32, HangingCall>,
 
+    /// Active circuit calls (P2P) from Brew keyed by session UUID
+    active_circuit_calls: HashMap<Uuid, ActiveCircuitCall>,
+
     /// UL calls being forwarded to TetraPack, keyed by timeslot
     ul_forwarded: HashMap<u8, UlForwardedCall>,
 
@@ -151,6 +168,7 @@ impl BrewEntity {
             event_receiver,
             command_sender,
             active_calls: HashMap::new(),
+            active_circuit_calls: HashMap::new(),
             hanging_calls: HashMap::new(),
             ul_forwarded: HashMap::new(),
             subscriber_groups: HashMap::new(),
@@ -235,6 +253,16 @@ impl BrewEntity {
                 } => {
                     self.handle_voice_frame(queue, uuid, length_bits, data);
                 }
+                BrewEvent::CircuitCallSetupRequest { uuid, call } => {
+                    self.handle_circuit_call_setup(queue, uuid, call);
+                }
+                BrewEvent::CircuitCallRelease { uuid, cause } => {
+                    self.handle_circuit_call_release(queue, uuid, cause);
+                }
+                BrewEvent::CircuitCallGrant { uuid: _, grant: _ } => {
+                    // TODO: handle simplex grant/permission updates (floor control)
+                }
+
                 BrewEvent::SubscriberEvent {
                     msg_type,
                     issi,
@@ -863,6 +891,7 @@ impl BrewEntity {
                 layer2_qos: 0,
                 stealing_permission: true,
                 stealing_repeats_flag: false,
+                // No (re)allocation needed here; the circuit is already established.
                 chan_alloc: None,
                 main_address: TetraAddress::new(dest_gssi, SsiType::Gssi),
             }),
@@ -923,6 +952,7 @@ impl BrewEntity {
                 layer2_qos: 0,
                 stealing_permission: true,
                 stealing_repeats_flag: false,
+                // No (re)allocation needed here; the circuit is already established.
                 chan_alloc: None,
                 main_address: TetraAddress::new(dest_gssi, SsiType::Gssi),
             }),
@@ -1141,6 +1171,272 @@ impl TetraEntityTrait for BrewEntity {
     }
 }
 
+
+// ─── Circuit (P2P) call handling ────────────────────────────────
+
+impl BrewEntity {
+    fn handle_circuit_call_setup(&mut self, queue: &mut MessageQueue, uuid: Uuid, call: super::protocol::BrewCircularCall) {
+        let source_issi = call.source;
+        let dest_ssi = call.destination;
+        let duplex = call.duplex != 0;
+
+        let (ts, call_id, usage) = match self.allocate_timeslot() {
+            Some(v) => v,
+            None => {
+                tracing::error!("BrewEntity: no free timeslot for circuit call uuid={}", uuid);
+                return;
+            }
+        };
+
+        tracing::info!(
+            "BrewEntity: CIRCUIT_SETUP uuid={} call_id={} src={} dst_ssi={} ts={} duplex={}",
+            uuid,
+            call_id,
+            source_issi,
+            dest_ssi,
+            ts,
+            duplex
+        );
+
+        let dl_circuit = Circuit {
+            direction: Direction::Dl,
+            ts,
+            usage,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+        };
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Umac,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::Open(dl_circuit)),
+        });
+
+        let ul_circuit = Circuit {
+            direction: Direction::Ul,
+            ts,
+            usage,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+        };
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Umac,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::Open(ul_circuit)),
+        });
+
+        self.send_d_setup_p2p(queue, call_id, usage, ts, source_issi, dest_ssi, duplex);
+        self.send_d_connect_p2p(queue, call_id, dest_ssi, duplex);
+
+        self.active_circuit_calls.insert(
+            uuid,
+            ActiveCircuitCall {
+                uuid,
+                call_id,
+                ts,
+                usage,
+                source_issi,
+                dest_ssi,
+                duplex,
+                frame_count: 0,
+            },
+        );
+    }
+
+    fn handle_circuit_call_release(&mut self, queue: &mut MessageQueue, uuid: Uuid, _cause: u8) {
+        let Some(call) = self.active_circuit_calls.remove(&uuid) else {
+            return;
+        };
+        tracing::info!(
+            "BrewEntity: CIRCUIT_RELEASE uuid={} call_id={} ts={}",
+            uuid,
+            call.call_id,
+            call.ts
+        );
+
+        // Use cause 0 (normal) as default.
+        self.send_d_release_p2p(queue, call.call_id, 0, call.dest_ssi);
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Umac,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Dl, call.ts)),
+        });
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Umac,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Ul, call.ts)),
+        });
+        self.release_timeslot(call.ts);
+    }
+
+    fn send_d_setup_p2p(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        usage: u8,
+        ts: u8,
+        source_issi: u32,
+        dest_ssi: u32,
+        duplex: bool,
+    ) {
+        use tetra_saps::control::enums::communication_type::CommunicationType;
+
+        let d_setup = DSetup {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: false,
+            simplex_duplex_selection: duplex,
+            basic_service_information: BasicServiceInformation {
+                circuit_mode_type: CircuitModeType::TchS,
+                encryption_flag: false,
+                communication_type: CommunicationType::P2p,
+                slots_per_frame: None,
+                speech_service: Some(0),
+            },
+            transmission_grant: TransmissionGrant::GrantedToOtherUser,
+            transmission_request_permission: true,
+            call_priority: 0,
+            notification_indicator: None,
+            temporary_address: None,
+            calling_party_address_ssi: Some(source_issi),
+            calling_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(96);
+        if let Err(e) = d_setup.to_bitbuf(&mut sdu) {
+            tracing::error!("BrewEntity: failed to serialize D-SETUP(P2P): {:?}", e);
+            return;
+        }
+        sdu.seek(0);
+
+        let mut timeslots = [false; 4];
+        timeslots[ts as usize - 1] = true;
+        let chan_alloc = CmceChanAllocReq {
+            usage: Some(usage),
+            alloc_type: ChanAllocType::Replace,
+            carrier: None,
+            timeslots,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Mle,
+            dltime: self.dltime,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: 0,
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: 0,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: Some(chan_alloc),
+                main_address: TetraAddress::new(dest_ssi, SsiType::Ssi),
+            }),
+        });
+    }
+
+    fn send_d_connect_p2p(&self, queue: &mut MessageQueue, call_id: u16, dest_ssi: u32, duplex: bool) {
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: false,
+            simplex_duplex_selection: duplex,
+            transmission_grant: TransmissionGrant::GrantedToOtherUser,
+            transmission_request_permission: false,
+            call_ownership: false,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        if let Err(e) = d_connect.to_bitbuf(&mut sdu) {
+            tracing::error!("BrewEntity: failed to serialize D-CONNECT(P2P): {:?}", e);
+            return;
+        }
+        sdu.seek(0);
+
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Mle,
+            dltime: self.dltime,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: 0,
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: 0,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: None,
+                main_address: TetraAddress::new(dest_ssi, SsiType::Ssi),
+            }),
+        });
+    }
+
+    fn send_d_release_p2p(&self, queue: &mut MessageQueue, call_id: u16, cause: u8, dest_ssi: u32) {
+        let d_release = DRelease {
+            call_identifier: call_id,
+            disconnect_cause: cause,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        if let Err(e) = d_release.to_bitbuf(&mut sdu) {
+            tracing::error!("BrewEntity: failed to serialize D-RELEASE(P2P): {:?}", e);
+            return;
+        }
+        sdu.seek(0);
+
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Mle,
+            dltime: self.dltime,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: 0,
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: 0,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: None,
+                main_address: TetraAddress::new(dest_ssi, SsiType::Ssi),
+            }),
+        });
+    }
+}
+
 // ─── UL call forwarding to TetraPack ──────────────────────────────
 
 impl BrewEntity {
@@ -1262,11 +1558,20 @@ impl BrewEntity {
         //   - 35 bytes (already packed) → prepend header
         //   - 36 bytes (already STE with header) → send as-is
         let ste_data = if acelp_bits.len() == 36 {
-            acelp_bits
+            // Ensure STE header has bit7 set (per spec) and unused tail bits are 1s
+            let mut ste = acelp_bits;
+            if !ste.is_empty() {
+                ste[0] |= 0x80;
+            }
+            if ste.len() == 36 {
+                ste[35] |= 0x3f; // octet 35: bits5-0 unused
+            }
+            ste
         } else if acelp_bits.len() == 35 {
             let mut ste = Vec::with_capacity(36);
-            ste.push(0x00); // STE header byte: normal speech frame
+            ste.push(0x80); // STE header byte: normal speech frame (bit7=1)
             ste.extend_from_slice(&acelp_bits);
+            ste[35] |= 0x3f;
             ste
         } else {
             if acelp_bits.len() < 274 {
@@ -1276,7 +1581,7 @@ impl BrewEntity {
 
             // Pack 274 bits into bytes, MSB first, prepend STE header
             let mut ste = Vec::with_capacity(36);
-            ste.push(0x00); // STE header byte: normal speech frame
+            ste.push(0x80); // STE header byte: normal speech frame (bit7=1)
 
             // Pack 274 bits (1-per-byte) into 35 bytes (280 bits, last 6 bits padded)
             for chunk_idx in 0..35 {
@@ -1289,6 +1594,7 @@ impl BrewEntity {
                 }
                 ste.push(byte);
             }
+            ste[35] |= 0x3f;
             ste
         };
 

@@ -34,6 +34,15 @@ pub enum BrewEvent {
     /// Group call ended
     GroupCallEnd { uuid: Uuid, cause: u8 },
 
+    /// Circuit (P2P) call setup requested by TetraPack
+    CircuitCallSetupRequest { uuid: Uuid, call: BrewCircularCall },
+
+    /// Circuit call released
+    CircuitCallRelease { uuid: Uuid, cause: u8 },
+
+    /// Circuit call grant / permission update
+    CircuitCallGrant { uuid: Uuid, grant: BrewCircularGrant },
+
     /// Voice frame received (ACELP traffic)
     VoiceFrame {
         uuid: Uuid,
@@ -760,6 +769,37 @@ impl BrewWorker {
                     uuid: cc.identifier,
                     cause,
                 });
+                let _ = self.event_sender.send(BrewEvent::CircuitCallRelease { uuid: cc.identifier, cause });
+            }
+            CALL_STATE_SETUP_REQUEST | CALL_STATE_CONNECT_REQUEST => {
+                if let BrewCallPayload::CircularCall(call) = cc.payload {
+                    tracing::info!(
+                        "BrewWorker: CIRCUIT_SETUP uuid={} src={} dst={} duplex={} service={} comm={}",
+                        cc.identifier,
+                        call.source,
+                        call.destination,
+                        call.duplex,
+                        call.service,
+                        call.communication
+                    );
+                    let _ = self.event_sender.send(BrewEvent::CircuitCallSetupRequest {
+                        uuid: cc.identifier,
+                        call,
+                    });
+                } else {
+                    tracing::debug!(
+                        "BrewWorker: SETUP_REQUEST without CircularCall payload uuid={}",
+                        cc.identifier
+                    );
+                }
+            }
+            CALL_STATE_CONNECT_CONFIRM | CALL_STATE_SIMPLEX_GRANTED | CALL_STATE_SIMPLEX_IDLE => {
+                if let BrewCallPayload::CircularGrant(grant) = cc.payload {
+                    let _ = self.event_sender.send(BrewEvent::CircuitCallGrant {
+                        uuid: cc.identifier,
+                        grant,
+                    });
+                }
             }
             CALL_STATE_CALL_RELEASE => {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload {
@@ -776,6 +816,7 @@ impl BrewWorker {
                     uuid: cc.identifier,
                     cause,
                 });
+                let _ = self.event_sender.send(BrewEvent::CircuitCallRelease { uuid: cc.identifier, cause });
             }
             state => {
                 tracing::debug!(

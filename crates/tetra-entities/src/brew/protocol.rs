@@ -78,6 +78,35 @@ pub struct BrewGroupTransmission {
     pub service: u16, // Speech service
 }
 
+/// Circuit ("circular") call data (CALL_STATE_SETUP_REQUEST / CALL_STATE_CONNECT_REQUEST)
+/// Matches `struct BrewCircularCall` in the Brew protocol spec.
+#[derive(Debug, Clone)]
+pub struct BrewCircularCall {
+    pub source: u32,
+    pub destination: u32,
+    /// External number (ASCII, may be empty, NUL-terminated in the fixed 32-byte field)
+    pub number: String,
+    pub priority: u8,
+    pub service: u8,
+    pub mode: u8,
+    pub duplex: u8,
+    pub method: u8,
+    pub communication: u8,
+    pub grant: u8,
+    pub permission: u8,
+    pub timeout: u8,
+    pub ownership: u8,
+    pub queued: u8,
+}
+
+/// Transmission grant/permission update (CALL_STATE_CONNECT_CONFIRM / CALL_STATE_SIMPLEX_GRANTED / CALL_STATE_SIMPLEX_IDLE)
+#[derive(Debug, Clone)]
+pub struct BrewCircularGrant {
+    pub grant: u8,
+    pub permission: u8,
+}
+
+
 /// Call control (0xf1)
 #[derive(Debug, Clone)]
 pub struct BrewCallControlMessage {
@@ -95,6 +124,12 @@ pub enum BrewCallPayload {
     Cause(u8),
     /// CALL_STATE_SETUP_ACCEPT, CALL_STATE_CALL_ALERT — no extra payload
     Empty,
+
+    /// CALL_STATE_SETUP_REQUEST, CALL_STATE_CONNECT_REQUEST
+    CircularCall(BrewCircularCall),
+
+    /// CALL_STATE_CONNECT_CONFIRM, CALL_STATE_SIMPLEX_GRANTED, CALL_STATE_SIMPLEX_IDLE
+    CircularGrant(BrewCircularGrant),
     /// Unknown/unhandled call state
     Raw(Vec<u8>),
 }
@@ -273,6 +308,46 @@ fn parse_call_control(call_state: u8, data: &[u8]) -> Result<BrewMessage, BrewPa
         CALL_STATE_SETUP_ACCEPT | CALL_STATE_CALL_ALERT => {
             // No extra payload
             BrewCallPayload::Empty
+        }
+
+        CALL_STATE_SETUP_REQUEST | CALL_STATE_CONNECT_REQUEST => {
+            // BrewCircularCall: 4 + 4 + 32 + 11*1 = 51 bytes, align to 52 bytes in spec.
+            if payload_data.len() < 52 {
+                return Err(BrewParseError::TooShort(data.len()));
+            }
+
+            let source = read_u32_le(payload_data, 0);
+            let destination = read_u32_le(payload_data, 4);
+            let num_raw = &payload_data[8..40];
+            let num_end = num_raw.iter().position(|&b| b == 0).unwrap_or(num_raw.len());
+            let number = String::from_utf8_lossy(&num_raw[..num_end]).to_string();
+
+            BrewCallPayload::CircularCall(BrewCircularCall {
+                source,
+                destination,
+                number,
+                priority: payload_data[40],
+                service: payload_data[41],
+                mode: payload_data[42],
+                duplex: payload_data[43],
+                method: payload_data[44],
+                communication: payload_data[45],
+                grant: payload_data[46],
+                permission: payload_data[47],
+                timeout: payload_data[48],
+                ownership: payload_data[49],
+                queued: payload_data[50],
+            })
+        }
+
+        CALL_STATE_CONNECT_CONFIRM | CALL_STATE_SIMPLEX_GRANTED | CALL_STATE_SIMPLEX_IDLE => {
+            if payload_data.len() < 2 {
+                return Err(BrewParseError::TooShort(data.len()));
+            }
+            BrewCallPayload::CircularGrant(BrewCircularGrant {
+                grant: payload_data[0],
+                permission: payload_data[1],
+            })
         }
 
         _ => {
