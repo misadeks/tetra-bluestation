@@ -166,7 +166,7 @@ impl CircuitMgr {
             circuit_mode: CircuitModeType::TchS, // TODO: only speech supported for now
             // endpoint_id: 0, // TODO, we don't use endpoints as of yet
             comm_type,
-            simplex_duplex: false,   // TODO, simplex only for now
+            simplex_duplex,   // TODO, simplex only for now
             speech_service: Some(0), // TODO, only TETRA encoded speech for now
             etee_encrypted: false,   // TODO, no encryption for now
         };
@@ -196,7 +196,7 @@ impl CircuitMgr {
             usage,
             circuit_mode: CircuitModeType::TchS, // TODO: only speech supported for now
             comm_type,
-            simplex_duplex: false,   // TODO, simplex only for now
+            simplex_duplex,   // TODO, simplex only for now
             speech_service: Some(0), // TODO, only TETRA encoded speech for now
             etee_encrypted: false,   // TODO, no encryption for now
         };

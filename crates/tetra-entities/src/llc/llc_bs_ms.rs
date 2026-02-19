@@ -211,6 +211,7 @@ impl Llc {
                 stealing_repeats_flag: prim.stealing_repeats_flag,
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
+                traffic_ts_hint: prim.traffic_ts_hint,
                 // redundant_transmission: prim.redundant_transmission,
             }),
         };
@@ -517,6 +518,7 @@ impl TetraEntityTrait for Llc {
                     stealing_repeats_flag: None,    // TODO FIXME
                     data_category: None,            // TODO FIXME
                     chan_alloc: None,               // TODO FIXME
+                    traffic_ts_hint: None,
                 }),
             };
             queue.push_back(sapmsg);

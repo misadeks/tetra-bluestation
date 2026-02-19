@@ -56,6 +56,8 @@ struct ActiveLocalCall {
     tx_active: bool,
     /// When PTT was released (for hangtime). None if transmitting.
     hangtime_start: Option<TdmaTime>,
+    /// Tail-delay: if set, we delay sending D-TX CEASED + LocalCallEnd to avoid cutting the last speech frame(s).
+    pending_tx_ceased: Option<TdmaTime>,
 }
 
 impl CcBsSubentity {
@@ -82,6 +84,7 @@ impl CcBsSubentity {
             self.circuits.allocate_circuit_with_allocator(
                 Direction::Dl,
                 CommunicationType::P2Mp,
+                false,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
             )
@@ -184,12 +187,18 @@ impl CcBsSubentity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc,
+                traffic_ts_hint: None,
                 main_address: address,
             }),
         }
     }
 
-    fn build_sapmsg_stealing(sdu: BitBuffer, dltime: TdmaTime, address: TetraAddress) -> SapMsg {
+    fn build_sapmsg_stealing(
+        sdu: BitBuffer,
+        dltime: TdmaTime,
+        address: TetraAddress,
+        traffic_ts_hint: Option<u8>,
+    ) -> SapMsg {
         SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -206,6 +215,7 @@ impl CcBsSubentity {
                 stealing_permission: true,
                 stealing_repeats_flag: false,
                 chan_alloc: None,
+                traffic_ts_hint,
                 main_address: address,
             }),
         }
@@ -281,6 +291,7 @@ impl CcBsSubentity {
                 stealing_repeats_flag: false,
 
                 chan_alloc: None,
+                                traffic_ts_hint: None,
                 main_address: prim.received_tetra_address,
                 // redundant_transmission: 1,
             }),
@@ -345,6 +356,7 @@ impl CcBsSubentity {
                 stealing_repeats_flag: false,
 
                 chan_alloc: None,
+                                traffic_ts_hint: None,
                 main_address: prim.received_tetra_address,
                 // redundant_transmission: 1,
             }),
@@ -485,6 +497,7 @@ impl CcBsSubentity {
             self.circuits.allocate_circuit_with_allocator(
                 Direction::Both,
                 pdu.basic_service_information.communication_type,
+                pdu.simplex_duplex_selection,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
             )
@@ -621,6 +634,7 @@ impl CcBsSubentity {
                 usage: circuit.usage,
                 tx_active: true,
                 hangtime_start: None,
+                pending_tx_ceased: None,
             },
         );
 
@@ -694,6 +708,9 @@ impl CcBsSubentity {
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
         self.dltime = dltime;
 
+        // Process tail-delay completions (DTxCeased + LocalCallEnd)
+        self.process_pending_tx_ceased(queue);
+
         // Check hangtime expiry for active local calls
         self.check_hangtime_expiry(queue);
 
@@ -740,17 +757,17 @@ impl CcBsSubentity {
         }
     }
 
-    /// Check if any active calls in hangtime have expired, and if so, release them
-    fn check_hangtime_expiry(&mut self, queue: &mut MessageQueue) {
-        // Hangtime: ~1 second = 1 * 18 * 4 = 72 frames (approximately)
-        const HANGTIME_FRAMES: i32 = 1 * 18 * 4;
+    /// Tail-delay: complete any pending TX-CEASED after a small delay to avoid clipping.
+    fn process_pending_tx_ceased(&mut self, queue: &mut MessageQueue) {
+        const TAIL_DELAY_SLOTS: i32 = 6 * 4; // ~6 frames
 
-        let expired: Vec<u16> = self
+        // Collect call_ids first to avoid borrow issues
+        let ready: Vec<u16> = self
             .active_calls
             .iter()
             .filter_map(|(&call_id, call)| {
-                if let Some(hangtime_start) = call.hangtime_start {
-                    if hangtime_start.age(self.dltime) > HANGTIME_FRAMES {
+                if let Some(t) = call.pending_tx_ceased {
+                    if t.age(self.dltime) >= 0 {
                         return Some(call_id);
                     }
                 }
@@ -758,126 +775,54 @@ impl CcBsSubentity {
             })
             .collect();
 
-        for call_id in expired {
-            tracing::info!("Hangtime expired for call_id={}, releasing", call_id);
-            self.release_call(queue, call_id);
-        }
-    }
-
-    fn release_timeslot(&mut self, ts: u8) {
-        let mut state = self.config.state_write();
-        if let Err(err) = state.timeslot_alloc.release(TimeslotOwner::Cmce, ts) {
-            tracing::warn!(
-                "CcBsSubentity: failed to release timeslot ts={} err={:?}",
-                ts,
-                err
-            );
-        }
-    }
-
-    /// Release a call: send D-RELEASE, close circuits, clean up state
-    fn release_call(&mut self, queue: &mut MessageQueue, call_id: u16) {
-        if let Some((pdu, dest_addr)) = self.cached_setups.get(&call_id) {
-            let dest_addr = *dest_addr;
-            // Send D-RELEASE to group
-            let sdu = Self::build_d_release_from_d_setup(pdu);
-            let prim = Self::build_sapmsg(sdu, None, self.dltime, dest_addr);
-            queue.push_back(prim);
-        } else {
-            tracing::error!("No cached D-SETUP for call_id={}", call_id);
+        for call_id in ready {
+            self.complete_tx_ceased_group(queue, call_id);
         }
 
-        // Close the circuit in CircuitMgr and notify Brew
-        if let Some(call) = self.active_calls.get(&call_id) {
-            let ts = call.ts;
-            if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, ts) {
-                Self::signal_umac_circuit_close(queue, circuit, self.dltime);
-            }
+        // Note: TAIL_DELAY_SLOTS is applied when scheduling in rx_u_tx_ceased.
+        let _ = TAIL_DELAY_SLOTS;
+    }
 
-            self.release_timeslot(ts);
-
-            // Notify Brew entity that this local call has ended
-            let notify = SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts }),
-            };
-            queue.push_back(notify);
-
-            // Also notify UMAC to stop UL voice loopback/forwarding
-            let notify_umac = SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts }),
-            };
-            queue.push_back(notify_umac);
+    fn complete_tx_ceased_group(&mut self, queue: &mut MessageQueue, call_id: u16) {
+        let Some(call) = self.active_calls.get_mut(&call_id) else {
+            return;
+        };
+        if call.pending_tx_ceased.is_none() {
+            return;
         }
+        call.pending_tx_ceased = None;
 
-        // Clean up
-        self.cached_setups.remove(&call_id);
-        self.active_calls.remove(&call_id);
-    }
+        // Get destination address
+        let Some((_pdu, dest_addr)) = self.cached_setups.get(&call_id) else {
+            tracing::warn!("complete_tx_ceased_group: no cached setup for call_id={}", call_id);
+            return;
+        };
+        let dest_addr = *dest_addr;
 
-    fn feature_check_u_setup(pdu: &USetup) -> bool {
-        let mut supported = true;
-
-        if !(pdu.area_selection == 0 || pdu.area_selection == 1) {
-            unimplemented_log!("Area selection not supported: {}", pdu.area_selection);
-            supported = false;
-        };
-        if pdu.hook_method_selection == true {
-            unimplemented_log!(
-                "Hook method selection not supported: {}",
-                pdu.hook_method_selection
-            );
-            supported = false;
-        };
-        if pdu.simplex_duplex_selection != false {
-            unimplemented_log!(
-                "Only simplex calls supported: {}",
-                pdu.simplex_duplex_selection
-            );
-            supported = false;
-        };
-        // if pdu.basic_service_information != 0xFC {
-        //     // TODO FIXME implement parsing
-        //     tracing::error!("Basic service information not supported: {}", pdu.basic_service_information);
-        //     return;
-        // };
-        // request_to_transmit_send_data can be false for speech group calls — the MS
-        // implicitly requests to transmit by initiating the call. No action needed.
-        if pdu.clir_control != 0 {
-            unimplemented_log!("clir_control not supported: {}", pdu.clir_control);
-        };
-        if pdu.called_party_ssi.is_none()
-            || pdu.called_party_short_number_address.is_some()
-            || pdu.called_party_extension.is_some()
-        {
-            unimplemented_log!("we only support ssi-based calling");
-        };
-        // Then, we warn about some other unhandled/unsupported fields
-        if let Some(v) = &pdu.external_subscriber_number {
-            unimplemented_log!("external_subscriber_number not supported: {:?}", v);
-        };
-        if let Some(v) = &pdu.facility {
-            unimplemented_log!("facility not supported: {:?}", v);
-        };
-        if let Some(v) = &pdu.dm_ms_address {
-            unimplemented_log!("dm_ms_address not supported: {:?}", v);
-        };
-        if let Some(v) = &pdu.proprietary {
-            unimplemented_log!("proprietary not supported: {:?}", v);
+        // Send D-TX CEASED via FACCH (stealing)
+        let d_tx_ceased = DTxCeased {
+            call_identifier: call_id,
+            transmission_request_permission: true,
+            notification_indicator: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
         };
 
-        supported
-    }
+        tracing::info!("-> {:?} (tail-delay)", d_tx_ceased);
+        let mut sdu = BitBuffer::new_autoexpand(25);
+        d_tx_ceased
+            .to_bitbuf(&mut sdu)
+            .expect("Failed to serialize DTxCeased");
+        sdu.seek(0);
+
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, Some(call.ts));
+        queue.push_back(msg);
+
+
 
     /// Handle U-TX CEASED: radio released PTT
-    /// Response: send D-TX CEASED via FACCH to all group members, enter hangtime
+    /// Response: enter hangtime; tail-delay D-TX CEASED + LocalCallEnd to avoid clipping
     fn rx_u_tx_ceased(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
             panic!()
@@ -903,12 +848,15 @@ impl CcBsSubentity {
         };
 
         tracing::info!(
-            "U-TX CEASED: PTT released on call_id={}, entering hangtime",
+            "U-TX CEASED: PTT released on call_id={}, entering hangtime (tail-delay)",
             call_id
         );
 
         call.tx_active = false;
         call.hangtime_start = Some(self.dltime);
+
+        // Tail-delay: schedule D-TX CEASED + LocalCallEnd a few frames later
+        call.pending_tx_ceased = Some(self.dltime.add_timeslots(6 * 4));
 
         // Get dest address and cached D-SETUP from cached setup
         let Some((pdu, dest_addr)) = self.cached_setups.get_mut(&call_id) else {
@@ -916,27 +864,6 @@ impl CcBsSubentity {
             return;
         };
         let dest_addr = *dest_addr;
-
-        // Send D-TX CEASED via FACCH (stealing) to all group members
-        let d_tx_ceased = DTxCeased {
-            call_identifier: call_id,
-            transmission_request_permission: true, // Allow other MSs to request the floor
-            notification_indicator: None,
-            facility: None,
-            dm_ms_address: None,
-            proprietary: None,
-        };
-
-        tracing::info!("-> {:?}", d_tx_ceased);
-        let mut sdu = BitBuffer::new_autoexpand(25);
-        d_tx_ceased
-            .to_bitbuf(&mut sdu)
-            .expect("Failed to serialize DTxCeased");
-        sdu.seek(0);
-
-        // Send via FACCH (stealing channel) so radios on the traffic channel hear the beep
-        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr);
-        queue.push_back(msg);
 
         // Update cached D-SETUP to reflect hangtime state and allow immediate PTT,
         // then re-send on MCCH so all radios see the floor is free.
@@ -947,32 +874,6 @@ impl CcBsSubentity {
         let setup_msg =
             Self::build_sapmsg(setup_sdu, Some(setup_chan_alloc), self.dltime, dest_addr);
         queue.push_back(setup_msg);
-
-        // Notify Brew that this local talkspurt has ended so it can send GROUP_IDLE
-        let notify = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd {
-                call_id,
-                ts: call.ts,
-            }),
-        };
-        queue.push_back(notify);
-
-        // Also notify UMAC to stop UL voice loopback/forwarding
-        let notify_umac = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd {
-                call_id,
-                ts: call.ts,
-            }),
-        };
-        queue.push_back(notify_umac);
     }
 
     /// Handle U-TX DEMAND: another radio requests floor during hangtime
@@ -1010,6 +911,7 @@ impl CcBsSubentity {
         // Grant the floor to the requesting MS
         call.tx_active = true;
         call.hangtime_start = None;
+        call.pending_tx_ceased = None;
         call.caller_addr = requesting_party;
 
         let Some((pdu, dest_addr)) = self.cached_setups.get_mut(&call_id) else {
@@ -1076,7 +978,7 @@ impl CcBsSubentity {
             .expect("Failed to serialize DTxGranted");
         sdu.seek(0);
 
-        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, Some(call.ts));
         queue.push_back(msg);
     }
 

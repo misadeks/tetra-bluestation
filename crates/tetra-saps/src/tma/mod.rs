@@ -69,6 +69,8 @@ pub struct TmaUnitdataReq {
 
     // Custom fields for BS stack:
     /// Optional Channel Allocation Request that may be included by CMCE
+    /// Custom hint: preferred traffic timeslot for FACCH/stealing (TS2-TS4).
+    pub traffic_ts_hint: Option<u8>,
     pub chan_alloc: Option<CmceChanAllocReq>,
     // Number of identical retransmissions
     // pub redundant_transmission: u8,

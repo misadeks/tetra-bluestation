@@ -491,6 +491,7 @@ impl Mle {
                 req_handle: 0, // TODO FIXME; should we pass the same handle here?
                 graceful_degradation: None,
                 chan_alloc: None,
+                traffic_ts_hint: None,
                 // redundant_transmission: 1,
             }),
         };
@@ -557,6 +558,7 @@ impl Mle {
                 req_handle: 0, // TODO FIXME
                 graceful_degradation: None,
                 chan_alloc,
+                traffic_ts_hint: prim.traffic_ts_hint,
                 // redundant_transmission: prim.redundant_transmission
             }),
         };

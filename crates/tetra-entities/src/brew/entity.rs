@@ -334,7 +334,7 @@ impl BrewEntity {
                     uuid,
                     gssi
                 );
-                self.send_d_tx_ceased(queue, call.call_id, call.dest_gssi);
+                self.send_d_tx_ceased(queue, call.call_id, call.ts, call.dest_gssi);
                 self.finalize_call(queue, call.call_id, call.ts, call.dest_gssi);
             }
         }
@@ -534,7 +534,7 @@ impl BrewEntity {
             self.active_calls.insert(uuid, call);
 
             // Send D-TX GRANTED to reactivate MS U-plane for new speaker (EN 300 392-2, §14.5.2.2.1b).
-            self.send_d_tx_granted(queue, call_id, source_issi, dest_gssi);
+            self.send_d_tx_granted(queue, call_id, hanging.ts, source_issi, dest_gssi);
             return;
         }
 
@@ -700,6 +700,7 @@ impl BrewEntity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: Some(chan_alloc),
+                traffic_ts_hint: None,
                 main_address: TetraAddress::new(dest_gssi, SsiType::Gssi),
             }),
         };
@@ -754,6 +755,7 @@ impl BrewEntity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: None,
+                traffic_ts_hint: None,
                 main_address: TetraAddress::new(dest_gssi, SsiType::Gssi),
             }),
         };
@@ -780,7 +782,7 @@ impl BrewEntity {
         );
 
         // Send D-TX CEASED to signal end of current transmission (EN 300 392-2, 14.7.1.13)
-        self.send_d_tx_ceased(queue, call.call_id, call.dest_gssi);
+        self.send_d_tx_ceased(queue, call.call_id, call.ts, call.dest_gssi);
 
         // Finalize any existing hanging call for this GSSI before replacing.
         if let Some(old) = self.hanging_calls.remove(&call.dest_gssi) {
@@ -857,7 +859,7 @@ impl BrewEntity {
     }
 
     /// Send D-TX CEASED via FACCH/STCH to signal transmission end.
-    fn send_d_tx_ceased(&self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32) {
+    fn send_d_tx_ceased(&self, queue: &mut MessageQueue, call_id: u16, ts: u8, dest_gssi: u32) {
         let d_tx_ceased = DTxCeased {
             call_identifier: call_id,
             transmission_request_permission: true,
@@ -897,6 +899,7 @@ impl BrewEntity {
                 stealing_repeats_flag: false,
                 // No (re)allocation needed here; the circuit is already established.
                 chan_alloc: None,
+                traffic_ts_hint: Some(ts),
                 main_address: TetraAddress::new(dest_gssi, SsiType::Gssi),
             }),
         };
@@ -908,6 +911,7 @@ impl BrewEntity {
         &self,
         queue: &mut MessageQueue,
         call_id: u16,
+        ts: u8,
         source_issi: u32,
         dest_gssi: u32,
     ) {
@@ -958,6 +962,7 @@ impl BrewEntity {
                 stealing_repeats_flag: false,
                 // No (re)allocation needed here; the circuit is already established.
                 chan_alloc: None,
+                traffic_ts_hint: Some(ts),
                 main_address: TetraAddress::new(dest_gssi, SsiType::Gssi),
             }),
         };
@@ -1003,6 +1008,7 @@ impl BrewEntity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: None,
+                traffic_ts_hint: None,
                 main_address: TetraAddress::new(dest_gssi, SsiType::Gssi),
             }),
         };
@@ -1120,7 +1126,7 @@ impl BrewEntity {
         // Finalize all active calls immediately (no hangtime on disconnect)
         let calls: Vec<(Uuid, ActiveCall)> = self.active_calls.drain().collect();
         for (_, call) in calls {
-            self.send_d_tx_ceased(queue, call.call_id, call.dest_gssi);
+            self.send_d_tx_ceased(queue, call.call_id, call.ts, call.dest_gssi);
             self.finalize_call(queue, call.call_id, call.ts, call.dest_gssi);
         }
 
@@ -1409,6 +1415,7 @@ impl BrewEntity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: Some(chan_alloc),
+                traffic_ts_hint: None,
                 main_address: TetraAddress::new(dest_ssi, SsiType::Ssi),
             }),
         });
@@ -1454,6 +1461,7 @@ impl BrewEntity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: None,
+                traffic_ts_hint: None,
                 main_address: TetraAddress::new(dest_ssi, SsiType::Ssi),
             }),
         });
@@ -1491,6 +1499,7 @@ impl BrewEntity {
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 chan_alloc: None,
+                traffic_ts_hint: None,
                 main_address: TetraAddress::new(dest_ssi, SsiType::Ssi),
             }),
         });

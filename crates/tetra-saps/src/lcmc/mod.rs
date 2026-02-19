@@ -184,6 +184,10 @@ pub struct LcmcMleUnitdataReq {
     /// We use this to indicate it may be retransmitted
     /// This may differ from what ETSI envisioned
     // pub eligible_for_graceful_degradation: bool,
+
+    /// Custom hint: preferred traffic timeslot for FACCH/stealing (TS2-TS4).
+    /// If None, lower layers may pick any active traffic timeslot.
+    pub traffic_ts_hint: Option<u8>,
     
 
     /// Custom field to allow for creating circuits
