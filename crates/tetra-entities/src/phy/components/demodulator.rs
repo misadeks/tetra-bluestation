@@ -21,6 +21,9 @@ pub const SAMPLES_SYMBOL: SampleCount = SPS as SampleCount;
 
 /// Samples per slot
 const SAMPLES_SLOT: SampleCount = SAMPLES_SYMBOL * 255;
+/// Maximum slot correction applied from a single discontinuity event.
+/// This prevents pathological counter jumps from overflowing TDMA slot math.
+const MAX_SLOT_SKIP_PER_EVENT: i64 = 1024;
 
 /// Input sample rate
 pub const SAMPLE_RATE: f64 = 18000.0 * SPS as f64;
@@ -172,7 +175,17 @@ impl Demodulator {
         if !(-2 * SAMPLES_SLOT..=0).contains(&tdiff) {
             // div_euclid always rounds towards negative numbers,
             // so use it with negations to round up to the next slot.
-            let slots_to_skip = -(-tdiff).div_euclid(SAMPLES_SLOT) as i32;
+            let raw_slots_to_skip = -(-tdiff).div_euclid(SAMPLES_SLOT);
+            let clamped_slots_to_skip = raw_slots_to_skip.clamp(-MAX_SLOT_SKIP_PER_EVENT, MAX_SLOT_SKIP_PER_EVENT);
+            if raw_slots_to_skip != clamped_slots_to_skip {
+                tracing::warn!(
+                    "Clamping slot skip from {} to {} due to discontinuity (tdiff={})",
+                    raw_slots_to_skip,
+                    clamped_slots_to_skip,
+                    tdiff
+                );
+            }
+            let slots_to_skip = clamped_slots_to_skip as i32;
             tracing::warn!("Skipping demodulation of {} slots due to lost samples", slots_to_skip);
             self.add_slots(slots_to_skip);
         }

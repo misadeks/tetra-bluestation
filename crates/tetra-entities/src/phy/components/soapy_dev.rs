@@ -45,6 +45,7 @@ pub struct RxTxDevSoapySdr {
 }
 
 type FftPlanner = rustfft::FftPlanner<RealSample>;
+const RX_COUNT_JITTER_TOLERANCE_SAMPLES: SampleCount = 1;
 
 impl RxTxDevSoapySdr {
     // pub fn new(
@@ -278,7 +279,7 @@ impl RxDsp {
             let block_size = self.rx_block_size.new as SampleCount;
             let expected_count = self.rx_block_count as SampleCount * block_size + self.rx_buffer_i as SampleCount;
             let samples_lost = result.count - expected_count;
-            if samples_lost != 0 {
+            if samples_lost.abs() > RX_COUNT_JITTER_TOLERANCE_SAMPLES {
                 // Samples have been lost.
                 // Mark RX buffer as empty and skip the right number of samples
                 // to receive the next full processing block in the next iteration.
@@ -309,6 +310,9 @@ impl RxDsp {
                     samples_to_skip -= result.len as SampleCount;
                 }
             } else {
+                if samples_lost != 0 {
+                    tracing::warn!("Ignoring small RX count jitter of {} sample(s)", samples_lost);
+                }
                 self.rx_buffer_i += result.len;
                 if self.rx_buffer_i == self.rx_buffer.len() {
                     // tracing::trace!("Received processing block {} ({} samples in SDR buffer)",
