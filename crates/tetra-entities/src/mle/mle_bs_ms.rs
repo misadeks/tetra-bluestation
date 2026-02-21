@@ -440,14 +440,8 @@ impl Mle {
         pdu.copy_bits(&mut prim.sdu, sdu_len);
         pdu.seek(0);
 
-        let (link, endpoint) = if prim.handle == 0 {
-            // Handle 0 means no connection context; use default link/endpoint without router lookup.
-            (0, 0)
-        } else {
-            let (addr, link, endpoint) = self.router.use_handle(prim.handle, message.dltime);
-            assert_eq!(addr.ssi, prim.address.ssi);
-            (link, endpoint)
-        };
+        let (addr, link, endpoint) = self.router.use_handle(prim.handle, message.dltime);
+        assert_eq!(addr.ssi, prim.address.ssi);
         let sapmsg = SapMsg {
             sap: Sap::TlaSap,
             src: self.self_component,
@@ -506,11 +500,9 @@ impl Mle {
         pdu.copy_bits(&mut prim.sdu, sdu_len);
         pdu.seek(0);
 
-        if prim.handle != 0 {
-            let (_addr, link, endpoint) = self.router.use_handle(prim.handle, message.dltime);
-            assert_eq!(link, prim.link_id);
-            assert_eq!(endpoint, prim.endpoint_id);
-        }
+        let (_addr, link, endpoint) = self.router.use_handle(prim.handle, message.dltime);
+        assert_eq!(link, prim.link_id);
+        assert_eq!(endpoint, prim.endpoint_id);
         // Take Channel Allocation Request if any
         let chan_alloc = prim.chan_alloc.take();
 

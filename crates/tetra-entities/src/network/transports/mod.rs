@@ -82,9 +82,7 @@ impl std::fmt::Display for NetworkError {
             NetworkError::SendFailed(msg) => write!(f, "Send failed: {}", msg),
             NetworkError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
             NetworkError::InvalidService(msg) => write!(f, "Invalid service: {}", msg),
-            NetworkError::InvalidServiceVersion(msg) => {
-                write!(f, "Invalid service version: {}", msg)
-            }
+            NetworkError::InvalidServiceVersion(msg) => write!(f, "Invalid service version: {}", msg),
             NetworkError::ReceiveFailed(_) => write!(f, "Receive failed"),
             NetworkError::Timeout => write!(f, "Operation timed out"),
         }

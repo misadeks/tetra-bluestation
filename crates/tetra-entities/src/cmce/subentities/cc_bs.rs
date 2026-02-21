@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use tetra_config::{SharedConfig, TimeslotOwner};
+use tetra_config::SharedConfig;
+use tetra_core::TimeslotOwner;
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, tetra_entities::TetraEntity, unimplemented_log};
 use tetra_pdus::cmce::{
     enums::{
@@ -18,7 +19,7 @@ use tetra_saps::{
     SapMsg, SapMsgInner,
     control::{
         call_control::{CallControl, Circuit},
-        enums::communication_type::CommunicationType,
+        enums::{circuit_mode_type::CircuitModeType, communication_type::CommunicationType},
     },
     lcmc::{
         LcmcMleUnitdataReq,
@@ -39,16 +40,32 @@ pub struct CcBsSubentity {
     /// Cached D-SETUP PDUs for late-entry re-sends: call_id -> (D-SETUP PDU, dest address)
     cached_setups: HashMap<u16, (DSetup, TetraAddress)>,
     circuits: CircuitMgr,
-    /// Active local calls: call_id -> (caller address, timeslot)
-    active_calls: HashMap<u16, ActiveLocalCall>,
+    /// Active group calls: call_id -> call info
+    active_calls: HashMap<u16, ActiveCall>,
 }
 
-/// Tracks an active locally-initiated group call
-struct ActiveLocalCall {
-    caller_addr: TetraAddress,
+/// Origin of a group call
+#[derive(Clone)]
+enum CallOrigin {
+    /// Local MS-initiated call, needs MLE routing for individual addressing
+    Local {
+        caller_addr: TetraAddress, // For D-CALL-PROCEEDING, D-CONNECT routing
+    },
+    /// Network-initiated call from TetraPack/Brew
+    Network {
+        brew_uuid: uuid::Uuid, // For Brew tracking
+    },
+}
+
+/// Tracks an active group call (local or network-initiated)
+#[derive(Clone)]
+struct ActiveCall {
+    origin: CallOrigin,
+    dest_gssi: u32,   // Destination group
+    source_issi: u32, // Current speaker
     ts: u8,
     usage: u8,
-    /// True if the caller is currently transmitting
+    /// True if someone is currently transmitting
     tx_active: bool,
     /// When PTT was released (for hangtime). None if transmitting.
     hangtime_start: Option<TdmaTime>,
@@ -173,7 +190,18 @@ impl CcBsSubentity {
         }
     }
 
-    fn build_sapmsg_stealing(sdu: BitBuffer, dltime: TdmaTime, address: TetraAddress) -> SapMsg {
+    fn build_sapmsg_stealing(sdu: BitBuffer, dltime: TdmaTime, address: TetraAddress, ts: u8) -> SapMsg {
+        // For FACCH stealing on traffic channel, must specify target timeslot
+        let mut timeslots = [false; 4];
+        timeslots[(ts - 1) as usize] = true;
+        let chan_alloc = CmceChanAllocReq {
+            usage: None,
+            carrier: None,
+            timeslots,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+
         SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -189,7 +217,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: true,
                 stealing_repeats_flag: false,
-                chan_alloc: None,
+                chan_alloc: Some(chan_alloc),
                 main_address: address,
             }),
         }
@@ -569,8 +597,12 @@ impl CcBsSubentity {
         // Track the active local call — caller is granted the floor, so tx_active = true
         self.active_calls.insert(
             circuit.call_id,
-            ActiveLocalCall {
-                caller_addr: calling_party,
+            ActiveCall {
+                origin: CallOrigin::Local {
+                    caller_addr: calling_party,
+                },
+                dest_gssi,
+                source_issi: calling_party.ssi,
                 ts: circuit.ts,
                 usage: circuit.usage,
                 tx_active: true,
@@ -578,36 +610,38 @@ impl CcBsSubentity {
             },
         );
 
-        // Notify Brew entity about this local call so it can forward to TetraPack
-        // if the group is subscribed
-        let notify = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            dltime: message.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
-                call_id: circuit.call_id,
-                source_issi: calling_party.ssi,
-                dest_gssi,
-                ts: circuit.ts,
-            }),
-        };
-        queue.push_back(notify);
+        // Notify Brew entity about this local call if Brew is loaded.
+        // It can then forward to TetraPack if the group is subscribed
+        if self.config.config().brew.is_some() {
+            let msg = SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                dltime: message.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
+                    call_id: circuit.call_id,
+                    source_issi: calling_party.ssi,
+                    dest_gssi,
+                    ts: circuit.ts,
+                }),
+            };
+            queue.push_back(msg);
+        }
 
         // Also notify UMAC so it can gate UL voice loopback/forwarding
-        let notify_umac = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            dltime: message.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
-                call_id: circuit.call_id,
-                source_issi: calling_party.ssi,
-                dest_gssi,
-                ts: circuit.ts,
-            }),
-        };
-        queue.push_back(notify_umac);
+        // let notify_umac = SapMsg {
+        //     sap: Sap::Control,
+        //     src: TetraEntity::Cmce,
+        //     dest: TetraEntity::Umac,
+        //     dltime: message.dltime,
+        //     msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
+        //         call_id: circuit.call_id,
+        //         source_issi: calling_party.ssi,
+        //         dest_gssi,
+        //         ts: circuit.ts,
+        //     }),
+        // };
+        // queue.push_back(notify_umac);
     }
 
     pub fn route_xx_deliver(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
@@ -725,44 +759,51 @@ impl CcBsSubentity {
 
     /// Release a call: send D-RELEASE, close circuits, clean up state
     fn release_call(&mut self, queue: &mut MessageQueue, call_id: u16) {
-        if let Some((pdu, dest_addr)) = self.cached_setups.get(&call_id) {
-            let dest_addr = *dest_addr;
-            // Send D-RELEASE to group
-            let sdu = Self::build_d_release_from_d_setup(pdu);
-            let prim = Self::build_sapmsg(sdu, None, self.dltime, dest_addr);
-            queue.push_back(prim);
-        } else {
+        let Some((pdu, dest_addr)) = self.cached_setups.get(&call_id) else {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
-        }
+            return;
+        };
+        let dest_addr = *dest_addr;
+
+        // Send D-RELEASE to group
+        let sdu = Self::build_d_release_from_d_setup(pdu);
+        let prim = Self::build_sapmsg(sdu, None, self.dltime, dest_addr);
+        queue.push_back(prim);
 
         // Close the circuit in CircuitMgr and notify Brew
         if let Some(call) = self.active_calls.get(&call_id) {
             let ts = call.ts;
+            let is_local = matches!(call.origin, CallOrigin::Local { .. });
+
             if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, ts) {
                 Self::signal_umac_circuit_close(queue, circuit, self.dltime);
             }
 
             self.release_timeslot(ts);
 
-            // Notify Brew entity that this local call has ended
-            let notify = SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts }),
-            };
-            queue.push_back(notify);
+            // Notify Brew only for local calls
+            if self.config.config().brew.is_some() {
+                if is_local {
+                    let notify = SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Cmce,
+                        dest: TetraEntity::Brew,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts }),
+                    };
+                    queue.push_back(notify);
+                }
+            }
 
             // Also notify UMAC to stop UL voice loopback/forwarding
-            let notify_umac = SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts }),
-            };
-            queue.push_back(notify_umac);
+            // let notify_umac = SapMsg {
+            //     sap: Sap::Control,
+            //     src: TetraEntity::Cmce,
+            //     dest: TetraEntity::Umac,
+            //     dltime: self.dltime,
+            //     msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts }),
+            // };
+            // queue.push_back(notify_umac);
         }
 
         // Clean up
@@ -841,13 +882,21 @@ impl CcBsSubentity {
             return;
         };
 
+        // Check if already in hangtime - ignore duplicate U-TX CEASED to avoid resetting timer
+        if !call.tx_active && call.hangtime_start.is_some() {
+            tracing::debug!("U-TX CEASED: already in hangtime for call_id={}, ignoring duplicate", call_id);
+            return;
+        }
+
         tracing::info!("U-TX CEASED: PTT released on call_id={}, entering hangtime", call_id);
 
+        let ts = call.ts;
+        let is_local = matches!(call.origin, CallOrigin::Local { .. });
         call.tx_active = false;
         call.hangtime_start = Some(self.dltime);
 
-        // Get dest address and cached D-SETUP from cached setup
-        let Some((pdu, dest_addr)) = self.cached_setups.get_mut(&call_id) else {
+        // Get dest address from cached setup
+        let Some((_, dest_addr)) = self.cached_setups.get(&call_id) else {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
             return;
         };
@@ -869,36 +918,30 @@ impl CcBsSubentity {
         sdu.seek(0);
 
         // Send via FACCH (stealing channel) so radios on the traffic channel hear the beep
-        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, ts);
         queue.push_back(msg);
 
-        // Update cached D-SETUP to reflect hangtime state and allow immediate PTT,
-        // then re-send on MCCH so all radios see the floor is free.
-        pdu.transmission_grant = TransmissionGrant::NotGranted;
-        pdu.transmission_request_permission = true;
-        let (setup_sdu, setup_chan_alloc) = Self::build_d_setup_prim(pdu, call.usage, call.ts, UlDlAssignment::Both);
-        let setup_msg = Self::build_sapmsg(setup_sdu, Some(setup_chan_alloc), self.dltime, dest_addr);
-        queue.push_back(setup_msg);
-
-        // Notify Brew that this local talkspurt has ended so it can send GROUP_IDLE
-        let notify = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts: call.ts }),
-        };
-        queue.push_back(notify);
-
+        // Notify Brew to stop forwarding audio for local calls
+        if self.config.config().brew.is_some() {
+            if is_local {
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    dltime: self.dltime,
+                    msg: SapMsgInner::CmceCallControl(CallControl::LocalCallTxStopped { call_id, ts }),
+                });
+            }
+        }
         // Also notify UMAC to stop UL voice loopback/forwarding
-        let notify_umac = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts: call.ts }),
-        };
-        queue.push_back(notify_umac);
+        // let notify_umac = SapMsg {
+        //     sap: Sap::Control,
+        //     src: TetraEntity::Cmce,
+        //     dest: TetraEntity::Umac,
+        //     dltime: self.dltime,
+        //     msg: SapMsgInner::CmceCallControl(CallControl::LocalCallEnd { call_id, ts: call.ts }),
+        // };
+        // queue.push_back(notify_umac);
     }
 
     /// Handle U-TX DEMAND: another radio requests floor during hangtime
@@ -930,49 +973,55 @@ impl CcBsSubentity {
         tracing::info!("U-TX DEMAND: ISSI {} requests floor on call_id={}", requesting_party.ssi, call_id);
 
         // Grant the floor to the requesting MS
+        let ts = call.ts;
         call.tx_active = true;
         call.hangtime_start = None;
-        call.caller_addr = requesting_party;
+        call.source_issi = requesting_party.ssi;
 
-        let Some((pdu, dest_addr)) = self.cached_setups.get_mut(&call_id) else {
+        // Update caller_addr for local calls
+        if let CallOrigin::Local { caller_addr } = &mut call.origin {
+            *caller_addr = requesting_party;
+        }
+
+        let Some((_, dest_addr)) = self.cached_setups.get(&call_id) else {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
             return;
         };
         let dest_addr = *dest_addr;
 
-        // Update cached D-SETUP to reflect active transmission (floor taken)
-        pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
-        pdu.transmission_request_permission = false;
-
-        // Notify Brew so it can (re)start forwarding UL audio for this talkspurt
-        let notify = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
-                call_id,
-                source_issi: requesting_party.ssi,
-                dest_gssi: dest_addr.ssi,
-                ts: call.ts,
-            }),
-        };
-        queue.push_back(notify);
-
-        // Also notify UMAC to resume UL voice loopback/forwarding
-        let notify_umac = SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
-                call_id,
-                source_issi: requesting_party.ssi,
-                dest_gssi: dest_addr.ssi,
-                ts: call.ts,
-            }),
-        };
-        queue.push_back(notify_umac);
+        // // Update cached D-SETUP to reflect active transmission (floor taken)
+        // pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
+        // pdu.transmission_request_permission = false;
+        //
+        // // Notify Brew so it can (re)start forwarding UL audio for this talkspurt
+        // let notify = SapMsg {
+        //     sap: Sap::Control,
+        //     src: TetraEntity::Cmce,
+        //     dest: TetraEntity::Brew,
+        //     dltime: self.dltime,
+        //     msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
+        //         call_id,
+        //         source_issi: requesting_party.ssi,
+        //         dest_gssi: dest_addr.ssi,
+        //         ts: call.ts,
+        //     }),
+        // };
+        // queue.push_back(notify);
+        //
+        // // Also notify UMAC to resume UL voice loopback/forwarding
+        // let notify_umac = SapMsg {
+        //     sap: Sap::Control,
+        //     src: TetraEntity::Cmce,
+        //     dest: TetraEntity::Umac,
+        //     dltime: self.dltime,
+        //     msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
+        //         call_id,
+        //         source_issi: requesting_party.ssi,
+        //         dest_gssi: dest_addr.ssi,
+        //         ts: call.ts,
+        //     }),
+        // };
+        // queue.push_back(notify_umac);
 
         // Send D-TX GRANTED via FACCH
         let d_tx_granted = DTxGranted {
@@ -996,8 +1045,30 @@ impl CcBsSubentity {
         d_tx_granted.to_bitbuf(&mut sdu).expect("Failed to serialize DTxGranted");
         sdu.seek(0);
 
-        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, ts);
         queue.push_back(msg);
+
+        // Notify Brew only for local calls (speaker change = new LocalCallStart for new speaker)
+        if self.config.config().brew.is_some() {
+            let Some(call) = self.active_calls.get(&call_id) else {
+                return;
+            };
+            if matches!(call.origin, CallOrigin::Local { .. }) {
+                let notify = SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    dltime: self.dltime,
+                    msg: SapMsgInner::CmceCallControl(CallControl::LocalCallStart {
+                        call_id,
+                        source_issi: requesting_party.ssi,
+                        dest_gssi: dest_addr.ssi,
+                        ts: call.ts,
+                    }),
+                };
+                queue.push_back(notify);
+            }
+        }
     }
 
     /// Handle U-RELEASE: radio explicitly releases the call
@@ -1020,5 +1091,315 @@ impl CcBsSubentity {
         let call_id = pdu.call_identifier;
         tracing::info!("U-RELEASE: call_id={} cause={}", call_id, pdu.disconnect_cause);
         self.release_call(queue, call_id);
+    }
+
+    /// Handle incoming CallControl messages from Brew
+    pub fn rx_call_control(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        let SapMsgInner::CmceCallControl(call_control) = message.msg else {
+            panic!("Expected CmceCallControl message");
+        };
+
+        match call_control {
+            CallControl::NetworkCallStart {
+                brew_uuid,
+                source_issi,
+                dest_gssi,
+                priority,
+            } => {
+                self.rx_network_call_start(queue, brew_uuid, source_issi, dest_gssi, priority);
+            }
+            CallControl::NetworkCallEnd { brew_uuid } => {
+                self.rx_network_call_end(queue, brew_uuid);
+            }
+            _ => {
+                tracing::warn!("Unexpected CallControl message: {:?}", call_control);
+            }
+        }
+    }
+
+    /// Handle network-initiated group call start
+    fn rx_network_call_start(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, source_issi: u32, dest_gssi: u32, _priority: u8) {
+        // Check if there's an active call for this GSSI (speaker change scenario)
+        if let Some((call_id, call)) = self.active_calls.iter_mut().find(|(_, c)| c.dest_gssi == dest_gssi) {
+            // Speaker change during active or hangtime
+            tracing::info!(
+                "CMCE: network call speaker change gssi={} new_speaker={} (was {})",
+                dest_gssi,
+                source_issi,
+                call.source_issi
+            );
+
+            call.source_issi = source_issi;
+            call.tx_active = true;
+            call.hangtime_start = None;
+
+            if let CallOrigin::Network { brew_uuid: old_uuid } = call.origin {
+                // Update UUID if different (shouldn't happen but handle it)
+                if old_uuid != brew_uuid {
+                    tracing::warn!("CMCE: brew_uuid changed during speaker change");
+                    call.origin = CallOrigin::Network { brew_uuid };
+                }
+            }
+
+            // Extract values before mutable borrow ends
+            let call_id_val = *call_id;
+            let ts = call.ts;
+            let usage = call.usage;
+
+            // End the mutable borrow
+            let _ = call;
+
+            // Send D-TX GRANTED via FACCH to notify radios of new speaker
+            self.send_d_tx_granted_facch(queue, call_id_val, source_issi, dest_gssi, ts);
+
+            // Respond to Brew with existing call resources
+            if self.config.config().brew.is_some() {
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    dltime: self.dltime,
+                    msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
+                        brew_uuid,
+                        call_id: call_id_val,
+                        ts,
+                        usage,
+                    }),
+                });
+            }
+        }
+
+        // New network call - allocate circuit
+        let circuit = match {
+            let mut state = self.config.state_write();
+            self.circuits.allocate_circuit_with_allocator(
+                Direction::Both,
+                CommunicationType::P2Mp,
+                &mut state.timeslot_alloc,
+                TimeslotOwner::Cmce,
+            )
+        } {
+            Ok(c) => c.clone(),
+            Err(err) => {
+                tracing::warn!("CMCE: failed to allocate circuit for network call: {:?}", err);
+                return;
+            }
+        };
+
+        let call_id = circuit.call_id;
+        let ts = circuit.ts;
+        let usage = circuit.usage;
+
+        tracing::info!(
+            "CMCE: starting NEW network call brew_uuid={} gssi={} speaker={} ts={} call_id={}",
+            brew_uuid,
+            dest_gssi,
+            source_issi,
+            ts,
+            call_id
+        );
+
+        // Signal UMAC to open DL and UL circuits
+        Self::signal_umac_circuit_open(queue, &circuit, self.dltime);
+
+        tracing::debug!(
+            "CMCE: sending D-SETUP for NEW call call_id={} gssi={} (network-initiated)",
+            call_id,
+            dest_gssi
+        );
+
+        // Send D-SETUP to group (broadcast on MCCH)
+        let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
+        let d_setup = DSetup {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: false,
+            simplex_duplex_selection: false, // Simplex
+            basic_service_information: BasicServiceInformation {
+                circuit_mode_type: CircuitModeType::TchS,
+                encryption_flag: false,
+                communication_type: CommunicationType::P2Mp,
+                slots_per_frame: None,
+                speech_service: Some(0),
+            },
+            transmission_grant: TransmissionGrant::GrantedToOtherUser,
+            transmission_request_permission: false,
+            call_priority: 0,
+            notification_indicator: None,
+            temporary_address: None,
+            calling_party_address_ssi: Some(source_issi),
+            calling_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+
+        // Cache for late-entry re-sends
+        self.cached_setups.insert(call_id, (d_setup, dest_addr.clone()));
+        let (d_setup_ref, _) = self.cached_setups.get(&call_id).unwrap();
+
+        let (setup_sdu, setup_chan_alloc) = Self::build_d_setup_prim(d_setup_ref, usage, ts, UlDlAssignment::Both);
+        let setup_msg = Self::build_sapmsg(setup_sdu, Some(setup_chan_alloc), self.dltime, dest_addr.clone());
+        queue.push_back(setup_msg);
+
+        // Send D-CONNECT to group
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: false,
+            simplex_duplex_selection: false, // Simplex
+            transmission_grant: TransmissionGrant::GrantedToOtherUser,
+            transmission_request_permission: false,
+            call_ownership: false,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+
+        let connect_msg = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            dltime: self.dltime,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: 0, // Broadcast to group, no specific handle
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: 0,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: None, // Already sent in D-SETUP
+                main_address: dest_addr,
+            }),
+        };
+        queue.push_back(connect_msg);
+
+        // Track the active call
+        self.active_calls.insert(
+            call_id,
+            ActiveCall {
+                origin: CallOrigin::Network { brew_uuid },
+                dest_gssi,
+                source_issi,
+                ts,
+                usage,
+                tx_active: true,
+                hangtime_start: None,
+            },
+        );
+
+        // Respond to Brew with allocated resources
+        if self.config.config().brew.is_some() {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
+                    brew_uuid,
+                    call_id,
+                    ts,
+                    usage,
+                }),
+            });
+        }
+    }
+
+    /// Handle network call end request
+    fn rx_network_call_end(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid) {
+        // Find the call by brew_uuid
+        let Some((call_id, call)) = self
+            .active_calls
+            .iter()
+            .find(|(_, c)| matches!(c.origin, CallOrigin::Network { brew_uuid: u } if u == brew_uuid))
+            .map(|(id, c)| (*id, c.clone()))
+        else {
+            tracing::debug!("CMCE: network call end for unknown brew_uuid={}", brew_uuid);
+            return;
+        };
+
+        tracing::info!(
+            "CMCE: network call ended brew_uuid={} call_id={} gssi={}",
+            brew_uuid,
+            call_id,
+            call.dest_gssi
+        );
+
+        // If currently transmitting, enter hangtime instead of immediate release
+        let tx_active = call.tx_active;
+        let dest_gssi = call.dest_gssi;
+        let ts = call.ts;
+
+        if tx_active {
+            if let Some(active_call) = self.active_calls.get_mut(&call_id) {
+                active_call.tx_active = false;
+                active_call.hangtime_start = Some(self.dltime);
+            }
+            // Send D-TX CEASED via FACCH
+            self.send_d_tx_ceased_facch(queue, call_id, dest_gssi, ts);
+        } else {
+            // Already in hangtime or idle, release immediately
+            self.release_call(queue, call_id);
+        }
+    }
+
+    /// Send D-TX GRANTED via FACCH stealing
+    fn send_d_tx_granted_facch(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8) {
+        let pdu = DTxGranted {
+            call_identifier: call_id,
+            transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: Some(1), // SSI
+            transmitting_party_address_ssi: Some(source_issi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+
+        tracing::debug!("-> D-TX GRANTED (FACCH) {:?}", pdu);
+        let mut sdu = BitBuffer::new_autoexpand(30);
+        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DTxGranted");
+        sdu.seek(0);
+
+        let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, ts);
+        queue.push_back(msg);
+    }
+
+    /// Send D-TX CEASED via FACCH stealing
+    fn send_d_tx_ceased_facch(&mut self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32, ts: u8) {
+        let pdu = DTxCeased {
+            call_identifier: call_id,
+            transmission_request_permission: true,
+            notification_indicator: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+
+        tracing::debug!("-> D-TX CEASED (FACCH) {:?}", pdu);
+        let mut sdu = BitBuffer::new_autoexpand(30);
+        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DTxCeased");
+        sdu.seek(0);
+
+        let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, ts);
+        queue.push_back(msg);
     }
 }

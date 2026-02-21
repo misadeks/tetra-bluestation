@@ -127,12 +127,12 @@ impl MmClientMgr {
         };
 
         if let Some(client) = self.clients.get_mut(&issi) {
-            let changed = if do_attach {
-                client.groups.insert(gssi)
+            if do_attach {
+                client.groups.insert(gssi);
             } else {
-                client.groups.remove(&gssi)
-            };
-            Ok(changed)
+                client.groups.remove(&gssi);
+            }
+            Ok(true)
         } else {
             Err(ClientMgrErr::ClientNotFound { issi })
         }

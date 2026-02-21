@@ -179,26 +179,22 @@ impl CircuitMgr {
         let call_id = self.get_next_call_id();
         let usage = self.get_next_usage_number();
 
+        // Create circuit
         let circuit = CmceCircuit {
             ts_created: self.dltime,
             direction: dir,
             ts,
             call_id,
             usage,
-            circuit_mode: CircuitModeType::TchS, // TODO: only speech supported for now
+            circuit_mode: CircuitModeType::TchS,
             comm_type,
-            simplex_duplex: false,   // TODO, simplex only for now
-            speech_service: Some(0), // TODO, only TETRA encoded speech for now
-            etee_encrypted: false,   // TODO, no encryption for now
+            simplex_duplex: false,
+            speech_service: Some(0),
+            etee_encrypted: false,
         };
 
-        match self.open_circuit(dir, circuit) {
-            Ok(circuit) => Ok(circuit),
-            Err(e) => {
-                let _ = timeslot_alloc.release(owner, ts);
-                Err(e)
-            }
-        }
+        // Register circuit and return
+        Ok(self.open_circuit(dir, circuit)?)
     }
 
     /// Closes any active circuits for given timeslot and direction.

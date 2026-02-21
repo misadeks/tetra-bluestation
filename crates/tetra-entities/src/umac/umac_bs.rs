@@ -53,8 +53,6 @@ pub struct UmacBs {
     /// Access to this field is used only by testing code
     pub channel_scheduler: BsChannelScheduler,
     // ulrx_scheduler: UlScheduler,
-    /// Track whether UL talkspurt is currently active per timeslot (1-4)
-    ul_tx_active: [bool; 4],
 }
 
 impl UmacBs {
@@ -70,7 +68,6 @@ impl UmacBs {
             defrag: BsDefrag::new(),
             // event_label_store: EventLabelStore::new(),
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
-            ul_tx_active: [false; 4],
         }
     }
 
@@ -1306,10 +1303,6 @@ impl UmacBs {
             };
             self.channel_scheduler.create_circuit(d, c);
             tracing::debug!("  rx_control_circuit_open: Setup {:?} circuit for ts {}", d, ts);
-            // TODO: test this
-            // if d == Direction::Ul {
-            //     self.set_ul_tx_active(ts, true);
-            // }
         }
     }
 
@@ -1336,8 +1329,6 @@ impl UmacBs {
                 }
             }
         }
-
-        self.set_ul_tx_active(ts, false);
     }
 
     fn rx_control(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -1353,32 +1344,16 @@ impl UmacBs {
             CallControl::Close(_, _) => {
                 self.rx_control_circuit_close(queue, prim);
             }
-            CallControl::LocalCallStart { ts, .. } => {
-                tracing::trace!("rx_control: LocalCallStart ts={} -> tx active", ts);
-                self.set_ul_tx_active(ts, true);
+            // LocalCall* and NetworkCall* are for CMCE ↔ Brew, not UMAC
+            CallControl::LocalCallStart { .. }
+            | CallControl::LocalCallTxStopped { .. }
+            | CallControl::LocalCallEnd { .. }
+            | CallControl::NetworkCallStart { .. }
+            | CallControl::NetworkCallReady { .. }
+            | CallControl::NetworkCallEnd { .. } => {
+                tracing::trace!("rx_control: ignoring CMCE-Brew notification (not for UMAC)");
             }
-            CallControl::LocalCallEnd { ts, .. } => {
-                tracing::trace!("rx_control: LocalCallEnd ts={} -> tx inactive", ts);
-                self.set_ul_tx_active(ts, false);
-            }
         }
-    }
-
-    fn set_ul_tx_active(&mut self, ts: u8, active: bool) {
-        let idx = ts as usize;
-        if idx == 0 || idx > self.ul_tx_active.len() {
-            tracing::warn!("set_ul_tx_active: invalid ts {}", ts);
-            return;
-        }
-        self.ul_tx_active[idx - 1] = active;
-    }
-
-    fn ul_tx_is_active(&self, ts: u8) -> bool {
-        let idx = ts as usize;
-        if idx == 0 || idx > self.ul_tx_active.len() {
-            return false;
-        }
-        self.ul_tx_active[idx - 1]
     }
 }
 

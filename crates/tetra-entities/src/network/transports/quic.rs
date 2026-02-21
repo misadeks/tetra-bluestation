@@ -289,9 +289,7 @@ impl NetworkTransport for QuicTransport {
         // Extract server name for SNI
         let server_name = match &self.server_addr {
             NetworkAddress::Tcp { host, .. } | NetworkAddress::Udp { host, .. } => host.clone(),
-            _ => {
-                return Err(NetworkError::ConnectionFailed("Invalid address type".to_string()));
-            }
+            _ => return Err(NetworkError::ConnectionFailed("Invalid address type".to_string())),
         };
 
         // Connect with timeout

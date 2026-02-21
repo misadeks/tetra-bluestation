@@ -47,7 +47,7 @@ impl MleRouter {
             conn.ts_last_used = ts; // Update last used timestamp
             (conn.addr.clone(), conn.link_id, conn.endpoint_id)
         } else {
-            self.dump_mappings();
+            // self.dump_mappings();
             tracing::warn!("Unknown MLE handle: {}", handle);
             (TetraAddress::issi(0), 0, 0)
         }

@@ -632,12 +632,7 @@ impl BrewWorker {
                 BrewMessage::CallControl(cc) => self.handle_call_control(cc),
                 BrewMessage::Frame(frame) => self.handle_frame(frame),
                 BrewMessage::Subscriber(sub) => {
-                    tracing::debug!(
-                        "BrewWorker: subscriber event type={} issi={} groups={:?}",
-                        sub.msg_type,
-                        sub.number,
-                        sub.groups
-                    );
+                    tracing::debug!("BrewWorker: subscriber event type={}", sub.msg_type);
                     let _ = self.event_sender.send(BrewEvent::SubscriberEvent {
                         msg_type: sub.msg_type,
                         issi: sub.number,
@@ -645,17 +640,7 @@ impl BrewWorker {
                     });
                 }
                 BrewMessage::Error(err) => {
-                    let ascii = String::from_utf8_lossy(&err.data);
-                    let trimmed = ascii.trim_matches('\0');
-                    tracing::warn!(
-                        "BrewWorker: server error type={}: {} bytes ascii='{}'",
-                        err.error_type,
-                        err.data.len(),
-                        trimmed
-                    );
-                    if trimmed.is_empty() {
-                        tracing::warn!("BrewWorker: server error raw={:02x?}", err.data);
-                    }
+                    tracing::warn!("BrewWorker: server error type={}: {} bytes", err.error_type, err.data.len());
                     let _ = self.event_sender.send(BrewEvent::ServerError {
                         error_type: err.error_type,
                         data: err.data,

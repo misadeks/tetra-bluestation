@@ -40,19 +40,11 @@ impl MmMs {
             MmPduTypeDl::DLocationUpdateAccept => unimplemented_log!("DLocationUpdateAccept"),
             MmPduTypeDl::DLocationUpdateCommand => unimplemented_log!("DLocationUpdateCommand"),
             MmPduTypeDl::DLocationUpdateReject => unimplemented_log!("DLocationUpdateReject"),
-            MmPduTypeDl::DLocationUpdateProceeding => {
-                unimplemented_log!("DLocationUpdateProceeding")
-            }
-            MmPduTypeDl::DAttachDetachGroupIdentity => {
-                unimplemented_log!("DAttachDetachGroupIdentity")
-            }
-            MmPduTypeDl::DAttachDetachGroupIdentityAcknowledgement => {
-                unimplemented_log!("DAttachDetachGroupIdentityAcknowledgement")
-            }
+            MmPduTypeDl::DLocationUpdateProceeding => unimplemented_log!("DLocationUpdateProceeding"),
+            MmPduTypeDl::DAttachDetachGroupIdentity => unimplemented_log!("DAttachDetachGroupIdentity"),
+            MmPduTypeDl::DAttachDetachGroupIdentityAcknowledgement => unimplemented_log!("DAttachDetachGroupIdentityAcknowledgement"),
             MmPduTypeDl::DMmStatus => unimplemented_log!("DMmStatus"),
-            MmPduTypeDl::MmPduFunctionNotSupported => {
-                unimplemented_log!("MmPduFunctionNotSupported")
-            }
+            MmPduTypeDl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
         };
     }
 }

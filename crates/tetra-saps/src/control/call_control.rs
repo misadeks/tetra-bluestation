@@ -46,6 +46,30 @@ pub enum CallControl {
         dest_gssi: u32,
         ts: u8,
     },
+    /// Notifies Brew that transmission stopped on a local call (entering hangtime).
+    /// Brew should immediately stop forwarding audio to TetraPack.
+    LocalCallTxStopped { call_id: u16, ts: u8 },
     /// Notifies Brew entity that a local UL call has ended
     LocalCallEnd { call_id: u16, ts: u8 },
+    /// Request CMCE to start a network-initiated group call
+    /// Sent by Brew when TetraPack sends GROUP_TX
+    NetworkCallStart {
+        brew_uuid: uuid::Uuid, // Brew session UUID for tracking
+        source_issi: u32,      // Current speaker
+        dest_gssi: u32,        // Target group
+        priority: u8,          // Call priority
+    },
+    /// Notify Brew that network call is ready with allocated resources
+    /// Response from CMCE after circuit allocation
+    NetworkCallReady {
+        brew_uuid: uuid::Uuid, // Matches request
+        call_id: u16,          // CMCE-allocated call identifier
+        ts: u8,                // Allocated timeslot
+        usage: u8,             // Usage number
+    },
+    /// Request CMCE to end a network call
+    /// Sent by Brew when TetraPack sends GROUP_IDLE
+    NetworkCallEnd {
+        brew_uuid: uuid::Uuid, // Identifies the call to end
+    },
 }

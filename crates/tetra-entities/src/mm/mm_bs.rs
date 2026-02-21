@@ -47,7 +47,7 @@ impl MmBs {
         queue.push_back(msg);
     }
 
-    fn rx_u_itsi_detach(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+    fn rx_u_itsi_detach(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_u_itsi_detach");
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
             panic!()
@@ -75,9 +75,9 @@ impl MmBs {
         if let Some(client) = detached_client {
             if !client.groups.is_empty() {
                 let groups: Vec<u32> = client.groups.iter().copied().collect();
-                self.emit_brew_update(queue, message.dltime, ssi, groups, BrewSubscriberAction::Deaffiliate);
+                self.emit_brew_update(_queue, message.dltime, ssi, groups, BrewSubscriberAction::Deaffiliate);
             }
-            self.emit_brew_update(queue, message.dltime, ssi, Vec::new(), BrewSubscriberAction::Deregister);
+            self.emit_brew_update(_queue, message.dltime, ssi, Vec::new(), BrewSubscriberAction::Deregister);
         } else {
             tracing::warn!("Received UItsiDetach for unknown client with SSI: {}", ssi);
             // return;

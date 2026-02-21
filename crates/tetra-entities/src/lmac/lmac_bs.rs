@@ -266,6 +266,7 @@ impl LmacBs {
 
         let ul_time = message.dltime;
         let SapMsgInner::TpUnitdataInd(prim) = message.msg else { panic!() };
+
         // let pchan = self.determine_phy_chan_ul();
         let pchan = self.uplink_phy_chan[ul_time.t as usize - 1];
         let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, self.second_block_stolen);
