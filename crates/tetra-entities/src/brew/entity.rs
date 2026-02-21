@@ -301,30 +301,6 @@ impl BrewEntity {
         }
     }
 
-    // /// Allocate a free timeslot for a new call. Returns (timeslot, call_id, usage) or None.
-    // fn allocate_timeslot(&mut self) -> Option<(u8, u16, u8)> {
-    //     let ts = {
-    //         let mut state = self.config.state_write();
-    //         state.timeslot_alloc.allocate_any(TimeslotOwner::Brew)?
-    //     };
-    //
-    //     let call_id = self.next_call_id;
-    //     self.next_call_id = if self.next_call_id >= 0x3FF { 100 } else { self.next_call_id + 1 };
-    //
-    //     let usage = self.next_usage;
-    //     self.next_usage = if self.next_usage >= 63 { 10 } else { self.next_usage + 1 };
-    //
-    //     Some((ts, call_id, usage))
-    // }
-    //
-    // /// Release a timeslot
-    // fn release_timeslot(&mut self, ts: u8) {
-    //     let mut state = self.config.state_write();
-    //     if let Err(err) = state.timeslot_alloc.release(TimeslotOwner::Brew, ts) {
-    //         tracing::warn!("BrewEntity: failed to release timeslot ts={} err={:?}", ts, err);
-    //     }
-    // }
-
     /// Process all pending events from the worker thread
     fn process_events(&mut self, queue: &mut MessageQueue) {
         while let Ok(event) = self.event_receiver.try_recv() {
