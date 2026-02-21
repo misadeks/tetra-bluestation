@@ -410,11 +410,24 @@ impl BrewEntity {
                 let _ = self.command_sender.send(BrewCommand::RegisterSubscriber { issi });
             }
             BrewSubscriberAction::Deregister => {
+                let mut removed_groups = Vec::new();
                 if let Some(existing) = self.subscriber_groups.remove(&issi) {
                     for gssi in existing {
+                        removed_groups.push(gssi);
                         self.dec_group_listener(gssi);
                         self.drop_group_calls_if_unlistened(queue, gssi);
                     }
+                }
+                if !removed_groups.is_empty() {
+                    tracing::info!(
+                        "BrewEntity: subscriber deaffiliate on deregister issi={} groups={:?}",
+                        issi,
+                        removed_groups
+                    );
+                    let _ = self.command_sender.send(BrewCommand::DeaffiliateGroups {
+                        issi,
+                        groups: removed_groups,
+                    });
                 }
                 tracing::info!("BrewEntity: subscriber deregister issi={}", issi);
                 let _ = self.command_sender.send(BrewCommand::DeregisterSubscriber { issi });

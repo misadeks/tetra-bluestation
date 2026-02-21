@@ -1,5 +1,6 @@
 //! Brew WebSocket worker thread handling HTTP Digest Auth, TLS, and bidirectional Brew message exchange
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -94,8 +95,6 @@ pub struct BrewConfig {
     pub password: Option<String>,
     /// ISSI to register with the server
     pub issi: u32,
-    /// GSSIs (group IDs) to affiliate to
-    pub groups: Vec<u32>,
     /// Reconnection delay
     pub reconnect_delay: Duration,
     /// Extra initial jitter playout delay in frames (added on top of adaptive baseline)
@@ -253,6 +252,8 @@ pub struct BrewWorker {
     event_sender: Sender<BrewEvent>,
     /// Receive commands from the BrewEntity
     command_receiver: Receiver<BrewCommand>,
+    /// Registered subscribers and their affiliated groups (tracked from commands)
+    subscriber_groups: HashMap<u32, HashSet<u32>>,
 }
 
 impl BrewWorker {
@@ -261,6 +262,7 @@ impl BrewWorker {
             config,
             event_sender,
             command_receiver,
+            subscriber_groups: HashMap::new(),
         }
     }
 
@@ -466,7 +468,7 @@ impl BrewWorker {
             _ => {}
         }
 
-        // Step 3: Register subscriber and affiliate to groups
+        // Step 3: Register subscriber
         self.send_registration(&mut ws)?;
 
         // Step 4: Main message loop
@@ -474,39 +476,37 @@ impl BrewWorker {
     }
 
     /// Send initial registration and group affiliation
-    fn send_registration(&self, ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<(), String> {
+    fn send_registration(&mut self, ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<(), String> {
         // Register ISSI
-        let reg_msg = build_subscriber_register(self.config.issi, &self.config.groups);
+        let reg_msg = build_subscriber_register(self.config.issi, &[]);
         ws.send(Message::Binary(reg_msg.into()))
             .map_err(|e| format!("failed to send registration: {}", e))?;
         tracing::info!("BrewWorker: registered ISSI {}", self.config.issi);
-
-        // Affiliate to groups
-        if !self.config.groups.is_empty() {
-            tracing::debug!(
-                "BrewWorker: config.groups is set but initial affiliation is disabled (dynamic listeners only): {:?}",
-                self.config.groups
-            );
-        }
+        self.subscriber_groups.entry(self.config.issi).or_insert_with(HashSet::new);
 
         Ok(())
     }
 
     /// Graceful teardown: DEAFFILIATE → DEREGISTER → WS close
     fn graceful_teardown(&self, ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
-        if !self.config.groups.is_empty() {
-            let deaff_msg = build_subscriber_deaffiliate(self.config.issi, &self.config.groups);
-            if let Err(e) = ws.send(Message::Binary(deaff_msg.into())) {
-                tracing::error!("BrewWorker: failed to send deaffiliation: {}", e);
-            } else {
-                tracing::info!("BrewWorker: deaffiliated from groups {:?}", self.config.groups);
+        for (issi, groups) in &self.subscriber_groups {
+            if !groups.is_empty() {
+                let mut group_list: Vec<u32> = groups.iter().copied().collect();
+                group_list.sort_unstable();
+                let deaff_msg = build_subscriber_deaffiliate(*issi, &group_list);
+                if let Err(e) = ws.send(Message::Binary(deaff_msg.into())) {
+                    tracing::error!("BrewWorker: failed to send deaffiliation: {}", e);
+                } else {
+                    tracing::info!("BrewWorker: deaffiliated issi={} groups={:?}", issi, group_list);
+                }
             }
-        }
-        let dereg_msg = build_subscriber_deregister(self.config.issi);
-        if let Err(e) = ws.send(Message::Binary(dereg_msg.into())) {
-            tracing::error!("BrewWorker: failed to send deregistration: {}", e);
-        } else {
-            tracing::info!("BrewWorker: deregistered ISSI {}", self.config.issi);
+
+            let dereg_msg = build_subscriber_deregister(*issi);
+            if let Err(e) = ws.send(Message::Binary(dereg_msg.into())) {
+                tracing::error!("BrewWorker: failed to send deregistration: {}", e);
+            } else {
+                tracing::info!("BrewWorker: deregistered ISSI {}", issi);
+            }
         }
         let _ = ws.close(None);
     }
@@ -559,6 +559,7 @@ impl BrewWorker {
                 };
                 match cmd {
                     BrewCommand::RegisterSubscriber { issi } => {
+                        self.subscriber_groups.entry(issi).or_insert_with(HashSet::new);
                         let msg = build_subscriber_register(issi, &[]);
                         if let Err(e) = ws.send(Message::Binary(msg.into())) {
                             tracing::error!("BrewWorker: failed to send registration: {}", e);
@@ -567,6 +568,7 @@ impl BrewWorker {
                         }
                     }
                     BrewCommand::DeregisterSubscriber { issi } => {
+                        self.subscriber_groups.remove(&issi);
                         let msg = build_subscriber_deregister(issi);
                         if let Err(e) = ws.send(Message::Binary(msg.into())) {
                             tracing::error!("BrewWorker: failed to send deregistration: {}", e);
@@ -575,6 +577,10 @@ impl BrewWorker {
                         }
                     }
                     BrewCommand::AffiliateGroups { issi, groups } => {
+                        let entry = self.subscriber_groups.entry(issi).or_insert_with(HashSet::new);
+                        for gssi in &groups {
+                            entry.insert(*gssi);
+                        }
                         let msg = build_subscriber_affiliate(issi, &groups);
                         if let Err(e) = ws.send(Message::Binary(msg.into())) {
                             tracing::error!("BrewWorker: failed to send affiliation: {}", e);
@@ -583,6 +589,11 @@ impl BrewWorker {
                         }
                     }
                     BrewCommand::DeaffiliateGroups { issi, groups } => {
+                        if let Some(entry) = self.subscriber_groups.get_mut(&issi) {
+                            for gssi in &groups {
+                                entry.remove(gssi);
+                            }
+                        }
                         let msg = build_subscriber_deaffiliate(issi, &groups);
                         if let Err(e) = ws.send(Message::Binary(msg.into())) {
                             tracing::error!("BrewWorker: failed to send deaffiliation: {}", e);
