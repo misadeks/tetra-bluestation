@@ -1,18 +1,20 @@
 use crate::mle::components::mle_router::MleRouter;
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::SharedConfig;
+use time::{OffsetDateTime, UtcOffset};
+use tetra_config::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, unimplemented_log};
+use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::lmm::LmmMleUnitdataInd;
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
-use tetra_saps::tla::TlaTlDataReqBl;
+use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataReqBl};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
+use tetra_pdus::mle::pdus::d_nwrk_broadcast::DNwrkBroadcast;
 
 pub struct Mle {
     // config: Option<SharedConfig>,
@@ -540,6 +542,145 @@ impl Mle {
             _ => panic!(),
         }
     }
+
+    /// Encodes TETRA Network Time IE (Table 18.100) into the low 48 bits of a u64:
+    /// [47..24] UTC time (24) in 2-second units since Jan 1 00:00 UTC
+    /// [23]     Local time offset sign (1): 0=+, 1=-
+    /// [22..17] Local time offset (6) in 15-minute units (0..=0x38 valid; 0x3F invalid)
+    /// [16..11] Year since 2000 (6) (0..=0x3E valid; 0x3F invalid)
+    /// [10..0]  Reserved (11) = all ones (0x7FF)
+    fn encode_tetra_network_time(now: OffsetDateTime) -> u64 {
+        // UTC time field (24 bits): 2-second ticks since Jan 1 00:00 UTC
+        let utc = now.to_offset(UtcOffset::UTC);
+        let doy = utc.ordinal() as u64; // 1..=366
+        let secs_of_day = (utc.hour() as u64) * 3600
+            + (utc.minute() as u64) * 60
+            + (utc.second() as u64);
+
+        let secs_since_year_start = (doy - 1) * 86_400 + secs_of_day;
+        let mut utc_units = secs_since_year_start / 2; // 2-second steps
+
+        // Enforce 24-bit + reserved-range rules (NOTE 1)
+        // Reserved: 0xF142FF..=0xFFFFFE, Invalid: 0xFFFFFF
+        if utc_units > 0x00FF_FFFF || (utc_units >= 0x00F1_42FF && utc_units <= 0x00FF_FFFE) {
+            utc_units = 0x00FF_FFFF;
+        }
+
+        // Local time offset sign + magnitude (NOTE 2,3)
+        // Use the offset embedded in `now` (includes DST if caller provided local time properly)
+        let offset_secs = now.offset().whole_seconds();
+        let sign: u64 = if offset_secs < 0 { 1 } else { 0 };
+
+        // Step size is 15 minutes = 900 seconds, max ±14h => 56 steps.
+        // If it's not a multiple of 15 minutes or out of range -> invalid (0x3F).
+        let mut offset_units_15m: u64 = {
+            let abs = offset_secs.unsigned_abs() as u64;
+            if abs % 900 != 0 {
+                0x3F
+            } else {
+                let steps = abs / 900;
+                if steps > 56 { 0x3F } else { steps }
+            }
+        };
+
+        // Avoid reserved encodings 0x39..0x3E (shouldn’t happen if <=56 anyway)
+        if (0x39..=0x3E).contains(&offset_units_15m) {
+            offset_units_15m = 0x3F;
+        }
+
+        // Year since 2000 (NOTE 4)
+        let year_since_2000_i32 = now.year() - 2000;
+        let year_field: u64 = if (0..=62).contains(&year_since_2000_i32) {
+            year_since_2000_i32 as u64
+        } else {
+            0x3F // invalid year
+        };
+
+        // Reserved (NOTE 5): all ones
+        let reserved_11: u64 = 0x7FF;
+
+        // Pack into 48 bits:
+        // UTC(24) | sign(1) | offset(6) | year(6) | reserved(11)
+        ((utc_units & 0x00FF_FFFF) << 24)
+            | ((sign & 0x1) << 23)
+            | ((offset_units_15m & 0x3F) << 17)
+            | ((year_field & 0x3F) << 11)
+            | reserved_11
+    }
+
+    fn send_network_time_broadcast(&self, queue: &mut MessageQueue, ts: TdmaTime) {
+        if self.config.config().stack_mode != StackMode::Bs {
+            return;
+        }
+
+        // Broadcast once per multiframe on MCCH (avoid control frame 18).
+        if ts.f != 1 || ts.t != 1 {
+            return;
+        }
+
+        let utc_now = OffsetDateTime::now_utc();
+
+        // Derive local offset at "now" and convert (includes DST if OS reports it)
+        let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+        let local_now = utc_now.to_offset(local_offset);
+
+        let tetra_network_time = Self::encode_tetra_network_time(local_now);
+
+        let cell_load_ca = self.config.state_read().cell_load_ca & 0x3;
+        let pdu = DNwrkBroadcast {
+            cell_re_select_parameters: 0,
+            cell_load_ca,
+            tetra_network_time: Some(tetra_network_time),
+            // Explicitly signal "no neighbour cell information" (P-bit set, value 0).
+            number_of_ca_neighbour_cells: Some(0),
+            neighbour_cell_information_for_ca: None,
+        };
+
+        tracing::debug!("DNwrkBroadcast {:?}", &pdu);
+
+        let mut sdu = BitBuffer::new_autoexpand(96);
+        sdu.write_bits(MleProtocolDiscriminator::Mle.into_raw(), 3);
+        if let Err(err) = pdu.to_bitbuf(&mut sdu) {
+            tracing::warn!("Failed building D-NWRK-BROADCAST: {:?}", err);
+            return;
+        }
+        sdu.seek(0);
+
+        // Broadcast on MCCH using the "all ones" address (cell-wide broadcast).
+        let main_address = TetraAddress {
+            ssi: 0x00FF_FFFF,
+            ssi_type: SsiType::Gssi,
+            encrypted: false,
+        };
+
+        let msg = SapMsg {
+            sap: Sap::TlaSap,
+            src: self.self_component,
+            dest: TetraEntity::Llc,
+            dltime: ts,
+            msg: SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
+                main_address,
+                link_id: 0,
+                endpoint_id: 0,
+                tl_sdu: sdu,
+                scrambling_code: 0,
+                pdu_prio: 0,
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: false,
+                air_interface_encryption: 0,
+                data_prio: 0,
+                packet_data_flag: false,
+                n_tlsdu_repeats: None,
+                scheduled_data_status: 0,
+                max_schedule_interval: None,
+                data_class_info: None,
+                req_handle: 0,
+            }),
+        };
+
+        queue.push_back(msg);
+    }
 }
 
 impl TetraEntityTrait for Mle {
@@ -574,5 +715,9 @@ impl TetraEntityTrait for Mle {
                 panic!();
             }
         }
+    }
+
+    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        self.send_network_time_broadcast(queue, ts);
     }
 }
