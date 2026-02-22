@@ -103,7 +103,7 @@ colour_code = 1
 # defaults should be fine
 
 # Neighbor cell broadcast settings
-# neighbor_cell_broadcast = 0
+neighbor_cell_broadcast = 2
 
 # Cell load (Channel Allocation) - current load
 # cell_load_ca = 0
