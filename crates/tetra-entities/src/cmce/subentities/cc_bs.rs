@@ -861,8 +861,8 @@ impl CcBsSubentity {
 
     /// Check if any active calls in hangtime have expired, and if so, release them
     fn check_hangtime_expiry(&mut self, queue: &mut MessageQueue) {
-        // Hangtime: ~1 second = 1 * 18 * 4 = 72 frames (approximately)
-        const HANGTIME_FRAMES: i32 = 1 * 18 * 4;
+        // Hangtime: ~1 second = 5 * 18 * 4 = 72 frames (approximately)
+        const HANGTIME_FRAMES: i32 = 5 * 18 * 4;
 
         let expired: Vec<u16> = self
             .active_calls

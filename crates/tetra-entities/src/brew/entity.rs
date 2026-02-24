@@ -16,7 +16,7 @@ use tetra_saps::{SapMsg, SapMsgInner, control::call_control::CallControl, tmd::T
 use super::worker::{BrewCommand, BrewConfig, BrewEvent, BrewWorker};
 
 /// Hangtime before releasing group call circuit to allow reuse without re-signaling.
-const GROUP_CALL_HANGTIME: Duration = Duration::from_secs(1);
+const GROUP_CALL_HANGTIME: Duration = Duration::from_secs(5);
 /// Minimum playout buffer depth in frames.
 const BREW_JITTER_MIN_FRAMES: usize = 2;
 /// Default playout buffer depth in frames.
