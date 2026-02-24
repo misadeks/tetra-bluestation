@@ -60,6 +60,67 @@ pub struct CfgNetInfo {
     pub mnc: u16,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CfgBsServiceDetails {
+    #[serde(default)]
+    pub registration: bool,
+    #[serde(default)]
+    pub deregistration: bool,
+    #[serde(default)]
+    pub priority_cell: bool,
+    #[serde(default)]
+    pub no_minimum_mode: bool,
+    #[serde(default)]
+    pub migration: bool,
+    #[serde(default)]
+    pub system_wide_services: bool,
+    #[serde(default)]
+    pub voice_service: bool,
+    #[serde(default)]
+    pub circuit_mode_data_service: bool,
+    #[serde(default)]
+    pub sndcp_service: bool,
+    #[serde(default)]
+    pub aie_service: bool,
+    #[serde(default)]
+    pub advanced_link: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CfgNeighborCellCa {
+    /// Type1, 5 bits
+    pub cell_identifier_ca: u8,
+    /// Type1, 2 bits
+    pub cell_reselection_types_supported: u8,
+    /// Type1, 1 bit
+    pub neighbor_cell_synchronized: bool,
+    /// Type1, 2 bits
+    pub cell_load_ca: u8,
+    /// Type1, 12 bits
+    pub main_carrier_number: u16,
+
+    /// Type2, 10 bits
+    pub main_carrier_number_extension: Option<u16>,
+    /// Type2, 10 bits
+    pub mcc: Option<u16>,
+    /// Type2, 14 bits
+    pub mnc: Option<u16>,
+    /// Type2, 14 bits
+    pub location_area: Option<u16>,
+    /// Type2, 3 bits
+    pub maximum_ms_transmit_power: Option<u8>,
+    /// Type2, 4 bits
+    pub minimum_rx_access_level: Option<u8>,
+    /// Type2, 16 bits
+    pub subscriber_class: Option<u16>,
+    /// Type2, 12 bits
+    pub bs_service_details: Option<CfgBsServiceDetails>,
+    /// Type2, 5 bits
+    pub timeshare_cell_information_or_security_parameters: Option<u8>,
+    /// Type2, 6 bits
+    pub tdma_frame_offset: Option<u8>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CfgCellInfo {
     // 2 bits, from 18.4.2.1 D-MLE-SYNC
@@ -137,6 +198,10 @@ pub struct CfgCellInfo {
     pub u_plane_dtx: bool,
     #[serde(default)]
     pub frame_18_ext: bool,
+
+    /// Neighbour cell list for D-NWRK-BROADCAST (CA)
+    #[serde(default)]
+    pub neighbor_cells_ca: Vec<CfgNeighborCellCa>,
 }
 
 impl Default for CfgCellInfo {
@@ -172,6 +237,8 @@ impl Default for CfgCellInfo {
             ts_reserved_frames: 0,
             u_plane_dtx: false,
             frame_18_ext: false,
+
+            neighbor_cells_ca: Vec::new(),
         }
     }
 }
@@ -286,6 +353,64 @@ impl StackConfig {
             if soapy_cfg.ul_freq as u32 != ulfreq {
                 return Err("PhyIo UlFrequency does not match computed FreqInfo");
             };
+        }
+
+        if self.cell.neighbor_cells_ca.len() > 7 {
+            return Err("cell_info.neighbor_cells_ca supports at most 7 entries");
+        }
+        for cell in &self.cell.neighbor_cells_ca {
+            if cell.cell_identifier_ca > 0x1F {
+                return Err("cell_info.neighbor_cells_ca.cell_identifier_ca must be <= 31");
+            }
+            if cell.cell_reselection_types_supported > 0x3 {
+                return Err("cell_info.neighbor_cells_ca.cell_reselection_types_supported must be <= 3");
+            }
+            if cell.cell_load_ca > 0x3 {
+                return Err("cell_info.neighbor_cells_ca.cell_load_ca must be <= 3");
+            }
+            if cell.main_carrier_number > 0x0FFF {
+                return Err("cell_info.neighbor_cells_ca.main_carrier_number must be <= 4095");
+            }
+            if let Some(v) = cell.main_carrier_number_extension {
+                if v > 0x03FF {
+                    return Err("cell_info.neighbor_cells_ca.main_carrier_number_extension must be <= 1023");
+                }
+            }
+            if let Some(v) = cell.mcc {
+                if v > 0x03FF {
+                    return Err("cell_info.neighbor_cells_ca.mcc must be <= 1023");
+                }
+            }
+            if let Some(v) = cell.mnc {
+                if v > 0x3FFF {
+                    return Err("cell_info.neighbor_cells_ca.mnc must be <= 16383");
+                }
+            }
+            if let Some(v) = cell.location_area {
+                if v > 0x3FFF {
+                    return Err("cell_info.neighbor_cells_ca.location_area must be <= 16383");
+                }
+            }
+            if let Some(v) = cell.maximum_ms_transmit_power {
+                if v > 0x7 {
+                    return Err("cell_info.neighbor_cells_ca.maximum_ms_transmit_power must be <= 7");
+                }
+            }
+            if let Some(v) = cell.minimum_rx_access_level {
+                if v > 0xF {
+                    return Err("cell_info.neighbor_cells_ca.minimum_rx_access_level must be <= 15");
+                }
+            }
+            if let Some(v) = cell.timeshare_cell_information_or_security_parameters {
+                if v > 0x1F {
+                    return Err("cell_info.neighbor_cells_ca.timeshare_cell_information_or_security_parameters must be <= 31");
+                }
+            }
+            if let Some(v) = cell.tdma_frame_offset {
+                if v > 0x3F {
+                    return Err("cell_info.neighbor_cells_ca.tdma_frame_offset must be <= 63");
+                }
+            }
         }
 
         Ok(())

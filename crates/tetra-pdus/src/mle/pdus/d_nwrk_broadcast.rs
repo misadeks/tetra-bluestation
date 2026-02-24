@@ -4,6 +4,7 @@ use tetra_core::typed_pdu_fields::*;
 use tetra_core::{BitBuffer, expect_pdu_type, pdu_parse_error::PduParseErr};
 
 use crate::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
+use crate::mle::fields::neighbour_cell_information_for_ca::NeighbourCellInformationForCa;
 
 /// Representation of the D-NWRK-BROADCAST PDU (Clause 18.4.1.4.1).
 /// Upon receipt from the SwMI, the message shall inform the MS-MLE about parameters for the CA serving cell and parameters for one or more CA neighbour cells.
@@ -22,12 +23,11 @@ pub struct DNwrkBroadcast {
     /// Type2, 48 bits, TETRA network time
     pub tetra_network_time: Option<u64>,
     /// Type2, 3 bits, See note 2,
-    pub number_of_ca_neighbour_cells: Option<u64>,
+    pub number_of_ca_neighbour_cells: Option<u8>,
     /// Conditional See note 3, condition: number_of_ca_neighbour_cells > Some(0)
-    pub neighbour_cell_information_for_ca: Option<u64>,
+    pub neighbour_cell_information_for_ca: Vec<NeighbourCellInformationForCa>,
 }
 
-#[allow(unreachable_code)] // TODO FIXME review, finalize and remove this
 impl DNwrkBroadcast {
     /// Parse from BitBuffer
     pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
@@ -45,15 +45,22 @@ impl DNwrkBroadcast {
         // Type2
         let tetra_network_time = typed::parse_type2_generic(obit, buffer, 48, "tetra_network_time")?;
         // Type2
-        let number_of_ca_neighbour_cells = typed::parse_type2_generic(obit, buffer, 3, "number_of_ca_neighbour_cells")?;
+        let number_of_ca_neighbour_cells =
+            typed::parse_type2_generic(obit, buffer, 3, "number_of_ca_neighbour_cells")?.map(|v| v as u8);
 
         // Conditional
-        let neighbour_cell_information_for_ca = if obit && number_of_ca_neighbour_cells > Some(0) {
-            unimplemented!();
-            Some(buffer.read_field(999, "neighbour_cell_information_for_ca")?)
-        } else {
-            None
-        };
+        let mut neighbour_cell_information_for_ca = Vec::new();
+        if let Some(count) = number_of_ca_neighbour_cells {
+            if count > 7 {
+                return Err(PduParseErr::InvalidValue {
+                    field: "number_of_ca_neighbour_cells",
+                    value: count as u64,
+                });
+            }
+            for _ in 0..count {
+                neighbour_cell_information_for_ca.push(NeighbourCellInformationForCa::from_bitbuf(buffer)?);
+            }
+        }
 
         // Read trailing obit (if not previously encountered)
         obit = if obit { buffer.read_field(1, "trailing_obit")? == 1 } else { obit };
@@ -72,6 +79,27 @@ impl DNwrkBroadcast {
 
     /// Serialize this PDU into the given BitBuffer.
     pub fn to_bitbuf(&self, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        let neighbour_count = self.neighbour_cell_information_for_ca.len();
+        if let Some(count) = self.number_of_ca_neighbour_cells {
+            if count as usize != neighbour_count {
+                return Err(PduParseErr::Inconsistency {
+                    field: "number_of_ca_neighbour_cells",
+                    reason: "count does not match neighbour_cell_information_for_ca length",
+                });
+            }
+            if count > 7 {
+                return Err(PduParseErr::InvalidValue {
+                    field: "number_of_ca_neighbour_cells",
+                    value: count as u64,
+                });
+            }
+        } else if neighbour_count > 0 {
+            return Err(PduParseErr::Inconsistency {
+                field: "neighbour_cell_information_for_ca",
+                reason: "missing number_of_ca_neighbour_cells",
+            });
+        }
+
         // PDU Type
         buffer.write_bits(MlePduTypeDl::DNwrkBroadcast.into_raw(), 3);
         // Type1
@@ -90,12 +118,18 @@ impl DNwrkBroadcast {
         typed::write_type2_generic(obit, buffer, self.tetra_network_time, 48);
 
         // Type2
-        typed::write_type2_generic(obit, buffer, self.number_of_ca_neighbour_cells, 3);
+        typed::write_type2_generic(
+            obit,
+            buffer,
+            self.number_of_ca_neighbour_cells.map(|v| v as u64),
+            3,
+        );
 
         // Conditional
-        if let Some(ref _value) = self.neighbour_cell_information_for_ca {
-            unimplemented!();
-            buffer.write_bits(*_value, 999);
+        if self.number_of_ca_neighbour_cells.unwrap_or(0) > 0 {
+            for neighbour in &self.neighbour_cell_information_for_ca {
+                neighbour.to_bitbuf(buffer)?;
+            }
         }
         // Write terminating m-bit
         delimiters::write_mbit(buffer, 0);

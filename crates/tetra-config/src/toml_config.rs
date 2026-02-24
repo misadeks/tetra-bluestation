@@ -8,7 +8,18 @@ use toml::Value;
 
 use super::stack_config_brew::{CfgBrewDto, apply_brew_patch};
 
-use super::stack_config::{CfgCellInfo, CfgNetInfo, CfgPhyIo, PhyBackend, SharedConfig, StackConfig, StackMode, StackState};
+use super::stack_config::{
+    CfgBsServiceDetails,
+    CfgCellInfo,
+    CfgNeighborCellCa,
+    CfgNetInfo,
+    CfgPhyIo,
+    PhyBackend,
+    SharedConfig,
+    StackConfig,
+    StackMode,
+    StackState,
+};
 use super::stack_config_soapy::{CfgSoapySdr, LimeSdrCfg, SXceiverCfg, UsrpB2xxCfg};
 
 /// Build `SharedConfig` from a TOML configuration file
@@ -237,6 +248,9 @@ fn apply_cell_info_patch(dst: &mut CfgCellInfo, ci: CellInfoDto) {
     if let Some(v) = ci.frame_18_ext {
         dst.frame_18_ext = v;
     }
+    if let Some(v) = ci.neighbor_cells_ca {
+        dst.neighbor_cells_ca = v.into_iter().map(Into::into).collect();
+    }
 }
 
 fn sorted_keys(map: &HashMap<String, Value>) -> Vec<&str> {
@@ -382,6 +396,8 @@ struct CellInfoDto {
     pub u_plane_dtx: Option<bool>,
     pub frame_18_ext: Option<bool>,
 
+    pub neighbor_cells_ca: Option<Vec<NeighborCellCaDto>>,
+
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
@@ -392,4 +408,91 @@ struct StackStatePatch {
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct NeighborCellCaDto {
+    pub cell_identifier_ca: u8,
+    pub cell_reselection_types_supported: u8,
+    pub neighbor_cell_synchronized: bool,
+    pub cell_load_ca: u8,
+    pub main_carrier_number: u16,
+
+    pub main_carrier_number_extension: Option<u16>,
+    pub mcc: Option<u16>,
+    pub mnc: Option<u16>,
+    pub location_area: Option<u16>,
+    pub maximum_ms_transmit_power: Option<u8>,
+    pub minimum_rx_access_level: Option<u8>,
+    pub subscriber_class: Option<u16>,
+    pub bs_service_details: Option<BsServiceDetailsDto>,
+    pub timeshare_cell_information_or_security_parameters: Option<u8>,
+    pub tdma_frame_offset: Option<u8>,
+}
+
+#[derive(Default, Deserialize)]
+struct BsServiceDetailsDto {
+    #[serde(default)]
+    pub registration: bool,
+    #[serde(default)]
+    pub deregistration: bool,
+    #[serde(default)]
+    pub priority_cell: bool,
+    #[serde(default)]
+    pub no_minimum_mode: bool,
+    #[serde(default)]
+    pub migration: bool,
+    #[serde(default)]
+    pub system_wide_services: bool,
+    #[serde(default)]
+    pub voice_service: bool,
+    #[serde(default)]
+    pub circuit_mode_data_service: bool,
+    #[serde(default)]
+    pub sndcp_service: bool,
+    #[serde(default)]
+    pub aie_service: bool,
+    #[serde(default)]
+    pub advanced_link: bool,
+}
+
+impl From<NeighborCellCaDto> for CfgNeighborCellCa {
+    fn from(dto: NeighborCellCaDto) -> Self {
+        Self {
+            cell_identifier_ca: dto.cell_identifier_ca,
+            cell_reselection_types_supported: dto.cell_reselection_types_supported,
+            neighbor_cell_synchronized: dto.neighbor_cell_synchronized,
+            cell_load_ca: dto.cell_load_ca,
+            main_carrier_number: dto.main_carrier_number,
+            main_carrier_number_extension: dto.main_carrier_number_extension,
+            mcc: dto.mcc,
+            mnc: dto.mnc,
+            location_area: dto.location_area,
+            maximum_ms_transmit_power: dto.maximum_ms_transmit_power,
+            minimum_rx_access_level: dto.minimum_rx_access_level,
+            subscriber_class: dto.subscriber_class,
+            bs_service_details: dto.bs_service_details.map(Into::into),
+            timeshare_cell_information_or_security_parameters: dto
+                .timeshare_cell_information_or_security_parameters,
+            tdma_frame_offset: dto.tdma_frame_offset,
+        }
+    }
+}
+
+impl From<BsServiceDetailsDto> for CfgBsServiceDetails {
+    fn from(dto: BsServiceDetailsDto) -> Self {
+        Self {
+            registration: dto.registration,
+            deregistration: dto.deregistration,
+            priority_cell: dto.priority_cell,
+            no_minimum_mode: dto.no_minimum_mode,
+            migration: dto.migration,
+            system_wide_services: dto.system_wide_services,
+            voice_service: dto.voice_service,
+            circuit_mode_data_service: dto.circuit_mode_data_service,
+            sndcp_service: dto.sndcp_service,
+            aie_service: dto.aie_service,
+            advanced_link: dto.advanced_link,
+        }
+    }
 }

@@ -12,6 +12,8 @@ use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
+use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
+use tetra_pdus::mle::fields::neighbour_cell_information_for_ca::NeighbourCellInformationForCa;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
 use tetra_pdus::mle::pdus::d_nwrk_broadcast::DNwrkBroadcast;
@@ -627,13 +629,50 @@ impl Mle {
         let tetra_network_time = Self::encode_tetra_network_time(local_now);
 
         let cell_load_ca = self.config.state_read().cell_load_ca & 0x3;
+        let neighbour_cells: Vec<NeighbourCellInformationForCa> = self
+            .config
+            .config()
+            .cell
+            .neighbor_cells_ca
+            .iter()
+            .map(|cfg| NeighbourCellInformationForCa {
+                cell_identifier_ca: cfg.cell_identifier_ca,
+                cell_reselection_types_supported: cfg.cell_reselection_types_supported,
+                neighbour_cell_synchronized: cfg.neighbor_cell_synchronized,
+                cell_load_ca: cfg.cell_load_ca,
+                main_carrier_number: cfg.main_carrier_number,
+                main_carrier_number_extension: cfg.main_carrier_number_extension,
+                mcc: cfg.mcc,
+                mnc: cfg.mnc,
+                location_area: cfg.location_area,
+                maximum_ms_transmit_power: cfg.maximum_ms_transmit_power,
+                minimum_rx_access_level: cfg.minimum_rx_access_level,
+                subscriber_class: cfg.subscriber_class,
+                bs_service_details: cfg.bs_service_details.as_ref().map(|bs| BsServiceDetails {
+                    registration: bs.registration,
+                    deregistration: bs.deregistration,
+                    priority_cell: bs.priority_cell,
+                    no_minimum_mode: bs.no_minimum_mode,
+                    migration: bs.migration,
+                    system_wide_services: bs.system_wide_services,
+                    voice_service: bs.voice_service,
+                    circuit_mode_data_service: bs.circuit_mode_data_service,
+                    sndcp_service: bs.sndcp_service,
+                    aie_service: bs.aie_service,
+                    advanced_link: bs.advanced_link,
+                }),
+                timeshare_cell_information_or_security_parameters: cfg
+                    .timeshare_cell_information_or_security_parameters,
+                tdma_frame_offset: cfg.tdma_frame_offset,
+            })
+            .collect();
         let pdu = DNwrkBroadcast {
             cell_re_select_parameters: 0,
             cell_load_ca,
             tetra_network_time: Some(tetra_network_time),
-            // Explicitly signal "no neighbour cell information" (P-bit set, value 0).
-            number_of_ca_neighbour_cells: Some(0),
-            neighbour_cell_information_for_ca: None,
+            // Explicitly signal "no neighbour cell information" when empty.
+            number_of_ca_neighbour_cells: Some(neighbour_cells.len() as u8),
+            neighbour_cell_information_for_ca: neighbour_cells,
         };
 
         tracing::debug!("DNwrkBroadcast {:?}", &pdu);

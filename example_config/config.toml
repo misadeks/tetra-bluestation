@@ -105,6 +105,24 @@ colour_code = 1
 # Neighbor cell broadcast settings
 neighbor_cell_broadcast = 2
 
+# Neighbor cells (CA) broadcast list for D-NWRK-BROADCAST
+# [[cell_info.neighbor_cells_ca]]
+# cell_identifier_ca = 1
+# cell_reselection_types_supported = 0
+# neighbor_cell_synchronized = true
+# cell_load_ca = 0
+# main_carrier_number = 1521
+# main_carrier_number_extension = 0
+# mcc = 204
+# mnc = 1337
+# location_area = 2
+# maximum_ms_transmit_power = 5
+# minimum_rx_access_level = 3
+# subscriber_class = 0xFFFF
+# bs_service_details = { registration = true, deregistration = true, priority_cell = false, no_minimum_mode = false, migration = false, system_wide_services = true, voice_service = true, circuit_mode_data_service = false, sndcp_service = false, aie_service = false, advanced_link = false }
+# timeshare_cell_information_or_security_parameters = 0
+# tdma_frame_offset = 0
+
 # Cell load (Channel Allocation) - current load
 # cell_load_ca = 0
 
