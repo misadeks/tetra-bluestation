@@ -459,6 +459,10 @@ impl BsChannelScheduler {
         self.circuits.is_active(dir, ts)
     }
 
+    pub fn duplex_peer_ts(&self, ts: u8) -> Option<u8> {
+        self.circuits.get_ul_peer_ts(ts)
+    }
+
     pub fn close_circuit(&mut self, dir: Direction, ts: u8) -> Option<Circuit> {
         // Clearing hangtime here is safe: if the circuit is gone, this timeslot is no longer in use.
         if (1..=4).contains(&ts) {

@@ -140,7 +140,12 @@ impl CircuitMgr {
         Err(CircuitErr::NoCircuitFree)
     }
 
-    pub fn allocate_circuit(&mut self, dir: Direction, comm_type: CommunicationType) -> Result<&CmceCircuit, CircuitErr> {
+    pub fn allocate_circuit(
+        &mut self,
+        dir: Direction,
+        comm_type: CommunicationType,
+        simplex_duplex: bool,
+    ) -> Result<&CmceCircuit, CircuitErr> {
         // Get timeslot, call_id and usage
         let ts = self.get_free_ts(dir)?;
         let call_id = self.get_next_call_id();
@@ -156,7 +161,7 @@ impl CircuitMgr {
             circuit_mode: CircuitModeType::TchS, // TODO: only speech supported for now
             // endpoint_id: 0, // TODO, we don't use endpoints as of yet
             comm_type,
-            simplex_duplex: false,   // TODO, simplex only for now
+            simplex_duplex,
             speech_service: Some(0), // TODO, only TETRA encoded speech for now
             etee_encrypted: false,   // TODO, no encryption for now
         };
@@ -170,6 +175,7 @@ impl CircuitMgr {
         &mut self,
         dir: Direction,
         comm_type: CommunicationType,
+        simplex_duplex: bool,
         timeslot_alloc: &mut TimeslotAllocator,
         owner: TimeslotOwner,
     ) -> Result<&CmceCircuit, CircuitErr> {
@@ -188,12 +194,41 @@ impl CircuitMgr {
             usage,
             circuit_mode: CircuitModeType::TchS,
             comm_type,
-            simplex_duplex: false,
+            simplex_duplex,
             speech_service: Some(0),
             etee_encrypted: false,
         };
 
         // Register circuit and return
+        Ok(self.open_circuit(dir, circuit)?)
+    }
+
+    /// Allocate an additional circuit for an existing call id using the centralized allocator.
+    pub fn allocate_circuit_for_call_with_allocator(
+        &mut self,
+        call_id: CallId,
+        dir: Direction,
+        comm_type: CommunicationType,
+        simplex_duplex: bool,
+        timeslot_alloc: &mut TimeslotAllocator,
+        owner: TimeslotOwner,
+    ) -> Result<&CmceCircuit, CircuitErr> {
+        let ts = timeslot_alloc.allocate_any(owner).ok_or(CircuitErr::NoCircuitFree)?;
+        let usage = self.get_next_usage_number();
+
+        let circuit = CmceCircuit {
+            ts_created: self.dltime,
+            direction: dir,
+            ts,
+            call_id,
+            usage,
+            circuit_mode: CircuitModeType::TchS,
+            comm_type,
+            simplex_duplex,
+            speech_service: Some(0),
+            etee_encrypted: false,
+        };
+
         Ok(self.open_circuit(dir, circuit)?)
     }
 

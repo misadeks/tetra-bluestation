@@ -48,6 +48,19 @@ impl CircuitMgr {
         }
     }
 
+    pub fn get_ul_peer_ts(&self, ts: u8) -> Option<u8> {
+        let circuit = if let Some(dl) = &self.dl[ts as usize - 1] {
+            if dl.direction == Direction::Both {
+                Some(dl)
+            } else {
+                self.ul[ts as usize - 1].as_ref()
+            }
+        } else {
+            self.ul[ts as usize - 1].as_ref()
+        };
+        circuit.and_then(|c| c.peer_ts)
+    }
+
     /// Closes an active circuit, and return the Circuit to the caller
     pub fn close_circuit(&mut self, dir: Direction, ts: u8) -> Option<Circuit> {
         match dir {

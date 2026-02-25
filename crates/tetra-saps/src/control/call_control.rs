@@ -10,6 +10,9 @@ pub struct Circuit {
     /// Timeslot in which this circuit exists
     pub ts: u8,
 
+    /// Optional peer timeslot for duplex cross-routing (UL on ts → DL on peer_ts)
+    pub peer_ts: Option<u8>,
+
     /// Usage number, between 4 and 63
     pub usage: u8,
 
