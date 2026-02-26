@@ -51,7 +51,7 @@ pub struct UmacBs {
     /// Subcomponents
     defrag: BsDefrag,
     /// Pending STCH MAC-DATA spanning block1+block2 (length_ind=0b111110), keyed by timeslot.
-    pending_stch: [Option<PendingStch>; 4],
+    pending_stch: Option<PendingStch>,
     // event_label_store: EventLabelStore,
     /// Contains UL/DL scheduling logic
     /// Access to this field is used only by testing code
@@ -80,7 +80,7 @@ impl UmacBs {
             system_wide_services,
             endpoint_id: 1,
             defrag: BsDefrag::new(),
-            pending_stch: [None, None, None, None],
+            pending_stch: None,
             // event_label_store: EventLabelStore::new(),
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
         }
@@ -308,28 +308,27 @@ impl UmacBs {
 
         // Iterate until no more messages left in mac block
         loop {
-            let (lchan, block_num) = match &message.msg {
-                SapMsgInner::TmvUnitdataInd(prim) => (prim.logical_channel, prim.block_num),
-                _ => panic!(),
-            };
-            let ts_idx = message.dltime.t as usize - 1;
+            // let (lchan, block_num) = match &message.msg {
+            //     SapMsgInner::TmvUnitdataInd(prim) => (prim.logical_channel, prim.block_num),
+            //     _ => panic!(),
+            // };
 
             // Handle STCH MAC-DATA spanning block1+block2 (length_ind=0b111110)
-            if lchan == LogicalChannel::Stch {
-                if block_num == PhyBlockNum::Block2 {
-                    if let Some(pending) = self.pending_stch[ts_idx].take() {
-                        self.rx_stch_second_half(queue, &mut message, pending);
-                        break;
-                    }
-                } else if self.pending_stch[ts_idx].is_some() {
-                    tracing::warn!(
-                        "rx_tmv_sch: pending STCH second-half but got {:?} on ts {}",
-                        block_num,
-                        message.dltime.t
-                    );
-                    self.pending_stch[ts_idx] = None;
-                }
-            }
+            // if lchan == LogicalChannel::Stch {
+            //     if block_num == PhyBlockNum::Block2 {
+            //         if let Some(pending) = self.pending_stch.take() {
+            //             self.rx_stch_second_half(queue, &mut message, pending);
+            //             break;
+            //         }
+            //     } else if self.pending_stch.is_some() {
+            //         tracing::warn!(
+            //             "rx_tmv_sch: pending STCH second-half but got {:?} on ts {}",
+            //             block_num,
+            //             message.dltime.t
+            //         );
+            //         self.pending_stch = None;
+            //     }
+            // }
 
             // Extract info from inner block
             let SapMsgInner::TmvUnitdataInd(prim) = &message.msg else {
@@ -440,25 +439,22 @@ impl UmacBs {
         }
         let addr = pdu.addr.unwrap();
 
-        // Compute len and extract flags
-        if pdu.length_ind == Some(0b111110) {
-            // Second half slot stolen in STCH: store block1 SDU and wait for block2
-            self.store_stch_second_half_start(queue, message, addr, &pdu);
-            return;
-        }
-
-        let (mut pdu_len_bits, is_frag_start, is_null_pdu) = {
+        let (mut pdu_len_bits, is_frag_start, second_half_stolen, is_null_pdu) = {
             if let Some(len_ind) = pdu.length_ind {
                 // We have a length ind, either clear length or a fragmentation start
                 match len_ind {
                     0b000000 => {
                         // Null PDU
-                        (if pdu.event_label.is_some() { 23 } else { 37 }, false, true)
+                        (if pdu.event_label.is_some() { 23 } else { 37 }, false, false, true)
                     }
-                    0b000010..0b111000 => (len_ind as usize * 8, false, false),
+                    0b000010..0b111000 => (len_ind as usize * 8, false, false, false),
+                    0b111110 => {
+                        // Second half stolen. Should be in STCH
+                        (prim.pdu.get_len(), false, true, false)
+                    }
                     0b111111 => {
                         // Start of fragmentation
-                        (prim.pdu.get_len(), true, false)
+                        (prim.pdu.get_len(), true, false, false)
                     }
                     _ => panic!("rx_mac_data: Invalid length_ind {}", len_ind),
                 }
@@ -468,9 +464,14 @@ impl UmacBs {
                     "rx_mac_data: cap_req {}",
                     if pdu.frag_flag.unwrap() { "with frag_start" } else { "" }
                 );
-                (prim.pdu.get_len(), pdu.frag_flag.unwrap(), false)
+                (prim.pdu.get_len(), pdu.frag_flag.unwrap(), false, false)
             }
         };
+
+        if second_half_stolen {
+            tracing::debug!("rx_mac_data: STCH 2nd half stolen");
+            self.signal_lmac_second_half_stolen(queue);
+        }
 
         // Truncate len if past end (okay with standard)
         if pdu_len_bits > prim.pdu.get_len() {
@@ -530,23 +531,14 @@ impl UmacBs {
         } else {
             // Pass directly to LLC
             let sdu = {
-                // if prim.pdu.get_len_remaining() == 0 {
-                //     None // No more data in this block
-                // } else {
-                // TODO FIXME should not copy here but take ownership
-                // Copy inner part, without MAC header or fill bits
-                Some(BitBuffer::from_bitbuffer_pos(&prim.pdu))
-                // }
+                if prim.pdu.get_len_remaining() == 0 {
+                    None // No more data in this block
+                } else {
+                    // TODO FIXME should not copy here but take ownership
+                    // Copy inner part, without MAC header or fill bits
+                    Some(BitBuffer::from_bitbuffer_pos(&prim.pdu))
+                }
             };
-
-            // Try to grant reservation requirement if present
-            if let Some(_reservation_requirement) = pdu.reservation_req {
-                // let grant = self.ulrx_scheduler.process_granting_request(pdu.addr, &reservation_requirement);
-                // if let Some(grant) = grant {
-                //     self.channel_scheduler.schedule_grant(pdu.addr, grant);
-                // }
-                unimplemented_log!("rx_mac_data: Reservation requests not implemented");
-            }
 
             if sdu.is_some() {
                 // We have an SDU for the LLC, deliver it.
@@ -606,13 +598,6 @@ impl UmacBs {
         let addr = if let Some(_label) = pdu.event_label {
             tracing::warn!("event labels not implemented");
             return;
-            // let ret = self.event_label_store.get_addr_by_label(label);
-            // if let Some(ssi) = ret {
-            //     ssi
-            // } else {
-            //     tracing::warn!("Could not resolve event label for {}", label);
-            //     return;
-            // }
         } else if let Some(addr) = pdu.addr {
             addr
         } else {
@@ -1304,120 +1289,76 @@ impl UmacBs {
         }
     }
 
-    fn store_stch_second_half_start(&mut self, queue: &mut MessageQueue, message: &mut SapMsg, addr: TetraAddress, pdu: &MacData) {
-        let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
-            panic!()
-        };
-        let ts_idx = message.dltime.t as usize - 1;
-
-        if self.pending_stch[ts_idx].is_some() {
-            tracing::warn!("store_stch_second_half_start: overwriting pending STCH on ts {}", message.dltime.t);
-        }
-
-        let sdu_part = BitBuffer::from_bitbuffer_pos(&prim.pdu);
-        self.pending_stch[ts_idx] = Some(PendingStch {
-            addr,
-            scrambling_code: prim.scrambling_code,
-            encrypted: pdu.encrypted,
-            fill_bits: pdu.fill_bits,
-            sdu_part,
-        });
-
+    fn signal_lmac_second_half_stolen(&mut self, queue: &mut MessageQueue) {
         // Signal LMAC that Block2 is also stolen (STCH, not TCH).
         // Must be Immediate priority so LMAC sees it before processing Block2.
         let m = SapMsg {
             sap: Sap::TmvSap,
             src: self.self_component,
             dest: TetraEntity::Lmac,
-            dltime: message.dltime,
+            dltime: self.dltime, // Control message so don't care
             msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
-                second_half_stolen: Some(true),
-                ..Default::default()
+                blk2_stolen: Some(true),
+                scrambling_code: None,
+                is_traffic: None,
+                tch_type_and_interleaving_depth: None,
+                time: None,
             }),
         };
         queue.push_prio(m, MessagePrio::Immediate);
     }
 
-    fn rx_stch_second_half(&mut self, queue: &mut MessageQueue, message: &mut SapMsg, pending: PendingStch) {
-        let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
-            panic!()
-        };
-
-        if prim.logical_channel != LogicalChannel::Stch || prim.block_num != PhyBlockNum::Block2 {
-            tracing::warn!(
-                "rx_stch_second_half: unexpected block lchan={:?} blk={:?}",
-                prim.logical_channel,
-                prim.block_num
-            );
-            return;
-        }
-
-        let mut first = pending.sdu_part;
-        first.seek(0);
-        let first_len = first.get_len_remaining();
-        prim.pdu.seek(0);
-        let second_len = prim.pdu.get_len_remaining();
-
-        let mut combined = BitBuffer::new(first_len + second_len);
-        combined.copy_bits(&mut first, first_len);
-        combined.copy_bits(&mut prim.pdu, second_len);
-        combined.seek(0);
-
-        if pending.fill_bits {
-            let total_len = combined.get_len();
-            let num_fill_bits = fillbits::removal::get_num_fill_bits(&combined, total_len, false);
-            if num_fill_bits > 0 {
-                combined.set_raw_end(total_len - num_fill_bits);
-            }
-            combined.seek(0);
-        }
-
-        let m = SapMsg {
-            sap: Sap::TmaSap,
-            src: TetraEntity::Umac,
-            dest: TetraEntity::Llc,
-            dltime: message.dltime,
-            msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
-                pdu: Some(combined),
-                main_address: pending.addr,
-                scrambling_code: pending.scrambling_code,
-                endpoint_id: 0,
-                new_endpoint_id: None,
-                css_endpoint_id: None,
-                air_interface_encryption: pending.encrypted as Todo,
-                chan_change_response_req: false,
-                chan_change_handle: None,
-                chan_info: None,
-            }),
-        };
-        queue.push_back(m);
-    }
-
-    // fn signal_lmac_circuit_setup(&self, queue: &mut MessageQueue, circuit: Circuit) {
-    //     let cmd = SapMsg {
-    //         sap: Sap::Control,
-    //         src: TetraEntity::Umac,
-    //         dest: TetraEntity::Lmac,
-    //         dltime: self.dltime,
-    //         msg: SapMsgInner::CmceCallControl(
-    //             CallControl::Open(circuit)
-    //         ),
+    // fn rx_stch_second_half(&mut self, queue: &mut MessageQueue, message: &mut SapMsg, pending: PendingStch) {
+    //     let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
+    //         panic!()
     //     };
-    //     queue.push_back(cmd);
-    // }
 
-    // fn signal_lmac_circuit_close(&self, queue: &mut MessageQueue, dir: Direction, ts: u8) {
-    //     let s = SapMsg {
-    //         sap: Sap::Control,
+    //     // Sanity checks
+    //     assert!(prim.logical_channel == LogicalChannel::Stch, "rx_stch_second_half: expected STCH logical channel, got {:?}", prim.logical_channel);
+    //     assert!(prim.block_num == PhyBlockNum::Block2, "rx_stch_second_half: expected Block2, got {:?}", prim.block_num);
+    //     assert!(self.pending_stch.is_some(), "rx_stch_second_half: no pending STCH, cannot process second half");
+
+    //     let mut first = pending.sdu_part;
+    //     first.seek(0);
+    //     let first_len = first.get_len_remaining();
+    //     prim.pdu.seek(0);
+    //     let second_len = prim.pdu.get_len_remaining();
+
+    //     self.rx_mac_access(queue, message);
+
+    //     let mut combined = BitBuffer::new(first_len + second_len);
+    //     combined.copy_bits(&mut first, first_len);
+    //     combined.copy_bits(&mut prim.pdu, second_len);
+    //     combined.seek(0);
+
+    //     if pending.fill_bits {
+    //         let total_len = combined.get_len();
+    //         let num_fill_bits = fillbits::removal::get_num_fill_bits(&combined, total_len, false);
+    //         if num_fill_bits > 0 {
+    //             combined.set_raw_end(total_len - num_fill_bits);
+    //         }
+    //         combined.seek(0);
+    //     }
+
+    //     let m = SapMsg {
+    //         sap: Sap::TmaSap,
     //         src: TetraEntity::Umac,
-    //         dest: TetraEntity::Lmac,
-    //         dltime: self.dltime,
-    //         msg: SapMsgInner::CmceCallControl(
-    //             CallControl::Close(dir, ts)
-    //         ),
+    //         dest: TetraEntity::Llc,
+    //         dltime: message.dltime,
+    //         msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+    //             pdu: Some(combined),
+    //             main_address: pending.addr,
+    //             scrambling_code: pending.scrambling_code,
+    //             endpoint_id: 0,
+    //             new_endpoint_id: None,
+    //             css_endpoint_id: None,
+    //             air_interface_encryption: pending.encrypted as Todo,
+    //             chan_change_response_req: false,
+    //             chan_change_handle: None,
+    //             chan_info: None,
+    //         }),
     //     };
-    //     tracing::trace!("signaling LMAC circuit close for ts {}", ts);
-    //     queue.push_back(s);
+    //     queue.push_back(m);
     // }
 
     fn rx_control_circuit_open(&mut self, _queue: &mut MessageQueue, prim: CallControl) {

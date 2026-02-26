@@ -54,16 +54,16 @@ pub struct TmvUnitdataInd {
 
 #[derive(Debug, Default)]
 pub struct TmvConfigureReq {
-    pub channel_info: Option<Todo>,
+    // pub channel_info: Option<Todo>,
     /// Received from umac upon change of network information
     pub scrambling_code: Option<u32>,
-    /// Energy economy or part-time reception or napping information
-    pub energy_economy_info: Option<Todo>,
+    // Energy economy or part-time reception or napping information
+    // pub energy_economy_info: Option<Todo>,
     pub is_traffic: Option<bool>,
-    pub second_half_stolen: Option<bool>,
+    /// Used by Umac to signal Lmac that the second half of the slot is stolen
+    pub blk2_stolen: Option<bool>,
     pub tch_type_and_interleaving_depth: Option<Todo>,
-    pub monitoring_pattern_info: Option<Todo>,
-
+    // pub monitoring_pattern_info: Option<Todo>,
     /// NOTE time not usually passed down but convenient for detecting fr18 etc.
     pub time: Option<TdmaTime>,
 }
