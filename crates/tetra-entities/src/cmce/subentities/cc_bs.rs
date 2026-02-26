@@ -970,6 +970,19 @@ impl CcBsSubentity {
         };
         let called_addr = TetraAddress::new(called_ssi as u32, SsiType::Issi);
 
+        if !self.subscriber_groups.contains_key(&called_addr.ssi) {
+            tracing::info!(
+                "CMCE: rejecting U-SETUP P2P from ISSI {} to ISSI {} (callee not registered)",
+                calling_party.ssi,
+                called_addr.ssi
+            );
+            let call_id = self.circuits.get_next_call_id();
+            let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
+            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            queue.push_back(msg);
+            return;
+        }
+
         // Allocate circuit(s). Duplex uses two traffic timeslots, one per MS, with cross-routing.
         let (circuit_calling, circuit_called) = {
             let mut state = self.config.state_write();
