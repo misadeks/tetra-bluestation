@@ -11,7 +11,11 @@ use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::{CfgBrew, SharedConfig};
 use tetra_core::{Sap, TdmaTime, tetra_entities::TetraEntity};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
-use tetra_saps::{SapMsg, SapMsgInner, control::call_control::CallControl, tmd::TmdCircuitDataReq};
+use tetra_saps::{
+    SapMsg, SapMsgInner,
+    control::call_control::{CallControl, NetworkCircuitCall},
+    tmd::TmdCircuitDataReq,
+};
 
 use super::worker::{BrewCommand, BrewEvent, BrewWorker};
 
@@ -83,9 +87,22 @@ struct UlForwardedCall {
     call_id: u16,
     /// Source ISSI of the calling radio
     source_issi: u32,
-    /// Destination GSSI
-    dest_gssi: u32,
+    /// Group/circuit metadata for signaling updates/release
+    kind: UlForwardKind,
     /// Number of voice frames forwarded
+    frame_count: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UlForwardKind {
+    Group { dest_gssi: u32 },
+    Circuit,
+}
+
+#[derive(Debug)]
+struct ActiveCircuitMedia {
+    call_id: u16,
+    ts: u8,
     frame_count: u64,
 }
 
@@ -248,6 +265,8 @@ pub struct BrewEntity {
 
     /// UL calls being forwarded to TetraPack, keyed by timeslot
     ul_forwarded: HashMap<u8, UlForwardedCall>,
+    /// Active duplex/PBX/phone media sessions keyed by Brew UUID
+    active_circuit_media: HashMap<Uuid, ActiveCircuitMedia>,
 
     /// Registered subscriber groups (ISSI -> set of GSSIs)
     subscriber_groups: HashMap<u32, HashSet<u32>>,
@@ -291,6 +310,7 @@ impl BrewEntity {
             dl_jitter: HashMap::new(),
             hanging_calls: HashMap::new(),
             ul_forwarded: HashMap::new(),
+            active_circuit_media: HashMap::new(),
             subscriber_groups: HashMap::new(),
             connected: false,
             worker_handle: Some(handle),
@@ -326,6 +346,75 @@ impl BrewEntity {
                 BrewEvent::GroupCallEnd { uuid, cause } => {
                     self.handle_group_call_end(queue, uuid, cause);
                 }
+                BrewEvent::CircuitSetupRequest { uuid, call } => {
+                    let call = Self::to_network_circuit_call(&call);
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { brew_uuid: uuid, call }),
+                    });
+                }
+                BrewEvent::CircuitSetupAccept { uuid } => {
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid: uuid }),
+                    });
+                }
+                BrewEvent::CircuitSetupReject { uuid, cause } => {
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject { brew_uuid: uuid, cause }),
+                    });
+                }
+                BrewEvent::CircuitAlert { uuid } => {
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid: uuid }),
+                    });
+                }
+                BrewEvent::CircuitConnectRequest { uuid, call } => {
+                    let call = Self::to_network_circuit_call(&call);
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest { brew_uuid: uuid, call }),
+                    });
+                }
+                BrewEvent::CircuitConnectConfirm { uuid, grant, permission } => {
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+                            brew_uuid: uuid,
+                            grant,
+                            permission,
+                        }),
+                    });
+                }
+                BrewEvent::CircuitRelease { uuid, cause } => {
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid: uuid, cause }),
+                    });
+                }
                 BrewEvent::VoiceFrame { uuid, length_bits, data } => {
                     self.handle_voice_frame(uuid, length_bits, data);
                 }
@@ -333,7 +422,12 @@ impl BrewEntity {
                     tracing::debug!("BrewEntity: subscriber event type={} issi={} groups={:?}", msg_type, issi, groups);
                 }
                 BrewEvent::ServerError { error_type, data } => {
-                    tracing::error!("BrewEntity: server error type={} data={} bytes", error_type, data.len());
+                    tracing::error!(
+                        "BrewEntity: server error type={} data={} bytes - {:?}",
+                        error_type,
+                        data.len(),
+                        data.to_ascii_lowercase()
+                    );
                 }
             }
         }
@@ -449,6 +543,44 @@ impl BrewEntity {
         if state.network_connected != connected {
             state.network_connected = connected;
             tracing::info!("BrewEntity: backhaul {}", if connected { "CONNECTED" } else { "DISCONNECTED" });
+        }
+    }
+
+    fn to_network_circuit_call(call: &super::protocol::BrewCircularCall) -> NetworkCircuitCall {
+        NetworkCircuitCall {
+            source_issi: call.source,
+            destination: call.destination,
+            number: call.number.clone(),
+            priority: call.priority,
+            service: call.service,
+            mode: call.mode,
+            duplex: call.duplex,
+            method: call.method,
+            communication: call.communication,
+            grant: call.grant,
+            permission: call.permission,
+            timeout: call.timeout,
+            ownership: call.ownership,
+            queued: call.queued,
+        }
+    }
+
+    fn from_network_circuit_call(call: &NetworkCircuitCall) -> super::protocol::BrewCircularCall {
+        super::protocol::BrewCircularCall {
+            source: call.source_issi,
+            destination: call.destination,
+            number: call.number.clone(),
+            priority: call.priority,
+            service: call.service,
+            mode: call.mode,
+            duplex: call.duplex,
+            method: call.method,
+            communication: call.communication,
+            grant: call.grant,
+            permission: call.permission,
+            timeout: call.timeout,
+            ownership: call.ownership,
+            queued: call.queued,
         }
     }
 
@@ -625,18 +757,21 @@ impl BrewEntity {
 
     /// Handle a voice frame from Brew — inject into the downlink
     fn handle_voice_frame(&mut self, uuid: Uuid, _length_bits: u16, data: Vec<u8>) {
-        let Some(call) = self.active_calls.get_mut(&uuid) else {
-            // Voice frame for unknown call — might arrive before GROUP_TX or after GROUP_IDLE
+        let (maybe_ts, frame_count) = if let Some(call) = self.active_calls.get_mut(&uuid) {
+            call.frame_count += 1;
+            (call.ts, call.frame_count)
+        } else if let Some(call) = self.active_circuit_media.get_mut(&uuid) {
+            call.frame_count += 1;
+            (Some(call.ts), call.frame_count)
+        } else {
+            // Voice frame for unknown call — might arrive before setup or after release
             tracing::trace!("BrewEntity: voice frame for unknown uuid={} ({} bytes)", uuid, data.len());
             return;
         };
 
-        call.frame_count += 1;
-
-        // Check if resources have been allocated yet
-        let Some(ts) = call.ts else {
-            // Audio arrived before NetworkCallReady - drop it
-            if call.frame_count == 1 {
+        let Some(ts) = maybe_ts else {
+            // Audio arrived before resources were announced by CMCE.
+            if frame_count == 1 {
                 tracing::debug!(
                     "BrewEntity: voice frame arrived before resources allocated, uuid={}, dropping",
                     uuid
@@ -645,11 +780,10 @@ impl BrewEntity {
             return;
         };
 
-        // Log first voice frame per call
-        if call.frame_count == 1 {
+        if frame_count == 1 {
             tracing::info!(
                 "BrewEntity: voice frame #{} uuid={} len={} bytes ts={}",
-                call.frame_count,
+                frame_count,
                 uuid,
                 data.len(),
                 ts
@@ -693,6 +827,19 @@ impl BrewEntity {
             }
         }
 
+        for (uuid, call) in &self.active_circuit_media {
+            if call.ts != self.dltime.t {
+                continue;
+            }
+            let Some(jitter) = self.dl_jitter.get_mut(uuid) else {
+                continue;
+            };
+            jitter.maybe_warn_unhealthy(*uuid);
+            if let Some(frame) = jitter.pop_ready() {
+                to_send.push((call.ts, *uuid, jitter.target_frames(), frame));
+            }
+        }
+
         for (ts, uuid, target_frames, frame) in to_send {
             tracing::trace!(
                 "BrewEntity: playout uuid={} ts={} rx_seq={} age_ms={} target_frames={}",
@@ -730,8 +877,23 @@ impl BrewEntity {
             });
         }
 
+        // Release active circuit/PBX/phone media sessions too.
+        let circuit_sessions: Vec<Uuid> = self.active_circuit_media.keys().copied().collect();
+        for uuid in circuit_sessions {
+            self.dl_jitter.remove(&uuid);
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Brew,
+                dest: TetraEntity::Cmce,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid: uuid, cause: 0 }),
+            });
+        }
+
         // Clear hanging call tracking
         self.hanging_calls.clear();
+        self.active_circuit_media.clear();
+        self.ul_forwarded.clear();
         self.dl_jitter.clear();
     }
 
@@ -776,6 +938,21 @@ impl BrewEntity {
             self.hanging_calls.remove(&gssi);
         } else {
             tracing::debug!("BrewEntity: drop requested for unknown uuid={}", brew_uuid);
+        }
+    }
+
+    fn drop_network_circuit(&mut self, brew_uuid: Uuid) {
+        if let Some(media) = self.active_circuit_media.remove(&brew_uuid) {
+            tracing::info!(
+                "BrewEntity: dropping network circuit uuid={} call_id={} ts={}",
+                brew_uuid,
+                media.call_id,
+                media.ts
+            );
+            self.dl_jitter.remove(&brew_uuid);
+            self.ul_forwarded.retain(|_, fwd| fwd.uuid != brew_uuid);
+        } else {
+            tracing::debug!("BrewEntity: circuit drop requested for unknown uuid={}", brew_uuid);
         }
     }
 }
@@ -833,6 +1010,104 @@ impl TetraEntityTrait for BrewEntity {
             }) => {
                 self.rx_network_call_ready(brew_uuid, call_id, ts, usage);
             }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { brew_uuid, call }) => {
+                if !self.connected {
+                    tracing::debug!("BrewEntity: not connected, dropping NetworkCircuitSetupRequest uuid={}", brew_uuid);
+                    return;
+                }
+                let call = Self::from_network_circuit_call(&call);
+                let _ = self.command_sender.send(BrewCommand::SendSetupRequest { uuid: brew_uuid, call });
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendSetupAccept { uuid: brew_uuid });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject { brew_uuid, cause }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendSetupReject { uuid: brew_uuid, cause });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendCallAlert { uuid: brew_uuid });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest { brew_uuid, call }) => {
+                if !self.connected {
+                    tracing::debug!(
+                        "BrewEntity: not connected, dropping NetworkCircuitConnectRequest uuid={}",
+                        brew_uuid
+                    );
+                    return;
+                }
+                let call = Self::from_network_circuit_call(&call);
+                let _ = self.command_sender.send(BrewCommand::SendConnectRequest { uuid: brew_uuid, call });
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+                brew_uuid,
+                grant,
+                permission,
+            }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendConnectConfirm {
+                        uuid: brew_uuid,
+                        grant,
+                        permission,
+                    });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady { brew_uuid, call_id, ts }) => {
+                tracing::info!(
+                    "BrewEntity: network circuit media ready uuid={} call_id={} ts={}",
+                    brew_uuid,
+                    call_id,
+                    ts
+                );
+                self.active_circuit_media.insert(
+                    brew_uuid,
+                    ActiveCircuitMedia {
+                        call_id,
+                        ts,
+                        frame_count: 0,
+                    },
+                );
+                self.ul_forwarded.insert(
+                    ts,
+                    UlForwardedCall {
+                        uuid: brew_uuid,
+                        call_id,
+                        source_issi: 0,
+                        kind: UlForwardKind::Circuit,
+                        frame_count: 0,
+                    },
+                );
+                self.dl_jitter
+                    .entry(brew_uuid)
+                    .or_insert_with(|| VoiceJitterBuffer::with_initial_latency(self.brew_config.jitter_initial_latency_frames as usize));
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitDtmf {
+                brew_uuid,
+                length_bits,
+                data,
+            }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendDtmf {
+                        uuid: brew_uuid,
+                        length_bits,
+                        data,
+                    });
+                    tracing::info!("BrewEntity: SendDtmf uuid={}", brew_uuid);
+                } else {
+                    tracing::debug!("BrewEntity: not connected, dropping NetworkCircuitDtmf uuid={}", brew_uuid);
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid, cause }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendCallRelease { uuid: brew_uuid, cause });
+                }
+                self.drop_network_circuit(brew_uuid);
+            }
             SapMsgInner::MmSubscriberUpdate(update) => {
                 self.handle_subscriber_update(update);
             }
@@ -872,32 +1147,49 @@ impl BrewEntity {
         // }
 
         // If we're already forwarding on this timeslot, treat as a talker change/update
+        let mut evict_circuit_forward = false;
         if let Some(fwd) = self.ul_forwarded.get_mut(&ts) {
-            if fwd.call_id != call_id || fwd.dest_gssi != dest_gssi {
-                tracing::warn!(
-                    "BrewEntity: updating forwarded call on ts={} (was call_id={} gssi={}) -> (call_id={} gssi={})",
-                    ts,
-                    fwd.call_id,
-                    fwd.dest_gssi,
-                    call_id,
-                    dest_gssi
-                );
+            match fwd.kind {
+                UlForwardKind::Group { dest_gssi: current_gssi } => {
+                    if fwd.call_id != call_id || current_gssi != dest_gssi {
+                        tracing::warn!(
+                            "BrewEntity: updating forwarded call on ts={} (was call_id={} gssi={}) -> (call_id={} gssi={})",
+                            ts,
+                            fwd.call_id,
+                            current_gssi,
+                            call_id,
+                            dest_gssi
+                        );
+                    }
+
+                    fwd.call_id = call_id;
+                    fwd.source_issi = source_issi;
+                    fwd.kind = UlForwardKind::Group { dest_gssi };
+                    fwd.frame_count = 0;
+
+                    // Send GROUP_TX update for the new talker
+                    let _ = self.command_sender.send(BrewCommand::SendGroupTx {
+                        uuid: fwd.uuid,
+                        source_issi,
+                        dest_gssi,
+                        priority: 0,
+                        service: 0, // TETRA encoded speech
+                    });
+                    return;
+                }
+                UlForwardKind::Circuit => {
+                    tracing::warn!(
+                        "BrewEntity: ts {} currently used by circuit forwarding, replacing with group call_id={} gssi={}",
+                        ts,
+                        call_id,
+                        dest_gssi
+                    );
+                    evict_circuit_forward = true;
+                }
             }
-
-            fwd.call_id = call_id;
-            fwd.source_issi = source_issi;
-            fwd.dest_gssi = dest_gssi;
-            fwd.frame_count = 0;
-
-            // Send GROUP_TX update for the new talker
-            let _ = self.command_sender.send(BrewCommand::SendGroupTx {
-                uuid: fwd.uuid,
-                source_issi,
-                dest_gssi,
-                priority: 0,
-                service: 0, // TETRA encoded speech
-            });
-            return;
+        }
+        if evict_circuit_forward {
+            self.ul_forwarded.remove(&ts);
         }
 
         // Generate a UUID for this Brew session
@@ -927,7 +1219,7 @@ impl BrewEntity {
                 uuid,
                 call_id,
                 source_issi,
-                dest_gssi,
+                kind: UlForwardKind::Group { dest_gssi },
                 frame_count: 0,
             },
         );
@@ -944,15 +1236,23 @@ impl BrewEntity {
                     call_id
                 );
             }
-            tracing::info!(
-                "BrewEntity: local call transmission stopped, sending GROUP_IDLE to TetraPack: uuid={} frames={}",
-                fwd.uuid,
-                fwd.frame_count
-            );
-            let _ = self.command_sender.send(BrewCommand::SendGroupIdle {
-                uuid: fwd.uuid,
-                cause: 0, // Normal release
-            });
+            match fwd.kind {
+                UlForwardKind::Group { .. } => {
+                    tracing::info!(
+                        "BrewEntity: local call transmission stopped, sending GROUP_IDLE to TetraPack: uuid={} frames={}",
+                        fwd.uuid,
+                        fwd.frame_count
+                    );
+                    let _ = self.command_sender.send(BrewCommand::SendGroupIdle {
+                        uuid: fwd.uuid,
+                        cause: 0, // Normal release
+                    });
+                }
+                UlForwardKind::Circuit => {
+                    // Duplex circuit calls are not floor-controlled like group PTT.
+                    self.ul_forwarded.insert(ts, fwd);
+                }
+            }
         }
     }
 
@@ -967,11 +1267,18 @@ impl BrewEntity {
                     call_id
                 );
             }
-            tracing::debug!(
-                "BrewEntity: local call ended (already sent GROUP_IDLE during tx_stopped): uuid={} frames={}",
-                fwd.uuid,
-                fwd.frame_count
-            );
+            match fwd.kind {
+                UlForwardKind::Group { .. } => {
+                    tracing::debug!(
+                        "BrewEntity: local call ended (already sent GROUP_IDLE during tx_stopped): uuid={} frames={}",
+                        fwd.uuid,
+                        fwd.frame_count
+                    );
+                }
+                UlForwardKind::Circuit => {
+                    self.drop_network_circuit(fwd.uuid);
+                }
+            }
         } else {
             tracing::debug!("BrewEntity: local call ended on ts={} (already cleaned up during tx_stopped)", ts);
         }

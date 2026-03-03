@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::SharedConfig;
+use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, tetra_entities::TetraEntity, unimplemented_log};
 use tetra_core::{TimeslotOwner, TxReporter};
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
@@ -13,7 +14,7 @@ use tetra_pdus::cmce::{
     pdus::{
         d_alert::DAlert, d_call_proceeding::DCallProceeding, d_connect::DConnect, d_connect_acknowledge::DConnectAcknowledge,
         d_disconnect::DDisconnect, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased, d_tx_granted::DTxGranted, u_alert::UAlert,
-        u_connect::UConnect, u_disconnect::UDisconnect, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
+        u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
         u_tx_demand::UTxDemand,
     },
     structs::cmce_circuit::CmceCircuit,
@@ -22,7 +23,7 @@ use tetra_saps::{
     SapMsg, SapMsgInner,
     control::{
         brew::{BrewSubscriberAction, MmSubscriberUpdate},
-        call_control::{CallControl, Circuit},
+        call_control::{CallControl, Circuit, CircuitDlMediaSource, NetworkCircuitCall},
         enums::{circuit_mode_type::CircuitModeType, communication_type::CommunicationType},
     },
     lcmc::{
@@ -114,6 +115,43 @@ struct IndividualCall {
     simplex_duplex: bool,
     state: IndividualCallState,
     alert_sent: bool,
+    /// True when the called party lives behind Brew/TetraPack (PBX/phone/non-local ISSI).
+    called_over_brew: bool,
+    /// True when the calling party lives behind Brew/TetraPack.
+    calling_over_brew: bool,
+    /// Brew UUID when this call is bridged to TetraPack.
+    brew_uuid: Option<uuid::Uuid>,
+    /// Cached network call metadata for Brew bridged legs.
+    network_call: Option<NetworkCircuitCall>,
+    /// True once CONNECT_REQUEST has been sent for Brew-originated setup.
+    connect_request_sent: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DtmfKind {
+    /// ETSI EN 300 392-2 V3.x: DTMF type = 000 (digits present)
+    ToneStart,
+    /// ETSI EN 300 392-2 V3.x: DTMF type = 001
+    ToneEnd,
+    /// ETSI EN 300 392-2 V3.x: DTMF type = 010
+    NotSupported,
+    /// ETSI EN 300 392-2 V3.x: DTMF type = 011
+    NotSubscribed,
+    /// ETSI EN 300 392-2 V3.x: reserved values 100..111
+    Reserved(u8),
+    /// Legacy edition-1 style payload (length divisible by 4): digits only, no 3-bit type.
+    LegacyDigits,
+    /// Payload could not be interpreted according to either format.
+    Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DtmfDecoded {
+    kind: DtmfKind,
+    digits: String,
+    parsed_bits: usize,
+    full_len_bits: usize,
+    malformed: bool,
 }
 
 impl CcBsSubentity {
@@ -487,6 +525,201 @@ impl CcBsSubentity {
         queue.push_back(msg);
     }
 
+    fn decode_external_number(field: &Type3FieldGeneric) -> String {
+        if field.len == 0 {
+            return String::new();
+        }
+
+        // External number IE is commonly BCD-like packed digits.
+        // Keep best-effort conversion and drop filler nibbles.
+        let nibble_count = (field.len / 4).min(16);
+        let mut digits = String::with_capacity(nibble_count);
+        for i in 0..nibble_count {
+            let shift = (nibble_count - 1 - i) * 4;
+            let nibble = ((field.data >> shift) & 0x0f) as u8;
+            match nibble {
+                0..=9 => digits.push(char::from(b'0' + nibble)),
+                0x0a => digits.push('*'),
+                0x0b => digits.push('#'),
+                0x0c..=0x0f => {}
+                _ => {}
+            }
+        }
+        digits
+    }
+
+    #[inline]
+    fn decode_dtmf_digit(nibble: u8) -> Option<char> {
+        match nibble {
+            0..=9 => Some(char::from(b'0' + nibble)),
+            0x0a => Some('*'),
+            0x0b => Some('#'),
+            0x0c => Some('A'),
+            0x0d => Some('B'),
+            0x0e => Some('C'),
+            0x0f => Some('D'),
+            _ => None,
+        }
+    }
+
+    fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
+        let full_len_bits = field.len;
+        let len_bits = full_len_bits.min(64);
+        if len_bits == 0 {
+            return DtmfDecoded {
+                kind: DtmfKind::Invalid,
+                digits: String::new(),
+                parsed_bits: 0,
+                full_len_bits,
+                malformed: true,
+            };
+        }
+
+        // Legacy mechanism (edition-1): payload is 4-bit digit nibbles only.
+        // ETSI EN 300 392-2 V3.x note: new mechanism length is not divisible by 4.
+        if len_bits % 4 == 0 {
+            let nibble_count = len_bits / 4;
+            let mut digits = String::with_capacity(nibble_count);
+            for i in 0..nibble_count {
+                let shift = (nibble_count - 1 - i) * 4;
+                let nibble = ((field.data >> shift) & 0x0f) as u8;
+                if let Some(c) = Self::decode_dtmf_digit(nibble) {
+                    digits.push(c);
+                }
+            }
+            return DtmfDecoded {
+                kind: DtmfKind::LegacyDigits,
+                digits,
+                parsed_bits: len_bits,
+                full_len_bits,
+                malformed: false,
+            };
+        }
+
+        if len_bits < 3 {
+            return DtmfDecoded {
+                kind: DtmfKind::Invalid,
+                digits: String::new(),
+                parsed_bits: len_bits,
+                full_len_bits,
+                malformed: true,
+            };
+        }
+
+        let dtmf_type = ((field.data >> (len_bits - 3)) & 0x07) as u8;
+        let tail_bits = len_bits - 3;
+
+        let mut digits = String::new();
+        let mut malformed = false;
+        let kind = match dtmf_type {
+            0 => {
+                if tail_bits == 0 || tail_bits % 4 != 0 {
+                    malformed = true;
+                } else {
+                    let nibble_count = tail_bits / 4;
+                    digits.reserve(nibble_count);
+                    for i in 0..nibble_count {
+                        let shift = tail_bits - 4 * (i + 1);
+                        let nibble = ((field.data >> shift) & 0x0f) as u8;
+                        if let Some(c) = Self::decode_dtmf_digit(nibble) {
+                            digits.push(c);
+                        }
+                    }
+                }
+                DtmfKind::ToneStart
+            }
+            1 => {
+                if tail_bits != 0 {
+                    malformed = true;
+                }
+                DtmfKind::ToneEnd
+            }
+            2 => {
+                if tail_bits != 0 {
+                    malformed = true;
+                }
+                DtmfKind::NotSupported
+            }
+            3 => {
+                if tail_bits != 0 {
+                    malformed = true;
+                }
+                DtmfKind::NotSubscribed
+            }
+            4..=7 => {
+                if tail_bits != 0 {
+                    malformed = true;
+                }
+                DtmfKind::Reserved(dtmf_type)
+            }
+            _ => DtmfKind::Invalid,
+        };
+
+        DtmfDecoded {
+            kind,
+            digits,
+            parsed_bits: len_bits,
+            full_len_bits,
+            malformed,
+        }
+    }
+
+    fn build_network_circuit_call_from_u_setup(pdu: &USetup, source_issi: u32) -> NetworkCircuitCall {
+        let mut number = pdu
+            .external_subscriber_number
+            .as_ref()
+            .map(Self::decode_external_number)
+            .unwrap_or_default();
+        if number.is_empty() {
+            if let Some(short) = pdu.called_party_short_number_address {
+                number = short.to_string();
+            } else if let Some(ext) = pdu.called_party_extension {
+                number = ext.to_string();
+            }
+        }
+
+        NetworkCircuitCall {
+            source_issi,
+            destination: pdu.called_party_ssi.unwrap_or(0) as u32,
+            number,
+            priority: pdu.call_priority,
+            service: pdu.basic_service_information.speech_service.unwrap_or(0),
+            mode: pdu.basic_service_information.circuit_mode_type.into_raw() as u8,
+            duplex: pdu.simplex_duplex_selection as u8,
+            method: pdu.hook_method_selection as u8,
+            communication: pdu.basic_service_information.communication_type.into_raw() as u8,
+            grant: 0,
+            permission: pdu.request_to_transmit_send_data as u8,
+            timeout: CallTimeout::T5m.into_raw() as u8,
+            ownership: 1,
+            queued: 0,
+        }
+    }
+
+    #[inline]
+    fn has_external_called_party(pdu: &USetup, network_call: &NetworkCircuitCall) -> bool {
+        !network_call.number.is_empty() || pdu.external_subscriber_number.is_some() || pdu.called_party_short_number_address.is_some()
+    }
+
+    fn pack_type3_bits_to_bytes(field: &Type3FieldGeneric) -> (u16, Vec<u8>) {
+        // Type3FieldGeneric stores up to 64 bits of payload; longer fields are already truncated on parse.
+        let len_bits = field.len.min(64);
+        if len_bits == 0 {
+            return (0, Vec::new());
+        }
+
+        let mut out = vec![0u8; len_bits.div_ceil(8)];
+        let src = field.data;
+        for bit_idx in 0..len_bits {
+            let src_shift = len_bits - 1 - bit_idx;
+            let bit = ((src >> src_shift) & 0x1) as u8;
+            let byte_idx = bit_idx / 8;
+            let bit_pos = 7 - (bit_idx % 8);
+            out[byte_idx] |= bit << bit_pos;
+        }
+        (len_bits as u16, out)
+    }
+
     fn send_d_disconnect_individual(
         &mut self,
         queue: &mut MessageQueue,
@@ -561,7 +794,13 @@ impl CcBsSubentity {
         queue.push_back(msg);
     }
 
-    fn signal_umac_circuit_open(queue: &mut MessageQueue, call: &CmceCircuit, dltime: TdmaTime, peer_ts: Option<u8>) {
+    fn signal_umac_circuit_open(
+        queue: &mut MessageQueue,
+        call: &CmceCircuit,
+        dltime: TdmaTime,
+        peer_ts: Option<u8>,
+        dl_media_source: CircuitDlMediaSource,
+    ) {
         let circuit = Circuit {
             direction: call.direction,
             ts: call.ts,
@@ -570,6 +809,7 @@ impl CcBsSubentity {
             circuit_mode: call.circuit_mode,
             speech_service: call.speech_service,
             etee_encrypted: call.etee_encrypted,
+            dl_media_source,
         };
         let cmd = SapMsg {
             sap: Sap::Control,
@@ -667,7 +907,7 @@ impl CcBsSubentity {
         );
 
         // Signal UMAC to open DL+UL circuits
-        Self::signal_umac_circuit_open(queue, &circuit, message.dltime, None);
+        Self::signal_umac_circuit_open(queue, &circuit, message.dltime, None, CircuitDlMediaSource::LocalLoopback);
 
         // Build channel allocation timeslot mask for this call
         let mut timeslots = [false; 4];
@@ -825,38 +1065,39 @@ impl CcBsSubentity {
             panic!()
         };
 
-        // For P2P calls, only ISSI addressing is valid (CPTI=1 or 2).
-        // Reject short-number or other types to avoid unintended group ringing.
-        if pdu.called_party_type_identifier != 1 && pdu.called_party_type_identifier != 2 {
+        let is_issi_address = pdu.called_party_type_identifier == 1 || pdu.called_party_type_identifier == 2;
+        if !is_issi_address && !brew::is_active(&self.config) {
             tracing::warn!(
-                "U-SETUP P2P with non-ISSI called_party_type_identifier={} (rejecting)",
+                "U-SETUP P2P with non-ISSI called_party_type_identifier={} (rejecting, Brew disabled)",
                 pdu.called_party_type_identifier
             );
             return;
         }
-        if pdu.called_party_short_number_address.is_some()
-            || (pdu.called_party_extension.is_some() && pdu.called_party_type_identifier != 2)
+        if is_issi_address
+            && (pdu.called_party_short_number_address.is_some()
+                || (pdu.called_party_extension.is_some() && pdu.called_party_type_identifier != 2))
         {
             tracing::warn!("U-SETUP P2P with invalid called party fields (short number/extension mismatch), rejecting");
             return;
         }
 
-        let Some(called_ssi) = pdu.called_party_ssi else {
-            tracing::warn!("U-SETUP P2P without called_party_ssi, ignoring");
+        let called_ssi = pdu.called_party_ssi.map(|v| v as u32).unwrap_or(0);
+        let has_external_number = pdu.external_subscriber_number.is_some() || pdu.called_party_short_number_address.is_some();
+        if called_ssi == 0 && !has_external_number {
+            tracing::warn!("U-SETUP P2P without called ISSI/number, ignoring");
             return;
-        };
-        let called_addr = TetraAddress::new(called_ssi as u32, SsiType::Issi);
+        }
+
+        let called_addr = TetraAddress::new(called_ssi, SsiType::Issi);
+
+        // PBX/phone calls (no concrete local ISSI) always go through Brew.
+        if called_ssi == 0 {
+            self.rx_u_setup_p2p_over_brew(queue, message, pdu, calling_party, called_addr);
+            return;
+        }
 
         if !self.subscriber_groups.contains_key(&called_addr.ssi) {
-            tracing::info!(
-                "CMCE: rejecting U-SETUP P2P from ISSI {} to ISSI {} (callee not registered)",
-                calling_party.ssi,
-                called_addr.ssi
-            );
-            let call_id = self.circuits.get_next_call_id();
-            let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
-            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-            queue.push_back(msg);
+            self.rx_u_setup_p2p_over_brew(queue, message, pdu, calling_party, called_addr);
             return;
         }
 
@@ -1020,6 +1261,177 @@ impl CcBsSubentity {
                 simplex_duplex: pdu.simplex_duplex_selection,
                 state: IndividualCallState::Setup,
                 alert_sent: false,
+                called_over_brew: false,
+                calling_over_brew: false,
+                brew_uuid: None,
+                network_call: None,
+                connect_request_sent: false,
+            },
+        );
+    }
+
+    /// Handle U-SETUP for non-local ISSI, PBX and phone calls via Brew/TetraPack.
+    fn rx_u_setup_p2p_over_brew(
+        &mut self,
+        queue: &mut MessageQueue,
+        message: &SapMsg,
+        pdu: &USetup,
+        calling_party: TetraAddress,
+        called_addr: TetraAddress,
+    ) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            panic!()
+        };
+        let mut network_call = Self::build_network_circuit_call_from_u_setup(pdu, calling_party.ssi);
+
+        if !brew::is_active(&self.config) {
+            tracing::info!(
+                "CMCE: rejecting U-SETUP P2P from ISSI {} (Brew disabled, called_ssi={})",
+                calling_party.ssi,
+                called_addr.ssi
+            );
+            let call_id = self.circuits.get_next_call_id();
+            let sdu = Self::build_d_release(call_id, DisconnectCause::RequestedServiceNotAvailable);
+            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            queue.push_back(msg);
+            return;
+        }
+
+        if !self.config.state_read().network_connected {
+            tracing::info!(
+                "CMCE: rejecting U-SETUP over Brew src={} dst={} (backhaul disconnected)",
+                calling_party.ssi,
+                called_addr.ssi
+            );
+            let call_id = self.circuits.get_next_call_id();
+            let sdu = Self::build_d_release(call_id, DisconnectCause::RequestedServiceNotAvailable);
+            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            queue.push_back(msg);
+            return;
+        }
+
+        if !brew::is_brew_issi_routable(&self.config, calling_party.ssi) {
+            tracing::info!(
+                "CMCE: rejecting U-SETUP P2P over Brew src={} dst={} (source ISSI not routable)",
+                calling_party.ssi,
+                called_addr.ssi
+            );
+            let call_id = self.circuits.get_next_call_id();
+            let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
+            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            queue.push_back(msg);
+            return;
+        }
+
+        let has_external_called_party = Self::has_external_called_party(pdu, &network_call);
+        let destination_routable = network_call.destination == 0 || brew::is_brew_issi_routable(&self.config, network_call.destination);
+
+        if !has_external_called_party && !destination_routable {
+            tracing::info!(
+                "CMCE: rejecting U-SETUP P2P over Brew src={} dst={} (destination ISSI not routable)",
+                calling_party.ssi,
+                network_call.destination
+            );
+            let call_id = self.circuits.get_next_call_id();
+            let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
+            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            queue.push_back(msg);
+            return;
+        }
+
+        // Some radios include a placeholder/non-routable SSI together with an external number.
+        // For number-based routing over Brew, force destination to 0 in this case.
+        if has_external_called_party && !destination_routable && network_call.destination != 0 {
+            tracing::debug!(
+                "CMCE: overriding non-routable destination SSI {} with 0 for external-number call src={} number='{}'",
+                network_call.destination,
+                calling_party.ssi,
+                network_call.number
+            );
+            network_call.destination = 0;
+        }
+
+        // Allocate one bearer for the local MS. Remote network endpoint does not consume local RF resources.
+        let circuit_calling = {
+            let mut state = self.config.state_write();
+            match self.circuits.allocate_circuit_with_allocator(
+                Direction::Both,
+                pdu.basic_service_information.communication_type,
+                pdu.simplex_duplex_selection,
+                &mut state.timeslot_alloc,
+                TimeslotOwner::Cmce,
+            ) {
+                Ok(circuit) => circuit.clone(),
+                Err(e) => {
+                    tracing::info!(
+                        "CMCE: rejecting U-SETUP over Brew src={} dst={} (allocation failed: {:?})",
+                        calling_party.ssi,
+                        called_addr.ssi,
+                        e
+                    );
+                    let call_id = self.circuits.get_next_call_id();
+                    let sdu = Self::build_d_release(call_id, DisconnectCause::CongestionInInfrastructure);
+                    let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+                    queue.push_back(msg);
+                    return;
+                }
+            }
+        };
+
+        let call_id = circuit_calling.call_id;
+        let ts = circuit_calling.ts;
+        let usage = circuit_calling.usage;
+        let brew_uuid = uuid::Uuid::new_v4();
+
+        tracing::info!(
+            "CMCE: forwarding U-SETUP over Brew call_id={} src={} dst={} ts={} duplex={} number='{}' uuid={}",
+            call_id,
+            calling_party.ssi,
+            network_call.destination,
+            ts,
+            network_call.duplex,
+            network_call.number,
+            brew_uuid
+        );
+
+        // Acknowledge setup to the local caller; alert/connect follows remote state.
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T60s, pdu.hook_method_selection);
+
+        // Ask Brew entity to start the remote setup.
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Brew,
+            dltime: message.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
+                brew_uuid,
+                call: network_call.clone(),
+            }),
+        });
+
+        self.individual_calls.insert(
+            call_id,
+            IndividualCall {
+                calling_addr: calling_party,
+                called_addr,
+                calling_handle: prim.handle,
+                calling_link_id: prim.link_id,
+                calling_endpoint_id: prim.endpoint_id,
+                called_handle: None,
+                called_link_id: None,
+                called_endpoint_id: None,
+                calling_ts: ts,
+                called_ts: ts,
+                calling_usage: usage,
+                called_usage: usage,
+                simplex_duplex: pdu.simplex_duplex_selection,
+                state: IndividualCallState::Setup,
+                alert_sent: false,
+                called_over_brew: true,
+                calling_over_brew: false,
+                brew_uuid: Some(brew_uuid),
+                network_call: Some(network_call),
+                connect_request_sent: false,
             },
         );
     }
@@ -1067,6 +1479,25 @@ impl CcBsSubentity {
                 call.called_link_id = Some(prim.link_id);
                 call.called_endpoint_id = Some(prim.endpoint_id);
             }
+        }
+
+        if call.calling_over_brew {
+            let Some(brew_uuid) = call.brew_uuid else {
+                tracing::warn!("CMCE: Brew-originated call_id={} missing brew_uuid on U-ALERT", call_id);
+                return;
+            };
+            tracing::info!("CMCE: forwarding U-ALERT call_id={} to Brew uuid={}", call_id, brew_uuid);
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid }),
+            });
+            if let Some(call_mut) = self.individual_calls.get_mut(&call_id) {
+                call_mut.alert_sent = true;
+            }
+            return;
         }
 
         let calling_addr = call.calling_addr;
@@ -1141,6 +1572,64 @@ impl CcBsSubentity {
                 call.called_link_id = Some(prim.link_id);
                 call.called_endpoint_id = Some(prim.endpoint_id);
             }
+        }
+
+        if call_snapshot.calling_over_brew {
+            let Some(brew_uuid) = call_snapshot.brew_uuid else {
+                tracing::warn!("CMCE: Brew-originated call_id={} missing brew_uuid on U-CONNECT", call_id);
+                return;
+            };
+
+            if call_snapshot.connect_request_sent {
+                tracing::trace!(
+                    "CMCE: duplicate U-CONNECT for Brew-originated call_id={}, CONNECT_REQUEST already sent",
+                    call_id
+                );
+                return;
+            }
+
+            let mut call_info = call_snapshot.network_call.clone().unwrap_or(NetworkCircuitCall {
+                source_issi: call_snapshot.calling_addr.ssi,
+                destination: call_snapshot.called_addr.ssi,
+                number: call_snapshot.called_addr.ssi.to_string(),
+                priority: 0,
+                service: 0,
+                mode: CircuitModeType::TchS.into_raw() as u8,
+                duplex: call_snapshot.simplex_duplex as u8,
+                method: pdu.hook_method_selection as u8,
+                communication: CommunicationType::P2p.into_raw() as u8,
+                grant: 0,
+                permission: 0,
+                timeout: CallTimeout::T5m.into_raw() as u8,
+                ownership: 0,
+                queued: 0,
+            });
+            call_info.duplex = pdu.simplex_duplex_selection as u8;
+            call_info.method = pdu.hook_method_selection as u8;
+
+            tracing::info!(
+                "CMCE: forwarding U-CONNECT as Brew CONNECT_REQUEST uuid={} call_id={} dst={} number='{}'",
+                brew_uuid,
+                call_id,
+                call_info.destination,
+                call_info.number
+            );
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
+                    brew_uuid,
+                    call: call_info.clone(),
+                }),
+            });
+
+            if let Some(call_mut) = self.individual_calls.get_mut(&call_id) {
+                call_mut.connect_request_sent = true;
+                call_mut.network_call = Some(call_info);
+            }
+            return;
         }
 
         let calling_addr = call_snapshot.calling_addr;
@@ -1286,7 +1775,13 @@ impl CcBsSubentity {
             etee_encrypted: cached.pdu.basic_service_information.encryption_flag,
         };
         let duplex_peer = if calling_ts != called_ts { Some(called_ts) } else { None };
-        Self::signal_umac_circuit_open(queue, &circuit_calling, self.dltime, duplex_peer);
+        Self::signal_umac_circuit_open(
+            queue,
+            &circuit_calling,
+            self.dltime,
+            duplex_peer,
+            CircuitDlMediaSource::LocalLoopback,
+        );
 
         if called_ts != calling_ts {
             let circuit_called = CmceCircuit {
@@ -1301,7 +1796,13 @@ impl CcBsSubentity {
                 speech_service: cached.pdu.basic_service_information.speech_service,
                 etee_encrypted: cached.pdu.basic_service_information.encryption_flag,
             };
-            Self::signal_umac_circuit_open(queue, &circuit_called, self.dltime, Some(calling_ts));
+            Self::signal_umac_circuit_open(
+                queue,
+                &circuit_called,
+                self.dltime,
+                Some(calling_ts),
+                CircuitDlMediaSource::LocalLoopback,
+            );
         }
 
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
@@ -1333,7 +1834,8 @@ impl CcBsSubentity {
             CmcePduTypeUl::UDisconnect => self.rx_u_disconnect(_queue, message),
             CmcePduTypeUl::UAlert => self.rx_u_alert(_queue, message),
             CmcePduTypeUl::UConnect => self.rx_u_connect(_queue, message),
-            CmcePduTypeUl::UInfo | CmcePduTypeUl::UStatus | CmcePduTypeUl::UCallRestore => {
+            CmcePduTypeUl::UInfo => self.rx_u_info(_queue, message),
+            CmcePduTypeUl::UStatus | CmcePduTypeUl::UCallRestore => {
                 unimplemented_log!("{}", pdu_type);
             }
             _ => {
@@ -1354,8 +1856,11 @@ impl CcBsSubentity {
                     CircuitMgrCmd::SendDSetup(call_id, usage, ts) => {
                         // Get our cached D-SETUP, build a prim and send it down the stack
                         let Some(cached) = self.cached_setups.get_mut(&call_id) else {
-                            tracing::error!("No cached D-SETUP for call id {}", call_id);
-                            return;
+                            tracing::debug!(
+                                "CMCE: skipping D-SETUP resend for call_id={} (no cached D-SETUP; likely Brew-routed individual call)",
+                                call_id
+                            );
+                            continue;
                         };
                         if !cached.resend {
                             continue;
@@ -1386,31 +1891,99 @@ impl CcBsSubentity {
                             queue.push_back(prim);
 
                             if let Some(ind_call) = self.individual_calls.get(&call_id) {
-                                let sdu_calling = Self::build_d_release_from_d_setup(&cached.pdu, DisconnectCause::ExpiryOfTimer);
-                                let prim_calling = SapMsg {
-                                    sap: Sap::LcmcSap,
-                                    src: TetraEntity::Cmce,
-                                    dest: TetraEntity::Mle,
-                                    dltime: self.dltime,
-                                    msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
-                                        sdu: sdu_calling,
-                                        handle: ind_call.calling_handle,
-                                        endpoint_id: ind_call.calling_endpoint_id,
-                                        link_id: ind_call.calling_link_id,
-                                        layer2service: 0,
-                                        pdu_prio: 0,
-                                        layer2_qos: 0,
-                                        stealing_permission: false,
-                                        stealing_repeats_flag: false,
-                                        chan_alloc: None,
-                                        main_address: ind_call.calling_addr,
-                                        tx_reporter: None,
-                                    }),
-                                };
-                                queue.push_back(prim_calling);
+                                if !ind_call.calling_over_brew {
+                                    let sdu_calling = Self::build_d_release_from_d_setup(&cached.pdu, DisconnectCause::ExpiryOfTimer);
+                                    let prim_calling = SapMsg {
+                                        sap: Sap::LcmcSap,
+                                        src: TetraEntity::Cmce,
+                                        dest: TetraEntity::Mle,
+                                        dltime: self.dltime,
+                                        msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                                            sdu: sdu_calling,
+                                            handle: ind_call.calling_handle,
+                                            endpoint_id: ind_call.calling_endpoint_id,
+                                            link_id: ind_call.calling_link_id,
+                                            layer2service: 0,
+                                            pdu_prio: 0,
+                                            layer2_qos: 0,
+                                            stealing_permission: false,
+                                            stealing_repeats_flag: false,
+                                            chan_alloc: None,
+                                            main_address: ind_call.calling_addr,
+                                            tx_reporter: None,
+                                        }),
+                                    };
+                                    queue.push_back(prim_calling);
+                                }
                             }
                         } else {
-                            tracing::error!("No cached D-SETUP for call id {}", call_id);
+                            tracing::warn!("No cached D-SETUP for call id {} during timer-close", call_id);
+                            if let Some(ind_call) = self.individual_calls.get(&call_id) {
+                                if !ind_call.calling_over_brew {
+                                    let sdu_calling = Self::build_d_release(call_id, DisconnectCause::ExpiryOfTimer);
+                                    let prim_calling = if ind_call.state == IndividualCallState::Active {
+                                        Self::build_sapmsg_stealing(
+                                            sdu_calling,
+                                            self.dltime,
+                                            ind_call.calling_addr,
+                                            ind_call.calling_ts,
+                                            Some(ind_call.calling_usage),
+                                        )
+                                    } else {
+                                        Self::build_sapmsg_direct(
+                                            sdu_calling,
+                                            self.dltime,
+                                            ind_call.calling_addr,
+                                            ind_call.calling_handle,
+                                            ind_call.calling_link_id,
+                                            ind_call.calling_endpoint_id,
+                                        )
+                                    };
+                                    queue.push_back(prim_calling);
+                                } else if !ind_call.called_over_brew {
+                                    let sdu_called = Self::build_d_release(call_id, DisconnectCause::ExpiryOfTimer);
+                                    let prim_called = if ind_call.state == IndividualCallState::Active {
+                                        Self::build_sapmsg_stealing(
+                                            sdu_called,
+                                            self.dltime,
+                                            ind_call.called_addr,
+                                            ind_call.called_ts,
+                                            Some(ind_call.called_usage),
+                                        )
+                                    } else if let (Some(handle), Some(link_id), Some(endpoint_id)) =
+                                        (ind_call.called_handle, ind_call.called_link_id, ind_call.called_endpoint_id)
+                                    {
+                                        Self::build_sapmsg_direct(
+                                            sdu_called,
+                                            self.dltime,
+                                            ind_call.called_addr,
+                                            handle,
+                                            link_id,
+                                            endpoint_id,
+                                        )
+                                    } else {
+                                        Self::build_sapmsg(sdu_called, None, self.dltime, ind_call.called_addr, None)
+                                    };
+                                    queue.push_back(prim_called);
+                                }
+                            }
+                        }
+
+                        if let Some(ind_call) = self.individual_calls.get(&call_id) {
+                            if (ind_call.called_over_brew || ind_call.calling_over_brew)
+                                && let Some(brew_uuid) = ind_call.brew_uuid
+                            {
+                                queue.push_back(SapMsg {
+                                    sap: Sap::Control,
+                                    src: TetraEntity::Cmce,
+                                    dest: TetraEntity::Brew,
+                                    dltime: self.dltime,
+                                    msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease {
+                                        brew_uuid,
+                                        cause: DisconnectCause::ExpiryOfTimer.into_raw() as u8,
+                                    }),
+                                });
+                            }
                         }
 
                         // Clean up call state
@@ -1519,6 +2092,9 @@ impl CcBsSubentity {
             return;
         };
 
+        let send_calling_leg = !call.calling_over_brew;
+        let send_called_leg = !call.called_over_brew;
+
         const SETUP_RELEASE_REPEATS: usize = 3;
 
         if call.state == IndividualCallState::Active {
@@ -1535,17 +2111,21 @@ impl CcBsSubentity {
                 } else {
                     Self::build_d_release(call_id, disconnect_cause)
                 };
-                let prim_calling = Self::build_sapmsg_stealing(
-                    sdu_calling,
-                    self.dltime,
-                    call.calling_addr,
-                    call.calling_ts,
-                    Some(call.calling_usage),
-                );
-                let prim_called =
-                    Self::build_sapmsg_stealing(sdu_called, self.dltime, call.called_addr, call.called_ts, Some(call.called_usage));
-                queue.push_back(prim_calling);
-                queue.push_back(prim_called);
+                if send_calling_leg {
+                    let prim_calling = Self::build_sapmsg_stealing(
+                        sdu_calling,
+                        self.dltime,
+                        call.calling_addr,
+                        call.calling_ts,
+                        Some(call.calling_usage),
+                    );
+                    queue.push_back(prim_calling);
+                }
+                if send_called_leg {
+                    let prim_called =
+                        Self::build_sapmsg_stealing(sdu_called, self.dltime, call.called_addr, call.called_ts, Some(call.called_usage));
+                    queue.push_back(prim_called);
+                }
             }
         } else {
             // Send D-RELEASE to calling and called MS via MCCH (no LLC link context).
@@ -1561,11 +2141,15 @@ impl CcBsSubentity {
                 } else {
                     Self::build_d_release(call_id, disconnect_cause)
                 };
-                let prim_calling = Self::build_sapmsg(sdu_calling, None, self.dltime, call.calling_addr, None);
-                queue.push_back(prim_calling);
+                if send_calling_leg {
+                    let prim_calling = Self::build_sapmsg(sdu_calling, None, self.dltime, call.calling_addr, None);
+                    queue.push_back(prim_calling);
+                }
 
-                let prim_called = Self::build_sapmsg(sdu_called, None, self.dltime, call.called_addr, None);
-                queue.push_back(prim_called);
+                if send_called_leg {
+                    let prim_called = Self::build_sapmsg(sdu_called, None, self.dltime, call.called_addr, None);
+                    queue.push_back(prim_called);
+                }
             }
         }
 
@@ -1590,6 +2174,21 @@ impl CcBsSubentity {
             self.release_timeslot(ts);
         }
         self.cached_setups.remove(&call_id);
+
+        if (call.called_over_brew || call.calling_over_brew) && disconnect_cause != DisconnectCause::SwmiRequestedDisconnection {
+            if let Some(brew_uuid) = call.brew_uuid {
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    dltime: self.dltime,
+                    msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease {
+                        brew_uuid,
+                        cause: disconnect_cause.into_raw() as u8,
+                    }),
+                });
+            }
+        }
     }
 
     fn feature_check_u_setup(pdu: &USetup) -> bool {
@@ -1626,13 +2225,16 @@ impl CcBsSubentity {
         if pdu.clir_control != 0 {
             unimplemented_log!("clir_control not supported: {}", pdu.clir_control);
         };
-        if pdu.called_party_ssi.is_none() || pdu.called_party_short_number_address.is_some() || pdu.called_party_extension.is_some() {
-            unimplemented_log!("we only support ssi-based calling");
+        if pdu.called_party_ssi.is_none() && pdu.called_party_short_number_address.is_none() && pdu.external_subscriber_number.is_none() {
+            unimplemented_log!("U-SETUP called party not set (no SSI, short number or external number)");
+        };
+        if pdu.called_party_extension.is_some() && pdu.called_party_type_identifier != 2 {
+            unimplemented_log!(
+                "U-SETUP called_party_extension present with unexpected called_party_type_identifier={}",
+                pdu.called_party_type_identifier
+            );
         };
         // Then, we warn about some other unhandled/unsupported fields
-        if let Some(v) = &pdu.external_subscriber_number {
-            unimplemented_log!("external_subscriber_number not supported: {:?}", v);
-        };
         if let Some(v) = &pdu.facility {
             unimplemented_log!("facility not supported: {:?}", v);
         };
@@ -1851,6 +2453,131 @@ impl CcBsSubentity {
         }
     }
 
+    /// Handle U-INFO from MS. For Brew-routed individual calls, forward DTMF payload to Brew.
+    fn rx_u_info(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+
+        let pdu = match UInfo::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- U-INFO {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing U-INFO: {:?}", e);
+                return;
+            }
+        };
+
+        let call_id = pdu.call_identifier;
+        let Some(call) = self.individual_calls.get(&call_id).cloned() else {
+            tracing::trace!("U-INFO for unknown/non-individual call_id={}, ignoring", call_id);
+            return;
+        };
+
+        if !call.called_over_brew && !call.calling_over_brew {
+            tracing::trace!("U-INFO call_id={} is local individual call, no Brew forwarding", call_id);
+            return;
+        }
+
+        let Some(brew_uuid) = call.brew_uuid else {
+            tracing::warn!("U-INFO call_id={} marked Brew-routed but missing brew_uuid", call_id);
+            return;
+        };
+
+        let Some(dtmf) = pdu.dtmf.as_ref() else {
+            tracing::trace!(
+                "U-INFO call_id={} has no DTMF element (modify={:?} facility={} proprietary={}), ignoring",
+                call_id,
+                pdu.modify,
+                pdu.facility.is_some(),
+                pdu.proprietary.is_some()
+            );
+            return;
+        };
+
+        let decoded = Self::decode_dtmf(dtmf);
+        if decoded.full_len_bits > decoded.parsed_bits {
+            tracing::warn!(
+                "U-INFO call_id={} DTMF payload is {} bits, parser retained only first {} bits",
+                call_id,
+                decoded.full_len_bits,
+                decoded.parsed_bits
+            );
+        }
+        if decoded.malformed {
+            tracing::warn!(
+                "U-INFO call_id={} has malformed DTMF payload (len={} bits, parsed={} bits, data=0x{:X}, kind={:?})",
+                call_id,
+                decoded.full_len_bits,
+                decoded.parsed_bits,
+                dtmf.data,
+                decoded.kind
+            );
+        }
+
+        match decoded.kind {
+            DtmfKind::ToneStart | DtmfKind::LegacyDigits => {}
+            DtmfKind::ToneEnd => {
+                tracing::trace!("U-INFO call_id={} DTMF tone end", call_id);
+                return;
+            }
+            DtmfKind::NotSupported => {
+                tracing::info!("U-INFO call_id={} DTMF not supported indication", call_id);
+                return;
+            }
+            DtmfKind::NotSubscribed => {
+                tracing::info!("U-INFO call_id={} DTMF not subscribed indication", call_id);
+                return;
+            }
+            DtmfKind::Reserved(v) => {
+                tracing::trace!("U-INFO call_id={} DTMF reserved type value {}", call_id, v);
+                return;
+            }
+            DtmfKind::Invalid => {
+                tracing::trace!("U-INFO call_id={} invalid/empty DTMF payload, ignoring", call_id);
+                return;
+            }
+        }
+        if decoded.digits.is_empty() {
+            tracing::trace!("U-INFO call_id={} DTMF has no decoded digits, ignoring", call_id);
+            return;
+        }
+
+        let (length_bits, data) = Self::pack_type3_bits_to_bytes(dtmf);
+        if length_bits == 0 || data.is_empty() {
+            tracing::debug!("U-INFO call_id={} has empty DTMF payload, ignoring", call_id);
+            return;
+        }
+
+        tracing::info!(
+            "U-INFO (individual Brew) call_id={} uuid={} dtmf_kind={:?} digits='{}' dtmf_bits={} dtmf_bytes={}",
+            call_id,
+            brew_uuid,
+            decoded.kind,
+            decoded.digits,
+            length_bits,
+            data.len()
+        );
+
+        for ch in decoded.digits.chars() {
+            let digit = ch as u8;
+
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitDtmf {
+                    brew_uuid,
+                    length_bits: 8,
+                    data: vec![digit],
+                }),
+            });
+        }
+    }
+
     /// Handle U-RELEASE: radio explicitly releases the call
     fn rx_u_release(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
@@ -1875,7 +2602,10 @@ impl CcBsSubentity {
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
             tracing::info!("U-RELEASE (individual) call_id={} cause={}", call_id, disconnect_cause);
             let sender_is_called = sender.ssi == call_snapshot.called_addr.ssi;
-            if call_snapshot.state == IndividualCallState::Active || sender_is_called {
+            if !call_snapshot.called_over_brew
+                && !call_snapshot.calling_over_brew
+                && (call_snapshot.state == IndividualCallState::Active || sender_is_called)
+            {
                 self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause);
             }
             self.release_individual_call(queue, call_id, disconnect_cause);
@@ -1913,7 +2643,10 @@ impl CcBsSubentity {
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
             tracing::info!("U-DISCONNECT (individual) call_id={} cause={}", call_id, disconnect_cause);
             let sender_is_called = sender.ssi == call_snapshot.called_addr.ssi;
-            if call_snapshot.state == IndividualCallState::Active || sender_is_called {
+            if !call_snapshot.called_over_brew
+                && !call_snapshot.calling_over_brew
+                && (call_snapshot.state == IndividualCallState::Active || sender_is_called)
+            {
                 self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause);
             }
             self.release_individual_call(queue, call_id, disconnect_cause);
@@ -1997,10 +2730,553 @@ impl CcBsSubentity {
             CallControl::NetworkCallEnd { brew_uuid } => {
                 self.rx_network_call_end(queue, brew_uuid);
             }
+            CallControl::NetworkCircuitSetupRequest { brew_uuid, call } => {
+                self.rx_network_circuit_setup_request(queue, brew_uuid, call);
+            }
+            CallControl::NetworkCircuitSetupAccept { brew_uuid } => {
+                self.rx_network_circuit_setup_accept(brew_uuid);
+            }
+            CallControl::NetworkCircuitSetupReject { brew_uuid, cause } => {
+                self.rx_network_circuit_setup_reject(queue, brew_uuid, cause);
+            }
+            CallControl::NetworkCircuitAlert { brew_uuid } => {
+                self.rx_network_circuit_alert(queue, brew_uuid);
+            }
+            CallControl::NetworkCircuitConnectRequest { brew_uuid, call } => {
+                self.rx_network_circuit_connect_request(queue, brew_uuid, call);
+            }
+            CallControl::NetworkCircuitConnectConfirm {
+                brew_uuid,
+                grant,
+                permission,
+            } => {
+                self.rx_network_circuit_connect_confirm(queue, brew_uuid, grant, permission);
+            }
+            CallControl::NetworkCircuitMediaReady { brew_uuid, .. } => {
+                tracing::trace!("CMCE: ignoring unexpected NetworkCircuitMediaReady uuid={}", brew_uuid);
+            }
+            CallControl::NetworkCircuitRelease { brew_uuid, cause } => {
+                self.rx_network_circuit_release(queue, brew_uuid, cause);
+            }
             _ => {
                 tracing::warn!("Unexpected CallControl message: {:?}", call_control);
             }
         }
+    }
+
+    fn find_brew_individual_call(&self, brew_uuid: uuid::Uuid) -> Option<(u16, IndividualCall)> {
+        self.individual_calls
+            .iter()
+            .find(|(_, c)| (c.called_over_brew || c.calling_over_brew) && c.brew_uuid == Some(brew_uuid))
+            .map(|(id, call)| (*id, call.clone()))
+    }
+
+    fn rx_network_circuit_setup_request(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, call: NetworkCircuitCall) {
+        let called_addr = TetraAddress::new(call.destination, SsiType::Issi);
+        if call.destination == 0 {
+            tracing::info!(
+                "CMCE: rejecting Brew setup request uuid={} src={} dst=0 number='{}' (missing called ISSI)",
+                brew_uuid,
+                call.source_issi,
+                call.number
+            );
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
+                    brew_uuid,
+                    cause: DisconnectCause::CalledPartyNotReachable.into_raw() as u8,
+                }),
+            });
+            return;
+        }
+
+        if !self.subscriber_groups.contains_key(&called_addr.ssi) {
+            tracing::info!(
+                "CMCE: rejecting Brew setup request uuid={} src={} dst={} number='{}' (called ISSI not registered locally)",
+                brew_uuid,
+                call.source_issi,
+                call.destination,
+                call.number
+            );
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                dltime: self.dltime,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
+                    brew_uuid,
+                    cause: DisconnectCause::CalledPartyNotReachable.into_raw() as u8,
+                }),
+            });
+            return;
+        }
+
+        let communication = CommunicationType::try_from(call.communication as u64).unwrap_or(CommunicationType::P2p);
+        let simplex_duplex = call.duplex != 0;
+
+        let circuit_called = {
+            let mut state = self.config.state_write();
+            match self.circuits.allocate_circuit_with_allocator(
+                Direction::Both,
+                communication,
+                simplex_duplex,
+                &mut state.timeslot_alloc,
+                TimeslotOwner::Cmce,
+            ) {
+                Ok(circuit) => circuit.clone(),
+                Err(e) => {
+                    tracing::info!(
+                        "CMCE: rejecting Brew setup request uuid={} src={} dst={} (allocation failed: {:?})",
+                        brew_uuid,
+                        call.source_issi,
+                        call.destination,
+                        e
+                    );
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Cmce,
+                        dest: TetraEntity::Brew,
+                        dltime: self.dltime,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
+                            brew_uuid,
+                            cause: DisconnectCause::CongestionInInfrastructure.into_raw() as u8,
+                        }),
+                    });
+                    return;
+                }
+            }
+        };
+
+        let call_id = circuit_called.call_id;
+        let ts = circuit_called.ts;
+        let usage = circuit_called.usage;
+        let call_timeout = CallTimeout::try_from(call.timeout as u64).unwrap_or(CallTimeout::T5m);
+        let circuit_mode = CircuitModeType::try_from(call.mode as u64).unwrap_or(CircuitModeType::TchS);
+
+        tracing::info!(
+            "CMCE: accepting Brew setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",
+            brew_uuid,
+            call_id,
+            call.source_issi,
+            call.destination,
+            ts,
+            simplex_duplex,
+            call.number
+        );
+
+        // Acknowledge setup to Brew first so network call state progresses while local MS is alerted.
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Brew,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }),
+        });
+
+        let d_setup = DSetup {
+            call_identifier: call_id,
+            call_time_out: call_timeout,
+            hook_method_selection: true,
+            simplex_duplex_selection: simplex_duplex,
+            basic_service_information: BasicServiceInformation {
+                circuit_mode_type: circuit_mode,
+                encryption_flag: false,
+                communication_type: communication,
+                slots_per_frame: None,
+                speech_service: Some(call.service),
+            },
+            transmission_grant: TransmissionGrant::NotGranted,
+            transmission_request_permission: false,
+            call_priority: call.priority,
+            notification_indicator: None,
+            temporary_address: None,
+            calling_party_address_ssi: Some(call.source_issi),
+            calling_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        tracing::debug!("-> {:?}", d_setup);
+
+        self.cached_setups.insert(
+            call_id,
+            CachedSetup {
+                pdu: d_setup,
+                dest_addr: called_addr,
+                resend: false, // no late-entry resends for individual calls
+            },
+        );
+
+        let d_setup_ref = &self.cached_setups.get(&call_id).unwrap().pdu;
+        let mut setup_sdu = BitBuffer::new_autoexpand(80);
+        d_setup_ref.to_bitbuf(&mut setup_sdu).expect("Failed to serialize DSetup");
+        setup_sdu.seek(0);
+        let setup_msg = Self::build_sapmsg(setup_sdu, None, self.dltime, called_addr, None);
+        queue.push_back(setup_msg);
+
+        self.individual_calls.insert(
+            call_id,
+            IndividualCall {
+                calling_addr: TetraAddress::new(call.source_issi, SsiType::Issi),
+                called_addr,
+                calling_handle: 0,
+                calling_link_id: 0,
+                calling_endpoint_id: 0,
+                called_handle: None,
+                called_link_id: None,
+                called_endpoint_id: None,
+                calling_ts: ts,
+                called_ts: ts,
+                calling_usage: usage,
+                called_usage: usage,
+                simplex_duplex,
+                state: IndividualCallState::Setup,
+                alert_sent: false,
+                called_over_brew: false,
+                calling_over_brew: true,
+                brew_uuid: Some(brew_uuid),
+                network_call: Some(call),
+                connect_request_sent: false,
+            },
+        );
+    }
+
+    fn rx_network_circuit_setup_accept(&mut self, brew_uuid: uuid::Uuid) {
+        if self.find_brew_individual_call(brew_uuid).is_some() {
+            tracing::info!("CMCE: Brew setup accepted uuid={}", brew_uuid);
+        } else {
+            tracing::debug!("CMCE: Brew setup accept for unknown uuid={}", brew_uuid);
+        }
+    }
+
+    fn rx_network_circuit_setup_reject(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, cause: u8) {
+        let Some((call_id, _)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!("CMCE: Brew setup reject for unknown uuid={} cause={}", brew_uuid, cause);
+            return;
+        };
+        let mapped = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::RequestedServiceNotAvailable);
+        tracing::info!(
+            "CMCE: Brew setup rejected uuid={} call_id={} cause={} ({:?})",
+            brew_uuid,
+            call_id,
+            cause,
+            mapped
+        );
+        self.release_individual_call(queue, call_id, mapped);
+    }
+
+    fn rx_network_circuit_alert(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid) {
+        let Some((call_id, call)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!("CMCE: Brew alert for unknown uuid={}", brew_uuid);
+            return;
+        };
+
+        if call.alert_sent {
+            tracing::trace!("CMCE: Brew alert already signalled for call_id={}", call_id);
+            return;
+        }
+
+        self.send_d_alert_individual(
+            queue,
+            self.dltime,
+            call_id,
+            call.simplex_duplex,
+            call.calling_addr,
+            call.calling_handle,
+            call.calling_link_id,
+            call.calling_endpoint_id,
+            CallTimeoutSetupPhase::T60s,
+        );
+
+        if let Some(call_mut) = self.individual_calls.get_mut(&call_id) {
+            call_mut.alert_sent = true;
+        }
+    }
+
+    fn rx_network_circuit_connect_request(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, call_info: NetworkCircuitCall) {
+        let Some((call_id, call)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!("CMCE: Brew connect request for unknown uuid={}", brew_uuid);
+            return;
+        };
+
+        if call.calling_over_brew {
+            tracing::warn!(
+                "CMCE: unexpected Brew CONNECT_REQUEST for Brew-originated call uuid={} call_id={}, treating as CONNECT_CONFIRM",
+                brew_uuid,
+                call_id
+            );
+            self.rx_network_circuit_connect_confirm(queue, brew_uuid, call_info.grant, call_info.permission);
+            return;
+        }
+
+        if call.state == IndividualCallState::Active {
+            tracing::trace!("CMCE: Brew connect request for active call_id={}, ignoring", call_id);
+            return;
+        }
+
+        tracing::info!(
+            "CMCE: Brew connect request uuid={} call_id={} dst={} number='{}'",
+            brew_uuid,
+            call_id,
+            call_info.destination,
+            call_info.number
+        );
+
+        if let Some(call_mut) = self.individual_calls.get_mut(&call_id) {
+            call_mut.network_call = Some(call_info.clone());
+        }
+
+        let mut calling_timeslots = [false; 4];
+        calling_timeslots[call.calling_ts as usize - 1] = true;
+        let chan_alloc_calling = CmceChanAllocReq {
+            usage: Some(call.calling_usage),
+            alloc_type: ChanAllocType::Replace,
+            carrier: None,
+            timeslots: calling_timeslots,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: false,
+            simplex_duplex_selection: call.simplex_duplex,
+            transmission_grant: TransmissionGrant::Granted,
+            transmission_request_permission: false,
+            call_ownership: true,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        tracing::info!("-> {:?}", d_connect);
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+
+        let connect_msg = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            dltime: self.dltime,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: call.calling_handle,
+                endpoint_id: call.calling_endpoint_id,
+                link_id: call.calling_link_id,
+                layer2service: 0,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: Some(chan_alloc_calling),
+                main_address: call.calling_addr,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(connect_msg);
+
+        let circuit = CmceCircuit {
+            ts_created: self.dltime,
+            direction: Direction::Both,
+            ts: call.calling_ts,
+            call_id,
+            usage: call.calling_usage,
+            circuit_mode: CircuitModeType::TchS,
+            comm_type: CommunicationType::P2p,
+            simplex_duplex: call.simplex_duplex,
+            speech_service: Some(0),
+            etee_encrypted: false,
+        };
+        Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None, CircuitDlMediaSource::SwMI);
+
+        if let Some(call_mut) = self.individual_calls.get_mut(&call_id) {
+            call_mut.state = IndividualCallState::Active;
+        }
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Brew,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+                brew_uuid,
+                grant: 1,
+                permission: 0,
+            }),
+        });
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Brew,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
+                brew_uuid,
+                call_id,
+                ts: call.calling_ts,
+            }),
+        });
+    }
+
+    fn rx_network_circuit_connect_confirm(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, grant: u8, permission: u8) {
+        let Some((call_id, call)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!(
+                "CMCE: Brew connect confirm for unknown uuid={} grant={} permission={}",
+                brew_uuid,
+                grant,
+                permission
+            );
+            return;
+        };
+
+        if !call.calling_over_brew {
+            tracing::trace!(
+                "CMCE: ignoring unexpected Brew connect confirm for local-origin call uuid={} call_id={}",
+                brew_uuid,
+                call_id
+            );
+            return;
+        }
+
+        if call.state == IndividualCallState::Active {
+            tracing::trace!("CMCE: Brew connect confirm for active call_id={}, ignoring", call_id);
+            return;
+        }
+
+        let (Some(called_handle), Some(called_link_id), Some(called_endpoint_id)) =
+            (call.called_handle, call.called_link_id, call.called_endpoint_id)
+        else {
+            tracing::warn!(
+                "CMCE: Brew connect confirm uuid={} call_id={} before local U-CONNECT context is known",
+                brew_uuid,
+                call_id
+            );
+            return;
+        };
+
+        tracing::info!(
+            "CMCE: Brew connect confirm uuid={} call_id={} grant={} permission={}",
+            brew_uuid,
+            call_id,
+            grant,
+            permission
+        );
+
+        let mut called_timeslots = [false; 4];
+        called_timeslots[call.called_ts as usize - 1] = true;
+        let chan_alloc_called = CmceChanAllocReq {
+            usage: Some(call.called_usage),
+            alloc_type: ChanAllocType::Replace,
+            carrier: None,
+            timeslots: called_timeslots,
+            ul_dl_assigned: UlDlAssignment::Both,
+        };
+
+        let grant_enum = TransmissionGrant::try_from((grant & 0x03) as u64).unwrap_or(TransmissionGrant::Granted);
+        let d_connect_ack = DConnectAcknowledge {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m.into_raw() as u8,
+            transmission_grant: grant_enum.into_raw() as u8,
+            transmission_request_permission: permission != 0,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        tracing::info!("-> {:?}", d_connect_ack);
+        let mut ack_sdu = BitBuffer::new_autoexpand(28);
+        d_connect_ack
+            .to_bitbuf(&mut ack_sdu)
+            .expect("Failed to serialize DConnectAcknowledge");
+        ack_sdu.seek(0);
+
+        let ack_msg = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            dltime: self.dltime,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: ack_sdu,
+                handle: called_handle,
+                endpoint_id: called_endpoint_id,
+                link_id: called_link_id,
+                layer2service: 0,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: Some(chan_alloc_called),
+                main_address: call.called_addr,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(ack_msg);
+
+        let (circuit_mode, comm_type, speech_service, etee_encrypted) = if let Some(cached) = self.cached_setups.get(&call_id) {
+            (
+                cached.pdu.basic_service_information.circuit_mode_type,
+                cached.pdu.basic_service_information.communication_type,
+                cached.pdu.basic_service_information.speech_service,
+                cached.pdu.basic_service_information.encryption_flag,
+            )
+        } else {
+            (CircuitModeType::TchS, CommunicationType::P2p, Some(0), false)
+        };
+
+        let circuit = CmceCircuit {
+            ts_created: self.dltime,
+            direction: Direction::Both,
+            ts: call.called_ts,
+            call_id,
+            usage: call.called_usage,
+            circuit_mode,
+            comm_type,
+            simplex_duplex: call.simplex_duplex,
+            speech_service,
+            etee_encrypted,
+        };
+        Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None, CircuitDlMediaSource::SwMI);
+
+        if let Some(call_mut) = self.individual_calls.get_mut(&call_id) {
+            call_mut.state = IndividualCallState::Active;
+            call_mut.connect_request_sent = false;
+        }
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Brew,
+            dltime: self.dltime,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
+                brew_uuid,
+                call_id,
+                ts: call.called_ts,
+            }),
+        });
+    }
+
+    fn rx_network_circuit_release(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, cause: u8) {
+        let Some((call_id, _)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!("CMCE: Brew release for unknown uuid={} cause={}", brew_uuid, cause);
+            return;
+        };
+        let mapped = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection);
+        tracing::info!(
+            "CMCE: Brew release uuid={} call_id={} cause={} ({:?})",
+            brew_uuid,
+            call_id,
+            cause,
+            mapped
+        );
+        self.release_individual_call(queue, call_id, mapped);
     }
 
     /// Handle network-initiated group call start
@@ -2122,7 +3398,7 @@ impl CcBsSubentity {
         );
 
         // Signal UMAC to open DL and UL circuits
-        Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None);
+        Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None, CircuitDlMediaSource::LocalLoopback);
 
         tracing::debug!(
             "CMCE: sending D-SETUP for NEW call call_id={} gssi={} (network-initiated)",

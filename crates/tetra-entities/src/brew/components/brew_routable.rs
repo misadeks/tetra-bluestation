@@ -14,6 +14,17 @@ fn is_tetrapack(config: &SharedConfig) -> bool {
     brew_config.host == "core.tetrapack.online"
 }
 
+#[inline]
+fn is_pbx_gateway_issi(config: &SharedConfig, issi: u32) -> bool {
+    let Some(brew_config) = &config.config().brew else {
+        return false;
+    };
+    brew_config
+        .pbx_gateway_issis
+        .as_ref()
+        .is_some_and(|allowed| allowed.contains(&issi))
+}
+
 /// Determine if a given GSSI should be routed over Brew, or is restricted to local handling
 pub fn is_brew_gssi_routable(config: &SharedConfig, ssi: u32) -> bool {
     let Some(brew_config) = &config.config().brew else {
@@ -50,8 +61,11 @@ pub fn is_brew_issi_routable(config: &SharedConfig, issi: u32) -> bool {
     if config.config().brew.is_none() {
         return false;
     }
+    if config.config().cell.local_ssi_ranges.contains(issi) {
+        return false;
+    }
     if is_tetrapack(config) {
-        issi >= 1_000_000 && issi <= 9_999_999
+        (issi >= 1_000_000 && issi <= 9_999_999) || is_pbx_gateway_issi(config, issi)
     } else {
         true
     }

@@ -184,3 +184,7 @@ voice_service = true
 # Uncomment to allow only select SSIs to be transmitted over Brew
 # If left commented, all (outside of local_ssi_ranges) are allowed over Brew
 # whitelisted_ssis = [91]
+
+# Optional PBX gateway ISSIs that should always be considered Brew-routable
+# (useful for phone/PBX interconnect IDs that do not follow normal Tetrapack ISSI rules)
+# pbx_gateway_issis = [2940003]

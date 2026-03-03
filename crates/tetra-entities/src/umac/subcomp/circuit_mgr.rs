@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use tetra_core::Direction;
-use tetra_saps::control::call_control::Circuit;
+use tetra_saps::control::call_control::{Circuit, CircuitDlMediaSource};
 
 pub struct CircuitMgr {
     pub dl: [Option<Circuit>; 4],
@@ -59,6 +59,10 @@ impl CircuitMgr {
             self.ul[ts as usize - 1].as_ref()
         };
         circuit.and_then(|c| c.peer_ts)
+    }
+
+    pub fn get_dl_media_source(&self, ts: u8) -> Option<CircuitDlMediaSource> {
+        self.dl[ts as usize - 1].as_ref().map(|c| c.dl_media_source)
     }
 
     /// Closes an active circuit, and return the Circuit to the caller

@@ -22,7 +22,7 @@ use tetra_pdus::umac::pdus::mac_sync::MacSync;
 use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
 use tetra_pdus::umac::pdus::mac_u_blck::MacUBlck;
 use tetra_pdus::umac::pdus::mac_u_signal::MacUSignal;
-use tetra_saps::control::call_control::{CallControl, Circuit};
+use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -1265,15 +1265,24 @@ impl UmacBs {
 
                 let dl_ts = self.channel_scheduler.duplex_peer_ts(ts).unwrap_or(ts);
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, dl_ts) {
-                    tracing::trace!("rx_tmd_prim: loopback UL voice on ts={} to dl_ts={}", ts, dl_ts);
-                    if let Some(packed) = pack_ul_acelp_bits(&data) {
-                        self.channel_scheduler.dl_schedule_tmd(dl_ts, packed);
-                    } else {
-                        tracing::warn!(
-                            "rx_tmd_prim: unsupported UL voice length {} on ts={}, skipping loopback",
-                            data.len(),
+                    let swmi_media_active = self.channel_scheduler.dl_media_source(dl_ts) == Some(CircuitDlMediaSource::SwMI);
+                    if swmi_media_active {
+                        tracing::trace!(
+                            "rx_tmd_prim: SwMI media active on dl_ts={}, suppressing local UL loopback from ts={}",
+                            dl_ts,
                             ts
                         );
+                    } else {
+                        tracing::trace!("rx_tmd_prim: loopback UL voice on ts={} to dl_ts={}", ts, dl_ts);
+                        if let Some(packed) = pack_ul_acelp_bits(&data) {
+                            self.channel_scheduler.dl_schedule_tmd(dl_ts, packed);
+                        } else {
+                            tracing::warn!(
+                                "rx_tmd_prim: unsupported UL voice length {} on ts={}, skipping loopback",
+                                data.len(),
+                                ts
+                            );
+                        }
                     }
                 } else {
                     tracing::trace!(
@@ -1392,6 +1401,7 @@ impl UmacBs {
                 circuit_mode: circuit.circuit_mode,
                 speech_service: circuit.speech_service,
                 etee_encrypted: circuit.etee_encrypted,
+                dl_media_source: circuit.dl_media_source,
             };
             self.channel_scheduler.create_circuit(d, c);
             tracing::debug!("  rx_control_circuit_open: Setup {:?} circuit for ts {}", d, ts);
@@ -1448,7 +1458,18 @@ impl UmacBs {
             }
 
             // NetworkCall* are for CMCE ↔ Brew, not UMAC (for now)
-            CallControl::NetworkCallStart { .. } | CallControl::NetworkCallReady { .. } | CallControl::NetworkCallEnd { .. } => {
+            CallControl::NetworkCallStart { .. }
+            | CallControl::NetworkCallReady { .. }
+            | CallControl::NetworkCallEnd { .. }
+            | CallControl::NetworkCircuitSetupRequest { .. }
+            | CallControl::NetworkCircuitSetupAccept { .. }
+            | CallControl::NetworkCircuitSetupReject { .. }
+            | CallControl::NetworkCircuitAlert { .. }
+            | CallControl::NetworkCircuitConnectRequest { .. }
+            | CallControl::NetworkCircuitConnectConfirm { .. }
+            | CallControl::NetworkCircuitMediaReady { .. }
+            | CallControl::NetworkCircuitDtmf { .. }
+            | CallControl::NetworkCircuitRelease { .. } => {
                 tracing::trace!("rx_control: ignoring CMCE-Brew notification (not for UMAC)");
             }
         }

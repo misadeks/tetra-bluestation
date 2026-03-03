@@ -2,6 +2,14 @@ use tetra_core::Direction;
 
 use crate::control::enums::circuit_mode_type::CircuitModeType;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitDlMediaSource {
+    /// Downlink media comes from local UL loopback (classic BS behavior).
+    LocalLoopback,
+    /// Downlink media is supplied by SwMI over the network bridge.
+    SwMI,
+}
+
 #[derive(Debug, Clone)]
 pub struct Circuit {
     /// Direction
@@ -28,6 +36,40 @@ pub struct Circuit {
     pub speech_service: Option<u8>,
     /// Whether end-to-end encryption is enabled on this circuit
     pub etee_encrypted: bool,
+    /// Downlink media source policy for this circuit.
+    pub dl_media_source: CircuitDlMediaSource,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkCircuitCall {
+    /// Calling party ISSI
+    pub source_issi: u32,
+    /// Called party ISSI/GSSI when available
+    pub destination: u32,
+    /// External number for PBX/phone calls (ASCII, may be empty)
+    pub number: String,
+    /// Call priority
+    pub priority: u8,
+    /// Speech service (Table 14.79)
+    pub service: u8,
+    /// Circuit mode (Table 14.52)
+    pub mode: u8,
+    /// Duplex flag (0 = simplex, 1 = duplex)
+    pub duplex: u8,
+    /// Hook method (Table 14.62)
+    pub method: u8,
+    /// Communication type (Table 14.54)
+    pub communication: u8,
+    /// Transmission grant (Table 14.80)
+    pub grant: u8,
+    /// Transmission request permission (Table 14.81)
+    pub permission: u8,
+    /// Call timeout (Table 14.50)
+    pub timeout: u8,
+    /// Call ownership (Table 14.38)
+    pub ownership: u8,
+    /// Call queued (Table 14.48)
+    pub queued: u8,
 }
 
 #[derive(Debug)]
@@ -76,4 +118,26 @@ pub enum CallControl {
     NetworkCallEnd {
         brew_uuid: uuid::Uuid, // Identifies the call to end
     },
+    /// Circuit-call setup request over Brew (individual/PBX/phone)
+    NetworkCircuitSetupRequest { brew_uuid: uuid::Uuid, call: NetworkCircuitCall },
+    /// Circuit-call setup accepted
+    NetworkCircuitSetupAccept { brew_uuid: uuid::Uuid },
+    /// Circuit-call setup rejected
+    NetworkCircuitSetupReject { brew_uuid: uuid::Uuid, cause: u8 },
+    /// Circuit-call alerting (ringing)
+    NetworkCircuitAlert { brew_uuid: uuid::Uuid },
+    /// Circuit-call connect request from remote side
+    NetworkCircuitConnectRequest { brew_uuid: uuid::Uuid, call: NetworkCircuitCall },
+    /// Circuit-call connect confirm from local side
+    NetworkCircuitConnectConfirm { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
+    /// Circuit-call media is active on this local timeslot
+    NetworkCircuitMediaReady { brew_uuid: uuid::Uuid, call_id: u16, ts: u8 },
+    /// Circuit-call INFO/DTMF payload from MS to SwMI/Brew
+    NetworkCircuitDtmf {
+        brew_uuid: uuid::Uuid,
+        length_bits: u16,
+        data: Vec<u8>,
+    },
+    /// Circuit-call release
+    NetworkCircuitRelease { brew_uuid: uuid::Uuid, cause: u8 },
 }

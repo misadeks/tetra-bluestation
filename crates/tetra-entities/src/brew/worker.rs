@@ -42,6 +42,27 @@ pub enum BrewEvent {
     /// Group call ended
     GroupCallEnd { uuid: Uuid, cause: u8 },
 
+    /// Circuit/PBX/phone call setup request from network
+    CircuitSetupRequest { uuid: Uuid, call: BrewCircularCall },
+
+    /// Circuit/PBX/phone call setup accepted by network
+    CircuitSetupAccept { uuid: Uuid },
+
+    /// Circuit/PBX/phone call setup rejected by network
+    CircuitSetupReject { uuid: Uuid, cause: u8 },
+
+    /// Circuit/PBX/phone call alerting from network
+    CircuitAlert { uuid: Uuid },
+
+    /// Circuit/PBX/phone connect request from network
+    CircuitConnectRequest { uuid: Uuid, call: BrewCircularCall },
+
+    /// Circuit/PBX/phone connect confirmed by network
+    CircuitConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// Circuit/PBX/phone call released by network
+    CircuitRelease { uuid: Uuid, cause: u8 },
+
     /// Voice frame received (ACELP traffic)
     VoiceFrame { uuid: Uuid, length_bits: u16, data: Vec<u8> },
 
@@ -78,9 +99,32 @@ pub enum BrewCommand {
 
     /// Send a voice frame to TetraPack (ACELP data from UL)
     SendVoiceFrame { uuid: Uuid, length_bits: u16, data: Vec<u8> },
+    /// Send DTMF data to TetraPack (from CMCE U-INFO)
+    SendDtmf { uuid: Uuid, length_bits: u16, data: Vec<u8> },
 
     /// Send GROUP_IDLE to TetraPack (transmission ended)
     SendGroupIdle { uuid: Uuid, cause: u8 },
+
+    /// Send circuit/PBX/phone SETUP_REQUEST
+    SendSetupRequest { uuid: Uuid, call: BrewCircularCall },
+
+    /// Send circuit/PBX/phone SETUP_ACCEPT
+    SendSetupAccept { uuid: Uuid },
+
+    /// Send circuit/PBX/phone SETUP_REJECT
+    SendSetupReject { uuid: Uuid, cause: u8 },
+
+    /// Send circuit/PBX/phone CALL_ALERT
+    SendCallAlert { uuid: Uuid },
+
+    /// Send circuit/PBX/phone CONNECT_REQUEST
+    SendConnectRequest { uuid: Uuid, call: BrewCircularCall },
+
+    /// Send circuit/PBX/phone CONNECT_CONFIRM
+    SendConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// Send circuit/PBX/phone CALL_RELEASE
+    SendCallRelease { uuid: Uuid, cause: u8 },
 
     /// Disconnect gracefully
     Disconnect,
@@ -638,12 +682,99 @@ impl BrewWorker {
                             tracing::error!("BrewWorker: failed to send voice frame: {}", e);
                         }
                     }
+                    BrewCommand::SendDtmf { uuid, length_bits, data } => {
+                        let msg = build_dtmf_frame(&uuid, length_bits, &data);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send DTMF frame: {}", e);
+                        } else {
+                            tracing::debug!(
+                                "BrewWorker: sent DTMF frame uuid={} length_bits={} bytes={}",
+                                uuid,
+                                length_bits,
+                                data.len()
+                            );
+                        }
+                    }
                     BrewCommand::SendGroupIdle { uuid, cause } => {
                         let msg = build_group_idle(&uuid, cause);
                         if let Err(e) = ws.send(Message::Binary(msg.into())) {
                             tracing::error!("BrewWorker: failed to send GROUP_IDLE: {}", e);
                         } else {
                             tracing::debug!("BrewWorker: sent GROUP_IDLE uuid={} cause={}", uuid, cause);
+                        }
+                    }
+                    BrewCommand::SendSetupRequest { uuid, call } => {
+                        let msg = build_setup_request(&uuid, &call);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send SETUP_REQUEST: {}", e);
+                        } else {
+                            tracing::debug!(
+                                "BrewWorker: sent SETUP_REQUEST uuid={} src={} dst={} number='{}' duplex={}",
+                                uuid,
+                                call.source,
+                                call.destination,
+                                call.number,
+                                call.duplex
+                            );
+                        }
+                    }
+                    BrewCommand::SendSetupAccept { uuid } => {
+                        let msg = build_setup_accept(&uuid);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send SETUP_ACCEPT: {}", e);
+                        } else {
+                            tracing::debug!("BrewWorker: sent SETUP_ACCEPT uuid={}", uuid);
+                        }
+                    }
+                    BrewCommand::SendSetupReject { uuid, cause } => {
+                        let msg = build_setup_reject(&uuid, cause);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send SETUP_REJECT: {}", e);
+                        } else {
+                            tracing::debug!("BrewWorker: sent SETUP_REJECT uuid={} cause={}", uuid, cause);
+                        }
+                    }
+                    BrewCommand::SendCallAlert { uuid } => {
+                        let msg = build_call_alert(&uuid);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send CALL_ALERT: {}", e);
+                        } else {
+                            tracing::debug!("BrewWorker: sent CALL_ALERT uuid={}", uuid);
+                        }
+                    }
+                    BrewCommand::SendConnectRequest { uuid, call } => {
+                        let msg = build_connect_request(&uuid, &call);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send CONNECT_REQUEST: {}", e);
+                        } else {
+                            tracing::debug!(
+                                "BrewWorker: sent CONNECT_REQUEST uuid={} src={} dst={} duplex={}",
+                                uuid,
+                                call.source,
+                                call.destination,
+                                call.duplex
+                            );
+                        }
+                    }
+                    BrewCommand::SendConnectConfirm { uuid, grant, permission } => {
+                        let msg = build_connect_confirm(&uuid, grant, permission);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send CONNECT_CONFIRM: {}", e);
+                        } else {
+                            tracing::debug!(
+                                "BrewWorker: sent CONNECT_CONFIRM uuid={} grant={} permission={}",
+                                uuid,
+                                grant,
+                                permission
+                            );
+                        }
+                    }
+                    BrewCommand::SendCallRelease { uuid, cause } => {
+                        let msg = build_call_release(&uuid, cause);
+                        if let Err(e) = ws.send(Message::Binary(msg.into())) {
+                            tracing::error!("BrewWorker: failed to send CALL_RELEASE: {}", e);
+                        } else {
+                            tracing::debug!("BrewWorker: sent CALL_RELEASE uuid={} cause={}", uuid, cause);
                         }
                     }
                     BrewCommand::Disconnect => {
@@ -714,6 +845,73 @@ impl BrewWorker {
                     });
                 }
             }
+            CALL_STATE_SETUP_REQUEST => {
+                if let BrewCallPayload::CircularCall(call) = cc.payload {
+                    tracing::info!(
+                        "BrewWorker: SETUP_REQUEST uuid={} src={} dst={} number='{}' duplex={} comm={}",
+                        cc.identifier,
+                        call.source,
+                        call.destination,
+                        call.number,
+                        call.duplex,
+                        call.communication
+                    );
+                    let _ = self.event_sender.send(BrewEvent::CircuitSetupRequest { uuid: cc.identifier, call });
+                } else {
+                    tracing::warn!("BrewWorker: SETUP_REQUEST with unexpected payload uuid={}", cc.identifier);
+                }
+            }
+            CALL_STATE_SETUP_ACCEPT => {
+                tracing::info!("BrewWorker: SETUP_ACCEPT uuid={}", cc.identifier);
+                let _ = self.event_sender.send(BrewEvent::CircuitSetupAccept { uuid: cc.identifier });
+            }
+            CALL_STATE_SETUP_REJECT => {
+                let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
+                tracing::info!("BrewWorker: SETUP_REJECT uuid={} cause={}", cc.identifier, cause);
+                let _ = self.event_sender.send(BrewEvent::CircuitSetupReject {
+                    uuid: cc.identifier,
+                    cause,
+                });
+            }
+            CALL_STATE_CALL_ALERT => {
+                tracing::info!("BrewWorker: CALL_ALERT uuid={}", cc.identifier);
+                let _ = self.event_sender.send(BrewEvent::CircuitAlert { uuid: cc.identifier });
+            }
+            CALL_STATE_CONNECT_REQUEST => {
+                if let BrewCallPayload::CircularCall(call) = cc.payload {
+                    tracing::info!(
+                        "BrewWorker: CONNECT_REQUEST uuid={} src={} dst={} duplex={} grant={} perm={}",
+                        cc.identifier,
+                        call.source,
+                        call.destination,
+                        call.duplex,
+                        call.grant,
+                        call.permission
+                    );
+                    let _ = self
+                        .event_sender
+                        .send(BrewEvent::CircuitConnectRequest { uuid: cc.identifier, call });
+                } else {
+                    tracing::warn!("BrewWorker: CONNECT_REQUEST with unexpected payload uuid={}", cc.identifier);
+                }
+            }
+            CALL_STATE_CONNECT_CONFIRM => {
+                if let BrewCallPayload::CircularGrant(grant) = cc.payload {
+                    tracing::info!(
+                        "BrewWorker: CONNECT_CONFIRM uuid={} grant={} permission={}",
+                        cc.identifier,
+                        grant.grant,
+                        grant.permission
+                    );
+                    let _ = self.event_sender.send(BrewEvent::CircuitConnectConfirm {
+                        uuid: cc.identifier,
+                        grant: grant.grant,
+                        permission: grant.permission,
+                    });
+                } else {
+                    tracing::warn!("BrewWorker: CONNECT_CONFIRM with unexpected payload uuid={}", cc.identifier);
+                }
+            }
             CALL_STATE_GROUP_IDLE => {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
                 tracing::info!("BrewWorker: GROUP_IDLE uuid={} cause={}", cc.identifier, cause);
@@ -726,8 +924,12 @@ impl BrewWorker {
             CALL_STATE_CALL_RELEASE => {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
                 tracing::info!("BrewWorker: CALL_RELEASE uuid={} cause={}", cc.identifier, cause);
-                // TODO FIXME we could check whether this call is indeed a brew call here
+                // Legacy behavior for group flows remains.
                 let _ = self.event_sender.send(BrewEvent::GroupCallEnd {
+                    uuid: cc.identifier,
+                    cause,
+                });
+                let _ = self.event_sender.send(BrewEvent::CircuitRelease {
                     uuid: cc.identifier,
                     cause,
                 });

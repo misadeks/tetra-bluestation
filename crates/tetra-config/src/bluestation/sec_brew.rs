@@ -22,6 +22,8 @@ pub struct CfgBrew {
     pub jitter_initial_latency_frames: u8,
 
     pub whitelisted_ssis: Option<Vec<u32>>,
+    /// Optional PBX gateway ISSIs that should be routable over Brew even if they don't match normal Tetrapack ISSI constraints.
+    pub pbx_gateway_issis: Option<Vec<u32>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -45,6 +47,7 @@ pub struct CfgBrewDto {
     pub jitter_initial_latency_frames: u8,
 
     pub whitelisted_ssis: Option<Vec<u32>>,
+    pub pbx_gateway_issis: Option<Vec<u32>>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -69,5 +72,6 @@ pub fn apply_brew_patch(src: CfgBrewDto) -> CfgBrew {
         reconnect_delay: Duration::from_secs(src.reconnect_delay_secs),
         jitter_initial_latency_frames: src.jitter_initial_latency_frames,
         whitelisted_ssis: src.whitelisted_ssis,
+        pbx_gateway_issis: src.pbx_gateway_issis,
     }
 }

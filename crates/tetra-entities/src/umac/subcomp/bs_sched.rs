@@ -1,6 +1,6 @@
 use tetra_core::{BitBuffer, Direction, PhyBlockNum, PhysicalChannel, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log};
 use tetra_saps::{
-    control::call_control::Circuit,
+    control::call_control::{Circuit, CircuitDlMediaSource},
     tmv::{TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel},
 };
 
@@ -459,6 +459,10 @@ impl BsChannelScheduler {
 
     pub fn duplex_peer_ts(&self, ts: u8) -> Option<u8> {
         self.circuits.get_ul_peer_ts(ts)
+    }
+
+    pub fn dl_media_source(&self, ts: u8) -> Option<CircuitDlMediaSource> {
+        self.circuits.get_dl_media_source(ts)
     }
 
     pub fn close_circuit(&mut self, dir: Direction, ts: u8) -> Option<Circuit> {
