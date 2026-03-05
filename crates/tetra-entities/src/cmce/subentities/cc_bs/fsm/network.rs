@@ -350,7 +350,7 @@ impl CcBsSubentity {
             dltime: self.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
                 brew_uuid,
-                grant: 1,
+                grant: 0,
                 permission: 0,
             }),
         });
