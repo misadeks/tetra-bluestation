@@ -351,11 +351,13 @@ impl CcBsSubentity {
             }
 
             tracing::info!(
-                "CMCE: forwarding U-CONNECT as Brew CONNECT_REQUEST uuid={} call_id={} dst={} number='{}'",
+                "CMCE: forwarding U-CONNECT as Brew CONNECT_REQUEST uuid={} call_id={} dst={} number='{}' grant='{}'",
                 brew_uuid,
                 call_id,
                 call_info.destination,
                 call_info.number
+                call_info.number,
+                call_info.grant,
             );
             queue.push_back(SapMsg {
                 sap: Sap::Control,
