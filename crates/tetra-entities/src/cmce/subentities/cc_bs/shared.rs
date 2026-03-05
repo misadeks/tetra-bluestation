@@ -385,18 +385,18 @@ impl CcBsSubentity {
         queue.push_back(msg);
     }
 
-    pub(super) fn decode_external_number(field: &Type3FieldGeneric) -> String {
+    pub(super) fn decode_external_subscriber_number(field: &Type3FieldGeneric) -> String {
         if field.len == 0 {
             return String::new();
         }
 
         // External number IE is commonly BCD-like packed digits.
         // Keep best-effort conversion and drop filler nibbles.
-        let nibble_count = (field.len / 4).min(16);
+        let nibble_count = (field.len / 4).min(24);
         let mut digits = String::with_capacity(nibble_count);
         for i in 0..nibble_count {
-            let shift = (nibble_count - 1 - i) * 4;
-            let nibble = ((field.data >> shift) & 0x0f) as u8;
+            let byte = field.data.get(i / 2).copied().unwrap_or(0);
+            let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
             match nibble {
                 0..=9 => digits.push(char::from(b'0' + nibble)),
                 0x0a => digits.push('*'),
@@ -408,14 +408,14 @@ impl CcBsSubentity {
         digits
     }
 
-    pub(super) fn parse_external_subscriber_number(number: &str) -> Option<Type3FieldGeneric> {
+    pub(super) fn encode_external_subscriber_number(number: &str) -> Option<Type3FieldGeneric> {
         let trimmed = number.trim();
         if trimmed.is_empty() {
             return None;
         }
 
-        let mut data: u64 = 0;
-        let mut nibble_count = 0usize;
+        let mut nibbles = Vec::with_capacity(24);
+        let mut encoded_preview = String::with_capacity(24);
 
         for ch in trimmed.chars() {
             let nibble = match ch {
@@ -428,44 +428,48 @@ impl CcBsSubentity {
                 }
             };
 
-            if nibble_count == 16 {
+            if nibbles.len() == 24 {
                 tracing::debug!(
-                    "CMCE: truncating external number '{}' to first 16 BCD digits ('{}')",
+                    "CMCE: truncating external number '{}' to first 24 BCD digits ('{}')",
                     number,
-                    trimmed.chars().take(16).collect::<String>()
+                    encoded_preview
                 );
                 break;
             }
 
-            data = (data << 4) | nibble as u64;
-            nibble_count += 1;
+            nibbles.push(nibble);
+            encoded_preview.push(ch);
         }
 
-        if nibble_count == 0 {
+        if nibbles.is_empty() {
             tracing::debug!("CMCE: external number '{}' has no encodable digits", number);
             return None;
         }
 
+        let len_bits = nibbles.len() * 4;
+        let mut data = vec![0u8; len_bits.div_ceil(8)];
+        for (idx, nibble) in nibbles.into_iter().enumerate() {
+            let byte_idx = idx / 2;
+            if idx % 2 == 0 {
+                data[byte_idx] |= nibble << 4;
+            } else {
+                data[byte_idx] |= nibble;
+            }
+        }
+
         Some(Type3FieldGeneric {
             field_id: CmceType3ElemId::ExtSubscriberNum.into_raw(),
-            len: nibble_count * 4,
+            len: len_bits,
             data,
         })
     }
 
     pub(super) fn build_network_circuit_call_from_u_setup(pdu: &USetup, source_issi: u32) -> NetworkCircuitCall {
-        let mut number = pdu
+        let number = pdu
             .external_subscriber_number
             .as_ref()
-            .map(Self::decode_external_number)
+            .map(Self::decode_external_subscriber_number)
             .unwrap_or_default();
-        if number.is_empty() {
-            if let Some(short) = pdu.called_party_short_number_address {
-                number = short.to_string();
-            } else if let Some(ext) = pdu.called_party_extension {
-                number = ext.to_string();
-            }
-        }
 
         NetworkCircuitCall {
             source_issi,
@@ -485,28 +489,6 @@ impl CcBsSubentity {
         }
     }
 
-    pub(super) fn parse_calling_party_extension(number: &str) -> Option<u32> {
-        let trimmed = number.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        match trimmed.parse::<u32>() {
-            Ok(value) if value <= 0x00FF_FFFF => Some(value),
-            Ok(value) => {
-                tracing::debug!(
-                    "CMCE: ignoring Brew calling extension '{}' (value {} exceeds 24-bit field)",
-                    number,
-                    value
-                );
-                None
-            }
-            Err(_) => {
-                tracing::debug!("CMCE: ignoring non-numeric Brew calling extension '{}'", number);
-                None
-            }
-        }
-    }
 
     #[inline]
     pub(super) fn has_external_called_party(pdu: &USetup, network_call: &NetworkCircuitCall) -> bool {
@@ -896,5 +878,27 @@ impl CcBsSubentity {
         if let Err(err) = state.timeslot_alloc.release(TimeslotOwner::Cmce, ts) {
             tracing::warn!("CcBsSubentity: failed to release timeslot ts={} err={:?}", ts, err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CcBsSubentity;
+
+    #[test]
+    fn external_subscriber_number_supports_24_digits() {
+        let number = "123456789012345678901234";
+        let field = CcBsSubentity::encode_external_subscriber_number(number).expect("field should be generated");
+        assert_eq!(field.len, 96);
+        assert_eq!(field.data.len(), 12);
+        assert_eq!(CcBsSubentity::decode_external_subscriber_number(&field), number);
+    }
+
+    #[test]
+    fn external_subscriber_number_truncates_to_24_digits() {
+        let number = "1234567890123456789012345";
+        let field = CcBsSubentity::encode_external_subscriber_number(number).expect("field should be generated");
+        assert_eq!(field.len, 96);
+        assert_eq!(CcBsSubentity::decode_external_subscriber_number(&field), "123456789012345678901234");
     }
 }

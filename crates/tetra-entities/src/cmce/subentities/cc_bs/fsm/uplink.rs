@@ -146,7 +146,7 @@ impl CcBsSubentity {
         }
         if decoded.malformed {
             tracing::warn!(
-                "U-INFO call_id={} has malformed DTMF payload (len={} bits, parsed={} bits, data=0x{:X}, kind={:?})",
+                "U-INFO call_id={} has malformed DTMF payload (len={} bits, parsed={} bits, data={:?}, kind={:?})",
                 call_id,
                 decoded.full_len_bits,
                 decoded.parsed_bits,

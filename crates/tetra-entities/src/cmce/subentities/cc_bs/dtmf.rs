@@ -42,9 +42,31 @@ fn decode_dtmf_digit(nibble: u8) -> Option<char> {
     }
 }
 
+#[inline]
+fn type3_read_bit(field: &Type3FieldGeneric, bit_idx: usize) -> Option<u8> {
+    if bit_idx >= field.len || bit_idx >= field.data.len() * 8 {
+        return None;
+    }
+    let byte = field.data[bit_idx / 8];
+    Some((byte >> (7 - (bit_idx % 8))) & 0x01)
+}
+
+#[inline]
+fn type3_read_bits(field: &Type3FieldGeneric, start_bit: usize, num_bits: usize) -> Option<u64> {
+    if num_bits > 64 || start_bit + num_bits > field.len {
+        return None;
+    }
+
+    let mut value = 0u64;
+    for i in 0..num_bits {
+        value = (value << 1) | type3_read_bit(field, start_bit + i)? as u64;
+    }
+    Some(value)
+}
+
 pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
     let full_len_bits = field.len;
-    let len_bits = full_len_bits.min(64);
+    let len_bits = full_len_bits.min(field.data.len() * 8);
     if len_bits == 0 {
         return DtmfDecoded {
             kind: DtmfKind::Invalid,
@@ -61,8 +83,7 @@ pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
         let nibble_count = len_bits / 4;
         let mut digits = String::with_capacity(nibble_count);
         for i in 0..nibble_count {
-            let shift = (nibble_count - 1 - i) * 4;
-            let nibble = ((field.data >> shift) & 0x0f) as u8;
+            let nibble = type3_read_bits(field, i * 4, 4).unwrap_or(0) as u8;
             if let Some(c) = decode_dtmf_digit(nibble) {
                 digits.push(c);
             }
@@ -72,7 +93,7 @@ pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
             digits,
             parsed_bits: len_bits,
             full_len_bits,
-            malformed: false,
+            malformed: len_bits != full_len_bits,
         };
     }
 
@@ -86,11 +107,11 @@ pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
         };
     }
 
-    let dtmf_type = ((field.data >> (len_bits - 3)) & 0x07) as u8;
+    let dtmf_type = type3_read_bits(field, 0, 3).unwrap_or(0) as u8;
     let tail_bits = len_bits - 3;
 
     let mut digits = String::new();
-    let mut malformed = false;
+    let mut malformed = len_bits != full_len_bits;
     let kind = match dtmf_type {
         0 => {
             if tail_bits == 0 || tail_bits % 4 != 0 {
@@ -99,8 +120,7 @@ pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
                 let nibble_count = tail_bits / 4;
                 digits.reserve(nibble_count);
                 for i in 0..nibble_count {
-                    let shift = tail_bits - 4 * (i + 1);
-                    let nibble = ((field.data >> shift) & 0x0f) as u8;
+                    let nibble = type3_read_bits(field, 3 + i * 4, 4).unwrap_or(0) as u8;
                     if let Some(c) = decode_dtmf_digit(nibble) {
                         digits.push(c);
                     }
@@ -145,17 +165,14 @@ pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
 }
 
 pub(super) fn pack_type3_bits_to_bytes(field: &Type3FieldGeneric) -> (u16, Vec<u8>) {
-    // Type3FieldGeneric stores up to 64 bits of payload; longer fields are already truncated on parse.
-    let len_bits = field.len.min(64);
+    let len_bits = field.len.min(field.data.len() * 8);
     if len_bits == 0 {
         return (0, Vec::new());
     }
 
     let mut out = vec![0u8; len_bits.div_ceil(8)];
-    let src = field.data;
     for bit_idx in 0..len_bits {
-        let src_shift = len_bits - 1 - bit_idx;
-        let bit = ((src >> src_shift) & 0x1) as u8;
+        let bit = type3_read_bit(field, bit_idx).unwrap_or(0);
         let byte_idx = bit_idx / 8;
         let bit_pos = 7 - (bit_idx % 8);
         out[byte_idx] |= bit << bit_pos;

@@ -114,8 +114,7 @@ impl CcBsSubentity {
         let usage = circuit_called.usage;
         let call_timeout = CallTimeout::try_from(call.timeout as u64).unwrap_or(CallTimeout::T5m);
         let circuit_mode = CircuitModeType::try_from(call.mode as u64).unwrap_or(CircuitModeType::TchS);
-        let calling_party_extension = Self::parse_calling_party_extension(&call.number);
-        let external_subscriber_number = Self::parse_external_subscriber_number(&call.number);
+        let external_subscriber_number = Self::encode_external_subscriber_number(&call.number);
 
         tracing::info!(
             "CMCE: accepting Brew setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",
@@ -155,7 +154,7 @@ impl CcBsSubentity {
             notification_indicator: None,
             temporary_address: None,
             calling_party_address_ssi: Some(call.source_issi),
-            calling_party_extension,
+            calling_party_extension: None,
             external_subscriber_number,
             facility: None,
             dm_ms_address: None,
