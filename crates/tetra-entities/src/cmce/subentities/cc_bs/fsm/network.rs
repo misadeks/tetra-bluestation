@@ -429,11 +429,11 @@ impl CcBsSubentity {
             ul_dl_assigned: UlDlAssignment::Both,
         };
 
-        let grant_enum = TransmissionGrant::try_from((grant & 0x03) as u64).unwrap_or(TransmissionGrant::Granted);
         let d_connect_ack = DConnectAcknowledge {
             call_identifier: call_id,
             call_time_out: CallTimeout::T5m.into_raw() as u8,
-            transmission_grant: grant_enum.into_raw() as u8,
+            // Brew sends 1 if granted, we expect to actually grant permission to an individual call
+            transmission_grant: 0,
             transmission_request_permission: permission != 0,
             notification_indicator: None,
             facility: None,
