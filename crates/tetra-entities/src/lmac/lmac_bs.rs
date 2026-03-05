@@ -273,10 +273,15 @@ impl LmacBs {
             prim.block_num != PhyBlockNum::Block1 || !self.blk2_stolen,
             "blk2_stolen must be false when receiving block1"
         );
-        assert!(
-            pchan == PhysicalChannel::Tp || !self.blk2_stolen,
-            "blk2_stolen must be false when not in a traffic burst"
-        );
+        if pchan != PhysicalChannel::Tp && self.blk2_stolen {
+            tracing::warn!(
+                "blk2_stolen set on non-traffic burst (ts={}, pchan={:?}), ignoring stale STCH signal",
+                ul_time.t,
+                pchan
+            );
+            self.blk2_stolen = false;
+            return;
+        }
 
         match lchan {
             LogicalChannel::Clch => {}

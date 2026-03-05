@@ -924,11 +924,6 @@ impl BrewWorker {
             CALL_STATE_CALL_RELEASE => {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
                 tracing::info!("BrewWorker: CALL_RELEASE uuid={} cause={}", cc.identifier, cause);
-                // Legacy behavior for group flows remains.
-                let _ = self.event_sender.send(BrewEvent::GroupCallEnd {
-                    uuid: cc.identifier,
-                    cause,
-                });
                 let _ = self.event_sender.send(BrewEvent::CircuitRelease {
                     uuid: cc.identifier,
                     cause,

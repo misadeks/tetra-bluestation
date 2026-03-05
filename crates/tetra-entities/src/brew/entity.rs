@@ -347,7 +347,7 @@ impl BrewEntity {
                     self.handle_group_call_end(queue, uuid, cause);
                 }
                 BrewEvent::CircuitSetupRequest { uuid, call } => {
-                    let call = Self::to_network_circuit_call(&call);
+                    let call = Self::map_brew_to_network_circuit_call(&call);
                     queue.push_back(SapMsg {
                         sap: Sap::Control,
                         src: TetraEntity::Brew,
@@ -384,7 +384,7 @@ impl BrewEntity {
                     });
                 }
                 BrewEvent::CircuitConnectRequest { uuid, call } => {
-                    let call = Self::to_network_circuit_call(&call);
+                    let call = Self::map_brew_to_network_circuit_call(&call);
                     queue.push_back(SapMsg {
                         sap: Sap::Control,
                         src: TetraEntity::Brew,
@@ -407,13 +407,20 @@ impl BrewEntity {
                     });
                 }
                 BrewEvent::CircuitRelease { uuid, cause } => {
-                    queue.push_back(SapMsg {
-                        sap: Sap::Control,
-                        src: TetraEntity::Brew,
-                        dest: TetraEntity::Cmce,
-                        dltime: self.dltime,
-                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid: uuid, cause }),
-                    });
+                    // Clean up local circuit media first to prevent echo back to Brew.
+                    if self.drop_network_circuit(uuid) {
+                        // Was a circuit call - tell CMCE to release local MS legs.
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Brew,
+                            dest: TetraEntity::Cmce,
+                            dltime: self.dltime,
+                            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid: uuid, cause }),
+                        });
+                    } else {
+                        // Not a circuit call - try group call cleanup instead.
+                        self.handle_group_call_end(queue, uuid, cause);
+                    }
                 }
                 BrewEvent::VoiceFrame { uuid, length_bits, data } => {
                     self.handle_voice_frame(uuid, length_bits, data);
@@ -426,7 +433,7 @@ impl BrewEntity {
                         "BrewEntity: server error type={} data={} bytes - {:?}",
                         error_type,
                         data.len(),
-                        data.to_ascii_lowercase()
+                        data
                     );
                 }
             }
@@ -546,7 +553,7 @@ impl BrewEntity {
         }
     }
 
-    fn to_network_circuit_call(call: &super::protocol::BrewCircularCall) -> NetworkCircuitCall {
+    fn map_brew_to_network_circuit_call(call: &super::protocol::BrewCircularCall) -> NetworkCircuitCall {
         NetworkCircuitCall {
             source_issi: call.source,
             destination: call.destination,
@@ -565,7 +572,7 @@ impl BrewEntity {
         }
     }
 
-    fn from_network_circuit_call(call: &NetworkCircuitCall) -> super::protocol::BrewCircularCall {
+    fn map_network_to_brew_circuit_call(call: &NetworkCircuitCall) -> super::protocol::BrewCircularCall {
         super::protocol::BrewCircularCall {
             source: call.source_issi,
             destination: call.destination,
@@ -941,7 +948,8 @@ impl BrewEntity {
         }
     }
 
-    fn drop_network_circuit(&mut self, brew_uuid: Uuid) {
+    /// Drop a network circuit media session. Returns `true` if the UUID was found and removed.
+    fn drop_network_circuit(&mut self, brew_uuid: Uuid) -> bool {
         if let Some(media) = self.active_circuit_media.remove(&brew_uuid) {
             tracing::info!(
                 "BrewEntity: dropping network circuit uuid={} call_id={} ts={}",
@@ -951,8 +959,10 @@ impl BrewEntity {
             );
             self.dl_jitter.remove(&brew_uuid);
             self.ul_forwarded.retain(|_, fwd| fwd.uuid != brew_uuid);
+            true
         } else {
             tracing::debug!("BrewEntity: circuit drop requested for unknown uuid={}", brew_uuid);
+            false
         }
     }
 }
@@ -1015,7 +1025,7 @@ impl TetraEntityTrait for BrewEntity {
                     tracing::debug!("BrewEntity: not connected, dropping NetworkCircuitSetupRequest uuid={}", brew_uuid);
                     return;
                 }
-                let call = Self::from_network_circuit_call(&call);
+                let call = Self::map_network_to_brew_circuit_call(&call);
                 let _ = self.command_sender.send(BrewCommand::SendSetupRequest { uuid: brew_uuid, call });
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }) => {
@@ -1041,7 +1051,7 @@ impl TetraEntityTrait for BrewEntity {
                     );
                     return;
                 }
-                let call = Self::from_network_circuit_call(&call);
+                let call = Self::map_network_to_brew_circuit_call(&call);
                 let _ = self.command_sender.send(BrewCommand::SendConnectRequest { uuid: brew_uuid, call });
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
@@ -1103,10 +1113,12 @@ impl TetraEntityTrait for BrewEntity {
                 }
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid, cause }) => {
-                if self.connected {
+                // Only send CALL_RELEASE to Brew if we still have local circuit state,
+                // meaning this release was initiated by CMCE (user-initiated), not by Brew.
+                let was_active = self.drop_network_circuit(brew_uuid);
+                if was_active && self.connected {
                     let _ = self.command_sender.send(BrewCommand::SendCallRelease { uuid: brew_uuid, cause });
                 }
-                self.drop_network_circuit(brew_uuid);
             }
             SapMsgInner::MmSubscriberUpdate(update) => {
                 self.handle_subscriber_update(update);

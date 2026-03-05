@@ -270,7 +270,7 @@ impl CcBsSubentity {
         let d_connect = DConnect {
             call_identifier: call_id,
             call_time_out: CallTimeout::T5m,
-            hook_method_selection: false,
+            hook_method_selection: call.simplex_duplex,
             simplex_duplex_selection: call.simplex_duplex,
             transmission_grant: TransmissionGrant::Granted,
             transmission_request_permission: false,
