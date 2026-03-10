@@ -209,8 +209,8 @@ impl BitBuffer {
     /// Read `num_bits` at the current pos, advancing pos, and write them into the provided output slice as bytes
     pub fn read_bits_into_slice(&mut self, num_bits: usize, buf: &mut [u8]) -> Option<()> {
         let num_bytes = (num_bits + 7) / 8;
-        assert!(buf.len() >= num_bytes, "output buffer too small for num_bits");        
-        
+        assert!(buf.len() >= num_bytes, "output buffer too small for num_bits");
+
         let mut bits_remaining = num_bits;
         for i in 0..num_bytes {
             let bits_in_byte = usize::min(bits_remaining, 8);
