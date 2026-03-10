@@ -1,8 +1,13 @@
 use super::*;
 
+// TETRA TDMA timing: one slot is 170/12 milliseconds.
+const TIMESLOT_DURATION_MS: f64 = 170.0 / 12.0;
+
 #[inline]
 fn seconds_to_timeslots(seconds: i32) -> i32 {
-    seconds * 18 * 4
+    debug_assert!(seconds >= 0);
+    // slots = total_ms / slot_duration_ms
+    (f64::from(seconds) * 1_000.0 / TIMESLOT_DURATION_MS) as i32
 }
 
 #[inline]
