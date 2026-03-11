@@ -1159,7 +1159,7 @@ impl UmacBs {
                 );
 
                 self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
-                Self::send_tma_report_ind(queue, message.dltime, prim.req_handle, TmaReport::SuccessDownlinked);
+
                 return;
             } else {
                 tracing::warn!("rx_ul_tma_unitdata_req: stealing requested but no active DL circuit, falling back to MCCH");
@@ -1212,9 +1212,6 @@ impl UmacBs {
         };
 
         self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);
-
-        // TODO FIXME I'm not so sure whether we should send this now, or send it once the message is on its way
-        Self::send_tma_report_ind(queue, message.dltime, prim.req_handle, TmaReport::SuccessDownlinked);
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
