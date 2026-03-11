@@ -1197,10 +1197,19 @@ impl UmacBs {
         };
         pdu.update_len_and_fill_ind(sdu.get_len());
 
-        // Per ETSI EN 300 392-2 Clause 23.3.1.1.2: idle MSes monitor the MCCH (slot 1)
-        // for signaling. Without common SCCHs, all MSes listen on slot 1.
-        // All signaling on the normal path (non-FACCH) must go to the MCCH.
-        let enqueue_ts = 1;
+        // Add to scheduler: Group signaling (GSSI) → TS1 (MCCH).
+        // Individual signaling with no LLC link context (link_id == 0) → TS1 (MCCH),
+        // since the MS is listening on the control channel during setup/teardown.
+        // Otherwise, use current TS, avoiding active traffic circuits.
+        let enqueue_ts = if prim.main_address.ssi_type == SsiType::Gssi {
+            1 // Group signaling always on MCCH (TS1)
+        // } else if prim.link_id == 0 {
+        //     1 // No LLC link context, force MCCH
+        } else if self.channel_scheduler.circuit_is_active(Direction::Dl, message.dltime.t) {
+            1 // Redirect individual signaling away from traffic TS
+        } else {
+            message.dltime.t
+        };
 
         self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);
     }
