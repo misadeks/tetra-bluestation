@@ -1,5 +1,6 @@
 use core::fmt;
 
+use crate::cmce::enums::pre_coded_status::PreCodedStatus;
 use crate::cmce::enums::{cmce_pdu_type_dl::CmcePduTypeDl, party_type_identifier::PartyTypeIdentifier, type3_elem_id::CmceType3ElemId};
 use tetra_core::typed_pdu_fields::*;
 use tetra_core::{BitBuffer, expect_pdu_type, pdu_parse_error::PduParseErr};
@@ -19,7 +20,7 @@ pub struct DStatus {
     /// Conditional 24 bits, Calling party extension condition: calling_party_type_identifier == 2
     pub calling_party_extension: Option<u64>,
     /// Type1, 16 bits, Pre-coded status
-    pub pre_coded_status: u16,
+    pub pre_coded_status: PreCodedStatus,
     /// Type3, External subscriber number
     pub external_subscriber_number: Option<Type3FieldGeneric>,
     /// Type3, DM-MS address
@@ -53,7 +54,8 @@ impl DStatus {
             None
         };
         // Type1
-        let pre_coded_status = buffer.read_field(16, "pre_coded_status")? as u16;
+        let val = buffer.read_field(16, "pre_coded_status")? as u16;
+        let pre_coded_status = PreCodedStatus::from(val);
 
         // obit designates presence of any further type2, type3 or type4 fields
         let mut obit = delimiters::read_obit(buffer)?;
@@ -95,7 +97,7 @@ impl DStatus {
             buffer.write_bits(*value, 24);
         }
         // Type1
-        buffer.write_bits(self.pre_coded_status as u64, 16);
+        buffer.write_bits(self.pre_coded_status.into_raw().into(), 16);
 
         // Check if any optional field present and place o-bit
         let obit = self.external_subscriber_number.is_some() || self.dm_ms_address.is_some();

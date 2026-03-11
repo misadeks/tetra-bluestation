@@ -6,6 +6,7 @@ use tetra_config::bluestation::{CfgBrew, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
+use tetra_pdus::cmce::enums::pre_coded_status::PreCodedStatus;
 use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
 use tetra_pdus::cmce::pdus::u_status::UStatus;
 use tetra_saps::control::enums::sds_user_data::SdsUserData;
@@ -268,7 +269,7 @@ fn test_u_status_forwarded_as_d_status() {
         called_party_short_number_address: None,
         called_party_ssi: Some(2000001),
         called_party_extension: None,
-        pre_coded_status: 0x8210,
+        pre_coded_status: PreCodedStatus::try_from(0x8210).unwrap(),
         external_subscriber_number: None,
         dm_ms_address: None,
     };
@@ -331,7 +332,7 @@ fn test_u_status_unregistered_dest_dropped() {
         called_party_short_number_address: None,
         called_party_ssi: Some(9999999),
         called_party_extension: None,
-        pre_coded_status: 0x8210,
+        pre_coded_status: PreCodedStatus::from(0x8210),
         external_subscriber_number: None,
         dm_ms_address: None,
     };

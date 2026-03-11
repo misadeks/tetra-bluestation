@@ -1,5 +1,6 @@
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::{BitBuffer, Sap, SsiType, TetraAddress, tetra_entities::TetraEntity, unimplemented_log};
+use tetra_pdus::cmce::enums::pre_coded_status::PreCodedStatus;
 use tetra_saps::control::enums::sds_user_data::SdsUserData;
 use tetra_saps::control::sds::CmceSdsData;
 use tetra_saps::lcmc::LcmcMleUnitdataReq;
@@ -174,7 +175,7 @@ impl SdsBsSubentity {
         dltime: tetra_core::TdmaTime,
         source_issi: u32,
         dest_issi: u32,
-        pre_coded_status: u16,
+        pre_coded_status: PreCodedStatus,
     ) {
         let pdu = DStatus {
             calling_party_type_identifier: PartyTypeIdentifier::Ssi,
