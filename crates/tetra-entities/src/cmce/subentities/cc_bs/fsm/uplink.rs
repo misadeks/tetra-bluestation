@@ -20,7 +20,7 @@ impl CcBsSubentity {
                 panic!()
             };
             let reject_call_id = self.circuits.get_next_call_id();
-            let sdu = Self::build_d_release(reject_call_id, DisconnectCause::NotAllowedTrafficCase);
+            let sdu = Self::build_d_release(reject_call_id, DisconnectCause::IncompatibleTrafficCase);
             let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
             queue.push_back(msg);
             return;
