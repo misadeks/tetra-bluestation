@@ -7,7 +7,7 @@ use tetra_config::bluestation::sec_phy_soapy::*;
 /// For BS or MS mode, we want low latency at a fairly low sample rate.
 /// For monitor mode, a high sample rate is needed,
 /// so we want to maximize throughput, but latency is not critical.
-#[derive(Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Mode {
     Bs,
     Ms,
@@ -18,6 +18,10 @@ pub enum Mode {
 pub struct SdrSettings {
     /// Name used to print which SDR was detected
     pub name: String,
+    /// If false, timestamp of latest RX read is used to estimate
+    /// current hardware time. This is used in case get_hardware_time
+    /// is unacceptably slow or not supported.
+    pub use_get_hardware_time: bool,
     /// Receive and transmit sample rate.
     pub fs: f64,
     /// Receive antenna
@@ -35,18 +39,30 @@ pub struct SdrSettings {
     pub tx_args: Vec<(String, String)>,
 }
 
-impl SdrSettings {
-    /// Get device arguments based on IO configuration
-    pub fn get_device_arguments(io_cfg: &SoapySdrIoCfg) -> Vec<(String, String)> {
-        let mut args = Vec::<(String, String)>::new();
+/// Get device arguments based on IO configuration.
+///
+/// This is separate from SdrSettings because device arguments
+/// must be known before opening the device,
+/// whereas SdrSettings may depend on information
+/// that is obtained after the device has been opened.
+pub fn get_device_arguments(io_cfg: &SoapySdrIoCfg, mode: Mode) -> Vec<(String, String)> {
+    let mut args = Vec::<(String, String)>::new();
 
-        args.push(("driver".to_string(), io_cfg.get_soapy_driver_name().to_string()));
+    let driver = io_cfg.get_soapy_driver_name();
+    args.push(("driver".to_string(), driver.to_string()));
 
-        // Add custom device arguments here if needed for some SDR
-
-        args
+    // Additional device arguments for devices that need them
+    match driver {
+        "plutosdr" => {
+            // TODO
+        },
+        _ => { },
     }
 
+    args
+}
+
+impl SdrSettings {
     /// Get settings based on SDR type
     pub fn get_settings(
         io_cfg: &SoapySdrIoCfg,
@@ -66,6 +82,9 @@ impl SdrSettings {
             ("uhd", _) | ("b200", _) =>
                 Self::settings_usrp_b2x0(&io_cfg.iocfg_usrpb2xx, mode),
 
+            // TODO
+            //("PlutoSDR", _) => Self::settings_pluto(&io_cfg.iocfg_pluto, mode),
+
             _ => Self::unknown(mode),
         }
     }
@@ -73,6 +92,7 @@ impl SdrSettings {
     fn unknown(mode: Mode) -> Self {
         SdrSettings {
             name: "Unknown SDR device".to_string(),
+            use_get_hardware_time: true,
             fs: if mode == Mode::Mon { 16384e3 } else { 512e3 },
             rx_ant: None,
             tx_ant: None,
@@ -89,6 +109,7 @@ impl SdrSettings {
 
         SdrSettings {
             name: format!("{:?}", model),
+            use_get_hardware_time: true,
             fs: if mode == Mode::Mon { 16384e3 } else { 512e3 },
 
             rx_ant: Some(cfg.rx_ant.clone().unwrap_or(match model {
@@ -127,6 +148,7 @@ impl SdrSettings {
         let fs = 600e3;
         SdrSettings {
             name: "SXceiver".to_string(),
+            use_get_hardware_time: true,
             fs: fs,
 
             rx_ant: Some(cfg.rx_ant.clone().unwrap_or("RX".to_string())),
@@ -156,6 +178,7 @@ impl SdrSettings {
 
         SdrSettings {
             name: "USRP B200/B210".to_string(),
+            use_get_hardware_time: true,
             fs: if mode == Mode::Mon { 16384e3 } else { 512e3 },
 
             rx_ant: Some(cfg.rx_ant.clone().unwrap_or("TX/RX".to_string())),

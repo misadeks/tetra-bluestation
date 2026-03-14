@@ -4,6 +4,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 
 use super::dsp_types::*;
+use super::soapy_settings;
 use super::soapy_settings::SdrSettings;
 pub use super::soapy_settings::Mode;
 use super::soapy_time::{ticks_to_time_ns, time_ns_to_ticks};
@@ -30,7 +31,7 @@ pub struct SoapyIo {
 
     /// If false, timestamp of latest RX read is used to estimate
     /// current hardware time. This is used in case get_hardware_time
-    /// is unacceptably slow, particularly with SoapyRemote.
+    /// is unacceptably slow or not supported.
     use_get_hardware_time: bool,
 
     dev: soapysdr::Device,
@@ -59,24 +60,9 @@ macro_rules! soapycheck {
 }
 
 impl SoapyIo {
-    /// Get gain value from config or use default value from SdrSettings
-    fn get_gain_or_default(gain_name: &str, cfg_val: Option<f64>, defaults: &SdrSettings) -> (String, f64) {
-        if let Some(val) = cfg_val {
-            (gain_name.to_string(), val)
-        } else {
-            defaults
-                .rx_gain
-                .iter()
-                .find(|(name, _)| name == gain_name)
-                .cloned()
-                .unwrap_or_else(|| (gain_name.to_string(), 0.0))
-        }
-    }
-
     pub fn new(cfg: &SharedConfig, mode: Mode) -> Result<Self, soapysdr::Error> {
         let rx_ch = 0;
         let tx_ch = 0;
-        let mut use_get_hardware_time = true;
 
         let binding = cfg.config();
         let soapy_cfg = binding
@@ -103,21 +89,12 @@ impl SoapyIo {
             }
         };
 
-        let dev_args_str = SdrSettings::get_device_arguments(&soapy_cfg.io_cfg);
+        let dev_args_str = soapy_settings::get_device_arguments(&soapy_cfg.io_cfg, mode);
         tracing::info!("Using device arguments: {:?}", dev_args_str);
 
         let mut dev_args = soapysdr::Args::new();
         for (key, value) in dev_args_str {
-            // get_hardware_time tends to be unacceptably slow
-            // over SoapyRemote, so do not use it.
-            // Maybe this is not a reliable way to detect use of SoapyRemote
-            // in case SoapySDR selects it by default, but I do not know
-            // a better way to detect it.
-            if key == "driver" && value == "remote" {
-                use_get_hardware_time = false;
-            }
-
-            dev_args.set(key.clone(), value.clone());
+            dev_args.set(key, value);
         }
 
         let dev = soapycheck!("open SoapySDR device", soapysdr::Device::new(dev_args));
@@ -222,7 +199,12 @@ impl SoapyIo {
             tx_fs,
             initial_time: None,
             rx_next_count: 0,
-            use_get_hardware_time,
+            // TODO: if SoapyRemote support is added back,
+            // always set use_get_hardware_time to false when SoapyRemote is used.
+            // The setting was originally added to deal with unacceptably slow
+            // get_hardware_time over SoapyRemote but turns out it is needed
+            // for some SDR devices as well, so it now a part of sdr_settings.
+            use_get_hardware_time: sdr_settings.use_get_hardware_time,
             dev,
             rx,
             tx,
