@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "bluestation-bs"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "clap",
  "ctrlc",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "net-tnmm-test"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "clap",
  "tetra-config",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "net-tnmm-test-quic"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "quinn",
  "rcgen",
@@ -964,7 +964,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "pdu-tool"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "clap",
  "tetra-config",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-config"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "chrono-tz",
  "serde",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "const_format",
  "git-version",
@@ -1627,7 +1627,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-entities"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "as-any",
  "bitcode",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-pdus"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "tetra-config",
  "tetra-core",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-saps"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "tetra-core",
  "tracing",

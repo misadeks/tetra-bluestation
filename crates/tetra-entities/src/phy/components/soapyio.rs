@@ -5,8 +5,8 @@ use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 
 use super::dsp_types::*;
 use super::soapy_settings;
-use super::soapy_settings::SdrSettings;
 pub use super::soapy_settings::Mode;
+use super::soapy_settings::SdrSettings;
 use super::soapy_time::{ticks_to_time_ns, time_ns_to_ticks};
 
 type StreamType = ComplexSample;
@@ -117,14 +117,20 @@ impl SoapyIo {
 
         let mut rx_fs: f64 = 0.0;
         if rx_enabled {
-            soapycheck!("set RX sample rate", dev.set_sample_rate(soapysdr::Direction::Rx, rx_ch, sdr_settings.fs));
+            soapycheck!(
+                "set RX sample rate",
+                dev.set_sample_rate(soapysdr::Direction::Rx, rx_ch, sdr_settings.fs)
+            );
             // Read the actual sample rate obtained and store it
             // to avoid having to read it again every time it is needed.
             rx_fs = soapycheck!("get RX sample rate", dev.sample_rate(soapysdr::Direction::Rx, rx_ch));
         }
         let mut tx_fs: f64 = 0.0;
         if tx_enabled {
-            soapycheck!("set TX sample rate", dev.set_sample_rate(soapysdr::Direction::Tx, tx_ch, sdr_settings.fs));
+            soapycheck!(
+                "set TX sample rate",
+                dev.set_sample_rate(soapysdr::Direction::Tx, tx_ch, sdr_settings.fs)
+            );
             tx_fs = soapycheck!("get TX sample rate", dev.sample_rate(soapysdr::Direction::Tx, tx_ch));
         }
 

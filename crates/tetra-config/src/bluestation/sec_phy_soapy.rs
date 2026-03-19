@@ -176,4 +176,3 @@ pub struct PlutoDto {
     pub usb_direct: Option<bool>,
     pub direct: Option<bool>,
 }
-
