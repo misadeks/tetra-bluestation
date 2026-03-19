@@ -16,31 +16,16 @@ use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
 use tetra_pdus::mle::pdus::d_nwrk_broadcast::DNwrkBroadcast;
 
-pub struct Mle {
-    // config: Option<SharedConfig>,
-    self_component: TetraEntity,
+pub struct MleMs {
     config: SharedConfig,
-
     router: MleRouter,
-
-    /// Tracks the last hyperframe number on which we sent a D-NWRK-BROADCAST
-    last_time_broadcast_h: Option<u16>,
 }
 
-/// Multiframe at which D-NWRK-BROADCAST is sent within each hyperframe.
-/// Offset from multiframe 1 to avoid congestion with other hyperframe-triggered events.
-const MLE_BROADCAST_MULTIFRAME: u8 = 3;
-/// Frame at which D-NWRK-BROADCAST is sent within the broadcast multiframe.
-const MLE_BROADCAST_FRAME: u8 = 1;
-
-impl Mle {
+impl MleMs {
     pub fn new(config: SharedConfig) -> Self {
         Self {
-            self_component: TetraEntity::Mle,
             config,
-
             router: MleRouter::new(),
-            last_time_broadcast_h: Some(0), // Skip instant broadcast at startup; no radios are registered yet
         }
     }
 
@@ -429,63 +414,6 @@ impl Mle {
         // }
     }
 
-    fn send_d_nwrk_broadcast(&self, queue: &mut MessageQueue, ts: TdmaTime, tz: &str) {
-        // Timezone is validated at config parse time, so encode cannot fail here
-        let time_value = encode_tetra_network_time(tz).expect("timezone was validated at config parse time");
-
-        let pdu = DNwrkBroadcast {
-            cell_re_select_parameters: 0,
-            cell_load_ca: 0,
-            tetra_network_time: Some(time_value),
-            number_of_ca_neighbour_cells: Some(0),
-            neighbour_cell_information_for_ca: None,
-        };
-
-        // Serialize the PDU (includes 3-bit MLE PDU type)
-        let mut pdu_buf = BitBuffer::new(128);
-        if let Err(e) = pdu.to_bitbuf(&mut pdu_buf) {
-            tracing::warn!("Failed to serialize D-NWRK-BROADCAST: {:?}", e);
-            return;
-        }
-        let pdu_len = pdu_buf.get_pos();
-        pdu_buf.seek(0);
-
-        // Prepend 3-bit MLE protocol discriminator
-        let mut tl_sdu = BitBuffer::new(3 + pdu_len);
-        tl_sdu.write_bits(MleProtocolDiscriminator::Mle.into_raw(), 3);
-        tl_sdu.copy_bits(&mut pdu_buf, pdu_len);
-        tl_sdu.seek(0);
-
-        let sapmsg = SapMsg {
-            sap: Sap::TlaSap,
-            src: self.self_component,
-            dest: TetraEntity::Llc,
-            dltime: ts,
-            msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
-                main_address: TetraAddress {
-                    ssi: 0xFFFFFF,
-                    ssi_type: SsiType::Gssi,
-                    encrypted: false,
-                },
-                link_id: 0,
-                endpoint_id: 0,
-                tl_sdu,
-                stealing_permission: false,
-                subscriber_class: 0,
-                fcs_flag: false,
-                air_interface_encryption: None,
-                stealing_repeats_flag: None,
-                data_class_info: None,
-                req_handle: 0,
-                graceful_degradation: None,
-                chan_alloc: None,
-                tx_reporter: None,
-            }),
-        };
-        queue.push_back(sapmsg);
-        tracing::info!("D-NWRK-BROADCAST sent (tz={}, time=0x{:012X})", tz, time_value);
-    }
-
     fn rx_tlmc_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
         tracing::trace!("rx_tlmc_prim");
         unimplemented!("rx_tlmc_prim");
@@ -611,23 +539,9 @@ impl Mle {
     }
 }
 
-impl TetraEntityTrait for Mle {
+impl TetraEntityTrait for MleMs {
     fn entity(&self) -> TetraEntity {
         TetraEntity::Mle
-    }
-
-    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
-        // Broadcast D-NWRK-BROADCAST once per hyperframe if timezone is configured.
-        // Use a constant multiframe/frame offset to avoid congestion with other
-        // hyperframe-triggered events.
-        if ts.m == MLE_BROADCAST_MULTIFRAME && ts.f == MLE_BROADCAST_FRAME && ts.t == 1 {
-            if let Some(ref tz) = self.config.config().cell.timezone {
-                if self.last_time_broadcast_h != Some(ts.h) {
-                    self.send_d_nwrk_broadcast(queue, ts, tz);
-                    self.last_time_broadcast_h = Some(ts.h);
-                }
-            }
-        }
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {

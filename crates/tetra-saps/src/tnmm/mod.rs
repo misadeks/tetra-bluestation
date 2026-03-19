@@ -1,9 +1,9 @@
 // Placeholder for testing
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TnmmTestDemand {
     pub issi: u32,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TnmmTestResponse {
     pub issi: u32,
     pub data: u32,

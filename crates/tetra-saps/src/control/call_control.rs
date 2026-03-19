@@ -27,7 +27,7 @@ pub struct Circuit {
     pub etee_encrypted: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CallControl {
     /// Signals to set up a circuit
     /// Created by CMCE, sent to Umac

@@ -77,14 +77,14 @@ fn count_brew_sds(msgs: &[SapMsg]) -> usize {
 
 fn home_mode_cfg(
     source_issi: u32,
-    interval_frames: u32,
+    interval_multiframes: u32,
     protocol_id: u8,
     text_coding_scheme: HomeModeDisplaySdsTextCodingScheme,
     text: &str,
 ) -> CfgHomeModeDisplay {
     CfgHomeModeDisplay {
         source_issi,
-        interval_frames,
+        interval_multiframes,
         protocol_id,
         text_coding_scheme,
         text: text.to_string(),
@@ -273,7 +273,7 @@ fn test_periodic_home_mode_display_sds_broadcast() {
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.home_mode_display = Some(home_mode_cfg(
         1000001,
-        2, // every 8 ticks
+        2, // every 144 ticks (2 multiframes)
         220,
         HomeModeDisplaySdsTextCodingScheme::LATIN,
         "HOME MODE",
@@ -306,8 +306,8 @@ fn test_periodic_home_mode_display_sds_broadcast() {
         "Expected first periodic D-SDS-DATA broadcast after startup delay"
     );
 
-    // Second transmission after periodic interval (2 frames = 8 slots).
-    test.run_stack(Some(8));
+    // Second transmission after periodic interval (2 multiframes = 144 slots).
+    test.run_stack(Some(144));
     let sink_msgs = test.dump_sinks();
     let second_mle_msgs: Vec<_> = sink_msgs
         .iter()

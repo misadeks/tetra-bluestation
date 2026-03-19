@@ -46,29 +46,40 @@ impl TxState {
 /// expects_ack == false:
 ///   Transmitted is the final state.
 /// ```
-#[derive(Clone, Debug)]
-pub struct TxReceipt {
+
+/// The reporting half of a transmit receipt, carried alongside the PDU down
+/// through MAC and LLC. These layers call the `mark_*` methods to drive state
+/// transitions that the paired [`TxReceipt`] can observe.
+#[derive(Debug, Clone)]
+pub struct TxReporter {
     expects_ack: bool,
     state: Arc<AtomicU8>,
+    // t_tx: Option<TdmaTime>,
+    // t_ack: Option<TdmaTime>
 }
 
-impl TxReceipt {
-    /// Creates a linked `(TxReceipt, TxReporter)` pair.
-    /// The receipt stays with the originator; the signal travels down the stack.
-    pub fn new(expects_ack: bool) -> (Self, TxReporter) {
+impl TxReporter {
+    /// Creates a clonable TxReporter for acknowledged service. All clones share the same internal state.
+    pub fn new() -> Self {
         let state = Arc::new(AtomicU8::new(TxState::Pending as u8));
-        (
-            Self {
-                expects_ack,
-                state: state.clone(),
-            },
-            TxReporter { expects_ack, state },
-        )
+        Self { expects_ack: true, state }
     }
 
-    /// Returns the current state of the receipt.
+    /// Creates a clonable TxReporter for unacknowledged service. All clones share the same internal state.
+    pub fn new_unacked() -> Self {
+        let mut ret = Self::new();
+        ret.expects_ack = false;
+        ret
+    }
+
+    /// Returns the current state.
     pub fn get_state(&self) -> TxState {
         TxState::from_raw(self.state.load(Ordering::Relaxed))
+    }
+
+    /// True if the PDU was discarded by the Umac due to congestion
+    pub fn is_discarded(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == TxState::Discarded as u8
     }
 
     /// True once the PDU has been sent over the air (or further).
@@ -91,22 +102,6 @@ impl TxReceipt {
             TxState::Acknowledged => true,
         }
     }
-}
-
-/// The reporting half of a transmit receipt, carried alongside the PDU down
-/// through MAC and LLC. These layers call the `mark_*` methods to drive state
-/// transitions that the paired [`TxReceipt`] can observe.
-#[derive(Debug, Clone)]
-pub struct TxReporter {
-    expects_ack: bool,
-    state: Arc<AtomicU8>,
-}
-
-impl TxReporter {
-    /// Returns the current state.
-    pub fn get_state(&self) -> TxState {
-        TxState::from_raw(self.state.load(Ordering::Relaxed))
-    }
 
     fn mark(&self, curr_state: TxState, new_state: TxState) {
         // tracing::info!("TxReporter: marking {:?} -> {:?}", curr_state, new_state);
@@ -124,6 +119,10 @@ impl TxReporter {
                 );
             }
         }
+    }
+
+    fn mark_unchecked(&self, new_state: TxState) {
+        self.state.store(new_state as u8, Ordering::Relaxed);
     }
 
     /// Pending → Transmitted: MAC layer has sent the PDU over the air.
@@ -153,6 +152,12 @@ impl TxReporter {
         );
         self.mark(TxState::Transmitted, TxState::Lost);
     }
+
+    /// Tricky function to re-use linked TxReporters. Resets state to the initial state.
+    /// Be very careful when using this.
+    pub fn reset(&self) {
+        self.mark_unchecked(TxState::Pending);
+    }
 }
 
 #[cfg(test)]
@@ -161,7 +166,8 @@ mod tests {
 
     #[test]
     fn receipt_observes_signal_transitions() {
-        let (receipt, reporter) = TxReceipt::new(true);
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
         assert_eq!(reporter.get_state(), TxState::Pending);
         reporter.mark_transmitted();
         assert_eq!(receipt.get_state(), TxState::Transmitted);
@@ -171,9 +177,10 @@ mod tests {
 
     #[test]
     fn cloned_signal_shares_state() {
-        let (receipt, reporter) = TxReceipt::new(false);
-        let signal2 = reporter.clone();
-        signal2.mark_transmitted();
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
+        let reporter2 = reporter.clone();
+        reporter2.mark_transmitted();
         assert_eq!(receipt.get_state(), TxState::Transmitted);
         assert_eq!(reporter.get_state(), TxState::Transmitted);
     }
@@ -181,15 +188,26 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid transition")]
     fn double_mark_transmitted_panics() {
-        let (_receipt, reporter) = TxReceipt::new(false);
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
         reporter.mark_transmitted();
         reporter.mark_transmitted();
     }
 
     #[test]
+    #[should_panic(expected = "cannot mark as acknowledged")]
+    fn unacked_mark_acked_panics() {
+        let receipt = TxReporter::new_unacked();
+        let reporter = receipt.clone();
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+    }
+
+    #[test]
     #[should_panic(expected = "invalid transition")]
     fn mark_acknowledged_from_pending_panics() {
-        let (_receipt, reporter) = TxReceipt::new(true);
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
         reporter.mark_acknowledged(); // must be Transmitted first
     }
 }

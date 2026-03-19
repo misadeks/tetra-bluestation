@@ -24,7 +24,7 @@ use super::tp::*;
 
 /// Exhaustive list of SapMsgType structs for use in the SapMsg struct
 /// See Clause 19.2.1 for an overview of all lower-layer SAPs
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SapMsgInner {
     // TODO FIXME and all that stuff
     // PhyControlUpdateNetinfo(PhyControlUpdateNetinfo),
@@ -123,7 +123,7 @@ impl Display for SapMsgInner {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SapMsg {
     pub sap: Sap,
     // pub prim: SapPrim,

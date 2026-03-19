@@ -12,7 +12,7 @@ pub type CallId = u16;
 
 /// MLE-ACTIVITY request: this primitive shall be used by the CMCE to inform the MLE of the state of any circuit
 /// mode call(s).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleActivityReq {
     pub call_state: Todo,
 }
@@ -20,33 +20,33 @@ pub struct LcmcMleActivityReq {
 /// MLE-BREAK indication: this primitive shall be used by the MLE to inform the CMCE that access to the
 /// communication resources is temporarily unavailable and that the data transfer service cannot be used. In the graceful
 /// service degradation mode this primitive indicates which services can access communication resources.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleBreakInd {
     pub permitted_services_in_ms_graceful_service_degradation_mode: Todo,
 }
 
 /// MLE-BUSY indication: this shall be used by the MLE to inform the CMCE that a MM protocol exchange is in
 /// progress.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleBusyInd {}
 
 /// MLE-CANCEL request: this primitive shall be used by the CMCE to delete a previous request issued but not yet
 /// transmitted. The ability to cancel is removed when an MLE-REPORT indication is received indicating transmission
 /// of the CMCE PDU.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleCancelReq {
     pub handle: Todo,
 }
 
 /// MLE-CLOSE indication: this primitive shall be used by the MLE to indicate to the CMCE that access to the
 /// communications resources has been removed and that data transfer service cannot be used.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleCloseInd {}
 
 /// MLE-CONFIGURE request: this primitive shall be used to pass inter layer management information relating to
 /// circuit mode calls, e.g. whether Tx grant has been given, type of traffic, etc.
 /// Contents not fully standardized.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleConfigureReq {
     pub endpoint_id: EndpointId,
     pub chan_change_accepted: Option<bool>,
@@ -72,7 +72,7 @@ pub struct LcmcMleConfigureReq {
 
 /// MLE-CONFIGURE indication: this primitive shall be used to pass inter layer management information relating to
 /// circuit mode calls and packet data conflicts.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleConfigureInd {
     pub endpoint_id: EndpointId,
     pub chan_change_responce_required: bool,
@@ -83,32 +83,32 @@ pub struct LcmcMleConfigureInd {
 
 /// MLE-DISABLE indication: this primitive shall be used by the MLE entity to instruct the CMCE entity to enter the
 /// temporarily disabled state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleDisableInd {
     pub permitted_services_in_temp_disabled_mode: Todo,
 }
 
 /// MLE-ENABLE indication: this primitive shall be used by the MLE entity to instruct the CMCE entity to recover from
 /// the tamporarily [sic] disabled state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleEnableInd {}
 
 /// MLE-IDENTITIES request: this primitive shall be used by the CMCE to inform the MLE and layer 2 of a change to
 /// the list of group identities.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleIdentitiesReq {
     pub gssi_list: Vec<Todo>,
 }
 
 /// MLE-IDLE indication: this shall be used by the MLE to inform the CMCE that a MM protocol exchange has
 /// completed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleIdleInd {}
 
 /// MLE-INFO indication: this primitive shall be used by MLE to inform the CMCE of a change in system broadcast
 /// parameters, to indicate whether there is any match between the subscriber class being broadcast by the SwMI and the
 /// subscriber class of the MS, and to indicate if the present cell is a permitted cell.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleInfoInd {
     pub broadcast_params: Todo,
     pub subscriber_class_match: Todo,
@@ -117,7 +117,7 @@ pub struct LcmcMleInfoInd {
 
 /// MLE-OPEN indication: this primitive shall be used by the MLE to inform the CMCE that it has access to the
 /// communication resources and that the data transfer service can be used.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleOpenInd {
     pub mcc: Todo, // current network
     pub mnc: Todo, // current network
@@ -127,12 +127,12 @@ pub struct LcmcMleOpenInd {
 /// communication resources is once again available. MLE-REOPEN indication indicates the failure of current call
 /// restoration to CMCE but does not prevent CMCE from restoring other circuit-mode calls. The data transfer service can
 /// now be used.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleReopenInd {}
 
 /// MLE-REPORT indication: this shall be used by the MLE to report on the completion of an MLE-UNITDATA
 /// request procedure. The result of the transfer attempt shall be passed as a parameter.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleReportInd {
     pub handle: Todo,
     pub transfer_result: Todo,
@@ -141,7 +141,7 @@ pub struct LcmcMleReportInd {
 }
 
 /// MLE-RESTORE request: this primitive shall be used by the CMCE to restore a call after a successful cell reselection
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleRestoreReq {
     pub sdu: Todo,
     pub handle: Todo,
@@ -153,7 +153,7 @@ pub struct LcmcMleRestoreReq {
 
 /// MLE-RESTORE confirm: this primitive indicates the success or failure of call restoration to the CMCE as a result of
 /// a previously issued MLE-RESTORE request.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleRestoreConf {
     pub sdu: Todo,
     pub handle: Todo,
@@ -162,7 +162,7 @@ pub struct LcmcMleRestoreConf {
 /// MLE-RESUME indication: this primitive shall be used by the MLE to inform the CMCE that access to the
 /// communication resources is once again available. The data transfer service can now be used and the CMCE may
 /// attempt to restore any circuit mode calls.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleResumeInd {
     pub mcc: Todo, // current network
     pub mnc: Todo, // current network
@@ -170,7 +170,7 @@ pub struct LcmcMleResumeInd {
 
 /// MLE-UNITDATA request: this primitive shall be used by the CMCE to send unconfirmed data to a peer entity on the
 /// TETRA infrastructure side. Parameter indicates which layer 2 service is required.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleUnitdataReq {
     pub sdu: BitBuffer,
     pub handle: MleHandle,
@@ -195,7 +195,7 @@ pub struct LcmcMleUnitdataReq {
 
 /// MLE-UNITDATA indication: this primitive shall be used by the MLE to pass to the CMCE entity data which has
 /// been received from a peer entity on the TETRA infrastructure side.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LcmcMleUnitdataInd {
     pub sdu: BitBuffer,
     pub handle: MleHandle,

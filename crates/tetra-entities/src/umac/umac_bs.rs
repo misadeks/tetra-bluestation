@@ -1306,10 +1306,7 @@ impl UmacBs {
             dltime: self.dltime, // Control message so don't care
             msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
                 blk2_stolen: Some(true),
-                scrambling_code: None,
-                is_traffic: None,
-                tch_type_and_interleaving_depth: None,
-                time: None,
+                ..Default::default()
             }),
         };
         queue.push_prio(m, MessagePrio::Immediate);

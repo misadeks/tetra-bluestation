@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, tetra_entities::TetraEntity, unimplemented_log};
-use tetra_core::{TimeslotOwner, TxReceipt, TxReporter, TxState};
+use tetra_core::{TimeslotOwner, TxReporter, TxState};
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::{
     enums::{
@@ -41,8 +41,8 @@ use crate::{
 pub struct CcBsSubentity {
     config: SharedConfig,
     dltime: TdmaTime,
-    /// Cached D-SETUP PDUs for late-entry re-sends: call_id -> (D-SETUP PDU, dest address, tx receipt)
-    cached_setups: HashMap<u16, (DSetup, TetraAddress, Option<TxReceipt>)>,
+    /// Cached D-SETUP PDUs for late-entry re-sends: call_id -> (D-SETUP PDU, dest address, tx reporter)
+    cached_setups: HashMap<u16, (DSetup, TetraAddress, Option<TxReporter>)>,
     circuits: CircuitMgr,
     /// Active group calls: call_id -> call info
     active_calls: HashMap<u16, ActiveCall>,
@@ -683,9 +683,8 @@ impl CcBsSubentity {
                         let dest_addr = *dest_addr;
                         let (sdu, chan_alloc) = Self::build_d_setup_prim(pdu, usage, ts, UlDlAssignment::Both);
 
-                        // Create a fresh receipt/reporter for this re-send
-                        let (new_receipt, reporter) = TxReceipt::new(false);
-                        *receipt = Some(new_receipt);
+                        // Create a fresh txreporter for this re-send
+                        let reporter = TxReporter::new();
 
                         let prim = Self::build_sapmsg(sdu, Some(chan_alloc), self.dltime, dest_addr, Some(reporter));
                         queue.push_back(prim);

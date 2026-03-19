@@ -1,26 +1,26 @@
 use tetra_core::{EndpointId, Todo};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcAssessmentInd;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcAssessmentListReq;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcCellReadInd;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcCellReadConf;
 
 /// Clause 20.4.3 and 20.3.5.4.1c
 /// TMC-CONFIGURE indication: MAY BE USED BY LLC. this primitive shall be used to indicate loss of lower layer
 /// resources. It may be used to indicate regain of lower layer resources.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcConfigureInd {
     pub endpoint_id: EndpointId,
     pub lower_layer_resource_availability: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Poorly documented, but used in TL-CONFIGURE. Signals which addresses are valid,
 /// including full MCC/MNC.
 pub struct TlmcValidAddress {
@@ -32,7 +32,7 @@ pub struct TlmcValidAddress {
 /// TL-CONFIGURE request, confirm: this primitive shall be used to set up and configure the layer 2 according to the
 /// chosen cell parameters and the current state of the MS. It may also be used to provide the LLC and MAC with
 /// retransmission strategy in graceful service degradation mode. The parameters shall be as defined in table 20.36.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct TlmcConfigureReq {
     pub threshold_values: Option<Todo>,
     pub distribution_on_18th_frame: Option<Todo>,
@@ -64,7 +64,7 @@ pub struct TlmcConfigureReq {
 /// information that may be needed in the napping procedure. It may also be used for the LLC to provide the MAC with
 /// information that the MAC may use to make choices about link adaptation. It may also be used to provide the MAC with
 /// retransmission strategy in graceful service degradation mode. The parameters shall be as defined in table 20.57.
-// #[derive(Debug)]
+// #[derive(Debug, Clone)]
 // pub struct TmcTlConfigureReq {
 //     pub channel_change_handle: Option<Todo>,
 //     pub channel_change_accepted: Option<bool>,
@@ -79,7 +79,7 @@ pub struct TlmcConfigureReq {
 /// TL-CONFIGURE request, confirm: this primitive shall be used to set up and configure the layer 2 according to the
 /// chosen cell parameters and the current state of the MS. It may also be used to provide the LLC and MAC with
 /// retransmission strategy in graceful service degradation mode. The parameters shall be as defined in table 20.36.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcConfigureConf {
     pub threshold_values: Option<Todo>,
     pub distribution_on_18th_frame: Option<Todo>,
@@ -100,33 +100,33 @@ pub struct TlmcConfigureConf {
     pub endpoint_id: Option<Todo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcMeasurementInd;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcMonitorInd;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcMonitorListReq;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcReportInd;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcScanReq;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcScanConf;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcScanReportInd;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcSelectReq;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcSelectInd;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcSelectResp;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlmcSelectConf;
 
 // Clause 20.4.3

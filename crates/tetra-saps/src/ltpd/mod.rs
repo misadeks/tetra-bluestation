@@ -3,26 +3,26 @@
 #![allow(unused)]
 use tetra_core::{BitBuffer, EndpointId, LinkId, TetraAddress, Todo};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleActivityReq {
     pub sleep_mode: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleBreakInd {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleBusyInd {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleCancelReq {
     pub handle: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleCloseInd {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleConfigureReq {
     pub chan_change_accepted: bool,
     pub chan_change_handle: Todo,
@@ -38,7 +38,7 @@ pub struct LtpdMleConfigureReq {
     pub sndcp_status: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleConfigureInd {
     pub endpoint_id: EndpointId,
     pub chan_change_responce_required: bool,
@@ -47,7 +47,7 @@ pub struct LtpdMleConfigureInd {
     pub conflicting_endpoint_id: EndpointId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleConnectReq {
     pub address: Todo,
     pub endpoint_id: EndpointId,
@@ -59,7 +59,7 @@ pub struct LtpdMleConnectReq {
     pub setup_report: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleConnectInd {
     pub address: Todo,
     pub endpoint_id: EndpointId,
@@ -72,7 +72,7 @@ pub struct LtpdMleConnectInd {
     pub setup_report: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleConnectResp {
     pub address: Todo,
     pub endpoint_id: EndpointId,
@@ -84,7 +84,7 @@ pub struct LtpdMleConnectResp {
     pub setup_report: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleConnectConfirm {
     pub address: Todo,
     pub endpoint_id: EndpointId,
@@ -96,12 +96,12 @@ pub struct LtpdMleConnectConfirm {
     pub setup_report: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleDisableInd {
     pub permitted_services_in_temp_disabled_mode: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleDisconnectReq {
     pub endpoint_id: EndpointId,
     pub link_id: LinkId,
@@ -110,7 +110,7 @@ pub struct LtpdMleDisconnectReq {
     pub report: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleDisconnectInd {
     pub endpoint_id: EndpointId,
     pub new_endpoint_id: EndpointId,
@@ -121,10 +121,10 @@ pub struct LtpdMleDisconnectInd {
     pub report: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleEnableInd {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleInfoInd {
     pub broadcast_params: Todo,
     pub subscriber_class_match: Todo,
@@ -132,23 +132,23 @@ pub struct LtpdMleInfoInd {
     pub permitted_cell_info: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleIdleInd {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleOpenInd {
     pub mcc: Todo, // Current network
     pub mnc: Todo, // Current network
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleReceiveInd {
     pub endpoint_id: EndpointId,
     pub received_tetra_address: Todo, // ITSI/GSSI
     pub received_address_type: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleReconnectReq {
     pub endpoint_id: EndpointId,
     pub link_id: LinkId,
@@ -158,7 +158,7 @@ pub struct LtpdMleReconnectReq {
     pub stealing_permission: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleReconnectConfirm {
     pub endpoint_id: EndpointId,
     pub new_endpoint_id: EndpointId,
@@ -168,7 +168,7 @@ pub struct LtpdMleReconnectConfirm {
     pub reconnection_result: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleReconnectInd {
     pub endpoint_id: EndpointId,
     pub new_endpoint_id: EndpointId,
@@ -178,24 +178,24 @@ pub struct LtpdMleReconnectInd {
     pub reconnection_result: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleReleaseReq {
     pub link_id: LinkId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleReportInd {
     pub handle: Todo,
     pub transfer_result: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleResumeInd {
     pub mcc: Todo, // Current network
     pub mnc: Todo, // Current network
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleUnitdataReq {
     pub sdu: Todo,
     pub handle: Todo,
@@ -216,7 +216,7 @@ pub struct LtpdMleUnitdataReq {
     pub fcs_flag: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LtpdMleUnitdataInd {
     pub sdu: BitBuffer,
     pub endpoint_id: EndpointId,

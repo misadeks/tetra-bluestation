@@ -594,12 +594,6 @@ impl UmacMs {
             dltime: message.dltime,
             msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
                 is_traffic: Some(is_traffic),
-                // TODO FIXME we should set this based on the call
-                // For now, we'll just assume TCH and ILD 1 in lmac
-                tch_type_and_interleaving_depth: None,
-
-                // Could update scrambling code here, but LMAC should already have it
-                scrambling_code: None,
                 ..Default::default()
             }),
         };

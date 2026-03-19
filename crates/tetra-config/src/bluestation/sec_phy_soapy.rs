@@ -13,6 +13,9 @@ pub struct SoapySdrIoCfg {
 
     /// SXceiver configuration
     pub iocfg_sxceiver: Option<CfgSxCeiver>,
+
+    /// Pluto timestamp  configuration
+    pub iocfg_pluto: Option<CfgPluto>,
 }
 
 impl SoapySdrIoCfg {
@@ -23,6 +26,8 @@ impl SoapySdrIoCfg {
             "lime"
         } else if self.iocfg_sxceiver.is_some() {
             "sx"
+        } else if self.iocfg_pluto.is_some() {
+            "plutosdr"
         } else {
             "unknown"
         }
@@ -35,12 +40,13 @@ impl Default for SoapySdrIoCfg {
             iocfg_usrpb2xx: None,
             iocfg_limesdr: None,
             iocfg_sxceiver: None,
+            iocfg_pluto: None,
         }
     }
 }
 
 /// Configuration for Ettus USRP B2xx series
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct CfgUsrpB2xx {
     pub rx_ant: Option<String>,
     pub tx_ant: Option<String>,
@@ -49,7 +55,7 @@ pub struct CfgUsrpB2xx {
 }
 
 /// Configuration for LimeSDR
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct CfgLimeSdr {
     pub rx_ant: Option<String>,
     pub tx_ant: Option<String>,
@@ -61,7 +67,7 @@ pub struct CfgLimeSdr {
 }
 
 /// Configuration for SXceiver
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct CfgSxCeiver {
     pub rx_ant: Option<String>,
     pub tx_ant: Option<String>,
@@ -69,6 +75,20 @@ pub struct CfgSxCeiver {
     pub rx_gain_pga: Option<f64>,
     pub tx_gain_dac: Option<f64>,
     pub tx_gain_mixer: Option<f64>,
+}
+
+/// Configuration for Pluto timestamp
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CfgPluto {
+    pub rx_ant: Option<String>,
+    pub tx_ant: Option<String>,
+    pub rx_gain_pga: Option<f64>,
+    pub tx_gain_pga: Option<f64>,
+    pub uri: Option<String>,
+    pub usb_direct: Option<bool>,
+    pub direct: Option<bool>,
+    pub timestamp_every: Option<usize>,
+    pub loopback: Option<bool>,
 }
 
 /// SoapySDR configuration
@@ -109,6 +129,7 @@ pub struct SoapySdrDto {
     pub iocfg_usrpb2xx: Option<UsrpB2xxDto>,
     pub iocfg_limesdr: Option<LimeSdrDto>,
     pub iocfg_sxceiver: Option<SXceiverDto>,
+    pub iocfg_pluto: Option<PlutoDto>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -141,4 +162,17 @@ pub struct SXceiverDto {
     pub rx_gain_pga: Option<f64>,
     pub tx_gain_dac: Option<f64>,
     pub tx_gain_mixer: Option<f64>,
+}
+
+#[derive(Deserialize)]
+pub struct PlutoDto {
+    pub rx_ant: Option<String>,
+    pub tx_ant: Option<String>,
+    pub rx_gain_pga: Option<f64>,
+    pub tx_gain_pga: Option<f64>,
+    pub uri: Option<String>,
+    pub loopback: Option<bool>,
+    pub timestamp_every: Option<usize>,
+    pub usb_direct: Option<bool>,
+    pub direct: Option<bool>,
 }

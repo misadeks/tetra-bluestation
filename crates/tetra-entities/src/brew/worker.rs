@@ -866,6 +866,21 @@ impl BrewWorker {
                 });
             }
             FRAME_TYPE_SDS_TRANSFER => {
+                if !brew::feature_sds_enabled(&self.config) {
+                    tracing::warn!("BrewWorker: ignoring incoming SDS_TRANSFER because SDS over Brew is disabled in config");
+                    return;
+                }
+
+                if frame.length_bits > 2047 {
+                    // TODO FIXME we could split into multiple SDS messages here
+                    tracing::warn!(
+                        "BrewWorker: ignoring SDS_TRANSFER with excessive length_bits={} ({} bytes)",
+                        frame.length_bits,
+                        frame.data.len()
+                    );
+                    return;
+                }
+
                 // Match with pending SHORT_TRANSFER by UUID
                 if let Some(pending) = self.pending_sds.remove(&frame.identifier) {
                     tracing::info!(

@@ -5,6 +5,8 @@ use std::{
 
 use crate::pdu_parse_error::PduParseErr;
 
+#[derive(Clone)]
+
 pub struct BitBuffer {
     buffer: Vec<u8>,
     start: usize,          // bits before this are out of window

@@ -3,10 +3,6 @@ use std::{collections::HashMap, time::Duration};
 use serde::Deserialize;
 use toml::Value;
 
-fn default_brew_feature_sds_enabled() -> bool {
-    true
-}
-
 /// Brew protocol (TetraPack/BrandMeister) configuration
 #[derive(Debug, Clone)]
 pub struct CfgBrew {
@@ -68,6 +64,10 @@ fn default_brew_port() -> u16 {
 
 fn default_brew_reconnect_delay() -> u64 {
     15
+}
+
+fn default_brew_feature_sds_enabled() -> bool {
+    true
 }
 
 /// Convert a CfgBrewDto (from TOML) into a CfgBrew (used in the stack config)

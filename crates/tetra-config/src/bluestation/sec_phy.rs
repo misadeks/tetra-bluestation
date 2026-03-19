@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use toml::Value;
 
-use crate::bluestation::{CfgLimeSdr, CfgSoapySdr, CfgSxCeiver, CfgUsrpB2xx, SoapySdrDto, SoapySdrIoCfg};
+use crate::bluestation::{CfgLimeSdr, CfgPluto, CfgSoapySdr, CfgSxCeiver, CfgUsrpB2xx, SoapySdrDto, SoapySdrIoCfg};
 
 /// The PHY layer backend type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -80,6 +80,20 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
                 rx_gain_pga: sx_dto.rx_gain_pga,
                 tx_gain_dac: sx_dto.tx_gain_dac,
                 tx_gain_mixer: sx_dto.tx_gain_mixer,
+            });
+        }
+
+        if let Some(pluto_dto) = soapy_dto.iocfg_pluto {
+            soapy_cfg.io_cfg.iocfg_pluto = Some(CfgPluto {
+                rx_ant: pluto_dto.rx_ant,
+                tx_ant: pluto_dto.tx_ant,
+                rx_gain_pga: pluto_dto.rx_gain_pga,
+                tx_gain_pga: pluto_dto.tx_gain_pga,
+                uri: pluto_dto.uri,
+                loopback: pluto_dto.loopback,
+                timestamp_every: pluto_dto.timestamp_every,
+                usb_direct: pluto_dto.usb_direct,
+                direct: pluto_dto.direct,
             });
         }
 

@@ -11,7 +11,7 @@ use tetra_entities::{
     cmce::cmce_bs::CmceBs,
     llc::llc_bs_ms::Llc,
     lmac::lmac_bs::LmacBs,
-    mle::mle_bs_ms::Mle,
+    mle::mle_bs::MleBs,
     mm::mm_bs::MmBs,
     phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs},
     sndcp::sndcp_bs::Sndcp,
@@ -49,7 +49,7 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> MessageRouter {
     let lmac = LmacBs::new(cfg.clone());
     let umac = UmacBs::new(cfg.clone());
     let llc = Llc::new(cfg.clone());
-    let mle = Mle::new(cfg.clone());
+    let mle = MleBs::new(cfg.clone());
     let mm = MmBs::new(cfg.clone());
     let sndcp = Sndcp::new(cfg.clone());
     let cmce = CmceBs::new(cfg.clone());

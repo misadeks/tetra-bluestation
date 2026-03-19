@@ -5,7 +5,7 @@ use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 /// Clause 20.4.1.1.1
 /// TMA-CANCEL request: this primitive shall be used to cancel a TMA-UNITDATA
 /// request primitive that was submitted by the LLC.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmaCancelReq {
     pub req_handle: Todo,
 }
@@ -14,13 +14,13 @@ pub struct TmaCancelReq {
 /// TMA-RELEASE indication: this primitive may be used when the MAC leaves a
 /// channel in order to indicate that the connection on that channel is lost
 /// (e.g. to indicate local disconnection of any advanced links on that channel).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmaReleaseInd {
     pub endpoint_id: EndpointId,
 }
 
 /// Clause 22.3.3.1.1 gives some hints on reports in the MS context
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TmaReport {
     /// Confirm handle to the request
     ConfirmHandle,
@@ -39,7 +39,7 @@ pub enum TmaReport {
 /// TMA-REPORT indication: this primitive shall be used by the MAC to report
 /// on the progress or failure of a request procedure. The result of the
 /// transfer shall be passed as a report parameter.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmaReportInd {
     pub req_handle: Todo,
     pub report: TmaReport,
@@ -48,7 +48,7 @@ pub struct TmaReportInd {
 /// Clause 20.4.1.1.4
 /// TMA-UNITDATA request: this primitive shall be used to request the MAC to
 /// transmit a TM-SDU.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmaUnitdataReq {
     pub req_handle: Todo,
     pub pdu: BitBuffer,
@@ -73,7 +73,7 @@ pub struct TmaUnitdataReq {
 /// a received TM-SDU. This primitive may also be used with no TM-SDU if the
 /// MAC needs to inform the higher layers of a channel allocation received
 /// without an associated TM-SDU.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmaUnitdataInd {
     pub pdu: Option<BitBuffer>,
     pub main_address: TetraAddress,

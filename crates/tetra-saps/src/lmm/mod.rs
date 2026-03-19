@@ -4,7 +4,7 @@ use tetra_core::{BitBuffer, MleHandle, TetraAddress, Todo, TxReporter};
 
 /// This shall be used as a request to initiate the selection of a cell for communications. The
 /// request shall always be made after power on and may be made at any time thereafter.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleActivateReq {
     pub mcc_list: Vec<u16>,
     pub mnc_list: Vec<u16>,
@@ -12,57 +12,57 @@ pub struct LmmMleActivateReq {
     pub cell_type_prefs: Option<Todo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleActivateInd {
     pub cell_availability: Todo,
 }
 
 /// This shall be used as a confirmation to the MM entity that a cell has been selected with the
 /// required characteristics.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleActivateConf {
     pub registration_required: bool,
     pub la: u16,
     pub cell_type: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleActivityReq {
     pub sleep_mode: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleBusyReq {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleCancelReq {
     pub handle: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleCloseReq {}
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleConfigureReq {
     pub periodic_reporting_timer: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleConfigureInd {
     pub periodic_reporting_timer: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleDeactivateReq {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleDisableReq {
     pub permitted_services_in_temp_disabled_mode: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleEnableReq {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleIdentitiesReq {
     pub issi: Todo,
     pub assi: Todo,
@@ -70,10 +70,10 @@ pub struct LmmMleIdentitiesReq {
     pub detached_gssis: Vec<Todo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleIdleReq {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleInfoReq {
     pub subscriber_class: Todo,
     pub scch_config: Todo,
@@ -82,13 +82,13 @@ pub struct LmmMleInfoReq {
     pub dual_watch_config: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleInfoInd {
     pub broadcast_params: Todo,
     pub subscriber_class_match: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleLinkReq {
     pub mcc: Todo,
     pub mnc: Todo,
@@ -96,7 +96,7 @@ pub struct LmmMleLinkReq {
     pub cell_type_prefs: Option<Todo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleLinkInd {
     pub mcc: Todo,
     pub mnc: Todo,
@@ -106,10 +106,10 @@ pub struct LmmMleLinkInd {
     pub cell_type: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleOpen {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMlePrepareReq {
     pub sdu: Todo,
     pub handle: Todo,
@@ -119,19 +119,19 @@ pub struct LmmMlePrepareReq {
     pub stealing_repeats_flag: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMlePrepareConfirm {
     pub sdu: Todo,
     pub handle: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleReportInd {
     pub handle: MleHandle,
     pub transfer_result: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleUnitdataReq {
     pub sdu: BitBuffer,
     pub handle: MleHandle,
@@ -146,7 +146,7 @@ pub struct LmmMleUnitdataReq {
     pub tx_reporter: Option<TxReporter>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleUnitdataInd {
     pub sdu: BitBuffer,
     pub handle: MleHandle,
@@ -154,7 +154,7 @@ pub struct LmmMleUnitdataInd {
     // pub received_address_type: Todo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LmmMleUpdateReq {
     pub mcc: Todo,
     pub mnc: Todo,

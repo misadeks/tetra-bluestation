@@ -3,13 +3,13 @@ use tetra_core::{BitBuffer, EndpointId, LinkId, TetraAddress, Todo, TxReporter};
 
 use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlCancelReq {
     pub handle: Todo,
 }
 
 /// advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlConnectReq {
     // address_type: Todo,
     main_address: Todo,
@@ -26,7 +26,7 @@ pub struct TlConnectReq {
     setup_report: Todo,
 }
 /// advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlConnectInd {
     // address_type: Todo,
     main_address: Todo,
@@ -45,7 +45,7 @@ pub struct TlConnectInd {
     setup_report: Todo,
 }
 /// advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlConnectResp {
     // address_type: Todo,
     main_address: Todo,
@@ -62,7 +62,7 @@ pub struct TlConnectResp {
     setup_report: Todo,
 }
 /// advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlConnectConf {
     // address_type: Todo,
     main_address: Todo,
@@ -82,17 +82,17 @@ pub struct TlConnectConf {
 }
 
 /// advanced link only
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDataReqAl;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDataIndAl;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDataConfAl;
 
 /// Clause 20.3.5.1.4
 /// TL-DATA request: this primitive shall be used by the layer 2 service user to request transmission of a TL-SDU. The
 // TL-SDU will be acknowledged by the peer entity.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlaTlDataReqBl {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
@@ -121,7 +121,7 @@ pub struct TlaTlDataReqBl {
 /// Clause 20.3.5.1.4
 /// TL-DATA indication: this primitive shall be used by the layer 2 to deliver the received TL-SDU to the layer 2 service
 // user.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlaTlDataIndBl {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
@@ -143,7 +143,7 @@ pub struct TlaTlDataIndBl {
 /// TL-DATA response: this primitive shall be used by the layer 2 service user to respond to the previous TL-DATA
 // indication primitive. The TL-DATA response primitive may contain a TL-SDU. That TL-SDU will be sent without an
 // explicit acknowledgement from the peer entity.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDataRespBl {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
@@ -165,7 +165,7 @@ pub struct TlDataRespBl {
 // TL-DATA confirm: this primitive shall be used by the layer 2 to inform the layer 2 service user that it has completed
 // successfully the transmission of the requested TL-SDU. Depending on the availability of the response primitive at the
 // peer entity before transmission of the acknowledgement, the confirm primitive may or may not carry a TL-SDU.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDataConfBl {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
@@ -185,27 +185,27 @@ pub struct TlDataConfBl {
 }
 
 /// Advanced link only
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDisconnectReq;
 /// Advanced link only
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDisconnectInd;
 /// Advanced link only
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlDisconnectConf;
 
 /// advanced link, BS only
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlReceiveInd;
 
 // advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlReleaseReq {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
     pub link_id: LinkId,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlReleaseInd {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
@@ -214,10 +214,10 @@ pub struct TlReleaseInd {
 }
 
 /// advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlReconnectReq;
 /// advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlReconnectResp;
 
 // pub enum TlaReport {
@@ -226,7 +226,7 @@ pub struct TlReconnectResp;
 
 // }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlaTlReportInd {
     pub req_handle: Option<Todo>,
     pub report: Todo,
@@ -239,24 +239,24 @@ pub struct TlaTlReportInd {
 /// Clause 20.3.5.1.9
 /// TL-UNITDATA request: this primitive shall be used in the unacknowledged data transfer service by the layer 2
 /// service user to request layer 2 to transmit a TL-SDU.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlaTlUnitdataReqBl {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
     pub link_id: LinkId,
     pub endpoint_id: EndpointId,
     pub tl_sdu: BitBuffer,
-    pub scrambling_code: Todo,
-    pub pdu_prio: Todo,
+    // pub scrambling_code: Todo, // TODO FIXME reintroduce in MLE for sysinfo/sync
+    // pub pdu_prio: Todo,
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
     pub fcs_flag: bool,
-    pub air_interface_encryption: Todo,
-    pub data_prio: Todo,
+    pub air_interface_encryption: Option<Todo>,
+    // pub data_prio: Todo,
     pub packet_data_flag: bool,
-    pub n_tlsdu_repeats: Option<Todo>,
-    pub scheduled_data_status: Todo,
-    pub max_schedule_interval: Option<Todo>,
+    pub n_tlsdu_repeats: u8, // TODO check data type and purpose
+    // pub scheduled_data_status: Todo,
+    // pub max_schedule_interval: Option<Todo>,
     pub data_class_info: Option<Todo>,
     pub req_handle: Todo,
 }
@@ -264,7 +264,7 @@ pub struct TlaTlUnitdataReqBl {
 /// Clause 20.3.5.1.9
 /// TL-UNITDATA indication: this primitive shall be used in the unacknowledged data transfer service to deliver
 /// the received TL-SDU to the layer 2 service user.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlaTlUnitdataIndBl {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
@@ -285,7 +285,7 @@ pub struct TlaTlUnitdataIndBl {
 /// Clause 20.3.5.1.9, optional
 /// TL-UNITDATA confirm: this primitive may be used in the unacknowledged data transfer service to indicate
 /// completion of sending of the requested TL-SDU.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlUnitdataConfBl {
     // pub address_type: Todo,
     pub main_address: TetraAddress,
@@ -296,11 +296,11 @@ pub struct TlUnitdataConfBl {
 }
 
 /// Advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlUnitdataReqAl;
 /// Advanced link
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlUnitdataIndAl;
 /// Advanced link, optional?
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlUnitdataConfAl;

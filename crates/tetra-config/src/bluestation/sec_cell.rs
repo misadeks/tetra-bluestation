@@ -13,8 +13,8 @@ pub enum HomeModeDisplaySdsTextCodingScheme {
 #[derive(Debug, Clone)]
 pub struct CfgHomeModeDisplay {
     pub source_issi: u32,
-    /// Send interval in TDMA frames (1 frame = 4 timeslots)
-    pub interval_frames: u32,
+    /// Send interval in TDMA multiframes (1 multiframe = 18 frames = 72 timeslots)
+    pub interval_multiframes: u32,
     /// SDS Type4 protocol identifier byte.
     pub protocol_id: u8,
     /// Text coding scheme prepended to home mode display text user data.
@@ -27,7 +27,8 @@ pub struct CfgHomeModeDisplay {
 #[derive(Default, Deserialize)]
 pub struct HomeModeDisplayDto {
     pub source_issi: Option<u32>,
-    pub interval_frames: Option<u32>,
+    #[serde(alias = "interval_frames")]
+    pub interval_multiframes: Option<u32>,
     pub protocol_id: Option<u8>,
     pub text_coding_scheme: Option<HomeModeDisplaySdsTextCodingScheme>,
     pub text: Option<String>,
@@ -171,7 +172,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
         timezone: ci.timezone,
         home_mode_display: ci.home_mode_display.map(|h| CfgHomeModeDisplay {
             source_issi: h.source_issi.unwrap_or(0),
-            interval_frames: h.interval_frames.unwrap_or(96),
+            interval_multiframes: h.interval_multiframes.unwrap_or(96),
             protocol_id: h.protocol_id.unwrap_or(220),
             text_coding_scheme: h.text_coding_scheme.unwrap_or(HomeModeDisplaySdsTextCodingScheme::LATIN),
             text: h.text.unwrap_or_default(),
@@ -230,7 +231,7 @@ mod tests {
         let mut dto = base_cell_dto();
         dto.home_mode_display = Some(HomeModeDisplayDto {
             source_issi: Some(123456),
-            interval_frames: Some(25),
+            interval_multiframes: Some(25),
             protocol_id: None,
             text_coding_scheme: Some(HomeModeDisplaySdsTextCodingScheme::LATIN),
             text: Some("HOME MODE".to_string()),
@@ -239,7 +240,7 @@ mod tests {
         let cfg = cell_dto_to_cfg(dto);
         let home_mode = cfg.home_mode_display.expect("home_mode_display should be enabled");
         assert_eq!(home_mode.source_issi, 123456);
-        assert_eq!(home_mode.interval_frames, 25);
+        assert_eq!(home_mode.interval_multiframes, 25);
         assert_eq!(home_mode.protocol_id, 220);
         assert_eq!(home_mode.text, "HOME MODE");
     }

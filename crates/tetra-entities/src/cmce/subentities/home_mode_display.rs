@@ -19,8 +19,10 @@ pub(super) struct HomeModeDisplaySender {
 
 impl HomeModeDisplaySender {
     const HOME_MODE_BROADCAST_GSSI: u32 = 0x00FF_FFFF;
-    const HOME_MODE_START_DELAY_FRAMES: u32 = 90;
+    const HOME_MODE_START_DELAY_FRAMES: u32 = 96;
     const SLOTS_PER_FRAME: u32 = 4;
+    const FRAMES_PER_MULTIFRAME: u32 = 18;
+    const SLOTS_PER_MULTIFRAME: u32 = Self::FRAMES_PER_MULTIFRAME * Self::SLOTS_PER_FRAME;
     const MAX_SDS_TYPE4_BYTES: usize = 255; // 2040 bits max when byte-aligned
     const SDS_TL_TRANSFER_HEADER_BYTES: usize = 3;
     const HOME_MODE_TEXT_CODING_SCHEME_BYTES: usize = 1;
@@ -50,18 +52,18 @@ impl HomeModeDisplaySender {
         };
 
         let source_issi = home_mode_cfg.source_issi;
-        let interval_frames = home_mode_cfg.interval_frames;
+        let interval_multiframes = home_mode_cfg.interval_multiframes;
         let protocol_id = home_mode_cfg.protocol_id;
         let text_coding_scheme = Self::text_coding_scheme_to_sds_tl_value(home_mode_cfg.text_coding_scheme);
         let text = home_mode_cfg.text;
 
-        if interval_frames == 0 || source_issi > 0x00FF_FFFF {
+        if interval_multiframes == 0 || source_issi > 0x00FF_FFFF {
             self.reset_timers();
             if !self.warned_invalid_cfg {
                 tracing::warn!(
-                    "SDS: home_mode_display enabled but invalid config (source_issi={}, interval_frames={}), skipping",
+                    "SDS: home_mode_display enabled but invalid config (source_issi={}, interval_multiframes={}), skipping",
                     source_issi,
-                    interval_frames
+                    interval_multiframes
                 );
                 self.warned_invalid_cfg = true;
             }
@@ -76,7 +78,7 @@ impl HomeModeDisplaySender {
             return None;
         }
 
-        let interval_slots_u32 = interval_frames.saturating_mul(Self::SLOTS_PER_FRAME);
+        let interval_slots_u32 = interval_multiframes.saturating_mul(Self::SLOTS_PER_MULTIFRAME);
         let interval_slots = interval_slots_u32.min(i32::MAX as u32) as i32;
 
         let should_send = match self.last_tx {
@@ -88,11 +90,11 @@ impl HomeModeDisplaySender {
         }
 
         tracing::info!(
-            "SDS: periodic Home Mode Display broadcast src={} dst_gssi={} protocol_id={} interval_frames={} start_delay_frames={} text_coding_scheme={}",
+            "SDS: periodic Home Mode Display broadcast src={} dst_gssi={} protocol_id={} interval_multiframes={} start_delay_frames={} text_coding_scheme={}",
             source_issi,
             Self::HOME_MODE_BROADCAST_GSSI,
             protocol_id,
-            interval_frames,
+            interval_multiframes,
             Self::HOME_MODE_START_DELAY_FRAMES,
             text_coding_scheme
         );
