@@ -143,7 +143,7 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     let umac = UmacBs::new(cfg.clone());
     let llc = Llc::new(cfg.clone());
     let mle = MleBs::new(cfg.clone());
-    let mm = MmBs::with_services(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
+    let mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
     let sndcp = Sndcp::new(cfg.clone());
     let cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
     router.register_entity(Box::new(lmac));

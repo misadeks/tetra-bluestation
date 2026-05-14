@@ -1270,6 +1270,8 @@ impl UmacBs {
                     }
                 }
 
+                // Loopback only if there's an active DL circuit on this timeslot
+
                 let dl_ts = self.channel_scheduler.duplex_peer_ts(ts).unwrap_or(ts);
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, dl_ts) {
                     let swmi_media_active = self.channel_scheduler.dl_media_source(dl_ts) == Some(CircuitDlMediaSource::SwMI);

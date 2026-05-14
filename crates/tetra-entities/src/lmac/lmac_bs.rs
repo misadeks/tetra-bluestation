@@ -34,6 +34,8 @@ impl Default for LmacTrafficChan {
 // }
 
 pub struct LmacBs {
+    /// Timeslot time, provided by upper layer and then maintained in sync here
+    dltime: TdmaTime,
     config: SharedConfig,
 
     /// Cached from global config
@@ -43,9 +45,6 @@ pub struct LmacBs {
     /// Traffic channels and associated state
     // ul_circuits: [Option<LmacTrafficChan>; 4],
     // dl_circuits: [Option<LmacTrafficChan>; 4],
-
-    /// Timeslot time, provided by upper layer and then maintained in sync here
-    dltime: TdmaTime,
 
     /// Per-timeslot UL physical channel indicator from UMAC.
     /// UL bursts arrive 2 timeslots after the corresponding DL slot, so we must
@@ -258,16 +257,15 @@ impl LmacBs {
     fn rx_tp_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_tp_prim: msg {:?}", message);
 
-        let ul_time = self.dltime.add_timeslots(-2);
         let SapMsgInner::TpUnitdataInd(prim) = message.msg else { panic!() };
 
-        // let pchan = self.determine_phy_chan_ul();
-        let ts_idx = ul_time.t as usize - 1;
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        let ts_idx = msg_dltime.t as usize - 1;
         let pchan = self.uplink_phy_chan[ts_idx];
         if pchan != PhysicalChannel::Tp && self.blk2_stolen {
             tracing::warn!(
                 "blk2_stolen set on non-traffic burst (ts={}, pchan={:?}), ignoring stale STCH signal",
-                ul_time.t,
+                msg_dltime.t,
                 pchan
             );
             self.blk2_stolen = false;
@@ -279,11 +277,15 @@ impl LmacBs {
             prim.block_num != PhyBlockNum::Block1 || !self.blk2_stolen,
             "blk2_stolen must be false when receiving block1"
         );
+        assert!(
+            pchan == PhysicalChannel::Tp || !self.blk2_stolen,
+            "blk2_stolen must be false when not in a traffic burst"
+        );
 
         match lchan {
             LogicalChannel::Clch => {}
             LogicalChannel::TchS | LogicalChannel::Tch24 | LogicalChannel::Tch48 | LogicalChannel::Tch72 => {
-                self.rx_blk_traffic(queue, prim, lchan, ul_time)
+                self.rx_blk_traffic(queue, prim, lchan, msg_dltime)
             }
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
                 self.rx_blk_control(queue, prim, lchan);
@@ -429,7 +431,7 @@ impl TetraEntityTrait for LmacBs {
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::TpSap => {

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic;
 
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, unimplemented_log};
+use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, unimplemented_log};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -13,6 +13,8 @@ use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::llc::components::fcs;
+use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
+use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
@@ -22,34 +24,59 @@ use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
 pub struct ExpectedInAck {
-    pub addr: TetraAddress,
-    pub t_start: TdmaTime,
-    pub n: u8,
-    /// Timeslot on which the original message was received
+    /// Timeslot on which the original message was sent
     pub ts: u8,
-    /// Optional TxReporter, used to acknowledge reception by target MS
-    pub tx_reporter: Option<TxReporter>,
+    /// Address to which the message was sent
+    pub addr: TetraAddress,
+
+    /// Expected ack sequence number for the original message
+    pub ns: u8,
+
+    pub bl_type: Layer2Service,
+
+    /// Time this message was received from the MLE
+    pub t_first: TdmaTime,
+    /// Time this message was actually passed down to the Umac. If a previous message on the basic link is already
+    /// submitted, the message has to wait until that previous message was sent and acknowledged, or lost.
+    pub t_submitted_to_umac: Option<TdmaTime>,
+    /// Time the RxReporter signalled the message was fully transmitted. Also set if the Umac discarded the message
+    /// This helps attempting to retransmit the message after a brief delay.
+    pub t_umac_done: Option<TdmaTime>,
+    /// TxReporter struct. Used by Umac to signal Tx time to Llc, so llc can do retransmissions if needed.
+    /// Also used by Llc to signal Ack to upper layer (if appliccable)
+    pub tx_reporter: TxReporter,
+
     // Optional retransmission buffer, to allow for automatic retransmission of the PDU if no acknowledgement is received
-    pub retransmission_buf: Option<BitBuffer>,
+    pub retransmission_buf: SapMsg,
+    /// Number of retransmissions performed so far
+    pub retransmit_count: u8,
 }
 
 /// Struct that maintains state for an ACK we still need to send back.
 pub struct ScheduledOutAck {
     pub addr: TetraAddress,
     pub t_start: TdmaTime,
-    pub n: u8,
+    /// Received sequence number
+    pub nr: u8,
     /// Timeslot on which the original message was received
     pub ts: u8,
 }
 
 pub struct Llc {
-    dltime: TdmaTime,
     config: SharedConfig,
-    scheduled_out_acks: Vec<ScheduledOutAck>,
-    expected_in_acks: Vec<ExpectedInAck>,
+    dltime: TdmaTime,
 
-    /// Per-link send sequence variable V(S), keyed by SSI/GSSI address.
-    /// Each link starts at 0 and alternates 0,1,0,1,...
+    /// When we receive a message, and it needs to be acknowledged, we store it here for later
+    /// integration into a response message, or we will make a separate BL-ACK for it.
+    scheduled_out_acks: VecDeque<ScheduledOutAck>,
+
+    /// Outbound messages, that are either already submitted to the Umac, and wait for ack,
+    /// or, messages that can't be sent until previous messages for the same SSI have been
+    /// acknowledged, first.
+    outbound_messages: VecDeque<ExpectedInAck>,
+    outbound_udata_messages: VecDeque<SapMsg>,
+
+    /// Per-link send sequence variable per SSI. Alternates between 0 and 1.
     link_send_seq: HashMap<u32, u8>,
 }
 
@@ -58,28 +85,35 @@ impl Llc {
         Self {
             dltime: TdmaTime::default(),
             config,
-            // bl_links: BlLinkManager::new(),
-            scheduled_out_acks: Vec::new(),
-            expected_in_acks: Vec::new(),
+            scheduled_out_acks: VecDeque::new(),
+            outbound_messages: VecDeque::new(),
+            outbound_udata_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
         }
     }
 
     /// Schedule an ACK to be sent at a later time
     pub fn schedule_outgoing_ack(&mut self, dltime: TdmaTime, addr: TetraAddress, ns: u8) {
-        self.scheduled_out_acks.push(ScheduledOutAck {
+        self.scheduled_out_acks.push_back(ScheduledOutAck {
             t_start: dltime,
-            n: ns,
+            nr: ns,
             addr,
             ts: dltime.t,
         });
     }
 
-    /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number
-    fn get_out_ack_n_if_any(&mut self, tn: u8, addr: TetraAddress) -> Option<u8> {
+    /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number.
+    /// ETSI 22.3.2.3 case d: when a waiting ACK and outgoing TL-DATA exist for the same link, the
+    /// LLC shall emit a combined BL-ADATA PDU. Matching by SSI alone is correct today because all
+    /// downlink signalling funnels to ts1 (see dl_enqueue_tma in bs_sched), so any pending ACK
+    /// for this SSI will ride the same slot as the outgoing data.
+    /// TODO: once bs_sched's identify_timeslots_for_ssi is implemented and DL signalling can
+    /// land on non-ts1 slots, also match on the target timeslot to avoid bundling an ACK onto a
+    /// BL-DATA heading to a different slot than where the ACK was scheduled.
+    fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress) -> Option<u8> {
         for i in 0..self.scheduled_out_acks.len() {
-            if self.scheduled_out_acks[i].t_start.t == tn && self.scheduled_out_acks[i].addr.ssi == addr.ssi {
-                let n = self.scheduled_out_acks[i].n;
+            if self.scheduled_out_acks[i].addr.ssi == addr.ssi {
+                let n = self.scheduled_out_acks[i].nr;
                 self.scheduled_out_acks.remove(i);
                 return Some(n);
             }
@@ -96,40 +130,59 @@ impl Llc {
         ns
     }
 
-    /// Register that we expect an ACK for this link (acknowledged mode only)
-    fn register_expected_ack(&mut self, t: TdmaTime, addr: TetraAddress, n: u8, tx_reporter: Option<TxReporter>) {
-        self.expected_in_acks.push(ExpectedInAck {
-            t_start: t,
-            n,
-            addr,
-            ts: t.t,
-            tx_reporter,
-            retransmission_buf: None,
-        });
-    }
-
-    /// Process incoming ACK. Remove outstanding ACK expectation. We ignore unexpected ones, might be a retransmission
-    fn process_incoming_ack(&mut self, tn: u8, addr: TetraAddress, n: u8) {
-        for i in 0..self.expected_in_acks.len() {
-            if self.expected_in_acks[i].t_start.t == tn && self.expected_in_acks[i].addr.ssi == addr.ssi {
-                if self.expected_in_acks[i].n != n {
-                    tracing::warn!(
-                        "Received unexpected ACK for t: {} ssi: {} got n {}, expected {}",
-                        tn,
-                        addr.ssi,
-                        n,
-                        self.expected_in_acks[i].n
-                    );
-                }
-
-                // Remove this expected ACK from the list, and if it has a TxReporter, mark it as acknowledged
-                let ack = self.expected_in_acks.remove(i);
-                if let Some(tx_reporter) = ack.tx_reporter {
-                    tx_reporter.mark_acknowledged();
-                }
-                return;
+    /// Returns and removes the expected ACK entry for the given SSI, if any
+    fn take_expected_ack_for_ssi(&mut self, ssi: u32) -> Option<ExpectedInAck> {
+        for i in 0..self.outbound_messages.len() {
+            let msg = &self.outbound_messages[i];
+            if msg.addr.ssi == ssi && msg.t_submitted_to_umac.is_some() {
+                return self.outbound_messages.remove(i);
             }
         }
+        None
+    }
+
+    /// Process incoming ACK per ETSI 22.3.2.3(k).
+    /// Matches by SSI and N(R) so that retransmitted BL-DATA entries are matched correctly.
+    fn process_incoming_ack(&mut self, addr: TetraAddress, nr: u8) {
+        // Get the expected ACK entry
+        let Some(expected_ack) = self.take_expected_ack_for_ssi(addr.ssi) else {
+            tracing::warn!("received unexpected ACK for SSI {} N(R) {}", addr.ssi, nr);
+            return;
+        };
+
+        // Check it was indeed already transmitted by the Umac
+        if expected_ack.t_umac_done.is_none() {
+            // This may be an old retransmission of an ack for the before-last basic link message
+            // Let's push the ack back into the head of the queue (not tail)..
+            tracing::warn!(
+                "received ACK for SSI {} N(R) {} that was not yet transmitted by Umac. Ignoring",
+                addr.ssi,
+                nr
+            );
+            self.outbound_messages.push_front(expected_ack);
+            return;
+        }
+
+        // Check N(R)
+        if expected_ack.ns == nr {
+            // Successful ACK: N(R) matches N(S)
+            tracing::debug!("received ACK for SSI {} N(R) {}", addr.ssi, expected_ack.ns);
+            expected_ack.tx_reporter.mark_acknowledged();
+            return;
+        } else {
+            // N(R) mismatch — per ETSI 22.3.2.3(k), not a successful ACK. Maybe a retransmission?
+            // Let's push it back into the queue head (not the tail) and see if an ack arrives later
+            tracing::warn!(
+                "received unexpected ACK for SSI {}: N(R)={}, expected N(S)={}. Ignoring",
+                addr.ssi,
+                nr,
+                expected_ack.ns
+            );
+            self.outbound_messages.push_front(expected_ack);
+            return;
+        }
+
+        // The expected_ack is confirmed as matched and goes out of scope here
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -147,21 +200,21 @@ impl Llc {
         }
     }
 
-    fn rx_tla_tlunitdata_req_bl(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_tla_tlunitdata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tlunitdata_req_bl");
         let SapMsgInner::TlaTlUnitdataReqBl(mut prim) = message.msg else {
             panic!()
         };
 
         let mut pdu_buf = BitBuffer::new_autoexpand(32);
-        let pdu = BlUdata { has_fcs: prim.fcs_flag };
+        let pdu = BlUdata { has_fcs: false };
         pdu.to_bitbuf(&mut pdu_buf);
         let sdu_len = prim.tl_sdu.get_len_remaining();
         pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
         pdu_buf.seek(0);
         tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
 
-        queue.push_back(SapMsg {
+        let sapmsg = SapMsg {
             sap: Sap::TmaSap,
             src: self.entity(),
             dest: TetraEntity::Umac,
@@ -174,24 +227,39 @@ impl Llc {
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: prim.subscriber_class,
                 air_interface_encryption: prim.air_interface_encryption,
-                stealing_repeats_flag: None,
+                stealing_repeats_flag: None, // fixme
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
                 tx_reporter: prim.tx_reporter.take(),
             }),
-        });
+        };
+
+        // Put into transmit queue
+        self.outbound_udata_messages.push_back(sapmsg);
+    }
+
+    /// Schedules a message that was not acked in time for a retransmission
+    fn submit_for_acknowledged_transmission(queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime) {
+        // Clone the sapmsg. Make sure we set (or for retransmission: reset) timers properly
+        let sapmsg = ack.retransmission_buf.clone();
+        ack.t_submitted_to_umac = Some(dltime);
+        ack.t_umac_done = None;
+        ack.tx_reporter.reset();
+
+        // Send the message
+        queue.push_back(sapmsg);
     }
 
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
-    fn rx_tla_tldata_req_bl(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_tla_tldata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tldata_req_bl");
         let SapMsgInner::TlaTlDataReqBl(mut prim) = message.msg else {
             panic!()
         };
 
         // Use unacknowledged mode (BL-UDATA) when:
-        // 1. STCH (stolen half-slot) — no established LLC link on STCH.
-        // 2. GSSI-addressed messages — per ETSI EN 300 392-2, group-addressed
+        // 1. STCH (stolen half-slot) has no established LLC link.
+        // 2. GSSI-addressed messages: per ETSI EN 300 392-2, group-addressed
         //    signaling on SCH/F must use BL-UDATA because there is no
         //    established LLC link with individual group members. Using BL-DATA
         //    causes radios (e.g. Sepura) to silently discard frames when the
@@ -224,12 +292,12 @@ impl Llc {
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             };
-            queue.push_back(sapmsg);
+            self.outbound_udata_messages.push_back(sapmsg);
             return;
         }
 
         // If an ack still needs to be sent, get the relevant expected sequence number
-        let out_ack_n = self.get_out_ack_n_if_any(self.dltime.t, prim.main_address);
+        let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
         let ns = self.get_next_send_seq(&prim.main_address);
@@ -250,11 +318,9 @@ impl Llc {
             let sdu_len = prim.tl_sdu.get_len_remaining();
             pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
             pdu_buf.seek(0);
-            tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
-            // Register that we expect an ACK back (acknowledged mode only)
-            self.register_expected_ack(self.dltime, prim.main_address, ns, prim.tx_reporter.clone());
+            tracing::debug!(ts=%self.dltime, "-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
         } else {
-            // BL-DATA (unacknowledged, with or without FCS)
+            // BL-DATA (acknowledged, with or without FCS) — ETSI Clause 22.3.2.3
             let pdu = BlData {
                 has_fcs: prim.fcs_flag,
                 ns,
@@ -264,9 +330,11 @@ impl Llc {
             let sdu_len = prim.tl_sdu.get_len_remaining();
             pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
             pdu_buf.seek(0);
-            tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
-            // No ACK expected for unacknowledged BL-DATA
+            tracing::debug!(ts=%self.dltime, "-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
         }
+
+        // Either take tx_reporter passed down or create a new one
+        let tx_reporter = prim.tx_reporter.take().unwrap_or_else(|| TxReporter::new());
 
         let sapmsg = SapMsg {
             sap: Sap::TmaSap,
@@ -276,7 +344,7 @@ impl Llc {
                 req_handle: prim.req_handle,
                 pdu: pdu_buf,
                 main_address: prim.main_address,
-                link_id: 0,
+                link_id: prim.link_id,
                 endpoint_id: prim.endpoint_id,
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: prim.subscriber_class,
@@ -284,10 +352,27 @@ impl Llc {
                 stealing_repeats_flag: prim.stealing_repeats_flag,
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
-                tx_reporter: prim.tx_reporter.take(),
+                tx_reporter: Some(tx_reporter.clone()),
             }),
         };
-        queue.push_back(sapmsg);
+
+        // Register that we expect an ACK for this message
+        tracing::warn!("setting expected ack for ts1, but that's not neccessarily correct");
+        self.outbound_messages.push_back(ExpectedInAck {
+            ns,
+            addr: prim.main_address,
+            ts: 1,
+            bl_type: Layer2Service::Acknowledged,
+            tx_reporter,
+            t_first: self.dltime,
+            t_submitted_to_umac: None,
+            t_umac_done: None,
+            retransmission_buf: sapmsg, // Clone the message to keep a copy for potential retransmission
+            retransmit_count: 0,
+        });
+
+        // The message will now be picked up for transmission at end-of-tick, if the ssi does not yet have
+        // a pending message waiting for an ack.
     }
 
     fn rx_tla_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -364,7 +449,6 @@ impl Llc {
 
     fn rx_tma_unitdata_ind_bl(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tma_unitdata_ind_bl");
-        let msg_dltime = self.dltime.add_timeslots(-2);
 
         // Get header bits (again) and prepare MLE message
         let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else {
@@ -385,7 +469,7 @@ impl Llc {
         let (has_fcs, ns, nr) = match pdu_type {
             LlcPduType::BlAdata | LlcPduType::BlAdataFcs => match BlAdata::from_bitbuf(&mut pdu) {
                 Ok(pdu) => {
-                    tracing::debug!("<- {:?}", pdu);
+                    tracing::debug!(ts=%self.dltime, "<- {:?}", pdu);
                     (pdu.has_fcs, Some(pdu.ns), Some(pdu.nr))
                 }
                 Err(e) => {
@@ -396,7 +480,7 @@ impl Llc {
 
             LlcPduType::BlData | LlcPduType::BlDataFcs => match BlData::from_bitbuf(&mut pdu) {
                 Ok(pdu) => {
-                    tracing::debug!("<- {:?}", pdu);
+                    tracing::debug!(ts=%self.dltime, "<- {:?}", pdu);
                     (pdu.has_fcs, Some(pdu.ns), None)
                 }
                 Err(e) => {
@@ -406,7 +490,7 @@ impl Llc {
             },
             LlcPduType::BlAck | LlcPduType::BlAckFcs => match BlAck::from_bitbuf(&mut pdu) {
                 Ok(pdu) => {
-                    tracing::debug!("<- {:?}", pdu);
+                    tracing::debug!(ts=%self.dltime, "<- {:?}", pdu);
                     (pdu.has_fcs, None, Some(pdu.nr))
                 }
                 Err(e) => {
@@ -416,7 +500,7 @@ impl Llc {
             },
             LlcPduType::BlUdata | LlcPduType::BlUdataFcs => match BlUdata::from_bitbuf(&mut pdu) {
                 Ok(pdu) => {
-                    tracing::debug!("<- {:?}", pdu);
+                    tracing::debug!(ts=%self.dltime, "<- {:?}", pdu);
                     (pdu.has_fcs, None, None)
                 }
                 Err(e) => {
@@ -436,6 +520,7 @@ impl Llc {
         }
 
         // If ns is present, we need to send an ACK
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
         if let Some(ns) = ns {
             // Send ACK
             self.schedule_outgoing_ack(msg_dltime, prim.main_address, ns);
@@ -443,26 +528,26 @@ impl Llc {
 
         // if nr is present, we have received an ACK on a previous message
         if let Some(nr) = nr {
-            self.process_incoming_ack(msg_dltime.t, prim.main_address, nr);
+            self.process_incoming_ack(prim.main_address, nr);
         }
 
         if pdu_type == LlcPduType::BlAck || pdu_type == LlcPduType::BlAckFcs {
-            // No need to do anything further
-            // TODO FIXME: flag sent sdu as acked
+            // No payload, no need to do anything further
+            if pdu.get_len_remaining() > 4 {
+                tracing::warn!("BL-ACK PDU with unexpected payload, ignoring extra bits: {}", pdu.dump_bin());
+            }
             return;
         }
 
         // If unacknowledged data transfer service, we send a TL-UNITDATA indication
         // to MLE. If acknowledged data transfer service, we send a TL-DATA indication
-
         pdu.set_raw_start(pdu.get_raw_pos());
-        // tracing::info!("got sdu: {:}", sdu.dump_bin());
         let s = if pdu_type == LlcPduType::BlUdata || pdu_type == LlcPduType::BlUdataFcs {
             // Unacknowledged data transfer service
             let m = TlaTlUnitdataIndBl {
                 // address_type: 0, // TODO FIXME
                 main_address: prim.main_address,
-                link_id: msg_dltime.t as u32,
+                link_id: 0,
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,
@@ -486,7 +571,7 @@ impl Llc {
             let m = TlaTlDataIndBl {
                 // address_type: 0, // TODO FIXME
                 main_address: prim.main_address,
-                link_id: msg_dltime.t as u32,
+                link_id: 0,
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,
@@ -510,73 +595,128 @@ impl Llc {
         queue.push_back(s);
     }
 
-    fn format_expected_ack_list(ack_list: &Vec<ExpectedInAck>) -> String {
-        let mut ret = String::new();
-        ret.push_str("Expected in acks:\n");
-        for ack in ack_list {
-            ret.push_str(&format!("  t: {}, ssi: {}, n: {}\n", ack.t_start.t, ack.addr.ssi, ack.n));
-        }
-        ret
-    }
+    fn submit_retransmissions_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+        let mut had_activity = false;
+        let dltime = self.dltime;
+        let mut removals: Option<Vec<u32>> = None;
 
-    fn format_scheduled_ack_list(ack_list: &Vec<ScheduledOutAck>) -> String {
-        let mut ret = String::new();
-        ret.push_str("Scheduled out acks:\n");
-        for ack in ack_list {
-            ret.push_str(&format!("  t: {}, ssi: {}, n: {}\n", ack.t_start.t, ack.addr.ssi, ack.n));
-        }
-        ret
-    }
-}
+        // if !self.outbound_messages.is_empty() {
+        //     tracing::error!("{}", Self::format_expected_ack_list(&self.outbound_messages));
+        // }
 
-impl TetraEntityTrait for Llc {
-    fn entity(&self) -> TetraEntity {
-        TetraEntity::Llc
-    }
-
-    fn set_config(&mut self, config: SharedConfig) {
-        self.config = config;
-    }
-
-    fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
-
-        match message.sap {
-            Sap::TmaSap => {
-                self.rx_tma_prim(queue, message);
+        for ack in self.outbound_messages.iter_mut() {
+            // First, check which have newly been txed, or discarded by Umac. If so, start t_umac_done.
+            if ack.t_umac_done.is_none() && (ack.tx_reporter.is_transmitted() || ack.tx_reporter.is_discarded()) {
+                // TxReporter has now marked it as txed or dropped, so we can set t_umac_done
+                ack.t_umac_done = Some(self.dltime);
+                tracing::trace!("schedule_retransmissions: {} umac_done at {}", ack.addr.ssi, dltime);
             }
 
-            // TMB-SAP and TMC-SAP are skipped and passed straight between MAC and MLE
-            Sap::TlaSap => {
-                self.rx_tla_prim(queue, message);
+            // If we don't have a t_umac_done, there is no need for a retransmission in any case
+            let Some(t_umac_done) = ack.t_umac_done else {
+                continue;
+            };
+
+            // Retransmit scenario 1: it was transmitted but no ack received within the expected window (ETSI T.251 / N.252)
+            // Retransmission scenario 2: it has been dropped by Umac due to congestion. Retransmit after same window
+            let age = dltime.diff(t_umac_done); // Never fails
+            if age as u32 >= T251_SENDER_RETRY_TIMER {
+                // Time for either retransmitting or giving up
+                if ack.retransmit_count < N252_BL_MAX_TLSDU_RETRANSMITS_ACKED {
+                    // Retransmit
+                    ack.retransmit_count += 1;
+                    tracing::info!(
+                        "retransmitting SSI {} N(S) {} attempt {}",
+                        ack.addr.ssi,
+                        ack.ns,
+                        ack.retransmit_count
+                    );
+
+                    Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
+                    had_activity = true;
+                } else {
+                    // Exhausted retransmissions, flag for discard
+                    removals.get_or_insert(Vec::new()).push(ack.addr.ssi);
+                }
             }
-            _ => panic!(),
         }
+
+        // Remove any expired entries
+        if let Some(removals) = removals {
+            for ssi in removals {
+                let ack = self.take_expected_ack_for_ssi(ssi).unwrap(); // Never fails
+                tracing::warn!(
+                    "schedule_retransmissions: SSI {} N(S) {} exhausted retransmissions",
+                    ack.addr.ssi,
+                    ack.ns
+                );
+                ack.tx_reporter.mark_lost();
+            }
+            // The ack expires here
+        }
+
+        had_activity
     }
 
-    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
-        self.dltime = ts;
+    fn submit_free_messages_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+        let mut had_activity = false;
+        let mut ssi_blocked: HashSet<u32> = HashSet::new();
+        for ack in self.outbound_messages.iter_mut() {
+            // Check if already submitted to umac
+            if ack.t_submitted_to_umac.is_some() {
+                // This ssi currently waits for an ack, and is thus blocked
+                ssi_blocked.insert(ack.addr.ssi);
+                continue;
+            }
+
+            // Not submitted; check if blocked
+            if ssi_blocked.contains(&ack.addr.ssi) {
+                // SSI already has another message waiting for ack, so we cannot submit this one yet
+                tracing::debug!(
+                    "SSI {} N(S) {} still blocked by previous message, cannot submit next message",
+                    ack.addr.ssi,
+                    ack.ns
+                );
+                continue;
+            }
+
+            // Not submitted and not blocked. We can submit it now.
+            // tracing::debug!("submitting message for SSI {} N(S) {} to umac", ack.addr.ssi, ack.ns);
+            tracing::debug!(
+                "submitting message for SSI {} N(S) {} to umac: {:?}",
+                ack.addr.ssi,
+                ack.ns,
+                ack.retransmission_buf.msg
+            );
+            Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
+            ssi_blocked.insert(ack.addr.ssi);
+            had_activity = true;
+        }
+
+        had_activity
     }
 
-    fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
-        // Check if any unsent ACKs are still here
-        // Take oldest element from scheduled_out_acks, and remove it from the list
-        let ret = !self.scheduled_out_acks.is_empty();
-        while let Some(ack) = self.scheduled_out_acks.first() {
-            tracing::debug!("tick_end: auto-ack for ssi: {}, n: {}, ts: {}", ack.addr.ssi, ack.n, ack.ts);
+    /// Pops all elements from the scheduled_out_acks queue, prepares BL-ACK messages, and send them down
+    fn submit_ack_replies_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+        let had_activity = !self.scheduled_out_acks.is_empty();
+        while let Some(ack) = self.scheduled_out_acks.pop_front() {
+            tracing::debug!("auto-ack for ssi: {}, n: {}, ts: {}", ack.addr.ssi, ack.nr, ack.ts);
 
             // Send BL-ACK via FACCH (stealing) on the traffic timeslot if the original
             // message arrived on a traffic channel (TS2-4), otherwise via MCCH (TS1).
             let steal = matches!(ack.ts, 2..=4);
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
-            let pdu = BlAck { has_fcs: false, nr: ack.n };
+            let pdu = BlAck {
+                has_fcs: false,
+                nr: ack.nr,
+            };
             pdu.to_bitbuf(&mut pdu_buf);
             pdu_buf.seek(0);
-            tracing::debug!("-> {:?} {}", pdu, pdu_buf.dump_bin());
+            tracing::debug!(ts=%self.dltime, "-> {:?} {}", pdu, pdu_buf.dump_bin());
 
-            // We're sending an ACK for a received uplink message; channel choice is
-            // carried explicitly by the channel allocation below.
+            // We're sending an ACK for a received uplink message, however, we don't have that message here
+            // Since DL is two slots ahead of UL, we will correct that. We now have the dltime for reception
+            // of the original message.
             let chan_alloc = match steal {
                 true => {
                     let mut timeslots = [false; 4];
@@ -596,11 +736,10 @@ impl TetraEntityTrait for Llc {
                 src: TetraEntity::Llc,
                 dest: TetraEntity::Umac,
                 msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                    link_id: if steal { ack.ts as u32 } else { 0 },
                     req_handle: 0, // TODO FIXME
                     pdu: pdu_buf,
                     main_address: ack.addr,
-                    // scrambling_code: self.config.config().scrambling_code(),
-                    link_id: 0,
                     endpoint_id: 0, // todo fixme
                     stealing_permission: steal,
                     subscriber_class: 0,            // TODO FIXME
@@ -612,9 +751,95 @@ impl TetraEntityTrait for Llc {
                 }),
             };
             queue.push_back(sapmsg);
-            self.scheduled_out_acks.remove(0);
         }
+        had_activity
+    }
 
+    /// Pops all elements from the scheduled_out_acks queue, prepares BL-ACK messages, and send them down
+    fn submit_udata_msgs_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+        let had_activity = !self.outbound_udata_messages.is_empty();
+        while let Some(msg) = self.outbound_udata_messages.pop_front() {
+            tracing::debug!("submitting udata msg to umac: {:?}", msg.msg);
+            queue.push_back(msg);
+        }
+        had_activity
+    }
+
+    fn format_expected_ack_list(ack_list: &VecDeque<ExpectedInAck>) -> String {
+        let mut ret = String::new();
+        ret.push_str("Expected in acks:\n");
+        for ack in ack_list {
+            ret.push_str(&format!(
+                "  ssi: {}, n: {}, retransmissions: {}, t_first: {:?}, t_umac_done: {:?}, state: {:?}\n",
+                ack.addr.ssi,
+                ack.ns,
+                ack.retransmit_count,
+                ack.t_first,
+                ack.t_umac_done,
+                ack.tx_reporter.get_state()
+            ));
+        }
         ret
+    }
+
+    fn format_scheduled_ack_list(ack_list: &Vec<ScheduledOutAck>) -> String {
+        let mut ret = String::new();
+        ret.push_str("Scheduled out acks:\n");
+        for ack in ack_list {
+            ret.push_str(&format!("  t_start: {}, ssi: {}, n: {}\n", ack.t_start.t, ack.addr.ssi, ack.nr));
+        }
+        ret
+    }
+}
+
+impl TetraEntityTrait for Llc {
+    fn entity(&self) -> TetraEntity {
+        TetraEntity::Llc
+    }
+
+    fn set_config(&mut self, config: SharedConfig) {
+        self.config = config;
+    }
+
+    fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        tracing::debug!("rx_prim: {:?}", message);
+        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
+
+        match message.sap {
+            Sap::TmaSap => {
+                self.rx_tma_prim(queue, message);
+            }
+
+            // TMB-SAP and TMC-SAP are skipped and passed straight between MAC and MLE
+            Sap::TlaSap => {
+                self.rx_tla_prim(queue, message);
+            }
+            _ => panic!(),
+        }
+    }
+
+    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
+        self.dltime = ts;
+    }
+
+    fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
+        let mut had_activity = false;
+
+        // Step 1 / 4: Check if we have any transmitted messages that were not acked within the expected window
+        // Schedule a retransmission if appropriate.
+        had_activity |= self.submit_retransmissions_to_umac(queue);
+
+        // Step 2 / 4: Check if there are any messages that were not yet sent down, that we can now send down the stack
+        // Messages may be kept since the target SSI has not yet acked them . If the link is now free, we can send the message down and register that we expect an ACK for it.
+        had_activity |= self.submit_free_messages_to_umac(queue);
+
+        // Step 3 / 4: Check if any unsent ACKs are still here
+        // Take oldest element from scheduled_out_acks, and remove it from the list
+        had_activity |= self.submit_ack_replies_to_umac(queue);
+
+        // Step 4 / 4: Send any U-DATA messages
+        had_activity |= self.submit_udata_msgs_to_umac(queue);
+
+        had_activity
     }
 }
