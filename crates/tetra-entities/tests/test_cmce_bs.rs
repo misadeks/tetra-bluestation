@@ -1,11 +1,20 @@
 mod common;
 
-use tetra_config::bluestation::StackMode;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, TxState, debug};
+use tetra_entities::MessageQueue;
+use tetra_entities::cmce::subentities::cc_bs::CcBsSubentity;
+use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
+use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
+use tetra_pdus::cmce::pdus::d_setup::DSetup;
+use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+use tetra_saps::control::call_control::CallControl;
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::control::enums::communication_type::CommunicationType;
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
@@ -17,12 +26,11 @@ const TEST_GSSI: u32 = 91;
 const TEST_ISSI: u32 = 1000001;
 
 /// Helper: register a subscriber on a GSSI so CMCE accepts calls for that group.
-fn register_subscriber(test: &mut ComponentTest, dltime: TdmaTime, issi: u32, gssi: u32) {
+fn register_subscriber(test: &mut ComponentTest, issi: u32, gssi: u32) {
     let register = SapMsg {
         sap: Sap::Control,
         src: TetraEntity::Mm,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
             issi,
             groups: vec![],
@@ -36,7 +44,6 @@ fn register_subscriber(test: &mut ComponentTest, dltime: TdmaTime, issi: u32, gs
         sap: Sap::Control,
         src: TetraEntity::Mm,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
             issi,
             groups: vec![gssi],
@@ -49,7 +56,7 @@ fn register_subscriber(test: &mut ComponentTest, dltime: TdmaTime, issi: u32, gs
 }
 
 /// Helper: build a U-SETUP SAP message for a group call.
-fn build_u_setup_msg(dltime: TdmaTime, calling_issi: u32, dest_gssi: u32) -> SapMsg {
+fn build_u_setup_msg(calling_issi: u32, dest_gssi: u32) -> SapMsg {
     let u_setup = USetup {
         area_selection: 0,
         hook_method_selection: false,
@@ -64,7 +71,7 @@ fn build_u_setup_msg(dltime: TdmaTime, calling_issi: u32, dest_gssi: u32) -> Sap
         request_to_transmit_send_data: false,
         call_priority: 0,
         clir_control: 0,
-        called_party_type_identifier: 1,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
         called_party_ssi: Some(dest_gssi as u64),
         called_party_short_number_address: None,
         called_party_extension: None,
@@ -82,7 +89,6 @@ fn build_u_setup_msg(dltime: TdmaTime, calling_issi: u32, dest_gssi: u32) -> Sap
         sap: Sap::LcmcSap,
         src: TetraEntity::Mle,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
             sdu,
             handle: 1,
@@ -124,8 +130,63 @@ fn count_d_setups(msgs: &[SapMsg]) -> usize {
         .count()
 }
 
+fn extract_first_d_setup(msgs: &mut [SapMsg]) -> Option<(u16, u8)> {
+    for msg in msgs.iter_mut() {
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut msg.msg else {
+            continue;
+        };
+        if msg.dest != TetraEntity::Mle || prim.sdu.peek_bits(5) != Some(CmcePduTypeDl::DSetup.into_raw()) {
+            continue;
+        }
+
+        let d_setup = DSetup::from_bitbuf(&mut prim.sdu).ok()?;
+        let ts = prim
+            .chan_alloc
+            .as_ref()?
+            .timeslots
+            .iter()
+            .position(|assigned| *assigned)
+            .map(|idx| idx as u8 + 1)?;
+
+        return Some((d_setup.call_identifier, ts));
+    }
+
+    None
+}
+
+fn count_floor_released(msgs: &[SapMsg], dest: TetraEntity, call_id: u16, ts: u8) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            msg.dest == dest
+                && matches!(
+                    &msg.msg,
+                    SapMsgInner::CmceCallControl(CallControl::FloorReleased {
+                        call_id: msg_call_id,
+                        ts: msg_ts,
+                    }) if *msg_call_id == call_id && *msg_ts == ts
+                )
+        })
+        .count()
+}
+
+fn has_d_tx_ceased(msgs: &mut [SapMsg], call_id: u16) -> bool {
+    msgs.iter_mut().any(|msg| {
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut msg.msg else {
+            return false;
+        };
+        if msg.dest != TetraEntity::Mle || prim.sdu.peek_bits(5) != Some(CmcePduTypeDl::DTxCeased.into_raw()) {
+            return false;
+        }
+
+        match DTxCeased::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu.call_identifier == call_id,
+            Err(_) => false,
+        }
+    })
+}
+
 /// Test that late-entry D-SETUP re-sends are throttled when the previous
-/// D-SETUP's TxReceipt is still in Pending state (UMAC hasn't transmitted it yet),
+/// D-SETUP's TxReporter is still in Pending state (UMAC hasn't transmitted it yet),
 /// and that they resume once the receipt reaches a final state.
 #[test]
 fn test_dsetup_late_entry_throttle() {
@@ -139,10 +200,10 @@ fn test_dsetup_late_entry_throttle() {
     let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
     test.populate_entities(components, sinks);
 
-    register_subscriber(&mut test, dltime, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
 
     // Send U-SETUP to start a group call
-    let u_setup_msg = build_u_setup_msg(dltime, TEST_ISSI, TEST_GSSI);
+    let u_setup_msg = build_u_setup_msg(TEST_ISSI, TEST_GSSI);
     test.submit_message(u_setup_msg);
     test.run_stack(Some(1));
 
@@ -193,5 +254,81 @@ fn test_dsetup_late_entry_throttle() {
         new_reporters.len(),
         unthrottled_count,
         "Each re-sent D-SETUP should carry a fresh tx_reporter"
+    );
+}
+
+#[test]
+fn test_ul_inactivity_timeout_releases_group_floor_once() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let u_setup_msg = build_u_setup_msg(TEST_ISSI, TEST_GSSI);
+    test.submit_message(u_setup_msg);
+    test.run_stack(Some(1));
+
+    let mut initial_msgs = test.dump_sinks();
+    let (call_id, ts) = extract_first_d_setup(&mut initial_msgs).expect("expected D-SETUP after U-SETUP");
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts }),
+    });
+    test.run_stack(Some(1));
+
+    let mut timeout_msgs = test.dump_sinks();
+    assert!(
+        has_d_tx_ceased(&mut timeout_msgs, call_id),
+        "Expected D-TX CEASED for inactive uplink call"
+    );
+    assert_eq!(
+        count_floor_released(&timeout_msgs, TetraEntity::Umac, call_id, ts),
+        1,
+        "Expected exactly one FloorReleased notification to UMAC"
+    );
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts }),
+    });
+    test.run_stack(Some(1));
+
+    let repeated_timeout_msgs = test.dump_sinks();
+    assert_eq!(
+        count_floor_released(&repeated_timeout_msgs, TetraEntity::Umac, call_id, ts),
+        0,
+        "Repeated inactivity timeout while in hangtime must not re-release the floor"
+    );
+}
+
+#[test]
+fn test_cc_ingress_drops_wrong_message_shape_without_panicking() {
+    let shared = SharedConfig::from_config(ComponentTest::get_default_test_config(StackMode::Bs));
+    let mut cc = CcBsSubentity::new(shared);
+    let mut queue = MessageQueue::new();
+
+    let wrong_message = SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 1 }),
+    };
+
+    let result = catch_unwind(AssertUnwindSafe(|| cc.route_xx_deliver(&mut queue, wrong_message)));
+    assert!(result.is_ok(), "CC radio ingress should drop wrong message shapes, not panic");
+    assert!(
+        queue.pop_front().is_none(),
+        "Dropped ingress message should not emit follow-up messages"
     );
 }

@@ -26,6 +26,17 @@ impl CcBsSubentity {
                         if !cached.resend {
                             continue;
                         }
+                        if let Some(receipt) = cached.tx_receipt.as_ref()
+                            && !receipt.is_in_final_state()
+                        {
+                            tracing::debug!(
+                                "CMCE: throttling D-SETUP resend for call_id={} while previous resend is {:?}",
+                                call_id,
+                                receipt.get_state()
+                            );
+                            continue;
+                        }
+
                         // Update transmission_grant based on current call state:
                         // During NoActiveSpeaker (nobody transmitting), use NotGranted;
                         // during Transmitting, use GrantedToOtherUser.
@@ -38,7 +49,10 @@ impl CcBsSubentity {
                         }
                         let dest_addr = cached.dest_addr;
                         let (sdu, chan_alloc) = Self::build_d_setup_prim(&cached.pdu, usage, ts, UlDlAssignment::Both);
-                        let prim = Self::build_sapmsg(sdu, Some(chan_alloc), self.dltime, dest_addr, None);
+                        let reporter = TxReporter::new_unacked();
+                        let receipt = reporter.clone();
+                        cached.tx_receipt = Some(receipt);
+                        let prim = Self::build_sapmsg(sdu, Some(chan_alloc), self.dltime, dest_addr, Some(reporter));
                         queue.push_back(prim);
                     }
 
@@ -58,13 +72,12 @@ impl CcBsSubentity {
                                         sap: Sap::LcmcSap,
                                         src: TetraEntity::Cmce,
                                         dest: TetraEntity::Mle,
-                                        dltime: self.dltime,
                                         msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                                             sdu: sdu_calling,
                                             handle: ind_call.calling_handle,
                                             endpoint_id: ind_call.calling_endpoint_id,
                                             link_id: ind_call.calling_link_id,
-                                            layer2service: 0,
+                                            layer2service: Layer2Service::Todo,
                                             pdu_prio: 0,
                                             layer2_qos: 0,
                                             stealing_permission: false,
@@ -134,16 +147,7 @@ impl CcBsSubentity {
                             if (ind_call.called_over_brew || ind_call.calling_over_brew)
                                 && let Some(brew_uuid) = ind_call.brew_uuid
                             {
-                                queue.push_back(SapMsg {
-                                    sap: Sap::Control,
-                                    src: TetraEntity::Cmce,
-                                    dest: TetraEntity::Brew,
-                                    dltime: self.dltime,
-                                    msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease {
-                                        brew_uuid,
-                                        cause: DisconnectCause::ExpiryOfTimer.into_raw() as u8,
-                                    }),
-                                });
+                                self.notify_network_circuit_release(queue, brew_uuid, DisconnectCause::ExpiryOfTimer);
                             }
                         }
 
@@ -218,5 +222,37 @@ impl CcBsSubentity {
             tracing::info!("Hangtime expired for call_id={}, releasing", call_id);
             self.release_group_call(queue, call_id, DisconnectCause::ExpiryOfTimer);
         }
+    }
+
+    /// Handle UL inactivity timeout from UMAC: a radio disappeared mid-transmission.
+    /// Force the group floor to released and enter hangtime.
+    pub(super) fn handle_ul_inactivity_timeout(&mut self, queue: &mut MessageQueue, ts: u8) {
+        let call_id = self
+            .active_calls
+            .iter()
+            .find(|(_, call)| call.ts == ts && call.is_tx_active())
+            .map(|(call_id, _)| *call_id);
+
+        let Some(call_id) = call_id else {
+            tracing::debug!("UL inactivity timeout on ts={} but no active transmitting call found", ts);
+            return;
+        };
+
+        let Some(call) = self.active_calls.get_mut(&call_id) else {
+            return;
+        };
+
+        tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
+        let dest_gssi = call.dest_gssi;
+        call.enter_hangtime(self.dltime);
+
+        self.send_d_tx_ceased_facch(queue, call_id, dest_gssi, ts);
+
+        self.notify_floor_released(
+            queue,
+            CallTimeslot { call_id, ts },
+            true,
+            BrewNotification::IfGroupRoutable(dest_gssi),
+        );
     }
 }

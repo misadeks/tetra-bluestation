@@ -3,7 +3,6 @@
 
 use rustfft;
 use tetra_config::bluestation::SharedConfig;
-use tetra_config::bluestation::StackMode;
 
 use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
@@ -47,45 +46,8 @@ pub struct RxTxDevSoapySdr {
 type FftPlanner = rustfft::FftPlanner<RealSample>;
 
 impl RxTxDevSoapySdr {
-    // pub fn new(
-    //     sdr_config: SdrConfig,
-    //     phy_config: PhyConfig,
-    // ) -> Self {
-    //     let mut fft_planner = rustfft::FftPlanner::new();
-
-    //     let mut sdr = soapyio::SoapyIo::new(
-    //         sdr_config.dev_args,
-    //         sdr_config.rx_freq,
-    //         sdr_config.tx_freq,
-    //         if !phy_config.monitor_frequencies.is_empty() {
-    //             soapyio::Mode::Mon
-    //         } else {
-    //             soapyio::Mode::Bs
-    //         },
-    //     ).unwrap();
-
-    //     Self {
-    //         rx_dsp: if sdr.rx_enabled() {
-    //             Some(RxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
-    //         } else { None },
-
-    //         tx_dsp: if sdr.tx_enabled() {
-    //             Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
-    //         } else { None },
-
-    //         sdr,
-    //     }
-    // }
-
     pub fn new(cfg: &SharedConfig) -> Self {
         let mut fft_planner = rustfft::FftPlanner::new();
-
-        // TODO FIXME we can remove the soapyio::mode enum and replace it by the globally used StackMode
-        let mode = match cfg.config().stack_mode {
-            StackMode::Bs => soapyio::Mode::Bs,
-            StackMode::Ms => soapyio::Mode::Ms,
-            StackMode::Mon => soapyio::Mode::Mon,
-        };
 
         // TODO FIXME currently no MS and MON support in the below statement; need to fix
         let config_guard = cfg.config();
@@ -116,7 +78,7 @@ impl RxTxDevSoapySdr {
             ..Default::default()
         };
 
-        let mut sdr = soapyio::SoapyIo::new(cfg, mode).unwrap();
+        let mut sdr = soapyio::SoapyIo::new(cfg).unwrap();
 
         Self {
             rx_dsp: if sdr.rx_enabled() {

@@ -5,14 +5,14 @@ use tetra_core::{BitBuffer, PhyBlockNum, PhysicalChannel, TdmaTime, Todo};
 use crate::tmv::enums::logical_chans::LogicalChannel;
 
 // The TMV-UNITDATA request primitive shall be used to request the lower MAC to transmit a MAC block
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmvUnitdataReq {
     pub mac_block: BitBuffer,
     pub logical_channel: LogicalChannel,
     pub scrambling_code: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmvUnitdataReqSlot {
     /// Timeslot at which this block is to be transmitted
     pub ts: TdmaTime,
@@ -33,7 +33,7 @@ pub struct TmvUnitdataReqSlot {
 }
 
 /// The TMV-UNITDATA indication primitive shall be used by the lower MAC to deliver a received MAC block;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmvUnitdataInd {
     pub pdu: BitBuffer,
 
@@ -52,7 +52,7 @@ pub struct TmvUnitdataInd {
 /// The TMV-CONFIGURE primitive shall be used to provide the lower MAC with information about the configuration
 /// of the channel or about the format of a received slot.
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TmvConfigureReq {
     // pub channel_info: Option<Todo>,
     /// Received from umac upon change of network information
@@ -68,7 +68,7 @@ pub struct TmvConfigureReq {
     pub time: Option<TdmaTime>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmvConfigureConf {
     pub channel_info: Todo,
 }

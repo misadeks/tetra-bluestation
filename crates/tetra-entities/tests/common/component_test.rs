@@ -9,7 +9,8 @@ use tetra_entities::cmce::cmce_bs::CmceBs;
 use tetra_entities::cmce::cmce_ms::CmceMs;
 use tetra_entities::llc::llc_bs_ms::Llc;
 use tetra_entities::lmac::lmac_bs::LmacBs;
-use tetra_entities::mle::mle_bs_ms::Mle;
+use tetra_entities::mle::mle_bs::MleBs;
+use tetra_entities::mle::mle_ms::MleMs;
 use tetra_entities::mm::mm_bs::MmBs;
 use tetra_entities::sndcp::sndcp_bs::Sndcp;
 use tetra_entities::umac::umac_bs::UmacBs;
@@ -111,7 +112,7 @@ impl ComponentTest {
                     self.router.register_entity(Box::new(llc));
                 }
                 TetraEntity::Mle => {
-                    let mle = Mle::new(self.config.clone());
+                    let mle = MleBs::new(self.config.clone());
                     self.router.register_entity(Box::new(mle));
                 }
                 TetraEntity::Mm => {
@@ -149,7 +150,7 @@ impl ComponentTest {
                     self.router.register_entity(Box::new(llc));
                 }
                 TetraEntity::Mle => {
-                    let mle = Mle::new(self.config.clone());
+                    let mle = MleMs::new(self.config.clone());
                     self.router.register_entity(Box::new(mle));
                 }
                 TetraEntity::Cmce => {

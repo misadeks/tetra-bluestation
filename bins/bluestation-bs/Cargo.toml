@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "tetra-bluestation"
+name = "bluestation-bs"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,6 +15,7 @@ tetra-entities = { workspace = true }
 
 clap = { workspace = true }
 ctrlc = { workspace = true }
+rustls = { version = "0.23", default-features = false }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }

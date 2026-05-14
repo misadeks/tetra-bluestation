@@ -45,6 +45,13 @@ fn call_timeout_to_timeslots(timeout: CallTimeout) -> Option<i32> {
     }
 }
 
+pub(super) struct CachedSetup {
+    pub(super) pdu: DSetup,
+    pub(super) dest_addr: TetraAddress,
+    pub(super) resend: bool,
+    pub(super) tx_receipt: Option<TxReporter>,
+}
+
 /// Origin of a group call
 #[derive(Clone)]
 pub(super) enum CallOrigin {

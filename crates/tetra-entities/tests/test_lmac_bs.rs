@@ -28,7 +28,6 @@ fn test_non_traffic_blk2_stolen_does_not_panic() {
         sap: Sap::TmvSap,
         src: TetraEntity::Umac,
         dest: TetraEntity::Lmac,
-        dltime,
         msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
             scrambling_code: None,
             is_traffic: None,
@@ -42,7 +41,6 @@ fn test_non_traffic_blk2_stolen_does_not_panic() {
         sap: Sap::TpSap,
         src: TetraEntity::Phy,
         dest: TetraEntity::Lmac,
-        dltime,
         msg: SapMsgInner::TpUnitdataInd(TpUnitdataInd {
             train_type: TrainingSequence::NormalTrainSeq2,
             burst_type: BurstType::NUB,

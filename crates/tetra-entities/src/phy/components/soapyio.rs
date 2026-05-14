@@ -1,27 +1,21 @@
 use soapysdr;
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, StackMode, sec_phy_soapy::CfgSoapySdr};
 
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 
-use super::dsp_types;
 use super::dsp_types::*;
-use super::soapy_defaults::SdrSettings;
+use super::soapy_settings;
+use super::soapy_settings::{SdrSettings, SupportedDevice};
 use super::soapy_time::{ticks_to_time_ns, time_ns_to_ticks};
 
 type StreamType = ComplexSample;
-
-#[derive(Debug)]
-pub enum Mode {
-    Bs,
-    Ms,
-    Mon,
-}
+const SOAPY_FREQ_OFFSET: f64 = 20000.0;
 
 pub struct RxResult {
     /// Number of samples read
     pub len: usize,
     /// Sample counter for the first sample read
-    pub count: dsp_types::SampleCount,
+    pub count: SampleCount,
 }
 
 pub struct SoapyIo {
@@ -34,10 +28,11 @@ pub struct SoapyIo {
     /// so that sample counter startsB210 from 0 even if timestamp does not.
     initial_time: Option<i64>,
     rx_next_count: SampleCount,
+    prev_time_ns: i64,
 
     /// If false, timestamp of latest RX read is used to estimate
     /// current hardware time. This is used in case get_hardware_time
-    /// is unacceptably slow, particularly with SoapyRemote.
+    /// is unacceptably slow or not supported.
     use_get_hardware_time: bool,
 
     dev: soapysdr::Device,
@@ -66,175 +61,63 @@ macro_rules! soapycheck {
 }
 
 impl SoapyIo {
-    /// Get gain value from config or use default value from SdrSettings
-    fn get_gain_or_default(gain_name: &str, cfg_val: Option<f64>, defaults: &SdrSettings) -> (String, f64) {
-        if let Some(val) = cfg_val {
-            (gain_name.to_string(), val)
-        } else {
-            defaults
-                .rx_gain
-                .iter()
-                .find(|(name, _)| name == gain_name)
-                .cloned()
-                .unwrap_or_else(|| (gain_name.to_string(), 0.0))
-        }
-    }
-
-    pub fn new(cfg: &SharedConfig, mode: Mode) -> Result<Self, soapysdr::Error> {
-        let rx_ch = 0;
-        let tx_ch = 0;
-        let mut use_get_hardware_time = true;
-
+    pub fn new(cfg: &SharedConfig) -> Result<Self, soapysdr::Error> {
         let binding = cfg.config();
         let soapy_cfg = binding
             .phy_io
             .soapysdr
             .as_ref()
             .expect("SoapySdr config must be set for SoapySdr PhyIo");
-        let driver = soapy_cfg.io_cfg.get_soapy_driver_name();
-        let dev_args_str = &[("driver", driver)];
+
+        let mode = cfg.config().stack_mode;
+
+        let (dev, sdr_settings) = open_device(&soapy_cfg, mode)?;
+
+        let rx_ch = sdr_settings.rx_ch;
+        let tx_ch = sdr_settings.tx_ch;
 
         // Get PPM corrected freqs
         let (dl_corrected, _) = soapy_cfg.dl_freq_corrected();
         let (ul_corrected, _) = soapy_cfg.ul_freq_corrected();
 
         let (rx_freq, tx_freq) = match mode {
-            Mode::Bs => (
-                Some(ul_corrected - 20000.0), // Offset RX center frequency from carrier frequency
+            StackMode::Bs => (
+                Some(ul_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
                 Some(dl_corrected),
             ),
-            Mode::Ms => (
-                Some(dl_corrected - 20000.0), // Offset RX center frequency from carrier frequency
+            StackMode::Ms => (
+                Some(dl_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
                 Some(ul_corrected),
             ),
-            Mode::Mon => {
+            StackMode::Mon => {
                 unimplemented!("Monitor mode not implemented yet");
             }
         };
 
-        let mut dev_args = soapysdr::Args::new();
-        for (key, value) in dev_args_str {
-            dev_args.set(*key, *value);
-
-            // get_hardware_time tends to be unacceptably slow
-            // over SoapyRemote, so do not use it.
-            // Maybe this is not a reliably way to detect use of SoapyRemote
-            // in case SoapySDR selects it by default, but I do not know
-            // a better way to detect it.
-            if *key == "driver" && *value == "remote" {
-                use_get_hardware_time = false;
-            }
-        }
-
-        let dev = soapycheck!("open SoapySDR device", soapysdr::Device::new(dev_args));
-
         let rx_enabled = rx_freq.is_some();
         let tx_enabled = tx_freq.is_some();
 
-        // Get default settings based on detected hardware
-        let driver_key = dev.driver_key().unwrap_or_default();
-        let hardware_key = dev.hardware_key().unwrap_or_default();
-        let mut sdr_settings = SdrSettings::get_defaults(&driver_key, &hardware_key);
-
-        // Apply user configuration overrides based on driver type
-        let driver = soapy_cfg.io_cfg.get_soapy_driver_name();
-        match driver {
-            "uhd" => {
-                if let Some(cfg) = &soapy_cfg.io_cfg.iocfg_usrpb2xx {
-                    // Override antenna settings if specified
-                    if let Some(ref ant) = cfg.rx_ant {
-                        sdr_settings.rx_ant = Some(ant.clone());
-                    }
-                    if let Some(ref ant) = cfg.tx_ant {
-                        sdr_settings.tx_ant = Some(ant.clone());
-                    }
-
-                    // Override gain settings
-                    let mut rx_gains = Vec::new();
-                    rx_gains.push(Self::get_gain_or_default("PGA", cfg.rx_gain_pga, &sdr_settings));
-                    sdr_settings.rx_gain = rx_gains;
-
-                    let mut tx_gains = Vec::new();
-                    tx_gains.push(Self::get_gain_or_default("PGA", cfg.tx_gain_pga, &sdr_settings));
-                    sdr_settings.tx_gain = tx_gains;
-                }
-            }
-            "lime" => {
-                if let Some(cfg) = &soapy_cfg.io_cfg.iocfg_limesdr {
-                    // Override antenna settings if specified
-                    if let Some(ref ant) = cfg.rx_ant {
-                        sdr_settings.rx_ant = Some(ant.clone());
-                    }
-                    if let Some(ref ant) = cfg.tx_ant {
-                        sdr_settings.tx_ant = Some(ant.clone());
-                    }
-
-                    // Override gain settings
-                    let mut rx_gains = Vec::new();
-                    rx_gains.push(Self::get_gain_or_default("LNA", cfg.rx_gain_lna, &sdr_settings));
-                    rx_gains.push(Self::get_gain_or_default("TIA", cfg.rx_gain_tia, &sdr_settings));
-                    rx_gains.push(Self::get_gain_or_default("PGA", cfg.rx_gain_pga, &sdr_settings));
-                    sdr_settings.rx_gain = rx_gains;
-
-                    let mut tx_gains = Vec::new();
-                    tx_gains.push(Self::get_gain_or_default("PAD", cfg.tx_gain_pad, &sdr_settings));
-                    tx_gains.push(Self::get_gain_or_default("IAMP", cfg.tx_gain_iamp, &sdr_settings));
-                    sdr_settings.tx_gain = tx_gains;
-                }
-            }
-            "sx" => {
-                if let Some(cfg) = &soapy_cfg.io_cfg.iocfg_sxceiver {
-                    // Override antenna settings if specified
-                    if let Some(ref ant) = cfg.rx_ant {
-                        sdr_settings.rx_ant = Some(ant.clone());
-                    }
-                    if let Some(ref ant) = cfg.tx_ant {
-                        sdr_settings.tx_ant = Some(ant.clone());
-                    }
-
-                    // Override gain settings
-                    let mut rx_gains = Vec::new();
-                    rx_gains.push(Self::get_gain_or_default("LNA", cfg.rx_gain_lna, &sdr_settings));
-                    rx_gains.push(Self::get_gain_or_default("PGA", cfg.rx_gain_pga, &sdr_settings));
-                    sdr_settings.rx_gain = rx_gains;
-
-                    let mut tx_gains = Vec::new();
-                    tx_gains.push(Self::get_gain_or_default("DAC", cfg.tx_gain_dac, &sdr_settings));
-                    tx_gains.push(Self::get_gain_or_default("MIXER", cfg.tx_gain_mixer, &sdr_settings));
-                    sdr_settings.tx_gain = tx_gains;
-                }
-            }
-            _ => {
-                tracing::warn!("Unknown SoapySDR driver '{}', using default settings", driver);
-            }
-        }
-
-        tracing::info!(
-            "Got driver key '{}' hardware_key '{}', using settings for {}",
-            driver_key,
-            hardware_key,
-            sdr_settings.name
-        );
-
-        let samp_rate = match mode {
-            Mode::Bs | Mode::Ms => sdr_settings.fs_bs,
-            Mode::Mon => sdr_settings.fs_monitor,
-        };
         let mut rx_fs: f64 = 0.0;
         if rx_enabled {
-            soapycheck!("set RX sample rate", dev.set_sample_rate(soapysdr::Direction::Rx, rx_ch, samp_rate));
+            soapycheck!(
+                "set RX sample rate",
+                dev.set_sample_rate(soapysdr::Direction::Rx, rx_ch, sdr_settings.fs)
+            );
             // Read the actual sample rate obtained and store it
             // to avoid having to read it again every time it is needed.
             rx_fs = soapycheck!("get RX sample rate", dev.sample_rate(soapysdr::Direction::Rx, rx_ch));
         }
         let mut tx_fs: f64 = 0.0;
         if tx_enabled {
-            soapycheck!("set TX sample rate", dev.set_sample_rate(soapysdr::Direction::Tx, tx_ch, samp_rate));
+            soapycheck!(
+                "set TX sample rate",
+                dev.set_sample_rate(soapysdr::Direction::Tx, tx_ch, sdr_settings.fs)
+            );
             tx_fs = soapycheck!("get TX sample rate", dev.sample_rate(soapysdr::Direction::Tx, tx_ch));
         }
 
         if rx_enabled {
-            // If rx_enabled is true, we already know sdr_rx_freq is not None,
+            // If rx_enabled is true, we already know rx_freq is not None,
             // so unwrap is fine here.
             soapycheck!(
                 "set RX center frequency",
@@ -271,24 +154,15 @@ impl SoapyIo {
             }
         }
 
-        // TODO: add stream arguments to SdrSettings.
-        // Maybe they should be different for BS and monitor modes.
-        // For example, the latency argument with LimeSDR should probably
-        // be set for minimum latency for TMO BS
-        // but for maximum throughput for TMO monitor.
         let mut rx_args = soapysdr::Args::new();
-        let tx_args = soapysdr::Args::new();
-        // hack to test the idea above, TODO properly
-        match mode {
-            Mode::Bs | Mode::Ms => {
-                // Minimize latency
-                rx_args.set("latency", "0");
-            }
-            Mode::Mon => {
-                // Maximize throughput with high sample rates
-                rx_args.set("latency", "1");
-            }
-        };
+        for (key, value) in sdr_settings.rx_args {
+            rx_args.set(key, value);
+        }
+
+        let mut tx_args = soapysdr::Args::new();
+        for (key, value) in sdr_settings.tx_args {
+            tx_args.set(key, value);
+        }
 
         let mut rx = if rx_enabled {
             Some(soapycheck!("setup RX stream", dev.rx_stream_args(&[rx_ch], rx_args)))
@@ -313,7 +187,8 @@ impl SoapyIo {
             tx_fs,
             initial_time: None,
             rx_next_count: 0,
-            use_get_hardware_time,
+            prev_time_ns: -1,
+            use_get_hardware_time: sdr_settings.use_get_hardware_time,
             dev,
             rx,
             tx,
@@ -327,13 +202,26 @@ impl SoapyIo {
                 Ok(len) => {
                     // Get timestamp, set initial time if not yet set
                     let time = rx.time_ns();
-                    if self.initial_time.is_none() {
+                    // rust-soapysdr does not let us if a timestamp was available
+                    // so we have to guess by checking whether it has changed from its previous value.
+                    let timestamp_available = time != self.prev_time_ns;
+                    self.prev_time_ns = time;
+
+                    if self.initial_time.is_none() && timestamp_available {
                         self.initial_time = Some(time - ticks_to_time_ns(self.rx_next_count, self.rx_fs));
                         tracing::trace!("Set initial_time to {} ns", self.initial_time.unwrap());
                     };
 
                     // Re-compute total count from timestamp (gracefully handles lost samples).
-                    let mut count = time_ns_to_ticks(time - self.initial_time.unwrap(), self.rx_fs);
+                    let mut count = if timestamp_available {
+                        time_ns_to_ticks(time - self.initial_time.unwrap(), self.rx_fs)
+                    } else {
+                        // If timestamp was not available,
+                        // assume the read continues right after the previous read.
+                        // Some drivers, particularly SoapyRemote,
+                        // may provide a timestamp only in some of the reads.
+                        self.rx_next_count
+                    };
 
                     // Smooth tiny timestamp jitter (e.g. +/-1 sample) to keep counters monotonic
                     // This is known to happen for LimeSDR Mini v2 after some time
@@ -446,4 +334,143 @@ impl SoapyIo {
     pub fn tx_enabled(&self) -> bool {
         self.tx.is_some()
     }
+}
+
+// Messy logic related to opening a device follows...
+
+/// Struct to temporarily hold stuff related to opening and detecting a device
+struct OpenedDevice {
+    dev_args: soapysdr::Args,
+    dev: soapysdr::Device,
+    driver_key: String,
+    hardware_key: String,
+    detected_device: SupportedDevice,
+    soapyremote_used: bool,
+}
+
+fn open_given_device(dev_args: soapysdr::Args) -> Result<OpenedDevice, soapysdr::Error> {
+    let soapyremote_used = match dev_args.get("driver") {
+        Some("remote") => true,
+        _ => false,
+    };
+    tracing::info!("Trying to open a device with arguments: {}", dev_args);
+
+    let dev_args_copy: soapysdr::Args = dev_args.iter().collect();
+    let dev = match soapysdr::Device::new(dev_args_copy) {
+        Ok(dev) => dev,
+        Err(err) => {
+            tracing::info!("Skipping a SoapySDR device because opening failed: {}", err);
+            return Err(err);
+        }
+    };
+    let driver_key = dev.driver_key().unwrap_or_default();
+    let hardware_key = dev.hardware_key().unwrap_or_default();
+
+    // Check whether the device is supported
+    if let Some(detected_device) = SupportedDevice::detect(&driver_key, &hardware_key) {
+        tracing::info!(
+            "Found supported device with driver_key '{}' hardware_key '{}'",
+            driver_key,
+            hardware_key
+        );
+        Ok(OpenedDevice {
+            dev_args,
+            dev,
+            driver_key,
+            hardware_key,
+            detected_device,
+            soapyremote_used,
+        })
+    } else {
+        tracing::info!(
+            "Skipping unsupported device with driver_key '{}' hardware_key '{}'",
+            driver_key,
+            hardware_key
+        );
+        Err(soapysdr::Error {
+            code: soapysdr::ErrorCode::NotSupported,
+            message: "Unsupported device".to_string(),
+        })
+    }
+}
+
+/// Enumerate devices and find the first supported device
+fn find_supported_device(filter_args: soapysdr::Args) -> Result<OpenedDevice, soapysdr::Error> {
+    for dev_args in soapycheck!("Enumerate SoapySDR devices", soapysdr::enumerate(filter_args)) {
+        //tracing::info!("Trying to open a device with arguments: {}", args_formatted);
+        match open_given_device(dev_args) {
+            Ok(opened_device) => return Ok(opened_device),
+            Err(_) => {}
+        }
+    }
+    return Err(soapysdr::Error {
+        code: soapysdr::ErrorCode::NotSupported,
+        message: "No supported devices found".to_string(),
+    });
+}
+
+/// Open a given device if argument string is given,
+/// automatically find the first supported device if not.
+fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::Device, SdrSettings), soapysdr::Error> {
+    let mut opened_device = if let Some(arg_string) = &soapy_cfg.device {
+        open_given_device(arg_string.as_str().into())
+    } else {
+        find_supported_device(soapysdr::Args::new())
+    }?;
+
+    let mut sdr_settings = match SdrSettings::get_settings(&soapy_cfg, opened_device.detected_device, mode) {
+        Ok(sdr_settings) => sdr_settings,
+        Err(soapy_settings::Error::InvalidConfiguration) => {
+            return Err(soapysdr::Error {
+                code: soapysdr::ErrorCode::Other,
+                message: "Invalid SDR device configuration".to_string(),
+            });
+        }
+    };
+
+    if opened_device.soapyremote_used {
+        // Getting hardware time may be too slow over SoapyRemote
+        tracing::info!("SoapyRemote detected, forcing use_get_hardware_time=false");
+        sdr_settings.use_get_hardware_time = false;
+    }
+
+    tracing::info!("Using settings: {:?}", sdr_settings);
+
+    // If additional driver arguments are needed, reopen the device with them
+    if sdr_settings.dev_args.len() > 0 {
+        // Append additional arguments from settings
+        for (key, value) in &sdr_settings.dev_args {
+            opened_device.dev_args.set(key.as_str(), value.as_str());
+        }
+
+        tracing::info!("Reopening device with additional arguments: {}", opened_device.dev_args);
+
+        // Make sure device gets closed first. Not sure if needed.
+        std::mem::drop(opened_device.dev);
+        opened_device.dev = soapycheck!(
+            "open SoapySDR device with additional arguments",
+            soapysdr::Device::new(opened_device.dev_args)
+        );
+        // Make sure it is still the same device.
+        // Unlikely to change, but who knows if a device got connected just in between,
+        // or if the device broke from first opening attempt and something else got opened
+        // because device arguments were not precise enough to guarantee a specific device.
+        let new_driver_key = opened_device.dev.driver_key().unwrap_or_default();
+        let new_hardware_key = opened_device.dev.hardware_key().unwrap_or_default();
+        if new_driver_key != opened_device.driver_key || new_hardware_key != opened_device.hardware_key {
+            tracing::info!(
+                "Expected the same driver_key='{}' hardware_key='{}' after reopen, got driver_key='{}' hardware_key='{}'",
+                opened_device.driver_key,
+                opened_device.hardware_key,
+                new_driver_key,
+                new_hardware_key
+            );
+            return Err(soapysdr::Error {
+                code: soapysdr::ErrorCode::Other,
+                message: "Reopened a different device".to_string(),
+            });
+        }
+    }
+
+    Ok((opened_device.dev, sdr_settings))
 }

@@ -1,3 +1,4 @@
+use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
@@ -12,6 +13,7 @@ use super::subentities::ss_bs::SsBsSubentity;
 
 pub struct CmceBs {
     config: SharedConfig,
+    control: Option<ControlEndpoint>,
 
     cc: CcBsSubentity,
     sds: SdsBsSubentity,
@@ -20,9 +22,14 @@ pub struct CmceBs {
 
 impl CmceBs {
     pub fn new(config: SharedConfig) -> Self {
+        Self::with_control(config, None)
+    }
+
+    pub fn with_control(config: SharedConfig, control: Option<ControlEndpoint>) -> Self {
         Self {
             config: config.clone(),
-            sds: SdsBsSubentity::new(),
+            control,
+            sds: SdsBsSubentity::new(config.clone()),
             cc: CcBsSubentity::new(config.clone()),
             ss: SsBsSubentity::new(),
         }
@@ -51,15 +58,16 @@ impl CmceBs {
             | CmcePduTypeUl::UInfo
             | CmcePduTypeUl::URelease
             | CmcePduTypeUl::USetup
-            | CmcePduTypeUl::UStatus
             | CmcePduTypeUl::UTxCeased
             | CmcePduTypeUl::UTxDemand
             | CmcePduTypeUl::UCallRestore => {
                 self.cc.route_xx_deliver(_queue, message);
             }
+            CmcePduTypeUl::UStatus => {
+                self.sds.route_status_deliver(_queue, message);
+            }
             CmcePduTypeUl::USdsData => {
-                unimplemented_log!("{:?}", pdu_type);
-                // self.sds.route_xx_deliver(_queue, message);
+                self.sds.route_rf_deliver(_queue, message);
             }
             CmcePduTypeUl::UFacility => {
                 unimplemented_log!("{:?}", pdu_type);
@@ -84,11 +92,26 @@ impl TetraEntityTrait for CmceBs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         // Propagate tick to subentities
         self.cc.tick_start(queue, ts);
+        self.sds.tick_start(ts);
+
+        if let Some(control) = &self.control {
+            while let Some(command) = control.try_recv() {
+                match command {
+                    command @ ControlCommand::SendSds { handle, .. } => {
+                        let success = self.sds.rx_sds_from_control(queue, command);
+                        control.respond(ControlResponse::SendSdsResponse { handle, success });
+                    }
+                    other => {
+                        tracing::warn!("CMCE: unsupported control command {:?}", other);
+                    }
+                }
+            }
+        }
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::LcmcSap => match message.msg {
@@ -105,6 +128,9 @@ impl TetraEntityTrait for CmceBs {
                 }
                 SapMsgInner::MmSubscriberUpdate(update) => {
                     self.cc.handle_subscriber_update(queue, update);
+                }
+                SapMsgInner::CmceSdsData(_) => {
+                    self.sds.rx_sds_from_brew(queue, message);
                 }
                 _ => {
                     panic!("Unexpected control message: {:?}", message.msg);

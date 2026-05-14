@@ -21,7 +21,7 @@ impl CcBsSubentity {
             };
             let reject_call_id = self.circuits.get_next_call_id();
             let sdu = Self::build_d_release(reject_call_id, DisconnectCause::IncompatibleTrafficCase);
-            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
             queue.push_back(msg);
             return;
         }
@@ -216,7 +216,6 @@ impl CcBsSubentity {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
                 dest: TetraEntity::Brew,
-                dltime: self.dltime,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitDtmf {
                     brew_uuid,
                     length_bits: 8,
@@ -305,13 +304,12 @@ impl CcBsSubentity {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
-            dltime: self.dltime,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                 sdu,
                 handle: ul_handle,
                 endpoint_id: ul_endpoint_id,
                 link_id: ul_link_id,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,

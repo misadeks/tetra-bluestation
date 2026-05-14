@@ -156,33 +156,17 @@ impl CcBsSubentity {
         );
         self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts);
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+        self.notify_floor_granted(
+            queue,
+            GroupFloorGrant {
                 call_id,
                 source_issi: requesting_party.ssi,
                 dest_gssi: dest_addr.ssi,
                 ts,
-            }),
-        });
-
-        if brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id,
-                    source_issi: requesting_party.ssi,
-                    dest_gssi: dest_addr.ssi,
-                    ts,
-                }),
-            });
-        }
+            },
+            true,
+            BrewNotification::IfGroupRoutable(dest_ssi),
+        );
 
         Ok(())
     }
@@ -228,33 +212,17 @@ impl CcBsSubentity {
             self.fsm_send_d_tx_granted_individual(queue, call_id, requester, ts, TransmissionGrant::Granted, Some(requester.ssi));
             self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts);
 
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+            self.notify_floor_granted(
+                queue,
+                GroupFloorGrant {
                     call_id,
                     source_issi: requester.ssi,
                     dest_gssi: dest_addr.ssi,
                     ts,
-                }),
-            });
-
-            if brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    dltime: self.dltime,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: requester.ssi,
-                        dest_gssi: dest_addr.ssi,
-                        ts,
-                    }),
-                });
-            }
+                },
+                true,
+                BrewNotification::IfGroupRoutable(dest_ssi),
+            );
             return Ok(());
         }
 
@@ -274,23 +242,12 @@ impl CcBsSubentity {
         let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, ts, None);
         queue.push_back(msg);
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
-        });
-
-        if brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
-            });
-        }
+        self.notify_floor_released(
+            queue,
+            CallTimeslot { call_id, ts },
+            true,
+            BrewNotification::IfGroupRoutable(dest_ssi),
+        );
 
         Ok(())
     }
@@ -324,24 +281,22 @@ impl CcBsSubentity {
 
         self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts);
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            dltime: self.dltime,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+        self.notify_floor_granted(
+            queue,
+            GroupFloorGrant {
                 call_id,
                 source_issi,
                 dest_gssi,
                 ts,
-            }),
-        });
+            },
+            true,
+            BrewNotification::Never,
+        );
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            dltime: self.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
                 brew_uuid,
                 call_id,
@@ -372,13 +327,7 @@ impl CcBsSubentity {
             }
 
             self.send_d_tx_ceased_facch(queue, call_id, call.dest_gssi, call.ts);
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts: call.ts }),
-            });
+            self.notify_floor_released(queue, CallTimeslot { call_id, ts: call.ts }, true, BrewNotification::Never);
             return Ok(());
         }
 

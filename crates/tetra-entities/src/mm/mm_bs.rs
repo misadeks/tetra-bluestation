@@ -1,16 +1,21 @@
-use crate::{MessageQueue, TetraEntityTrait, brew};
+use crate::net_control::ControlEndpoint;
+use crate::net_telemetry::TelemetrySink;
+use crate::{MessageQueue, TetraEntityTrait, net_brew as brew};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, assert_warn, unimplemented_log};
+use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, assert_warn, unimplemented_log};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::mm::components::client_state::{MmClientMgr, MmClientState};
 use crate::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
+use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
+use tetra_pdus::mm::enums::reject_cause::RejectCause;
 use tetra_pdus::mm::enums::status_uplink::StatusUplink;
+use tetra_pdus::mm::fields::energy_saving_information::EnergySavingInformation;
 use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
 use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
 use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
@@ -18,6 +23,7 @@ use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
+use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
@@ -25,21 +31,29 @@ use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
 
 pub struct MmBs {
     config: SharedConfig,
+    control: Option<ControlEndpoint>,
+    dltime: TdmaTime,
     pub client_mgr: MmClientMgr,
 }
 
 impl MmBs {
     pub fn new(config: SharedConfig) -> Self {
+        Self::with_services(config, None, None)
+    }
+
+    pub fn with_services(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         Self {
             config,
-            client_mgr: MmClientMgr::new(),
+            control,
+            dltime: TdmaTime::default(),
+            client_mgr: MmClientMgr::new(telemetry),
         }
     }
 
     fn emit_subscriber_update(
         &self,
         queue: &mut MessageQueue,
-        dltime: TdmaTime,
+        _dltime: TdmaTime,
         issi: u32,
         groups: Vec<u32>,
         action: BrewSubscriberAction,
@@ -61,7 +75,6 @@ impl MmBs {
                     sap: Sap::Control,
                     src: TetraEntity::Mm,
                     dest: TetraEntity::Brew,
-                    dltime,
                     msg: SapMsgInner::MmSubscriberUpdate(brew_update),
                 };
                 queue.push_back(msg);
@@ -74,7 +87,6 @@ impl MmBs {
             sap: Sap::Control,
             src: TetraEntity::Mm,
             dest: TetraEntity::Cmce,
-            dltime,
             msg: SapMsgInner::MmSubscriberUpdate(mm_update),
         };
         queue.push_back(msg);
@@ -106,11 +118,12 @@ impl MmBs {
         let ssi = prim.received_address.ssi;
         let detached_client = self.client_mgr.remove_client(ssi);
         if let Some(client) = detached_client {
+            self.config.state_write().subscribers.deregister(ssi);
             if !client.groups.is_empty() {
                 let groups: Vec<u32> = client.groups.iter().copied().collect();
-                self.emit_subscriber_update(_queue, message.dltime, ssi, groups, BrewSubscriberAction::Deaffiliate);
+                self.emit_subscriber_update(_queue, self.dltime, ssi, groups, BrewSubscriberAction::Deaffiliate);
             }
-            self.emit_subscriber_update(_queue, message.dltime, ssi, Vec::new(), BrewSubscriberAction::Deregister);
+            self.emit_subscriber_update(_queue, self.dltime, ssi, Vec::new(), BrewSubscriberAction::Deregister);
         } else {
             tracing::warn!("Received UItsiDetach for unknown client with SSI: {}", ssi);
             // return;
@@ -134,28 +147,47 @@ impl MmBs {
             }
         };
 
+        if pdu.location_update_type == LocationUpdateType::MigratingLocationUpdating
+            || pdu.location_update_type == LocationUpdateType::ServiceRestorationMigratingLocationUpdating
+        {
+            tracing::warn!(
+                "Rejecting migration request from SSI {}: {}",
+                prim.received_address.ssi,
+                pdu.location_update_type
+            );
+            Self::send_d_location_update_reject(
+                queue,
+                self.dltime,
+                prim.received_address.ssi,
+                prim.handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+            );
+            return;
+        }
+
         // Check if we can satisfy this request, print unsupported stuff
         if !Self::feature_check_u_location_update_demand(&pdu) {
             tracing::error!("Unsupported critical features in ULocationUpdateDemand");
             return;
         }
 
-        // Handle Energy Saving Mode request
-        // TODO FIXME this does not yet seem to be functional, and prevents the MS from remaining
-        // properly registered.
-        // let esi = if let Some(esm) = pdu.energy_saving_mode {
-        //     if esm != EnergySavingMode::StayAlive {
-        //         unimplemented_log!("Got req for EnergySavingMode {}, overriding with {}", esm, EnergySavingMode::StayAlive);
-        //     }
-        //     Some(EnergySavingInformation {
-        //         energy_saving_mode: EnergySavingMode::StayAlive,
-        //         frame_number: None,
-        //         multiframe_number: None,
-        //     })
-        // } else {
-        //     None
-        // };
-        let esi = None;
+        // The scheduler does not track per-MS sleep windows. Accept the request
+        // but allocate StayAlive so downlink signalling remains reliable.
+        let esi = pdu.energy_saving_mode.map(|requested| {
+            if requested != EnergySavingMode::StayAlive {
+                tracing::debug!(
+                    "MS {} requested energy saving mode {}, overriding to StayAlive",
+                    prim.received_address.ssi,
+                    requested
+                );
+            }
+            EnergySavingInformation {
+                energy_saving_mode: EnergySavingMode::StayAlive,
+                frame_number: None,
+                multiframe_number: None,
+            }
+        });
 
         // Try to register the client
         let issi = prim.received_address.ssi;
@@ -164,7 +196,8 @@ impl MmBs {
         if is_new {
             match self.client_mgr.try_register_client(issi, true) {
                 Ok(_) => {
-                    self.emit_subscriber_update(queue, message.dltime, issi, Vec::new(), BrewSubscriberAction::Register);
+                    self.config.state_write().subscribers.register(issi);
+                    self.emit_subscriber_update(queue, self.dltime, issi, Vec::new(), BrewSubscriberAction::Register);
                 }
                 Err(e) => {
                     tracing::warn!("Failed registering roaming MS {}: {:?}", issi, e);
@@ -177,11 +210,36 @@ impl MmBs {
             return;
         }
 
+        let energy_saving_mode = esi
+            .as_ref()
+            .map(|value| value.energy_saving_mode)
+            .unwrap_or(EnergySavingMode::StayAlive);
+        let _ = self.client_mgr.set_client_energy_saving_mode(issi, energy_saving_mode);
+
         // Process optional GroupIdentityLocationDemand field
         let gila = if let Some(gild) = pdu.group_identity_location_demand {
+            if gild.group_identity_attach_detach_mode == 1 {
+                let prior_groups: Vec<u32> = self
+                    .client_mgr
+                    .get_client_by_issi(issi)
+                    .map(|client| client.groups.iter().copied().collect())
+                    .unwrap_or_default();
+                if let Err(e) = self.client_mgr.client_detach_all_groups(issi) {
+                    tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
+                } else if !prior_groups.is_empty() {
+                    {
+                        let mut state = self.config.state_write();
+                        for &gssi in &prior_groups {
+                            state.subscribers.deaffiliate(issi, gssi);
+                        }
+                    }
+                    self.emit_subscriber_update(queue, self.dltime, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                }
+            }
+
             // Try to attach to requested groups, then build GroupIdentityLocationAccept element
             let accepted_groups = if let Some(giu) = &gild.group_identity_uplink {
-                Some(self.try_attach_detach_groups(queue, message.dltime, issi, &giu))
+                Some(self.try_attach_detach_groups(queue, self.dltime, issi, &giu))
             } else {
                 None
             };
@@ -195,6 +253,11 @@ impl MmBs {
             // No GroupIdentityLocationAccept element present
             None
         };
+
+        if let Some(ref class) = pdu.class_of_ms {
+            tracing::info!("MS {} class_of_ms: {}", issi, class);
+        }
+        let _ = self.client_mgr.set_client_class_of_ms(issi, pdu.class_of_ms);
 
         // Build D-LOCATION UPDATE ACCEPT pdu
         let pdu_response = DLocationUpdateAccept {
@@ -223,7 +286,6 @@ impl MmBs {
 
         // Build and submit response prim
         let addr = TetraAddress {
-            encrypted: false,
             ssi_type: SsiType::Ssi,
             ssi: issi,
         };
@@ -231,12 +293,11 @@ impl MmBs {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
             dest: TetraEntity::Mle,
-            dltime: message.dltime,
             msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
                 sdu,
                 handle: prim.handle,
                 address: addr,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
@@ -250,7 +311,7 @@ impl MmBs {
         // re-register with full group report via D-LOCATION UPDATE COMMAND
         if is_new && pdu.location_update_type != LocationUpdateType::ItsiAttach {
             tracing::info!("Sending D-LOCATION UPDATE COMMAND to returning MS {} to request group report", issi);
-            Self::send_d_location_update_command(queue, message.dltime, issi, handle);
+            Self::send_d_location_update_command(queue, self.dltime, issi, handle);
         }
     }
 
@@ -303,8 +364,7 @@ impl MmBs {
                 prim.handle,
                 MmPduTypeUl::UMmStatus,
                 Some((6, pdu.status_uplink.into())),
-                prim.received_address.ssi,
-                message.dltime,
+                prim.received_address,
             );
             tracing::debug!("-> {}", debug_str);
             queue.push_back(sapmsg);
@@ -343,7 +403,8 @@ impl MmBs {
                 // Re-register so group attachment can proceed.
                 match self.client_mgr.try_register_client(issi, true) {
                     Ok(_) => {
-                        self.emit_subscriber_update(queue, message.dltime, issi, Vec::new(), BrewSubscriberAction::Register);
+                        self.config.state_write().subscribers.register(issi);
+                        self.emit_subscriber_update(queue, self.dltime, issi, Vec::new(), BrewSubscriberAction::Register);
                     }
                     Err(e) => {
                         tracing::warn!("Failed re-registering MS {} on group attach: {:?}", issi, e);
@@ -360,7 +421,13 @@ impl MmBs {
                 match self.client_mgr.client_detach_all_groups(issi) {
                     Ok(_) => {
                         if !prior_groups.is_empty() {
-                            self.emit_subscriber_update(queue, message.dltime, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                            {
+                                let mut state = self.config.state_write();
+                                for &gssi in &prior_groups {
+                                    state.subscribers.deaffiliate(issi, gssi);
+                                }
+                            }
+                            self.emit_subscriber_update(queue, self.dltime, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
                         }
                     }
                     Err(e) => {
@@ -373,7 +440,7 @@ impl MmBs {
 
         // Try to attach to requested groups, and retrieve list of accepted GroupIdentityDownlink elements
         // We can unwrap since we did compat check earlier
-        let accepted_gid = self.try_attach_detach_groups(queue, message.dltime, issi, &pdu.group_identity_uplink.unwrap());
+        let accepted_gid = self.try_attach_detach_groups(queue, self.dltime, issi, &pdu.group_identity_uplink.unwrap());
 
         // Build reply PDU
         let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
@@ -391,7 +458,6 @@ impl MmBs {
         tracing::debug!("-> {:?} sdu {}", pdu_response, sdu.dump_bin());
 
         let addr = TetraAddress {
-            encrypted: false,
             ssi_type: SsiType::Ssi,
             ssi: issi,
         };
@@ -399,12 +465,11 @@ impl MmBs {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
             dest: TetraEntity::Mle,
-            dltime: message.dltime,
             msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
                 sdu,
                 handle: prim.handle,
                 address: addr,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
@@ -471,6 +536,7 @@ impl MmBs {
                 match self.client_mgr.client_group_attach(issi, gssi, false) {
                     Ok(changed) => {
                         if changed {
+                            self.config.state_write().subscribers.deaffiliate(issi, gssi);
                             deaff_groups.push(gssi);
                         }
                         let gid = GroupIdentityDownlink {
@@ -490,6 +556,7 @@ impl MmBs {
                 match self.client_mgr.client_group_attach(issi, gssi, true) {
                     Ok(changed) => {
                         if changed {
+                            self.config.state_write().subscribers.affiliate(issi, gssi);
                             aff_groups.push(gssi);
                         }
                         // We have added the client to this group. Add an entry to the downlink response
@@ -524,7 +591,7 @@ impl MmBs {
 
     /// Sends a D-LOCATION UPDATE COMMAND to force the radio to re-register
     /// with full group identity report
-    fn send_d_location_update_command(queue: &mut MessageQueue, dltime: TdmaTime, issi: u32, handle: u32) {
+    fn send_d_location_update_command(queue: &mut MessageQueue, _dltime: TdmaTime, issi: u32, handle: u32) {
         let pdu = DLocationUpdateCommand {
             group_identity_report: true,
             cipher_control: false,
@@ -540,7 +607,6 @@ impl MmBs {
         tracing::debug!("-> DLocationUpdateCommand sdu {}", sdu.dump_bin());
 
         let addr = TetraAddress {
-            encrypted: false,
             ssi_type: SsiType::Ssi,
             ssi: issi,
         };
@@ -548,12 +614,53 @@ impl MmBs {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
             dest: TetraEntity::Mle,
-            dltime,
             msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
                 sdu,
                 handle,
                 address: addr,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    fn send_d_location_update_reject(
+        queue: &mut MessageQueue,
+        _dltime: TdmaTime,
+        issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        address_extension: Option<u64>,
+    ) {
+        let pdu = DLocationUpdateReject {
+            location_update_type,
+            reject_cause: RejectCause::MigrationNotSupported as u8,
+            cipher_control: false,
+            ciphering_parameters: None,
+            address_extension,
+            cell_type_control: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(16);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Todo,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
@@ -577,9 +684,7 @@ impl MmBs {
 
     fn feature_check_u_location_update_demand(pdu: &ULocationUpdateDemand) -> bool {
         let mut supported = true;
-        if pdu.location_update_type == LocationUpdateType::MigratingLocationUpdating
-            || pdu.location_update_type == LocationUpdateType::DisabledMsUpdating
-        {
+        if pdu.location_update_type == LocationUpdateType::DisabledMsUpdating {
             unimplemented_log!("Unsupported {}", pdu.location_update_type);
             supported = false;
         }
@@ -594,12 +699,6 @@ impl MmBs {
         if pdu.ciphering_parameters.is_some() {
             unimplemented_log!("Unsupported ciphering_parameters present");
             supported = false;
-        }
-        if pdu.class_of_ms.is_some() {
-            unimplemented_log!("Unsupported class_of_ms present");
-        }
-        if pdu.energy_saving_mode.is_some() {
-            unimplemented_log!("Unsupported energy_saving_mode present");
         }
         if pdu.la_information.is_some() {
             unimplemented_log!("Unsupported la_information present");
@@ -657,9 +756,18 @@ impl TetraEntityTrait for MmBs {
         self.config = config;
     }
 
+    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
+        self.dltime = ts;
+        if let Some(control) = &self.control {
+            while let Some(command) = control.try_recv() {
+                tracing::warn!("MM: unsupported control command {:?}", command);
+            }
+        }
+    }
+
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
 
         // There is only one SAP for MM
         assert!(message.sap == Sap::LmmSap);

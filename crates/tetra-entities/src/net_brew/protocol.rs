@@ -125,6 +125,8 @@ pub enum BrewCallPayload {
     CircularCall(BrewCircularCall),
     /// CALL_STATE_CONNECT_CONFIRM, CALL_STATE_SIMPLEX_GRANTED, CALL_STATE_SIMPLEX_IDLE
     CircularGrant(BrewCircularGrant),
+    /// CALL_STATE_SHORT_TRANSFER (SDS header)
+    ShortTransfer { source: u32, destination: u32 },
     /// Unknown/unhandled call state
     Raw(Vec<u8>),
 }
@@ -303,8 +305,6 @@ fn parse_call_control(call_state: u8, data: &[u8]) -> Result<BrewMessage, BrewPa
         }
 
         CALL_STATE_SETUP_REQUEST | CALL_STATE_CONNECT_REQUEST => {
-            // BrewCircularCall:
-            // source(4) + destination(4) + number(32) + 11 single-byte fields = 51 bytes
             if payload_data.len() < CIRCULAR_CALL_LEN {
                 return Err(BrewParseError::TooShort(data.len()));
             }
@@ -347,6 +347,17 @@ fn parse_call_control(call_state: u8, data: &[u8]) -> Result<BrewMessage, BrewPa
                 grant: payload_data[0],
                 permission: payload_data[1],
             })
+        }
+
+        CALL_STATE_SHORT_TRANSFER => {
+            // BrewShortData: source(4) + destination(4) + number[32](char) = 40 bytes
+            if payload_data.len() < 8 {
+                return Err(BrewParseError::TooShort(data.len()));
+            }
+            BrewCallPayload::ShortTransfer {
+                source: read_u32_le(payload_data, 0),
+                destination: read_u32_le(payload_data, 4),
+            }
         }
 
         _ => {
@@ -413,6 +424,21 @@ pub fn build_subscriber_register(issi: u32, groups: &[u32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(18 + groups.len() * 4);
     buf.push(BREW_CLASS_SUBSCRIBER);
     buf.push(BREW_SUBSCRIBER_REGISTER);
+    write_u32_le(&mut buf, issi);
+    write_u64_le(&mut buf, now.as_secs());
+    write_u32_le(&mut buf, now.subsec_nanos());
+    buf
+}
+
+/// Build a subscriber re-registration message (for already-registered subscribers)
+pub fn build_subscriber_reregister(issi: u32) -> Vec<u8> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let mut buf = Vec::with_capacity(18);
+    buf.push(BREW_CLASS_SUBSCRIBER);
+    buf.push(BREW_SUBSCRIBER_REREGISTER);
     write_u32_le(&mut buf, issi);
     write_u64_le(&mut buf, now.as_secs());
     write_u32_le(&mut buf, now.subsec_nanos());
@@ -487,7 +513,6 @@ pub fn build_group_tx(session_uuid: &Uuid, source_issi: u32, dest_gssi: u32, pri
 }
 
 fn build_circular_call(call_state: u8, session_uuid: &Uuid, call: &BrewCircularCall) -> Vec<u8> {
-    // kind(1) + type(1) + uuid(16) + circular_call(51)
     let mut buf = Vec::with_capacity(2 + 16 + CIRCULAR_CALL_LEN);
     buf.push(BREW_CLASS_CALL_CONTROL);
     buf.push(call_state);
@@ -603,6 +628,44 @@ pub fn build_group_idle(session_uuid: &Uuid, cause: u8) -> Vec<u8> {
     buf
 }
 
+/// Build a CALL_STATE_SHORT_TRANSFER message (SDS header with source/dest/number)
+pub fn build_short_transfer(session_uuid: &Uuid, source: u32, destination: u32) -> Vec<u8> {
+    // kind(1) + type(1) + uuid(16) + source(4) + destination(4) + number[32](1 byte each) = 58
+    let mut buf = Vec::with_capacity(58);
+    buf.push(BREW_CLASS_CALL_CONTROL);
+    buf.push(CALL_STATE_SHORT_TRANSFER);
+    buf.extend_from_slice(session_uuid.as_bytes());
+    write_u32_le(&mut buf, source);
+    write_u32_le(&mut buf, destination);
+    // number field: 32 bytes, zero-filled (external subscriber number not supported)
+    buf.extend_from_slice(&[0u8; 32]);
+    buf
+}
+
+/// Build a FRAME_TYPE_SDS_TRANSFER message (SDS Type 4 PDU payload)
+pub fn build_sds_frame(session_uuid: &Uuid, length_bits: u16, data: &[u8]) -> Vec<u8> {
+    // kind(1) + type(1) + uuid(16) + length(2) + data = 20 + data.len()
+    let mut buf = Vec::with_capacity(20 + data.len());
+    buf.push(BREW_CLASS_FRAME);
+    buf.push(FRAME_TYPE_SDS_TRANSFER);
+    buf.extend_from_slice(session_uuid.as_bytes());
+    write_u16_le(&mut buf, length_bits);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Build a FRAME_TYPE_SDS_REPORT message (delivery acknowledgement)
+/// Wire: kind(1) + type(1) + uuid(16) + length_bits(2) + status(1) = 21 bytes
+pub fn build_sds_report(session_uuid: &Uuid, status: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(21);
+    buf.push(BREW_CLASS_FRAME);
+    buf.push(FRAME_TYPE_SDS_REPORT);
+    buf.extend_from_slice(session_uuid.as_bytes());
+    write_u16_le(&mut buf, 8); // length_bits = 8 (1 byte status)
+    buf.push(status);
+    buf
+}
+
 /// Build a service query (query subscriber profiles)
 pub fn build_query_subscribers(issis: &[u32]) -> Vec<u8> {
     let json = serde_json::to_string(issis).unwrap_or_else(|_| "[]".to_string());
@@ -668,6 +731,70 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_short_transfer() {
+        let uuid = Uuid::new_v4();
+        let mut data = vec![BREW_CLASS_CALL_CONTROL, CALL_STATE_SHORT_TRANSFER];
+        data.extend_from_slice(uuid.as_bytes());
+        write_u32_le(&mut data, 5001); // source
+        write_u32_le(&mut data, 6001); // destination
+        // number field (32 bytes)
+        let number_str = b"6001";
+        data.extend_from_slice(number_str);
+        data.resize(data.len() + (32 - number_str.len()), 0);
+
+        let msg = parse_brew_message(&data).unwrap();
+        if let BrewMessage::CallControl(cc) = msg {
+            assert_eq!(cc.call_state, CALL_STATE_SHORT_TRANSFER);
+            assert_eq!(cc.identifier, uuid);
+            if let BrewCallPayload::ShortTransfer { source, destination } = cc.payload {
+                assert_eq!(source, 5001);
+                assert_eq!(destination, 6001);
+            } else {
+                panic!("Expected ShortTransfer payload");
+            }
+        } else {
+            panic!("Expected CallControl message");
+        }
+    }
+
+    #[test]
+    fn test_build_parse_sds_frame() {
+        let uuid = Uuid::new_v4();
+        let payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let built = build_sds_frame(&uuid, 32, &payload);
+
+        let msg = parse_brew_message(&built).unwrap();
+        if let BrewMessage::Frame(frame) = msg {
+            assert_eq!(frame.frame_type, FRAME_TYPE_SDS_TRANSFER);
+            assert_eq!(frame.identifier, uuid);
+            assert_eq!(frame.length_bits, 32);
+            assert_eq!(frame.data, payload);
+        } else {
+            panic!("Expected Frame message");
+        }
+    }
+
+    #[test]
+    fn test_build_parse_short_transfer() {
+        let uuid = Uuid::new_v4();
+        let built = build_short_transfer(&uuid, 1001, 2002);
+
+        let msg = parse_brew_message(&built).unwrap();
+        if let BrewMessage::CallControl(cc) = msg {
+            assert_eq!(cc.call_state, CALL_STATE_SHORT_TRANSFER);
+            assert_eq!(cc.identifier, uuid);
+            if let BrewCallPayload::ShortTransfer { source, destination } = cc.payload {
+                assert_eq!(source, 1001);
+                assert_eq!(destination, 2002);
+            } else {
+                panic!("Expected ShortTransfer payload");
+            }
+        } else {
+            panic!("Expected CallControl message");
+        }
+    }
+
+    #[test]
     fn test_parse_group_idle() {
         let uuid = Uuid::new_v4();
         let mut data = vec![BREW_CLASS_CALL_CONTROL, CALL_STATE_GROUP_IDLE];
@@ -684,6 +811,26 @@ mod tests {
             }
         } else {
             panic!("Expected CallControl message");
+        }
+    }
+
+    #[test]
+    fn test_build_parse_sds_report() {
+        let uuid = Uuid::new_v4();
+        let built = build_sds_report(&uuid, 0);
+
+        assert_eq!(built.len(), 21);
+        assert_eq!(built[0], BREW_CLASS_FRAME);
+        assert_eq!(built[1], FRAME_TYPE_SDS_REPORT);
+
+        let msg = parse_brew_message(&built).unwrap();
+        if let BrewMessage::Frame(frame) = msg {
+            assert_eq!(frame.frame_type, FRAME_TYPE_SDS_REPORT);
+            assert_eq!(frame.identifier, uuid);
+            assert_eq!(frame.length_bits, 8);
+            assert_eq!(frame.data, vec![0]);
+        } else {
+            panic!("Expected Frame message");
         }
     }
 

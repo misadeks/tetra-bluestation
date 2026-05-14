@@ -1,4 +1,6 @@
-use tetra_core::{BitBuffer, Direction, PhyBlockNum, PhysicalChannel, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log};
+use tetra_core::{
+    BitBuffer, Direction, LinkId, PhyBlockNum, PhysicalChannel, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log,
+};
 use tetra_saps::{
     control::call_control::{Circuit, CircuitDlMediaSource},
     tmv::{TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel},
@@ -40,6 +42,9 @@ pub const SCH_HD_CAP: usize = 124;
 pub const SCH_F_CAP: usize = 268;
 pub const TCH_S_CAP: usize = 274;
 
+/// Number of timeslots the scheduler operates on. May become larger when secondary carriers are supported.
+pub const NUM_TIMESLOTS: usize = 4;
+
 #[derive(Debug)]
 pub struct PrecomputedUmacPdus {
     pub mac_sysinfo1: MacSysinfo,
@@ -72,12 +77,13 @@ pub struct BsChannelScheduler {
 
     /// When true, the given timeslot is in call hangtime: keep circuit allocated but stop
     /// sending traffic-plane TCH blocks. Instead, transmit signalling-plane idle (Null PDUs)
-    /// and signal UL usage as CommonAndAssigned so MS can request the floor.
+    /// and signal UL usage as AssignedOnly so MS can request the floor.
     hangtime: [bool; 4],
 
-    /// Guard frames after entering hangtime. While >0, we keep the slot in traffic mode to
-    /// allow any already-scheduled FACCH/stealing (e.g. D-TX CEASED) to go out reliably.
-    hangtime_guard: [u8; 4],
+    /// Per-timeslot set of SSIs whose RandomAccessAck was dropped by dl_drop_all_except_stolen.
+    /// The next STCH built for a matching SSI should carry random_access_flag=true to properly
+    /// acknowledge the random access per ETSI 21.4.3.1.
+    pending_ra_acks: [Vec<u32>; 4],
 }
 
 #[derive(Debug)]
@@ -123,13 +129,11 @@ impl BsChannelScheduler {
             ulsched: EMPTY_SCHED,
             circuits: CircuitMgr::new(),
             hangtime: [false, false, false, false],
-            hangtime_guard: [0, 0, 0, 0],
+            pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         }
     }
 
     /// Enter/leave hangtime for a traffic timeslot (2..=4).
-    /// When entering, we keep a short guard window in traffic mode so any FACCH/stealing
-    /// already scheduled for this slot can still be transmitted.
     pub fn set_hangtime(&mut self, ts: u8, active: bool) {
         if !(1..=4).contains(&ts) {
             tracing::warn!("BsChannelScheduler::set_hangtime: invalid ts {}", ts);
@@ -138,21 +142,23 @@ impl BsChannelScheduler {
 
         let idx = ts as usize - 1;
         self.hangtime[idx] = active;
-        self.hangtime_guard[idx] = if active { 1 } else { 0 };
 
         // When leaving hangtime, drain stale signaling items that can only be consumed
         // in signaling mode. Keep Stealing items — they carry D-TX GRANTED/CEASED
         // that still need FACCH delivery.
         if !active {
-            self.dltx_queues[idx].retain(|e| matches!(e, DlSchedElem::Stealing(..)));
+            self.dl_drop_all_except_stolen(ts);
         }
 
         tracing::info!(
-            "BsChannelScheduler: hangtime {} for ts {} (guard={})",
+            "BsChannelScheduler: hangtime {} for ts {}",
             if active { "ENABLED" } else { "DISABLED" },
             ts,
-            self.hangtime_guard[idx]
         );
+    }
+
+    pub fn is_hangtime(&self, ts: u8) -> bool {
+        self.hangtime[ts as usize - 1]
     }
 
     fn is_hangtime_effective(&self, ts: u8) -> bool {
@@ -160,11 +166,8 @@ impl BsChannelScheduler {
         if !self.hangtime[idx] {
             return false;
         }
-        // If we're still in guard, keep traffic mode.
-        if self.hangtime_guard[idx] > 0 {
-            return false;
-        }
-        // If a stealing block is still queued for this slot, keep traffic mode.
+        // If a stealing block is still queued for this slot, keep traffic mode
+        // so it can be delivered via FACCH.
         !self.has_pending_stealing(ts)
     }
 
@@ -198,7 +201,8 @@ impl BsChannelScheduler {
     pub fn set_system_wide_services_state(&mut self, enabled: bool) {
         if self.precomps.mle_sysinfo.bs_service_details.system_wide_services != enabled {
             self.precomps.mle_sysinfo.bs_service_details.system_wide_services = enabled;
-            tracing::info!(
+            // Should already be signalled at SwMI interface level
+            tracing::debug!(
                 "BsChannelScheduler: system_wide_services {}",
                 if enabled { "ENABLED" } else { "DISABLED" }
             );
@@ -254,7 +258,7 @@ impl BsChannelScheduler {
                 grant_timeslots
             );
 
-            if self.cur_dltime.is_mandatory_clch() {
+            if candidate_t.is_mandatory_clch() {
                 // Not an opportunity; skip
                 continue;
             }
@@ -416,16 +420,106 @@ impl BsChannelScheduler {
         self.dltx_queues[ts as usize - 1].push(elem);
     }
 
-    pub fn dl_enqueue_tma(&mut self, ts: u8, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
-        tracing::debug!(
-            "dl_enqueue_tma: ts {} enqueueing {} PDU {:?} SDU {}",
-            if tx_reporter.is_some() { "reported" } else { "" },
-            ts,
-            pdu,
-            sdu.dump_bin(),
-        );
-        let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter);
-        self.dltx_queues[ts as usize - 1].push(elem);
+    fn identify_timeslots_for_ssi(&self, addr: Option<TetraAddress>, link_id: LinkId) -> [u8; NUM_TIMESLOTS] {
+        let Some(addr) = addr else {
+            tracing::warn!("identify_timeslots_for_ssi: MAC-RESOURCE has no address, defaulting to ts1");
+            return [1, 0, 0, 0];
+        };
+
+        if addr.ssi_type == SsiType::Gssi || link_id == 0 {
+            return [1, 0, 0, 0];
+        }
+
+        let Ok(link_ts) = u8::try_from(link_id) else {
+            tracing::warn!(
+                "identify_timeslots_for_ssi: invalid link_id {} for {}, defaulting to ts1",
+                link_id,
+                addr
+            );
+            return [1, 0, 0, 0];
+        };
+
+        if !(1..=NUM_TIMESLOTS as u8).contains(&link_ts) {
+            tracing::warn!(
+                "identify_timeslots_for_ssi: link_id {} is outside TS range for {}, defaulting to ts1",
+                link_id,
+                addr
+            );
+            return [1, 0, 0, 0];
+        }
+
+        if self.circuits.is_active(Direction::Dl, link_ts) {
+            tracing::debug!(
+                "identify_timeslots_for_ssi: link TS {} is active DL traffic for {}, routing normal signaling on ts1",
+                link_ts,
+                addr
+            );
+            return [1, 0, 0, 0];
+        }
+
+        [link_ts, 0, 0, 0]
+    }
+
+    fn dl_enqueue_tma_on_timeslots(
+        &mut self,
+        timeslots: [u8; NUM_TIMESLOTS],
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+    ) {
+        // Queue the message for all timeslots on which we should transmit this message.
+        // The loop basically prevents cloning the last element.
+        for i in 0..NUM_TIMESLOTS {
+            let ts = timeslots[i];
+            let next_ts = if i < NUM_TIMESLOTS - 1 { timeslots[i + 1] } else { 0 };
+            assert!(ts > 0);
+
+            tracing::debug!(
+                "dl_enqueue_tma: ts {} enqueueing {} PDU {:?} SDU {}",
+                ts,
+                if tx_reporter.is_some() { "reported" } else { "" },
+                pdu,
+                sdu.dump_bin(),
+            );
+
+            if next_ts > 0 {
+                // There is another ts for which we need to transmit this message.
+                // Clone the message now and push it to the current ts.
+                let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone());
+                self.dltx_queues[ts as usize - 1].push(elem);
+            } else {
+                // This is the last ts on which we need to transmit this message
+                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter);
+                self.dltx_queues[ts as usize - 1].push(elem);
+                break;
+            }
+        }
+    }
+
+    pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+        // Get all timeslots on which a relevant MS is listening.
+        let timeslots = self.identify_timeslots_for_ssi(pdu.addr, 0);
+        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter);
+    }
+
+    pub fn dl_enqueue_tma_for_link(&mut self, link_id: LinkId, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+        // Get all timeslots on which a relevant MS is listening, using the LLC link
+        // context when one exists.
+        let timeslots = self.identify_timeslots_for_ssi(pdu.addr, link_id);
+        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter);
+    }
+
+    /// Consumes and returns true if a pending random access ack exists for the given SSI on
+    /// this timeslot. Used when building STCH blocks so the MAC-RESOURCE can carry
+    /// random_access_flag=true per ETSI 21.4.3.1.
+    pub fn take_pending_ra_ack(&mut self, ts: u8, ssi: u32) -> bool {
+        let pending = &mut self.pending_ra_acks[ts as usize - 1];
+        if let Some(pos) = pending.iter().position(|&s| s == ssi) {
+            pending.remove(pos);
+            true
+        } else {
+            false
+        }
     }
 
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
@@ -469,7 +563,6 @@ impl BsChannelScheduler {
         // Clearing hangtime here is safe: if the circuit is gone, this timeslot is no longer in use.
         if (1..=4).contains(&ts) {
             self.hangtime[ts as usize - 1] = false;
-            self.hangtime_guard[ts as usize - 1] = 0;
         }
         self.circuits.close_circuit(dir, ts)
     }
@@ -478,7 +571,6 @@ impl BsChannelScheduler {
         // New/updated circuit implies traffic mode.
         if (1..=4).contains(&circuit.ts) {
             self.hangtime[circuit.ts as usize - 1] = false;
-            self.hangtime_guard[circuit.ts as usize - 1] = 0;
         }
         self.circuits.create_circuit(dir, circuit);
     }
@@ -561,6 +653,7 @@ impl BsChannelScheduler {
         pdu
     }
 
+    /// Takes and removes all grants and random access acknowledgements from the given timeslot's queue, returning them as a vec.
     pub fn dl_take_all_grants_and_acks(&mut self, timeslot: u8) -> Vec<DlSchedElem> {
         let queue = &mut self.dltx_queues[timeslot as usize - 1];
         let mut taken = Vec::new();
@@ -577,6 +670,53 @@ impl BsChannelScheduler {
         taken
     }
 
+    /// Removes all elements from the schedule, except stolen blocks. This function is used
+    /// when leaving hangtime to clear out any stale grants, resources, etc that can only be processed in signaling mode,
+    /// while keeping stealing blocks that may still need to be transmitted via FACCH.
+    /// Discarded elements are reported as such via tx_reporter if available. Returns true if elements were discarded.
+    pub fn dl_drop_all_except_stolen(&mut self, timeslot: u8) -> bool {
+        let queue = &mut self.dltx_queues[timeslot as usize - 1];
+        let mut i = 0;
+        let mut item_was_discarded = false;
+        while i < queue.len() {
+            if matches!(queue[i], DlSchedElem::Stealing(..)) {
+                i += 1;
+            } else {
+                // Found a to-be-discarded element.
+                // Remove, warn, and call tx_reporter::mark_discarded() if appliccable
+                let elem = queue.remove(i);
+                item_was_discarded = true;
+                tracing::warn!("dl_drop_all_except_stolen: discarding scheduled {:?} on ts {}", elem, timeslot);
+
+                match elem {
+                    DlSchedElem::Resource(_, _, tx_reporter) => {
+                        // Report as discarded manually
+                        if let Some(tx_reporter) = tx_reporter {
+                            tx_reporter.mark_discarded();
+                        }
+                    }
+
+                    DlSchedElem::FragBuf(_) => {
+                        // Fragger self-marks any unsent fragments as discarded when dropped, so we don't need to do anything here.
+                    }
+
+                    DlSchedElem::RandomAccessAck(addr) => {
+                        // Save the SSI so the next STCH for this address can carry
+                        // random_access_flag=true (ETSI 21.4.3.1)
+                        self.pending_ra_acks[timeslot as usize - 1].push(addr.ssi);
+                    }
+
+                    DlSchedElem::Grant(..) | DlSchedElem::Broadcast(_) => {
+                        // Silently dropped as internal or not equipped with a tx_reporter
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        item_was_discarded
+    }
+
     pub fn dl_integrate_sched_elems_for_timeslot(&mut self, ts: TdmaTime) {
         // Remove all grants and acks from queue and collect them into a vec
         let grants_and_acks = self.dl_take_all_grants_and_acks(ts.t);
@@ -590,7 +730,6 @@ impl BsChannelScheduler {
                 _ => panic!(),
             };
             let mac_resource = self.dl_get_scheduled_resource_for_ssi(ts, addr);
-
             match mac_resource {
                 Some(DlSchedElem::Resource(pdu, _sdu, _repeat)) => {
                     // Integrate grant into the resource
@@ -647,14 +786,11 @@ impl BsChannelScheduler {
     fn dl_build_block_from_signalling_schedule(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
         let mut buf_opt = None;
 
-        // Frame 18 cannot carry user signaling; defer everything to next frame.
-        if ts.f == 18 {
-            let q = &mut self.dltx_queues[ts.t as usize - 1];
-            if !q.is_empty() {
-                self.dltx_next_slot_queue.append(q);
-            }
-            return None;
-        }
+        // Frame 18 cannot carry user signaling. Leave the per-timeslot queue intact;
+        // this same timeslot will see the queued items again on frame 1.
+        // if ts.f == 18 {
+        //     return None;
+        // }
 
         while !self.dltx_queues[ts.t as usize - 1].is_empty() {
             let opt = self.dl_take_prioritized_sched_item(ts);
@@ -667,18 +803,6 @@ impl BsChannelScheduler {
                         }
 
                         DlSchedElem::Resource(pdu, sdu, tx_reporter) => {
-                            // Repeat on subsequent frames if needed (e.g. D-SETUP, TS 100 392-2 clause 23.5.2).
-                            // if repeat_count > 0 {
-                            //     let pdu_clone = pdu.clone();
-                            //     let sdu_clone = BitBuffer::from_bitbuffer(&sdu);
-                            //     tracing::debug!(
-                            //         "dl_build_block_from_signalling_schedule: repeating resource for next frame (remaining={})",
-                            //         repeat_count - 1
-                            //     );
-                            //     self.dltx_next_slot_queue
-                            //         .push(DlSchedElem::Resource(pdu_clone, sdu_clone, repeat_count - 1));
-                            // }
-
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
                             // Create fragger, either to send the whole PDU or to start fragmentation
@@ -702,13 +826,17 @@ impl BsChannelScheduler {
                             buf_opt = Some(buf);
                         }
 
-                        DlSchedElem::Stealing(..) => {
-                            // Stealing items should only appear on traffic timeslots; skip if found here
+                        DlSchedElem::Stealing(_, tx_reporter) => {
+                            // Stealing items should only appear on traffic timeslots; discard if found here
                             tracing::warn!(
-                                "dl_build_block_from_signalling_schedule: Stealing item found on non-traffic ts {}, skipping",
+                                "dl_build_block_from_signalling_schedule: Stealing item found on non-traffic ts {}, discarding",
                                 ts.t
                             );
+                            if let Some(tx_reporter) = tx_reporter {
+                                tx_reporter.mark_discarded();
+                            }
                         }
+
                         _ => panic!("finalize_ts_for_tick: Unexpected DlSchedElem type: {:?}", sched_elem),
                     }
                 }
@@ -724,10 +852,7 @@ impl BsChannelScheduler {
         if !self.dltx_next_slot_queue.is_empty() {
             let a = &mut self.dltx_queues[ts.t as usize - 1];
             let b = &mut self.dltx_next_slot_queue;
-            if !a.is_empty() {
-                // If anything remains unsent this frame, defer it along with other next-frame items.
-                b.append(a);
-            }
+            assert!(a.is_empty(), "queue should be empty");
             std::mem::swap(a, b);
         }
 
@@ -744,7 +869,7 @@ impl BsChannelScheduler {
             let mut buf = BitBuffer::from_vec(block);
             // Raw ACELP speech (274 bits for TCH/S).
             // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
-            buf.set_raw_end(TCH_S_CAP);
+            buf.set_raw_end(buf.get_raw_start() + TCH_S_CAP);
             buf
         } else {
             // No voice data queued — send silence frame (all zeros).
@@ -837,7 +962,7 @@ impl BsChannelScheduler {
         let ul_circuit_active = self.circuits.is_active(Direction::Ul, ts.t) && ts.f != 18;
 
         // During hangtime we stop sending traffic frames and switch to signalling mode.
-        // Keep traffic for a short guard window or while FACCH/stealing is still queued.
+        // Keep traffic mode while FACCH/stealing is still queued for delivery.
         let hang_effective = if (2..=4).contains(&ts.t) {
             self.is_hangtime_effective(ts.t)
         } else {
@@ -1018,15 +1143,6 @@ impl BsChannelScheduler {
         // self.dump_ul_schedule_full(true);
 
         // We now have our bbk, blk1 and (optional) blk2
-
-        // Decrement hangtime guard for this timeslot after we have built the slot.
-        if (2..=4).contains(&ts.t) {
-            let idx = ts.t as usize - 1;
-            if self.hangtime[idx] && self.hangtime_guard[idx] > 0 {
-                self.hangtime_guard[idx] -= 1;
-            }
-        }
-
         elem
     }
 
@@ -1050,50 +1166,33 @@ impl BsChannelScheduler {
                     assert!(dl_traffic_usage.is_none(), "DL ts 1 can't be traffic");
                     assert!(ul_traffic_usage.is_none(), "UL ts 1 can't be traffic (is this allowed?"); // TODO FIXME check spec
 
-                    // STRATEGY:
-                    // - Send UL AssignedOnly if both ul1 and ul2 has been granted to an MS
-                    // - Send UL CommonAndAssigned if only ul1 has been granted
-                    // - Send UL CommonOnly if no grants have been made
+                    // Always CommonOnly on TS1 (MCCH). Per ETSI 23.5.2.2.2, the MS
+                    // with a grant transmits in granted slots without checking the AACH.
                     aach.dl_usage = AccessAssignDlUsage::CommonControl;
-                    aach.ul_usage = self.ul_get_usage(ts);
-                    match aach.ul_usage {
-                        AccessAssignUlUsage::CommonOnly => {
-                            aach.f1_af1 = Some(AccessField {
-                                access_code: 0,
-                                base_frame_len: 4,
-                            });
-                            aach.f2_af2 = Some(AccessField {
-                                access_code: 0,
-                                base_frame_len: 4,
-                            });
-                        }
-                        AccessAssignUlUsage::CommonAndAssigned | AccessAssignUlUsage::AssignedOnly => {
-                            aach.f2_af = Some(AccessField {
-                                access_code: 0,
-                                base_frame_len: 4,
-                            });
-                        }
-                        _ => {
-                            // Traffic or unallocated; no AccessFields
-                        }
-                    }
+                    aach.ul_usage = AccessAssignUlUsage::CommonOnly;
+                    aach.f1_af1 = Some(AccessField {
+                        access_code: 0,
+                        base_frame_len: 4,
+                    });
+                    aach.f2_af2 = Some(AccessField {
+                        access_code: 0,
+                        base_frame_len: 4,
+                    });
                 }
                 2..=4 => {
                     // Additional channels (TS2..TS4).
                     // Normal operation: Traffic(usage) when a circuit is active, else Unallocated.
-                    // Hangtime: switch to signalling and allow MS to request the floor while the
-                    // channel remains allocated (UL CommonAndAssigned).
-                    let hang_effective = if (2..=4).contains(&ts.t) {
-                        self.is_hangtime_effective(ts.t)
-                    } else {
-                        false
-                    };
+                    // Hangtime: immediately switch AACH to AssignedControl so radios
+                    // detect the end of traffic in the same frame as D-TX CEASED.
+                    // The timeslot may still be in traffic mode (for STCH delivery) but
+                    // the AACH reflects the new channel state.
+                    let in_hangtime = (2..=4).contains(&ts.t) && self.hangtime[ts.t as usize - 1];
 
-                    if hang_effective && (dl_traffic_usage.is_some() || ul_traffic_usage.is_some()) {
+                    if in_hangtime && (dl_traffic_usage.is_some() || ul_traffic_usage.is_some()) {
                         aach.dl_usage = AccessAssignDlUsage::AssignedControl;
-                        aach.ul_usage = AccessAssignUlUsage::CommonAndAssigned;
-                        // ACCESS-ASSIGN header=1 requires an access field for both UL subslots.
-                        // Keep it consistent with TS1 defaults.
+                        // AssignedOnly (Header 2) allows random access for MSs on
+                        // the assigned channel while blocking common control MSs.
+                        aach.ul_usage = AccessAssignUlUsage::AssignedOnly;
                         aach.f2_af = Some(AccessField {
                             access_code: 0,
                             base_frame_len: 4,
@@ -1144,23 +1243,22 @@ impl BsChannelScheduler {
     fn generate_default_blks(&self, ts: TdmaTime) -> TmvUnitdataReq {
         match (ts.f, ts.t) {
             (1..=17, 1) => {
-                // Two options: [Blk1: Null | Blk2: SYSINFO] or [Both: Null]
-                // We'll alternate based on multiframe
-                match ts.m % 2 {
+                // Two options: [Blk1: SCH/HD Null | Blk2: BNCH SYSINFO] or [Both: SCH/F Null]
+                // Alternate every frame
+                match ts.f % 2 {
                     0 => {
-                        // Null + SYSINFO
-                        // SYSINFO gets added later, su we just make a half-slot Null pdu here
-                        let mut buf1 = BitBuffer::new(SCH_F_CAP);
+                        // Half-slot Null PDU on SCH/HD, SYSINFO gets added later as BNCH blk2
+                        let mut buf1 = BitBuffer::new(SCH_HD_CAP);
                         let blk1 = MacResource::null_pdu();
                         blk1.to_bitbuf(&mut buf1);
                         TmvUnitdataReq {
-                            logical_channel: LogicalChannel::SchF,
+                            logical_channel: LogicalChannel::SchHd,
                             mac_block: buf1,
                             scrambling_code: self.scrambling_code,
                         }
                     }
                     1 => {
-                        // Full-slot Null pdu
+                        // Full-slot Null PDU
                         let mut buf = BitBuffer::new(SCH_F_CAP);
                         let blk = MacResource::null_pdu();
                         blk.to_bitbuf(&mut buf);
@@ -1388,7 +1486,6 @@ mod tests {
         let mut sched = get_testing_slotter();
         let resreq = ReservationRequirement::Req1Subslot;
         let addr = TetraAddress {
-            encrypted: false,
             ssi_type: SsiType::Issi,
             ssi: 1234,
         };
@@ -1436,7 +1533,6 @@ mod tests {
         let mut sched = get_testing_slotter();
         let resreq1 = ReservationRequirement::Req1Subslot;
         let addr = TetraAddress {
-            encrypted: false,
             ssi_type: SsiType::Issi,
             ssi: 1234,
         };
@@ -1472,17 +1568,140 @@ mod tests {
     }
 
     #[test]
+    fn test_dl_tma_gssi_routes_to_mcch() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Gssi,
+            ssi: 2200699,
+        };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(3, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 0);
+    }
+
+    #[test]
+    fn test_dl_tma_linkless_issi_routes_to_mcch() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200699,
+        };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(0, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 0);
+    }
+
+    #[test]
+    fn test_dl_tma_issi_routes_by_link_timeslot() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200699,
+        };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(3, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+    }
+
+    #[test]
+    fn test_dl_tma_issi_avoids_active_dl_traffic_slot() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200699,
+        };
+        sched.create_circuit(
+            Direction::Dl,
+            Circuit {
+                direction: Direction::Dl,
+                ts: 3,
+                peer_ts: None,
+                usage: 4,
+                circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+                dl_media_source: CircuitDlMediaSource::LocalLoopback,
+            },
+        );
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(3, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 0);
+    }
+
+    #[test]
+    fn test_frame_18_defers_signaling_on_same_timeslot_queue() {
+        let mut sched = get_testing_slotter();
+        let addr_ts2 = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200002,
+        };
+        let addr_ts3 = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200003,
+        };
+        let pdu_ts2 = BsChannelScheduler::dl_make_minimal_resource(&addr_ts2, None, false);
+        let pdu_ts3 = BsChannelScheduler::dl_make_minimal_resource(&addr_ts3, None, false);
+
+        sched.dl_enqueue_tma_for_link(2, pdu_ts2, BitBuffer::new(0), None);
+        sched.dl_enqueue_tma_for_link(3, pdu_ts3, BitBuffer::new(0), None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 2, f: 18, m: 1, h: 0 })
+                .is_none()
+        );
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 3, f: 18, m: 1, h: 0 })
+                .is_none()
+        );
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 1, f: 1, m: 2, h: 0 })
+                .is_none()
+        );
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+    }
+
+    #[test]
     fn test_dl_grant_and_ack_integration() {
         let mut sched = get_testing_slotter();
         let ts = TdmaTime::default();
         let addr = TetraAddress {
-            encrypted: false,
             ssi_type: SsiType::Issi,
             ssi: 1234,
         };
         let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
         let sdu = BitBuffer::new(0);
-        sched.dl_enqueue_tma(ts.t, pdu, sdu, None);
+        sched.dl_enqueue_tma(pdu, sdu, None);
 
         let grant = BasicSlotgrant {
             capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,

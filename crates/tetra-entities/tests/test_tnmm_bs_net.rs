@@ -2,9 +2,9 @@ mod common;
 
 use std::time::Duration;
 use tetra_config::bluestation::StackMode;
+use tetra_core::Sap;
 use tetra_core::debug::setup_logging_verbose;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{Sap, TdmaTime};
 use tetra_entities::network::netentity::NetEntity;
 use tetra_entities::network::transports::NetworkAddress;
 use tetra_entities::network::transports::quic::QuicTransport;
@@ -78,7 +78,6 @@ fn run_test(mut test: ComponentTest) {
         sap: Sap::TnmmSap,
         src: TetraEntity::Mm,
         dest: TetraEntity::User,
-        dltime: TdmaTime::default(),
         msg: SapMsgInner::TnmmTestDemand(TnmmTestDemand { issi: 1001 }),
     };
 

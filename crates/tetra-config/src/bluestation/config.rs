@@ -2,9 +2,46 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
+use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, CfgTelemetry, PhyBackend, StackState};
 
 use super::sec_brew::CfgBrew;
+
+/// Wrapper for a string that should be treated as a secret. Display and Debug redact
+/// the actual value to prevent accidental logging of credentials.
+#[derive(Clone)]
+pub struct SecretField {
+    pub val: String,
+}
+
+impl From<String> for SecretField {
+    fn from(val: String) -> Self {
+        Self { val }
+    }
+}
+
+impl From<SecretField> for String {
+    fn from(secret: SecretField) -> Self {
+        secret.val
+    }
+}
+
+impl AsRef<str> for SecretField {
+    fn as_ref(&self) -> &str {
+        &self.val
+    }
+}
+
+impl std::fmt::Display for SecretField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "********")
+    }
+}
+
+impl std::fmt::Debug for SecretField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretField").field("val", &"********").finish()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -25,6 +62,12 @@ pub struct StackConfig {
 
     /// Brew protocol (TetraPack/BrandMeister) configuration
     pub brew: Option<CfgBrew>,
+
+    /// Telemetry endpoint configuration
+    pub telemetry: Option<CfgTelemetry>,
+
+    /// Control endpoint configuration
+    pub control: Option<CfgControl>,
 }
 
 impl StackConfig {
@@ -37,7 +80,8 @@ impl StackConfig {
                     return Err("soapysdr configuration must be provided for Soapysdr backend");
                 };
 
-                // Validate that exactly one hardware configuration is present
+                // Legacy configs may name a hardware profile explicitly; newer
+                // configs can rely on generic device detection/settings.
                 let config_count = [
                     soapy_cfg.io_cfg.iocfg_usrpb2xx.is_some(),
                     soapy_cfg.io_cfg.iocfg_limesdr.is_some(),
@@ -46,10 +90,8 @@ impl StackConfig {
                 .iter()
                 .filter(|&&x| x)
                 .count();
-                if config_count != 1 {
-                    return Err(
-                        "soapysdr backend requires exactly one hardware configuration (iocfg_usrpb2xx, iocfg_limesdr, or iocfg_sxceiver)",
-                    );
+                if config_count > 1 {
+                    return Err("soapysdr backend accepts at most one legacy hardware configuration");
                 }
             }
             PhyBackend::None => {} // For testing
@@ -90,6 +132,16 @@ impl StackConfig {
             };
         }
 
+        if self.cell.ms_txpwr_max_cell > 7 {
+            return Err("ms_txpwr_max_cell must be 0-7 (3 bits)");
+        }
+
+        if let Some(ref tz) = self.cell.timezone {
+            if tz.parse::<chrono_tz::Tz>().is_err() {
+                return Err("Invalid IANA timezone name in cell.timezone");
+            }
+        }
+
         Ok(())
     }
 }
@@ -108,7 +160,7 @@ impl SharedConfig {
         Self::from_parts(cfg, StackState::default())
     }
 
-    pub fn from_parts(cfg: StackConfig, state: StackState) -> Self {
+    pub fn from_parts<S: Into<Option<StackState>>>(cfg: StackConfig, state: S) -> Self {
         // Check config for validity before returning the SharedConfig object
         match cfg.validate() {
             Ok(_) => {}
@@ -117,7 +169,7 @@ impl SharedConfig {
 
         Self {
             cfg: Arc::new(cfg),
-            state: Arc::new(RwLock::new(state)),
+            state: Arc::new(RwLock::new(state.into().unwrap_or_default())),
         }
     }
 

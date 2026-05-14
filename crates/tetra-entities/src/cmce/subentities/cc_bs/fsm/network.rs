@@ -20,7 +20,6 @@ impl CcBsSubentity {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
                 dest: TetraEntity::Brew,
-                dltime: self.dltime,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                     brew_uuid,
                     cause: DisconnectCause::CalledPartyNotReachable.into_raw() as u8,
@@ -41,7 +40,6 @@ impl CcBsSubentity {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
                 dest: TetraEntity::Brew,
-                dltime: self.dltime,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                     brew_uuid,
                     cause: DisconnectCause::CalledPartyNotReachable.into_raw() as u8,
@@ -64,7 +62,6 @@ impl CcBsSubentity {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
                 dest: TetraEntity::Brew,
-                dltime: self.dltime,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                     brew_uuid,
                     cause: DisconnectCause::CalledPartyBusy.into_raw() as u8,
@@ -98,7 +95,6 @@ impl CcBsSubentity {
                         sap: Sap::Control,
                         src: TetraEntity::Cmce,
                         dest: TetraEntity::Brew,
-                        dltime: self.dltime,
                         msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                             brew_uuid,
                             cause: DisconnectCause::CongestionInInfrastructure.into_raw() as u8,
@@ -115,6 +111,7 @@ impl CcBsSubentity {
         let call_timeout = CallTimeout::try_from(call.timeout as u64).unwrap_or(CallTimeout::T5m);
         let circuit_mode = CircuitModeType::try_from(call.mode as u64).unwrap_or(CircuitModeType::TchS);
         let external_subscriber_number = Self::encode_external_subscriber_number(&call.number);
+        let calling_party_extension = call.number.trim().parse::<u32>().ok().filter(|value| *value <= 0x00ff_ffff);
 
         tracing::info!(
             "CMCE: accepting Brew setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",
@@ -132,7 +129,6 @@ impl CcBsSubentity {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            dltime: self.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }),
         });
 
@@ -154,7 +150,7 @@ impl CcBsSubentity {
             notification_indicator: None,
             temporary_address: None,
             calling_party_address_ssi: Some(call.source_issi),
-            calling_party_extension: None,
+            calling_party_extension,
             external_subscriber_number,
             facility: None,
             dm_ms_address: None,
@@ -168,6 +164,7 @@ impl CcBsSubentity {
                 pdu: d_setup,
                 dest_addr: called_addr,
                 resend: false, // no late-entry resends for individual calls
+                tx_receipt: None,
             },
         );
 
@@ -314,13 +311,12 @@ impl CcBsSubentity {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
-            dltime: self.dltime,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                 sdu: connect_sdu,
                 handle: call.calling_handle,
                 endpoint_id: call.calling_endpoint_id,
                 link_id: call.calling_link_id,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -369,7 +365,6 @@ impl CcBsSubentity {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            dltime: self.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
                 brew_uuid,
                 grant: 0,
@@ -381,7 +376,6 @@ impl CcBsSubentity {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            dltime: self.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
                 brew_uuid,
                 call_id,
@@ -473,13 +467,12 @@ impl CcBsSubentity {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
-            dltime: self.dltime,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                 sdu: ack_sdu,
                 handle: called_handle,
                 endpoint_id: called_endpoint_id,
                 link_id: called_link_id,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -539,7 +532,6 @@ impl CcBsSubentity {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            dltime: self.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
                 brew_uuid,
                 call_id,
@@ -567,13 +559,7 @@ impl CcBsSubentity {
             );
             self.drop_group_calls_if_unlistened(queue, dest_gssi);
 
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                dltime: self.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }),
-            });
+            self.notify_network_call_end(queue, brew_uuid);
             return;
         }
 
@@ -691,6 +677,7 @@ impl CcBsSubentity {
                 pdu: d_setup,
                 dest_addr: dest_addr.clone(),
                 resend: true,
+                tx_receipt: None,
             },
         );
         let d_setup_ref = &self.cached_setups.get(&call_id).unwrap().pdu;
@@ -723,13 +710,12 @@ impl CcBsSubentity {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
-            dltime: self.dltime,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                 sdu: connect_sdu,
                 handle: 0,
                 endpoint_id: 0,
                 link_id: 0,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -750,7 +736,6 @@ impl CcBsSubentity {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            dltime: self.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
                 brew_uuid,
                 call_id,

@@ -178,7 +178,6 @@ impl CcBsSubentity {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
                 dest: TetraEntity::Brew,
-                dltime: self.dltime,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid }),
             });
         } else if !call_snapshot.is_alerted() {
@@ -265,7 +264,6 @@ impl CcBsSubentity {
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_connect(
         &mut self,
         queue: &mut MessageQueue,
-        message_dltime: TdmaTime,
         received_tetra_address: TetraAddress,
         handle: u32,
         link_id: u32,
@@ -381,7 +379,6 @@ impl CcBsSubentity {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
                 dest: TetraEntity::Brew,
-                dltime: self.dltime,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
                     brew_uuid,
                     call: call_info.clone(),
@@ -459,13 +456,12 @@ impl CcBsSubentity {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
-            dltime: message_dltime,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                 sdu: connect_sdu,
                 handle: calling_handle,
                 endpoint_id: calling_endpoint_id,
                 link_id: calling_link_id,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -498,13 +494,12 @@ impl CcBsSubentity {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
-            dltime: message_dltime,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                 sdu: ack_sdu,
                 handle,
                 endpoint_id,
                 link_id,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,

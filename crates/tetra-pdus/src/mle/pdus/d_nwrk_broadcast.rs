@@ -39,8 +39,8 @@ impl DNwrkBroadcast {
         // Type1
         let cell_load_ca = buffer.read_field(2, "cell_load_ca")? as u8;
 
-        // obit designates presence of any further type2, type3 or type4 fields
-        let mut obit = delimiters::read_obit(buffer)?;
+        // obit designates presence of any further type2 fields
+        let obit = delimiters::read_obit(buffer)?;
 
         // Type2
         let tetra_network_time = typed::parse_type2_generic(obit, buffer, 48, "tetra_network_time")?;
@@ -55,11 +55,7 @@ impl DNwrkBroadcast {
             None
         };
 
-        // Read trailing obit (if not previously encountered)
-        obit = if obit { buffer.read_field(1, "trailing_obit")? == 1 } else { obit };
-        if obit {
-            return Err(PduParseErr::InvalidTrailingMbitValue);
-        }
+        // MLE PDUs do not use M-bits (Annex E.2.1) — no trailing delimiter to read
 
         Ok(DNwrkBroadcast {
             cell_re_select_parameters,
@@ -97,8 +93,7 @@ impl DNwrkBroadcast {
             unimplemented!();
             buffer.write_bits(*_value, 999);
         }
-        // Write terminating m-bit
-        delimiters::write_mbit(buffer, 0);
+        // MLE PDUs do not use M-bits (Annex E.2.1) — PDU ends after last Type 2 element
         Ok(())
     }
 }

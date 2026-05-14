@@ -82,7 +82,6 @@ impl LmacMs {
             sap: Sap::TmvSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            dltime: self.ts.unwrap_or_default(),
             msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
                 pdu: type1,
                 block_num: PhyBlockNum::Undefined,
@@ -182,7 +181,6 @@ impl LmacMs {
                 sap: Sap::TmvSap,
                 src: TetraEntity::Lmac,
                 dest: TetraEntity::Umac,
-                dltime: self.ts.unwrap_or_default(),
                 msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
                     pdu: type1bits,
                     block_num,
@@ -260,7 +258,7 @@ impl TetraEntityTrait for LmacMs {
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::TpSap => {

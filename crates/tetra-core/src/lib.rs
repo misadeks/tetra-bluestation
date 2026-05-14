@@ -9,12 +9,14 @@ pub const STACK_VERSION: &str = const_format::formatcp!("{}-{}", env!("CARGO_PKG
 
 pub mod address;
 pub mod bitbuffer;
+pub mod control;
 pub mod debug;
 pub mod direction;
 pub mod freqs;
 pub mod pdu_parse_error;
 pub mod phy_types;
 pub mod ranges;
+pub mod sap_fields;
 pub mod tdma_time;
 pub mod tetra_common;
 pub mod tetra_entities;
@@ -28,6 +30,7 @@ pub use bitbuffer::BitBuffer;
 pub use direction::Direction;
 pub use pdu_parse_error::PduParseErr;
 pub use phy_types::*;
+pub use sap_fields::*;
 pub use tdma_time::TdmaTime;
 pub use tetra_common::*;
 pub use timeslot_alloc::*;

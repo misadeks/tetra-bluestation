@@ -72,7 +72,7 @@ pub struct NetworkCircuitCall {
     pub queued: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CallControl {
     /// Signals to set up a circuit
     /// Created by CMCE, sent to Umac
@@ -118,6 +118,9 @@ pub enum CallControl {
     NetworkCallEnd {
         brew_uuid: uuid::Uuid, // Identifies the call to end
     },
+    /// UL inactivity detected on a traffic timeslot: no voice frames received
+    /// for the timeout period. Sent by UMAC to CMCE.
+    UlInactivityTimeout { ts: u8 },
     /// Circuit-call setup request over Brew (individual/PBX/phone)
     NetworkCircuitSetupRequest { brew_uuid: uuid::Uuid, call: NetworkCircuitCall },
     /// Circuit-call setup accepted

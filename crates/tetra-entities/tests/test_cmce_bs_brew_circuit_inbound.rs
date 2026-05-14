@@ -15,12 +15,11 @@ use uuid::Uuid;
 
 use crate::common::ComponentTest;
 
-fn register_subscriber(test: &mut ComponentTest, dltime: TdmaTime, issi: u32) {
+fn register_subscriber(test: &mut ComponentTest, issi: u32) {
     let register = SapMsg {
         sap: Sap::Control,
         src: TetraEntity::Mm,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
             issi,
             groups: vec![],
@@ -32,12 +31,11 @@ fn register_subscriber(test: &mut ComponentTest, dltime: TdmaTime, issi: u32) {
     let _ = test.dump_sinks();
 }
 
-fn build_setup_request(dltime: TdmaTime, brew_uuid: Uuid, source_issi: u32, destination_issi: u32, number: &str) -> SapMsg {
+fn build_setup_request(brew_uuid: Uuid, source_issi: u32, destination_issi: u32, number: &str) -> SapMsg {
     SapMsg {
         sap: Sap::Control,
         src: TetraEntity::Brew,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
             brew_uuid,
             call: NetworkCircuitCall {
@@ -60,7 +58,7 @@ fn build_setup_request(dltime: TdmaTime, brew_uuid: Uuid, source_issi: u32, dest
     }
 }
 
-fn build_u_alert(dltime: TdmaTime, call_id: u16, destination_issi: u32) -> SapMsg {
+fn build_u_alert(call_id: u16, destination_issi: u32) -> SapMsg {
     let pdu = UAlert {
         call_identifier: call_id,
         reserved: true,
@@ -77,7 +75,6 @@ fn build_u_alert(dltime: TdmaTime, call_id: u16, destination_issi: u32) -> SapMs
         sap: Sap::LcmcSap,
         src: TetraEntity::Mle,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
             sdu,
             handle: 11,
@@ -90,7 +87,7 @@ fn build_u_alert(dltime: TdmaTime, call_id: u16, destination_issi: u32) -> SapMs
     }
 }
 
-fn build_u_connect(dltime: TdmaTime, call_id: u16, destination_issi: u32) -> SapMsg {
+fn build_u_connect(call_id: u16, destination_issi: u32) -> SapMsg {
     let pdu = UConnect {
         call_identifier: call_id,
         hook_method_selection: false,
@@ -107,7 +104,6 @@ fn build_u_connect(dltime: TdmaTime, call_id: u16, destination_issi: u32) -> Sap
         sap: Sap::LcmcSap,
         src: TetraEntity::Mle,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
             sdu,
             handle: 11,
@@ -120,12 +116,11 @@ fn build_u_connect(dltime: TdmaTime, call_id: u16, destination_issi: u32) -> Sap
     }
 }
 
-fn build_connect_confirm(dltime: TdmaTime, brew_uuid: Uuid) -> SapMsg {
+fn build_connect_confirm(brew_uuid: Uuid) -> SapMsg {
     SapMsg {
         sap: Sap::Control,
         src: TetraEntity::Brew,
         dest: TetraEntity::Cmce,
-        dltime,
         msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
             brew_uuid,
             grant: 1,
@@ -148,15 +143,9 @@ fn test_incoming_brew_setup_alert_connect_flow() {
         vec![TetraEntity::Cmce],
         vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
     );
-    register_subscriber(&mut test, dltime, destination_issi);
+    register_subscriber(&mut test, destination_issi);
 
-    test.submit_message(build_setup_request(
-        dltime,
-        brew_uuid,
-        source_issi,
-        destination_issi,
-        &source_extension_str,
-    ));
+    test.submit_message(build_setup_request(brew_uuid, source_issi, destination_issi, &source_extension_str));
     test.run_stack(Some(1));
 
     let setup_msgs = test.dump_sinks();
@@ -185,7 +174,7 @@ fn test_incoming_brew_setup_alert_connect_flow() {
     assert!(saw_setup_accept, "Expected NetworkCircuitSetupAccept to Brew");
     let call_id = call_id.expect("Expected D-SETUP to local called ISSI");
 
-    test.submit_message(build_u_alert(dltime, call_id, destination_issi));
+    test.submit_message(build_u_alert(call_id, destination_issi));
     test.run_stack(Some(1));
 
     let alert_msgs = test.dump_sinks();
@@ -194,7 +183,7 @@ fn test_incoming_brew_setup_alert_connect_flow() {
         .any(|msg| matches!(msg.msg, SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid: msg_uuid }) if msg_uuid == brew_uuid));
     assert!(saw_alert, "Expected NetworkCircuitAlert to Brew");
 
-    test.submit_message(build_u_connect(dltime, call_id, destination_issi));
+    test.submit_message(build_u_connect(call_id, destination_issi));
     test.run_stack(Some(1));
 
     let connect_req_msgs = test.dump_sinks();
@@ -211,7 +200,7 @@ fn test_incoming_brew_setup_alert_connect_flow() {
 
     assert!(saw_connect_request, "Expected NetworkCircuitConnectRequest to Brew");
 
-    test.submit_message(build_connect_confirm(dltime, brew_uuid));
+    test.submit_message(build_connect_confirm(brew_uuid));
     test.run_stack(Some(1));
 
     let connect_msgs = test.dump_sinks();

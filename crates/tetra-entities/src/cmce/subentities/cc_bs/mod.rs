@@ -3,13 +3,14 @@ use std::collections::{HashMap, HashSet};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{
-    BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, tetra_entities::TetraEntity, unimplemented_log,
+    BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, tetra_entities::TetraEntity,
+    unimplemented_log,
 };
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::{
     enums::{
         call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_ul::CmcePduTypeUl,
-        transmission_grant::TransmissionGrant, type3_elem_id::CmceType3ElemId,
+        party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant, type3_elem_id::CmceType3ElemId,
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
@@ -34,7 +35,7 @@ use tetra_saps::{
     },
 };
 
-use crate::brew;
+use crate::net_brew as brew;
 use crate::{
     MessageQueue,
     cmce::components::circuit_mgr::{CircuitMgr, CircuitMgrCmd},
@@ -43,19 +44,15 @@ use crate::{
 mod call;
 mod dtmf;
 mod fsm;
+mod ingress;
+mod lifecycle;
 mod network;
 mod shared;
 mod timers;
-mod ingress;
 
-use call::{ActiveCall, CallOrigin, GroupCallState, IndividualCall, IndividualCallState, TxDemandQueueResult};
+use call::{ActiveCall, CachedSetup, CallOrigin, GroupCallState, IndividualCall, IndividualCallState, TxDemandQueueResult};
 use fsm::{GroupTransitionError, IndividualTransitionError};
-
-struct CachedSetup {
-    pdu: DSetup,
-    dest_addr: TetraAddress,
-    resend: bool,
-}
+use lifecycle::{BrewNotification, CallTimeslot, GroupFloorGrant};
 
 /// Clause 11 Call Control CMCE sub-entity
 pub struct CcBsSubentity {

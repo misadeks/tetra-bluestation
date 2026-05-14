@@ -206,13 +206,12 @@ impl LmacBs {
             sap: Sap::TmdSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            dltime: ul_time,
             msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: ul_time.t, data }),
         };
         queue.push_back(msg);
     }
 
-    fn rx_blk_control(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel, ul_time: TdmaTime) {
+    fn rx_blk_control(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) {
         assert!(
             lchan.is_control_channel(),
             "rx_blk_cp: lchan {:?} is not a signalling channel",
@@ -241,7 +240,6 @@ impl LmacBs {
             sap: Sap::TmvSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            dltime: ul_time,
             msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
                 pdu: type1bits,
                 logical_channel: lchan,
@@ -260,19 +258,12 @@ impl LmacBs {
     fn rx_tp_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_tp_prim: msg {:?}", message);
 
-        let ul_time = message.dltime;
+        let ul_time = self.dltime.add_timeslots(-2);
         let SapMsgInner::TpUnitdataInd(prim) = message.msg else { panic!() };
 
         // let pchan = self.determine_phy_chan_ul();
         let ts_idx = ul_time.t as usize - 1;
         let pchan = self.uplink_phy_chan[ts_idx];
-        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, self.blk2_stolen);
-
-        // Sanity checks
-        assert!(
-            prim.block_num != PhyBlockNum::Block1 || !self.blk2_stolen,
-            "blk2_stolen must be false when receiving block1"
-        );
         if pchan != PhysicalChannel::Tp && self.blk2_stolen {
             tracing::warn!(
                 "blk2_stolen set on non-traffic burst (ts={}, pchan={:?}), ignoring stale STCH signal",
@@ -280,8 +271,14 @@ impl LmacBs {
                 pchan
             );
             self.blk2_stolen = false;
-            return;
         }
+        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, self.blk2_stolen);
+
+        // Sanity checks
+        assert!(
+            prim.block_num != PhyBlockNum::Block1 || !self.blk2_stolen,
+            "blk2_stolen must be false when receiving block1"
+        );
 
         match lchan {
             LogicalChannel::Clch => {}
@@ -289,7 +286,7 @@ impl LmacBs {
                 self.rx_blk_traffic(queue, prim, lchan, ul_time)
             }
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
-                self.rx_blk_control(queue, prim, lchan, ul_time);
+                self.rx_blk_control(queue, prim, lchan);
             }
             _ => {
                 panic!()
@@ -380,7 +377,6 @@ impl LmacBs {
             sap: Sap::TpSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Phy,
-            dltime: self.dltime,
             msg: SapMsgInner::TpUnitdataReq(prim_phy),
         };
         queue.push_back(m);
@@ -433,7 +429,7 @@ impl TetraEntityTrait for LmacBs {
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::TpSap => {

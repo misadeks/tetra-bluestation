@@ -7,3 +7,4 @@ edition.workspace = true
 tetra-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+chrono-tz = { workspace = true }

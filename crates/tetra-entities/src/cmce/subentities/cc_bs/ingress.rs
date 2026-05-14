@@ -5,7 +5,8 @@ impl CcBsSubentity {
         tracing::trace!("route_xx_deliver");
 
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!();
+            tracing::warn!("CMCE CC ingress received non-LCMC unitdata indication: {:?}", message.msg);
+            return;
         };
         let Some(bits) = prim.sdu.peek_bits(5) else {
             tracing::warn!("insufficient bits: {}", prim.sdu.dump_bin());
@@ -29,14 +30,15 @@ impl CcBsSubentity {
                 unimplemented_log!("{}", pdu_type);
             }
             _ => {
-                panic!();
+                tracing::warn!("CMCE CC ingress received unsupported UL PDU type {}", pdu_type);
             }
         }
     }
 
     pub fn rx_call_control(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         let SapMsgInner::CmceCallControl(call_control) = message.msg else {
-            panic!("Expected CmceCallControl message");
+            tracing::warn!("CMCE CC control ingress received non-call-control message");
+            return;
         };
 
         match call_control {
@@ -50,6 +52,9 @@ impl CcBsSubentity {
             }
             CallControl::NetworkCallEnd { brew_uuid } => {
                 self.rx_network_call_end(queue, brew_uuid);
+            }
+            CallControl::UlInactivityTimeout { ts } => {
+                self.handle_ul_inactivity_timeout(queue, ts);
             }
             CallControl::NetworkCircuitSetupRequest { brew_uuid, call } => {
                 self.rx_network_circuit_setup_request(queue, brew_uuid, call);
@@ -88,7 +93,8 @@ impl CcBsSubentity {
     pub(super) fn rx_u_setup(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_u_setup: {:?}", message);
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_setup received non-LCMC unitdata indication");
+            return;
         };
         let calling_party = prim.received_tetra_address;
 
@@ -108,7 +114,8 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_tx_ceased(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_tx_ceased received non-LCMC unitdata indication");
+            return;
         };
 
         let sender = prim.received_tetra_address;
@@ -128,7 +135,8 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_tx_demand(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_tx_demand received non-LCMC unitdata indication");
+            return;
         };
 
         let requesting_party = prim.received_tetra_address;
@@ -148,7 +156,8 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_release(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_release received non-LCMC unitdata indication");
+            return;
         };
 
         let sender = prim.received_tetra_address;
@@ -168,7 +177,8 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_disconnect(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_disconnect received non-LCMC unitdata indication");
+            return;
         };
 
         let sender = prim.received_tetra_address;
@@ -192,7 +202,8 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_alert(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_alert received non-LCMC unitdata indication");
+            return;
         };
 
         let pdu = match UAlert::from_bitbuf(&mut prim.sdu) {
@@ -211,9 +222,9 @@ impl CcBsSubentity {
 
     /// Handle U-CONNECT for an individual call.
     pub(super) fn rx_u_connect(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
-        let message_dltime = message.dltime;
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_connect received non-LCMC unitdata indication");
+            return;
         };
 
         let pdu = match UConnect::from_bitbuf(&mut prim.sdu) {
@@ -227,20 +238,13 @@ impl CcBsSubentity {
             }
         };
 
-        self.fsm_on_u_connect(
-            queue,
-            message_dltime,
-            prim.received_tetra_address,
-            prim.handle,
-            prim.link_id,
-            prim.endpoint_id,
-            pdu,
-        );
+        self.fsm_on_u_connect(queue, prim.received_tetra_address, prim.handle, prim.link_id, prim.endpoint_id, pdu);
     }
 
     pub(super) fn rx_u_info(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!()
+            tracing::warn!("CMCE CC rx_u_info received non-LCMC unitdata indication");
+            return;
         };
 
         let pdu = match UInfo::from_bitbuf(&mut prim.sdu) {

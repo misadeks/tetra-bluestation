@@ -2,7 +2,7 @@
 # This is an example configuration file for the TETRA base station stack
 # DO NOT RUN without editing to stay within legal limits of your jurisdiction
 
-config_version = "0.5"
+config_version = "0.6"
 
 # Stack operation mode: "Bs" (Base Station), "Ms" (Mobile Station), or "Mon" (Monitor)
 stack_mode = "Bs"
@@ -19,52 +19,45 @@ stack_mode = "Bs"
 # Input type: set to SoapySdr. May allow for future non-soapy RF backends.
 backend = "SoapySdr"
 
-# DEBUG/TESTING code. Capture files get large quickly. 
+# DEBUG/TESTING code. Capture files get large quickly.
 # dl_tx_file = "./dl_output.bin"    # Debugging; uncomment to save generated DL RF samples to file
 # ul_rx_file = "./ul_output.bin"    # Debugging; uncomment to save received UL RF samples to file
 
 [phy_io.soapysdr]
 # Transmit tx(dl) and rx(ul) frequencies in Hz
-# !!! Make sure to also edit all related fields in the cell_info section to fit this frequency. 
+# !!! Make sure to also edit all related fields in the cell_info section to fit this frequency.
 tx_freq = 438025000
 rx_freq = 433025000
-ppm_err = 0.0                       # Adjust if your SDR has a non-negligible tuning error
 
-# Sane defaults for LimeSDR
-# [phy_io.soapysdr.iocfg_limesdr]
-# rx_ant = "LNAL"
-# tx_ant = "BAND1"
-# rx_gain_lna = 18.0
-# rx_gain_tia = 6.0
-# rx_gain_pga = 10.0
-# tx_gain_pad = 18.0
-# tx_gain_iamp = 3.0
+# Adjust if your SDR has a non-negligible tuning error
+# ppm_err = 0.0
 
-# Sane defaults for LimeSDR Mini v2
-# [phy_io.soapysdr.iocfg_limesdr]
-# rx_ant = "LNAW"
-# tx_ant = "BAND2"
-# rx_gain_lna = 18.0
-# rx_gain_tia = 6.0
-# rx_gain_pga = 10.0
-# tx_gain_pad = 18.0
-# tx_gain_iamp = 3.0
+################################################################################################
+## OPTIONAL: specific device, antenna, gain selection                                         ##
+## Make sure to check your device for valid settings using SoapySDRUtil --probe               ##
+## or check: https://github.com/MidnightBlueLabs/tetra-bluestation-docs/wiki/03-Configuration ##
+################################################################################################
 
-# Sane defaults for SXceiver
-# [phy_io.soapysdr.iocfg_sxceiver]
-# rx_ant = "RX"
-# tx_ant = "TX"
-# rx_gain_lna = 42.0
-# rx_gain_pga = 16.0
-# tx_gain_dac = 9.0
-# tx_gain_mixer = 30.0
+# Optional device selection arguments.
+# If not specified, the first supported device found is selected automatically.
+# You may need to specify this if you have multiple supported device connected,
+# or if your device cannot be automatically detected by enumeration.
+# For example, to use a Pluto+ with a given IP address:
+# device = "driver=plutosdr,uri=ip:192.168.42.42"
+# To select a LimeSDR with a given serial number (check with SoapySDRUtil --find):
+# device = "driver=lime,serial=123456789"
 
-# Sane defaults for Ettus USRP B210 (and probably B200)
-[phy_io.soapysdr.iocfg_usrpb2xx]
-rx_ant = "TX/RX"
-tx_ant = "TX/RX"
-rx_gain_pga = 50.0
-tx_gain_pga = 35.0
+# Optional antenna selection to override device-specific defaults
+# Check antenna names with SoapySDRUtil --probe
+# rx_antenna = "LNAW"
+# tx_antenna = "BAND2"
+
+# Optional gain values to override device-specific defaults.
+# Check valid gain names with SoapySDRUtil --probe
+# For example, to increase transmit power on a LimeSDR:
+# tx_gain_pad = 50.0
+# To adjust LNA gain to optimize RX performance on a LimeSDR or SXceiver:
+# rx_gain_lna = 30.0
 
 ###############################################################################
 
@@ -75,7 +68,7 @@ mcc = 204  # Netherlands
 
 # Mobile Network Code (MNC) - identifies the TETRA network
 # MAKE SURE MNC MAY BE USED, CONSULT RELEVANT AUTHORITIES IF NEEDED
-mnc = 1337  
+mnc = 1337
 
 # Cell Information
 [cell_info]
@@ -87,19 +80,19 @@ freq_band = 4                       # 400MHz band
 main_carrier = 1521                 # + 1521 * 25kHz = 38250kHz
 duplex_spacing = 4                  # Use 5MHz spacing between ul and dl (for 400 MHz band)
 # custom_duplex_spacing = 7600000   # Don't uncomment unless you have programmed a custom duplex spacing entry in your radios
-freq_offset = 0                     # Offset from carrier. Usually 0. Options: 0, 6250, -6250, 12500. 
-reverse_operation = false           # False: UL below DL. True: UL above DL. 
+freq_offset = 0                     # Offset from carrier. Usually 0. Options: 0, 6250, -6250, 12500.
+reverse_operation = false           # False: UL below DL. True: UL above DL.
 
 # Location Area identifier
 location_area = 2
 
-# Colour code (0-3), helps distinguish between adjacent cells on the same frequency
+# Colour code (0-63), helps distinguish between adjacent cells on the same frequency
 colour_code = 1
 
 ###############################################################################
 
 # OPTIONAL: Additional cell parameters
-# WIP; uncomment and configure as needed, many are not currently implemented, 
+# WIP; uncomment and configure as needed, many are not currently implemented,
 # defaults should be fine
 
 # Neighbor cell broadcast settings
@@ -144,14 +137,21 @@ voice_service = true
 # Frame 18 extension support
 # frame_18_ext = false
 
-# Local SSI ranges for this cell. Traffic for these ranges will not leave the cell
-# This overrides any settings in brew section, if enabled. 
-# Also, incoming brew traffic on those rangges will be dropped
-# Range end is exclusive, so the range end number is NOT inside the ranges
-# local_ssi_ranges = [
-#     [0, 91],
-# ]
+# Max MS TX power in cell: 0=Rsvd 1=15 2=20 3=25 4=30 5=35 6=40 7=45 dBm
+# ms_txpwr_max_cell = 4
 
+# IANA timezone for D-NWRK-BROADCAST time broadcasting. When set, the BS will
+# broadcast UTC time and local time offset once per hyperframe (~61s) so MSs
+# can synchronize their clocks. Handles DST automatically.
+# timezone = "Europe/Amsterdam"
+
+# Local SSI ranges for this cell. Traffic for these ranges will not leave the cell
+# This overrides any settings in brew section, if enabled.
+# Also, incoming brew traffic on those ranges will be dropped
+# Range end is INCLUSIVE, so the range end number IS inside the ranges
+local_ssi_ranges = [
+    [0, 90],
+]
 
 ###############################################################################
 
@@ -164,14 +164,15 @@ voice_service = true
 
 # Server address
 # host = "core.tetrapack.online"
-# port = 3003
+# port = 443
 
 # Use TLS (wss:// / https://)
 # tls = true
 
 # HTTP Digest auth credentials, as registered in BrandMeister
-# Username should be your RadioID / DMR ID. Password is your BrandMeister hotspot password.
-# username = 012345
+# Username should be your SSID (DMR ID + 2-digit suffix).
+# Password is your BrandMeister hotspot password.
+# username = 123456700
 # password = "012345"
 
 # Reconnection delay (seconds)
@@ -181,8 +182,12 @@ voice_service = true
 # Adaptive jitter buffering is always enabled; this adds fixed startup delay if needed.
 # jitter_initial_latency_frames = 0
 
-# Uncomment to allow only select SSIs to be transmitted over Brew
-# If left commented, all (outside of local_ssi_ranges) are allowed over Brew
+# Enable SDS forwarding between local and Brew clients. Enabled by default.
+# feature_sds_enabled = true
+
+# Uncomment to allow only calls for select SSIs to be transmitted over Brew
+# SDS works for all SSIs, currently, but the SDS over Brew feature may be fully disabled.
+# If left commented, all (outside of local_ssi_ranges) calls are allowed over Brew
 # whitelisted_ssis = [91]
 
 # Optional PBX gateway ISSIs that should always be considered Brew-routable

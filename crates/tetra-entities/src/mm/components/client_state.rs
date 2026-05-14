@@ -1,3 +1,9 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
+use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
+use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
+
 #[derive(Debug)]
 pub enum ClientMgrErr {
     ClientNotFound { issi: u32 },
@@ -14,18 +20,22 @@ pub enum MmClientState {
 }
 
 pub struct MmClientProperties {
-    pub ssi: u32,
+    pub issi: u32,
     pub state: MmClientState,
-    pub groups: std::collections::HashSet<u32>,
+    pub groups: HashSet<u32>,
+    pub energy_saving_mode: EnergySavingMode,
+    pub class_of_ms: Option<ClassOfMs>,
     // pub last_seen: TdmaTime,
 }
 
 impl MmClientProperties {
     pub fn new(ssi: u32) -> Self {
         MmClientProperties {
-            ssi,
+            issi: ssi,
             state: MmClientState::Unknown,
-            groups: std::collections::HashSet::new(),
+            groups: HashSet::new(),
+            energy_saving_mode: EnergySavingMode::StayAlive,
+            class_of_ms: None,
             // last_seen: TdmaTime::default(),
         }
     }
@@ -49,13 +59,15 @@ fn may_attach(_issi: u32, _gssi: u32) -> bool {
 }
 
 pub struct MmClientMgr {
-    clients: std::collections::HashMap<u32, MmClientProperties>,
+    clients: HashMap<u32, MmClientProperties>,
+    telemetry_sink: Option<TelemetrySink>,
 }
 
 impl MmClientMgr {
-    pub fn new() -> Self {
+    pub fn new(telemetry_sink: Option<TelemetrySink>) -> Self {
         MmClientMgr {
-            clients: std::collections::HashMap::new(),
+            clients: HashMap::new(),
+            telemetry_sink,
         }
     }
 
@@ -70,6 +82,24 @@ impl MmClientMgr {
     pub fn set_client_state(&mut self, issi: u32, state: MmClientState) -> Result<(), ClientMgrErr> {
         if let Some(client) = self.clients.get_mut(&issi) {
             client.state = state;
+            Ok(())
+        } else {
+            Err(ClientMgrErr::ClientNotFound { issi })
+        }
+    }
+
+    pub fn set_client_energy_saving_mode(&mut self, issi: u32, mode: EnergySavingMode) -> Result<(), ClientMgrErr> {
+        if let Some(client) = self.clients.get_mut(&issi) {
+            client.energy_saving_mode = mode;
+            Ok(())
+        } else {
+            Err(ClientMgrErr::ClientNotFound { issi })
+        }
+    }
+
+    pub fn set_client_class_of_ms(&mut self, issi: u32, class: Option<ClassOfMs>) -> Result<(), ClientMgrErr> {
+        if let Some(client) = self.clients.get_mut(&issi) {
+            client.class_of_ms = class;
             Ok(())
         } else {
             Err(ClientMgrErr::ClientNotFound { issi })
@@ -95,17 +125,37 @@ impl MmClientMgr {
         };
         self.clients.insert(issi, elem);
 
+        // Send telemetry event
+        if let Some(sink) = &self.telemetry_sink {
+            sink.send(TelemetryEvent::MsRegistration { issi });
+        }
+
         Ok(true)
     }
 
     /// Removes a client from the registry, returning its properties if found
     pub fn remove_client(&mut self, ssi: u32) -> Option<MmClientProperties> {
-        self.clients.remove(&ssi)
+        if let Some(client) = self.clients.remove(&ssi) {
+            // Send telemetry event
+            if let Some(sink) = &self.telemetry_sink {
+                sink.send(TelemetryEvent::MsDeregistration { issi: ssi });
+            }
+            Some(client)
+        } else {
+            None
+        }
     }
 
     /// Detaches all groups from a client
     pub fn client_detach_all_groups(&mut self, issi: u32) -> Result<bool, ClientMgrErr> {
         if let Some(client) = self.clients.get_mut(&issi) {
+            // Send telemetry event
+            if let Some(sink) = &self.telemetry_sink {
+                sink.send(TelemetryEvent::MsGroupDetach {
+                    issi: client.issi,
+                    gssis: client.groups.iter().cloned().collect(),
+                });
+            }
             client.groups.clear();
             Ok(true)
         } else {
@@ -128,6 +178,14 @@ impl MmClientMgr {
 
         if let Some(client) = self.clients.get_mut(&issi) {
             if do_attach {
+                // Send telemetry event
+                if let Some(sink) = &self.telemetry_sink {
+                    sink.send(TelemetryEvent::MsGroupAttach {
+                        issi: client.issi,
+                        gssis: vec![gssi].into_iter().collect(),
+                    });
+                }
+
                 Ok(client.groups.insert(gssi))
             } else {
                 Ok(client.groups.remove(&gssi))

@@ -1,5 +1,5 @@
 /// Pass TMD circuit data to UMAC for TX scheduling
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmdCircuitDataReq {
     // call_id: CallId,
     pub ts: u8,
@@ -7,7 +7,7 @@ pub struct TmdCircuitDataReq {
 }
 
 /// Rx'ed traffic
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TmdCircuitDataInd {
     // call_id: CallId,
     pub ts: u8,

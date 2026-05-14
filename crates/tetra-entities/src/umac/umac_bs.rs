@@ -3,7 +3,7 @@ use std::panic;
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, assert_warn, unimplemented_log};
+use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
@@ -57,6 +57,9 @@ pub struct UmacBs {
     /// Access to this field is used only by testing code
     pub channel_scheduler: BsChannelScheduler,
     // ulrx_scheduler: UlScheduler,
+    /// Timestamp of last received UL voice frame per timeslot (0-indexed: ts1..ts4).
+    /// Used to detect UL inactivity when a radio disappears mid-transmission.
+    last_ul_voice: [Option<TdmaTime>; 4],
 }
 
 struct PendingStch {
@@ -83,6 +86,7 @@ impl UmacBs {
             pending_stch: None,
             // event_label_store: EventLabelStore::new(),
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
+            last_ul_voice: [None; 4],
         }
     }
 
@@ -125,10 +129,10 @@ impl UmacBs {
             duplex_spacing: c.cell.duplex_spacing_id,
             reverse_operation: c.cell.reverse_operation,
             num_of_csch: 0, // Common secondary control channels
-            ms_txpwr_max_cell: 5,
-            rxlev_access_min: 3,
-            access_parameter: 7,
-            radio_dl_timeout: 3,
+            ms_txpwr_max_cell: c.cell.ms_txpwr_max_cell,
+            rxlev_access_min: 3, // -110 dBm (permissive, suitable for single-cell)
+            access_parameter: 7, // -39 dBm (MS open-loop power control setpoint)
+            radio_dl_timeout: 3, // 432 timeslots (~6s radio link timeout)
             cck_id: None,
             hyperframe_number: Some(0), // Updated dynamically in scheduler
             option_field: SysinfoOptFieldFlag::DefaultDefForAccCodeA,
@@ -218,11 +222,9 @@ impl UmacBs {
         if is_effective != self.system_wide_services {
             self.system_wide_services = is_effective;
             self.channel_scheduler.set_system_wide_services_state(is_effective);
-            if is_effective {
-                tracing::info!("UmacBs: system_wide_services ENABLED");
-            } else {
-                tracing::warn!("UmacBs: system_wide_services DISABLED");
-            }
+
+            // Should already be signalled at SwMI interface level
+            tracing::debug!("UmacBs: system_wide_services {}", if is_effective { "ENABLED" } else { "DISABLED" });
         }
     }
 
@@ -244,7 +246,7 @@ impl UmacBs {
     }
 
     /// Convenience function to send a TMA-REPORT.ind
-    fn send_tma_report_ind(queue: &mut MessageQueue, dltime: TdmaTime, handle: Todo, report: TmaReport) {
+    fn send_tma_report_ind(queue: &mut MessageQueue, handle: Todo, report: TmaReport) {
         let tma_report_ind = TmaReportInd {
             req_handle: handle,
             report,
@@ -253,7 +255,6 @@ impl UmacBs {
             sap: Sap::TmaSap,
             src: TetraEntity::Umac,
             dest: TetraEntity::Llc,
-            dltime,
             msg: SapMsgInner::TmaReportInd(tma_report_ind),
         };
         queue.push_back(msg);
@@ -512,13 +513,12 @@ impl UmacBs {
         }
 
         // Handle reservation if present
-        // let ul_time = message.dltime.add_timeslots(-2);
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
         if let Some(res_req) = &pdu.reservation_req {
-            tracing::error!("rx_mac_data: time {:?}", message.dltime);
-            let grant = self.channel_scheduler.ul_process_cap_req(message.dltime.t, addr, res_req);
+            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
             if let Some(grant) = grant {
                 // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(message.dltime.t, addr, grant);
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
             } else {
                 tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
             }
@@ -527,7 +527,7 @@ impl UmacBs {
         tracing::debug!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
         if is_frag_start {
             // Fragmentation start, add to defragmenter
-            self.defrag.insert_first(&mut prim.pdu, message.dltime, addr, None);
+            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, None);
         } else {
             // Pass directly to LLC
             let sdu = {
@@ -546,7 +546,6 @@ impl UmacBs {
                     sap: Sap::TmaSap,
                     src: TetraEntity::Umac,
                     dest: TetraEntity::Llc,
-                    dltime: message.dltime,
 
                     msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                         pdu: sdu,
@@ -654,7 +653,8 @@ impl UmacBs {
 
         // Schedule acknowledgement of this message
         // let ul_time = message.dltime.add_timeslots(-2);
-        self.channel_scheduler.dl_enqueue_random_access_ack(message.dltime.t, addr);
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        self.channel_scheduler.dl_enqueue_random_access_ack(msg_dltime.t, addr);
 
         // Decrypt if needed
         if pdu.encrypted {
@@ -664,10 +664,10 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(message.dltime.t, addr, res_req);
+            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
             if let Some(grant) = grant {
                 // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(message.dltime.t, addr, grant);
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
             } else {
                 tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
             }
@@ -676,7 +676,7 @@ impl UmacBs {
         // tracing::debug!("rx_mac_access: {}", prim.pdu.dump_bin_full(true));
         if pdu.is_frag_start() {
             // Fragmentation start, add to defragmenter
-            self.defrag.insert_first(&mut prim.pdu, message.dltime, addr, None);
+            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, None);
         } else {
             // Pass directly to LLC
             if prim.pdu.get_len_remaining() == 0 {
@@ -702,8 +702,6 @@ impl UmacBs {
                     sap: Sap::TmaSap,
                     src: TetraEntity::Umac,
                     dest: TetraEntity::Llc,
-                    dltime: message.dltime,
-
                     msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                         pdu: sdu,
                         main_address: addr,
@@ -764,20 +762,21 @@ impl UmacBs {
         prim.pdu.set_raw_end(prim.pdu.get_raw_start() + pdu_len_bits);
         tracing::debug!("rx_mac_frag_ul: pdu_len_bits: {} fill_bits: {}", pdu_len_bits, num_fill_bits);
 
-        // Get slot owner from schedule, decrypt if needed
-        // let ul_time = message.dltime.add_timeslots(-2);
-        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(message.dltime, prim.block_num) else {
+        // Get slot owner from schedule
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
             tracing::warn!("rx_mac_frag_ul: Received MAC-FRAG-UL for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, message.dltime) {
+
+        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
             unimplemented_log!("rx_mac_frag_ul: Encryption not supported");
             return;
         }
 
         // Insert into defragmenter
-        self.defrag.insert_next(&mut prim.pdu, slot_owner, message.dltime);
+        self.defrag.insert_next(&mut prim.pdu, slot_owner, msg_dltime);
     }
 
     fn rx_mac_end_ul(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
@@ -831,18 +830,18 @@ impl UmacBs {
         );
 
         // Get slot owner from schedule, decrypt if needed
-        // let ul_time = message.dltime.add_timeslots(-2);
-        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(message.dltime, prim.block_num) else {
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
             tracing::warn!("rx_mac_end_ul: Received MAC-END-UL for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, message.dltime) {
+        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
             unimplemented!("rx_mac_end_ul: Encryption not supported");
         }
 
         // Insert last fragment and retrieve finalized block
-        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, message.dltime);
+        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
         let Some(defragbuf) = defragbuf else {
             tracing::warn!("rx_mac_end_ul: could not obtain defragged buf");
             return;
@@ -850,10 +849,10 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(message.dltime.t, defragbuf.addr, res_req);
+            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
             if let Some(grant) = grant {
                 // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(message.dltime.t, defragbuf.addr, grant);
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
             } else {
                 tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
             }
@@ -866,8 +865,6 @@ impl UmacBs {
             sap: Sap::TmaSap,
             src: TetraEntity::Umac,
             dest: TetraEntity::Llc,
-            dltime: message.dltime,
-
             msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
@@ -912,7 +909,8 @@ impl UmacBs {
         // Will have either length_ind or reservation_req, never none or both
         let mut pdu_len_bits = if let Some(length_ind) = pdu.length_ind {
             if length_ind == 0 {
-                assert_warn!(false, "rx_mac_end_hu: PDU has length ind 0");
+                // Table 21.44: length indication 0 is reserved, discard PDU
+                tracing::debug!("rx_mac_end_hu: discarding PDU with reserved length indication 0");
                 return;
             }
             let len = length_ind as usize * 8;
@@ -948,17 +946,18 @@ impl UmacBs {
         );
 
         // Get slot owner from schedule, decrypt if needed
-        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(message.dltime, prim.block_num) else {
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
             tracing::warn!("rx_mac_end_hu: Received MAC-END-HU for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, message.dltime) {
+        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
             unimplemented!("rx_mac_end_hu: Encryption not supported");
         }
 
         // Insert last fragment and retrieve finalized block
-        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, message.dltime);
+        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
         let Some(defragbuf) = defragbuf else {
             tracing::warn!("rx_mac_end_hu: could not obtain defragged buf");
             return;
@@ -966,10 +965,10 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(message.dltime.t, defragbuf.addr, res_req);
+            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
             if let Some(grant) = grant {
                 // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(message.dltime.t, defragbuf.addr, grant);
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
             } else {
                 tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
             }
@@ -982,8 +981,6 @@ impl UmacBs {
             sap: Sap::TmaSap,
             src: TetraEntity::Umac,
             dest: TetraEntity::Llc,
-            dltime: message.dltime,
-
             msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
@@ -1049,10 +1046,9 @@ impl UmacBs {
             sap: Sap::TmaSap,
             src: TetraEntity::Umac,
             dest: TetraEntity::Llc,
-            dltime: message.dltime,
             msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                 pdu: Some(sdu),
-                main_address: TetraAddress::new(0, SsiType::Ssi), // Address unknown from MAC-U-SIGNAL
+                main_address: TetraAddress::issi(0), // Address unknown from MAC-U-SIGNAL
                 scrambling_code: prim.scrambling_code,
                 endpoint_id: 0,
                 new_endpoint_id: None,
@@ -1091,11 +1087,12 @@ impl UmacBs {
         unimplemented!();
     }
 
-    fn rx_ul_tma_unitdata_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_ul_tma_unitdata_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_ul_tma_unitdata_req");
 
         // Extract sdu
         let SapMsgInner::TmaUnitdataReq(prim) = message.msg else { panic!() };
+        // let req_handle = prim.req_handle;
         let mut sdu = prim.pdu;
 
         // ── FACCH/Stealing path ──────────────────────────────────────────
@@ -1117,12 +1114,18 @@ impl UmacBs {
                 const STCH_CAP: usize = 124;
 
                 let usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
-                let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi;
+                // Per ETSI 21.4.3.1: "The random access flag shall be used for the BS to
+                // acknowledge a successful random access so as to prevent the MS sending
+                // further random access requests."
+                // Set the flag if this address has a pending RA (dropped by
+                // dl_drop_all_except_stolen when leaving hangtime), or if the address
+                // is ISSI (direct CC-level response to a MAC-ACCESS).
+                let has_pending_ra = self.channel_scheduler.take_pending_ra_ack(ts, prim.main_address.ssi);
+                let is_random_access_response = has_pending_ra || prim.main_address.ssi_type == SsiType::Issi;
                 let mut mac_pdu = MacResource {
                     fill_bits: false,
                     pos_of_grant: 0,
                     encryption_mode: 0,
-                    // FACCH/STCH on traffic channels is not a random-access response.
                     random_access_flag: is_random_access_response,
                     length_ind: 0,
                     addr: Some(prim.main_address),
@@ -1152,7 +1155,7 @@ impl UmacBs {
                 );
 
                 self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
-                Self::send_tma_report_ind(queue, message.dltime, prim.req_handle, TmaReport::SuccessDownlinked);
+
                 return;
             } else {
                 tracing::warn!("rx_ul_tma_unitdata_req: stealing requested but no active DL circuit, falling back to MCCH");
@@ -1170,9 +1173,10 @@ impl UmacBs {
             (None, None)
         };
 
-        // Build MAC-RESOURCE optimistically (as if it would always fit in one slot)
-        // random_access_flag: true for SSI-addressed responses to random access requests.
-        // When link_id == 0, we have no LLC link context, so treat as unsolicited (flag = false).
+        // Build MAC-RESOURCE optimistically (as if it would always fit in one slot).
+        // random_access_flag: true for SSI-addressed responses to random access requests,
+        // false for GSSI-addressed unsolicited group signaling. When link_id == 0,
+        // we have no LLC link context, so treat the message as unsolicited too.
         let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && prim.link_id != 0;
         let mut pdu = MacResource {
             fill_bits: false, // Updated later
@@ -1189,24 +1193,17 @@ impl UmacBs {
         };
         pdu.update_len_and_fill_ind(sdu.get_len());
 
-        // Add to scheduler: Group signaling (GSSI) → TS1 (MCCH).
-        // Individual signaling with no LLC link context (link_id == 0) → TS1 (MCCH),
-        // since the MS is listening on the control channel during setup/teardown.
-        // Otherwise, use current TS, avoiding active traffic circuits.
-        let enqueue_ts = if prim.main_address.ssi_type == SsiType::Gssi {
-            1 // Group signaling always on MCCH (TS1)
-        } else if prim.link_id == 0 {
-            1 // No LLC link context, force MCCH
-        } else if self.channel_scheduler.circuit_is_active(Direction::Dl, message.dltime.t) {
-            1 // Redirect individual signaling away from traffic TS
-        } else {
-            message.dltime.t
-        };
-
-        self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);
+        // // Per ETSI EN 300 392-2 Clause 23.3.1.1.2: idle MSes monitor the MCCH (slot 1)
+        // // for signaling. Without common SCCHs, all MSes listen on slot 1.
+        // // All signaling on the normal path (non-FACCH) must go to the MCCH.
+        // Let the scheduler choose MCCH versus linked signaling timeslot from
+        // the SAP link context. FACCH/traffic-slot signaling uses the explicit
+        // stealing path above.
+        self.channel_scheduler
+            .dl_enqueue_tma_for_link(prim.link_id, pdu, sdu, prim.tx_reporter);
 
         // TODO FIXME I'm not so sure whether we should send this now, or send it once the message is on its way
-        Self::send_tma_report_ind(queue, message.dltime, prim.req_handle, TmaReport::SuccessDownlinked);
+        // Self::send_tma_report_ind(_queue, req_handle, TmaReport::SuccessDownlinked);
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -1226,12 +1223,17 @@ impl UmacBs {
 
     fn rx_tmd_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tmd_prim");
-        let dltime = message.dltime;
+
         let src = message.src;
         match message.msg {
             // DL voice from Brew/upper layer → schedule for DL transmission
             SapMsgInner::TmdCircuitDataReq(prim) => {
                 let ts = prim.ts;
+                // Refresh UL inactivity timer when DL voice is being fed (network call scenario).
+                // This prevents false timeout when Brew is the speaker and no UL radio is transmitting.
+                if (1..=4).contains(&ts) && self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                }
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
                     self.channel_scheduler.dl_schedule_tmd(ts, prim.data);
                 } else {
@@ -1239,7 +1241,7 @@ impl UmacBs {
                         "rx_tmd_prim: dropping DL voice on inactive circuit ts={} src={:?} dltime={}",
                         ts,
                         src,
-                        dltime
+                        self.dltime
                     );
                 }
             }
@@ -1248,6 +1250,11 @@ impl UmacBs {
                 let ts = prim.ts;
                 let data = prim.data;
 
+                // Track last UL voice frame time for inactivity detection
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                }
+
                 // Forward UL voice to Brew (User plane) if loaded
                 if self.config.config().brew.is_some() {
                     if self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
@@ -1255,7 +1262,6 @@ impl UmacBs {
                             sap: Sap::TmdSap,
                             src: TetraEntity::Umac,
                             dest: TetraEntity::Brew,
-                            dltime,
                             msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone() }),
                         };
                         queue.push_back(msg);
@@ -1286,11 +1292,7 @@ impl UmacBs {
                         }
                     }
                 } else {
-                    tracing::trace!(
-                        "rx_tmd_prim: no active DL circuit on ts={} (dl_ts={}), skipping loopback",
-                        ts,
-                        dl_ts
-                    );
+                    tracing::trace!("rx_tmd_prim: no active DL circuit on ts={}, skipping loopback", ts);
                 }
             }
             _ => {
@@ -1306,13 +1308,9 @@ impl UmacBs {
             sap: Sap::TmvSap,
             src: self.self_component,
             dest: TetraEntity::Lmac,
-            dltime: self.dltime, // Control message so don't care
             msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
                 blk2_stolen: Some(true),
-                scrambling_code: None,
-                is_traffic: None,
-                tch_type_and_interleaving_depth: None,
-                time: None,
+                ..Default::default()
             }),
         };
         queue.push_prio(m, MessagePrio::Immediate);
@@ -1405,6 +1403,12 @@ impl UmacBs {
                 dl_media_source: circuit.dl_media_source,
             };
             self.channel_scheduler.create_circuit(d, c);
+
+            // Start UL inactivity timer when opening a UL circuit
+            if d == Direction::Ul && (1..=4).contains(&ts) {
+                self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+            }
+
             tracing::debug!("  rx_control_circuit_open: Setup {:?} circuit for ts {}", d, ts);
         }
     }
@@ -1425,11 +1429,55 @@ impl UmacBs {
         for d in dirs {
             match self.channel_scheduler.close_circuit(d, ts) {
                 Some(_) => {
+                    // Clear UL inactivity timer when closing a UL circuit
+                    if d == Direction::Ul && (1..=4).contains(&ts) {
+                        self.last_ul_voice[ts as usize - 1] = None;
+                    }
                     tracing::info!("  rx_control_circuit_close: Closed {:?} circuit for ts {}", d, ts);
                 }
                 None => {
                     tracing::warn!("  rx_control_circuit_close: No {:?} circuit to close for ts {}", d, ts);
                 }
+            }
+        }
+    }
+
+    /// Check for UL inactivity on traffic timeslots. If no voice frames have arrived
+    /// for UL_INACTIVITY_TIMESLOTS on a timeslot with an active UL circuit (and not in
+    /// hangtime), send UlInactivityTimeout to CMCE.
+    fn check_ul_inactivity(&mut self, queue: &mut MessageQueue) {
+        // 3 multiframes ~ 3s. Above T.213 (1s) to tolerate DTX and brief RF fading.
+        const UL_INACTIVITY_TIMESLOTS: i32 = 3 * 18 * 4;
+
+        for ts in 2..=4u8 {
+            let idx = ts as usize - 1;
+
+            // Only check traffic timeslots with an active UL circuit.
+            if !self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                continue;
+            }
+
+            // Skip if in hangtime (no voice expected)
+            if self.channel_scheduler.is_hangtime(ts) {
+                continue;
+            }
+
+            // Check if we've exceeded the inactivity threshold
+            let timed_out = match self.last_ul_voice[idx] {
+                Some(t) => t.age(self.dltime) > UL_INACTIVITY_TIMESLOTS,
+                None => false, // Initialized at circuit open; shouldn't be None here
+            };
+
+            if timed_out {
+                tracing::warn!("UL inactivity timeout on ts={}, sending notification to CMCE", ts);
+                self.last_ul_voice[idx] = None;
+
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Umac,
+                    dest: TetraEntity::Cmce,
+                    msg: SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts }),
+                });
             }
         }
     }
@@ -1450,15 +1498,27 @@ impl UmacBs {
             // Floor-control signals drive traffic↔signalling transitions during hangtime.
             CallControl::FloorReleased { ts, .. } => {
                 self.channel_scheduler.set_hangtime(ts, true);
+                // Stop checking UL inactivity during hangtime
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = None;
+                }
             }
             CallControl::FloorGranted { ts, .. } => {
                 self.channel_scheduler.set_hangtime(ts, false);
+                // Restart UL inactivity timer when new speaker gets floor
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                }
             }
             CallControl::CallEnded { ts, .. } => {
                 self.channel_scheduler.set_hangtime(ts, false);
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = None;
+                }
             }
 
             // NetworkCall* are for CMCE ↔ Brew, not UMAC (for now)
+            CallControl::UlInactivityTimeout { .. } => {}
             CallControl::NetworkCallStart { .. }
             | CallControl::NetworkCallReady { .. }
             | CallControl::NetworkCallEnd { .. }
@@ -1527,6 +1587,9 @@ impl TetraEntityTrait for UmacBs {
             self.channel_scheduler.tick_start(ts);
         }
 
+        // Check for UL inactivity (stuck transmitter detection)
+        self.check_ul_inactivity(queue);
+
         // Collect/construct traffic that should be sent down to the LMAC
         // This is basically the _previous_ timeslot
         let elem = self.channel_scheduler.finalize_ts_for_tick();
@@ -1534,7 +1597,6 @@ impl TetraEntityTrait for UmacBs {
             sap: Sap::TmvSap,
             src: self.self_component,
             dest: TetraEntity::Lmac,
-            dltime: ts.add_timeslots(-1),
             msg: SapMsgInner::TmvUnitdataReq(elem),
         };
         tracing::trace!("UmacBs tick: Pushing finalized timeslot to LMAC: {:?}", s);

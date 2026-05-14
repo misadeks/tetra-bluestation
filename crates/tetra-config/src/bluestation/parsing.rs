@@ -6,10 +6,11 @@ use std::path::Path;
 use serde::Deserialize;
 use toml::Value;
 
-use crate::bluestation::{CellInfoDto, NetInfoDto, cell_dto_to_cfg, net_dto_to_cfg};
+use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, net_dto_to_cfg};
 
 use super::config::{SharedConfig, StackConfig, StackMode};
 use super::sec_brew::{CfgBrewDto, apply_brew_patch};
+use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
 use super::{PhyIoDto, StackState, phy_dto_to_cfg};
 
 /// Build `SharedConfig` from a TOML configuration file
@@ -17,13 +18,8 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
     let root: TomlConfigRoot = toml::from_str(toml_str)?;
 
     // Various sanity checks
-    let expected_config_version = "0.5";
-    if !root.config_version.eq(expected_config_version) {
-        return Err(format!(
-            "Unrecognized config_version: {}, expect {}",
-            root.config_version, expected_config_version
-        )
-        .into());
+    if root.config_version != "0.5" && root.config_version != "0.6" {
+        return Err(format!("Unrecognized config_version: {}, expect 0.5 or 0.6", root.config_version).into());
     }
     if !root.extra.is_empty() {
         return Err(format!("Unrecognized top-level fields: {:?}", sorted_keys(&root.extra)).into());
@@ -33,8 +29,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
         return Err(format!("Unrecognized fields: phy_io::{:?}", sorted_keys(&root.phy_io.extra)).into());
     }
     if let Some(ref soapy) = root.phy_io.soapysdr {
-        if !soapy.extra.is_empty() {
-            return Err(format!("Unrecognized fields: phy_io.soapysdr::{:?}", sorted_keys(&soapy.extra)).into());
+        let extra_keys = sorted_keys(&soapy.extra);
+        let extra_keys_filtered = extra_keys
+            .iter()
+            .filter(|key| !(key.starts_with("rx_gain_") || key.starts_with("tx_gain_")))
+            .collect::<Vec<&&str>>();
+        if !extra_keys_filtered.is_empty() {
+            return Err(format!("Unrecognized fields: phy_io.soapysdr::{:?}", extra_keys_filtered).into());
         }
     }
     if !root.net_info.extra.is_empty() {
@@ -51,6 +52,18 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
         }
     }
 
+    if let Some(ref telemetry) = root.telemetry {
+        if !telemetry.extra.is_empty() {
+            return Err(format!("Unrecognized fields in telemetry config: {:?}", sorted_keys(&telemetry.extra)).into());
+        }
+    }
+
+    if let Some(ref command) = root.command {
+        if !command.extra.is_empty() {
+            return Err(format!("Unrecognized fields in command config: {:?}", sorted_keys(&command.extra)).into());
+        }
+    }
+
     // Build config from required and optional values
     let mut cfg = StackConfig {
         stack_mode: root.stack_mode,
@@ -59,10 +72,20 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
         net: net_dto_to_cfg(root.net_info),
         cell: cell_dto_to_cfg(root.cell_info),
         brew: None,
+        telemetry: None,
+        control: None,
     };
 
     if let Some(brew) = root.brew {
         cfg.brew = Some(apply_brew_patch(brew));
+    }
+
+    if let Some(telemetry) = root.telemetry {
+        cfg.telemetry = Some(apply_telemetry_patch(telemetry)?);
+    }
+
+    if let Some(command) = root.command {
+        cfg.control = Some(apply_control_patch(command)?);
     }
 
     // Mutable runtime state
@@ -106,6 +129,8 @@ struct TomlConfigRoot {
     cell_info: CellInfoDto,
 
     brew: Option<CfgBrewDto>,
+    telemetry: Option<CfgTelemetryDto>,
+    command: Option<CfgControlDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,

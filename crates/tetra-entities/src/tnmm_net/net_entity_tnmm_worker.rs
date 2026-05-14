@@ -10,7 +10,7 @@ use crate::{
         test_pdu::{TestPdu, TestRequest, TestResponse, pack_test_pdu},
     },
 };
-use tetra_core::{TdmaTime, tetra_common::Sap, tetra_entities::TetraEntity};
+use tetra_core::{tetra_common::Sap, tetra_entities::TetraEntity};
 use tetra_saps::{
     sapmsg::{SapMsg, SapMsgInner},
     tnmm::TnmmTestResponse,
@@ -131,7 +131,6 @@ impl<T: NetworkTransport> NetEntityTnmmWorker<T> {
             sap: self.sap,
             src: self.entity_self,
             dest: self.entity_dest,
-            dltime: TdmaTime::default(),
             msg: SapMsgInner::TnmmTestResponse(inner),
         };
         match self.w2e_sender.send(msg) {

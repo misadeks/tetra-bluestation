@@ -3,6 +3,8 @@ use std::{collections::HashMap, time::Duration};
 use serde::Deserialize;
 use toml::Value;
 
+use crate::bluestation::SecretField;
+
 /// Brew protocol (TetraPack/BrandMeister) configuration
 #[derive(Debug, Clone)]
 pub struct CfgBrew {
@@ -15,12 +17,14 @@ pub struct CfgBrew {
     /// Optional username for HTTP Digest auth
     pub username: Option<String>,
     /// Optional password for HTTP Digest auth
-    pub password: Option<String>,
+    pub password: Option<SecretField>,
     /// Reconnection delay
     pub reconnect_delay: Duration,
     /// Extra initial jitter playout delay in frames (added on top of adaptive baseline)
     pub jitter_initial_latency_frames: u8,
 
+    /// Set to true when SDS between local and Brew clients is enabled
+    pub feature_sds_enabled: bool,
     pub whitelisted_ssis: Option<Vec<u32>>,
     /// Optional PBX gateway ISSIs that should be routable over Brew even if they don't match normal Tetrapack ISSI constraints.
     pub pbx_gateway_issis: Option<Vec<u32>>,
@@ -46,6 +50,10 @@ pub struct CfgBrewDto {
     #[serde(default)]
     pub jitter_initial_latency_frames: u8,
 
+    /// Set to true when SDS between local and Brew clients is enabled
+    #[serde(default = "default_brew_feature_sds_enabled")]
+    pub feature_sds_enabled: bool,
+
     pub whitelisted_ssis: Option<Vec<u32>>,
     pub pbx_gateway_issis: Option<Vec<u32>>,
 
@@ -54,11 +62,15 @@ pub struct CfgBrewDto {
 }
 
 fn default_brew_port() -> u16 {
-    3000
+    443
 }
 
 fn default_brew_reconnect_delay() -> u64 {
     15
+}
+
+fn default_brew_feature_sds_enabled() -> bool {
+    true
 }
 
 /// Convert a CfgBrewDto (from TOML) into a CfgBrew (used in the stack config)
@@ -68,9 +80,10 @@ pub fn apply_brew_patch(src: CfgBrewDto) -> CfgBrew {
         port: src.port,
         tls: src.tls,
         username: Some(src.username.to_string()),
-        password: Some(src.password),
+        password: Some(SecretField::from(src.password)),
         reconnect_delay: Duration::from_secs(src.reconnect_delay_secs),
         jitter_initial_latency_frames: src.jitter_initial_latency_frames,
+        feature_sds_enabled: src.feature_sds_enabled,
         whitelisted_ssis: src.whitelisted_ssis,
         pbx_gateway_issis: src.pbx_gateway_issis,
     }

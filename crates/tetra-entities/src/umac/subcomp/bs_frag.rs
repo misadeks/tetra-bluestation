@@ -231,10 +231,21 @@ impl BsFragger {
     }
 }
 
+impl Drop for BsFragger {
+    fn drop(&mut self) {
+        if !self.is_fully_transmitted
+            && let Some(tx_reporter) = &self.tx_reporter
+            && tx_reporter.get_state() == tetra_core::TxState::Pending
+        {
+            tx_reporter.mark_discarded();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tetra_core::{
-        TxReceipt,
+        TxState,
         address::{SsiType, TetraAddress},
         debug,
     };
@@ -250,8 +261,7 @@ mod tests {
             random_access_flag: false,
             length_ind: 0,
             addr: Some(TetraAddress {
-                encrypted: false,
-                ssi_type: SsiType::Ssi,
+                ssi_type: SsiType::Issi,
                 ssi: 1234,
             }),
             event_label: None,
@@ -341,8 +351,8 @@ mod tests {
         let mut reconstructed = String::new();
         let pdu = get_default_resource();
         let sdu = BitBuffer::from_bitstr(vec);
-        let (receipt, reporter) = TxReceipt::new(false);
-        let mut fragger = BsFragger::new(pdu, sdu, Some(reporter));
+        let reporter = TxReporter::new_unacked();
+        let mut fragger = BsFragger::new(pdu, sdu, Some(reporter.clone()));
 
         let mut mac_block = BitBuffer::new(SCH_HD_CAP);
         let done = fragger.get_next_chunk(&mut mac_block);
@@ -353,7 +363,7 @@ mod tests {
         reconstructed += &mac_block.to_bitstr();
         // tracing::info!("[1] reconstructed so far: {}", reconstructed);
         assert!(!done, "Should take four blocks");
-        assert!(!receipt.is_in_final_state() && !receipt.is_transmitted());
+        assert!(!reporter.is_in_final_state() && !reporter.is_transmitted());
 
         let mut mac_block = BitBuffer::new(SCH_HD_CAP);
         let done = fragger.get_next_chunk(&mut mac_block);
@@ -364,7 +374,7 @@ mod tests {
         reconstructed += &mac_block.to_bitstr();
         // tracing::info!("[1] reconstructed so far: {}", reconstructed);
         assert!(!done, "Should take four blocks");
-        assert!(!receipt.is_in_final_state() && !receipt.is_transmitted());
+        assert!(!reporter.is_in_final_state() && !reporter.is_transmitted());
 
         let mut mac_block = BitBuffer::new(SCH_HD_CAP);
         let done = fragger.get_next_chunk(&mut mac_block);
@@ -375,7 +385,7 @@ mod tests {
         reconstructed += &mac_block.to_bitstr();
         // tracing::info!("[1] reconstructed so far: {}", reconstructed);
         assert!(!done, "Should take four blocks");
-        assert!(!receipt.is_in_final_state() && !receipt.is_transmitted());
+        assert!(!reporter.is_in_final_state() && !reporter.is_transmitted());
 
         let mut mac_block = BitBuffer::new(SCH_HD_CAP);
         let done = fragger.get_next_chunk(&mut mac_block);
@@ -386,7 +396,7 @@ mod tests {
         reconstructed += &mac_block.to_bitstr();
         tracing::info!("     Reconstructed: {}", reconstructed);
         assert!(done, "Should take four blocks");
-        assert!(receipt.is_in_final_state() && receipt.is_transmitted());
+        assert!(reporter.is_in_final_state() && reporter.is_transmitted());
 
         // Test that the original vec is contained in the reconstructed string
         // We'll just assume the fill bits check out..
@@ -394,5 +404,20 @@ mod tests {
             reconstructed.starts_with(vec),
             "Original vec should be contained in reconstructed string"
         );
+    }
+
+    #[test]
+    fn test_drop_marks_discarded_when_not_fully_transmitted() {
+        debug::setup_logging_verbose();
+        let pdu = get_default_resource();
+        let sdu = BitBuffer::from_bitstr("10101010");
+        let reporter = TxReporter::new_unacked();
+
+        let _fragger = BsFragger::new(pdu, sdu, Some(reporter.clone()));
+        drop(_fragger);
+
+        assert_eq!(reporter.get_state(), TxState::Discarded);
+        assert!(reporter.is_in_final_state());
+        assert!(!reporter.is_transmitted());
     }
 }

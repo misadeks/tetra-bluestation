@@ -80,6 +80,22 @@ pub struct CfgSoapySdr {
     pub dl_freq: f64,
     /// PPM frequency error correction
     pub ppm_err: f64,
+    /// Argument string to select a specific SDR device.
+    pub device: Option<String>,
+    /// RX antenna. Device-specific default is used if None.
+    pub rx_ant: Option<String>,
+    /// TX antenna. Device-specific default is used if None.
+    pub tx_ant: Option<String>,
+    /// RX gain values keyed by device gain element name.
+    pub rx_gains: HashMap<String, f64>,
+    /// TX gain values keyed by device gain element name.
+    pub tx_gains: HashMap<String, f64>,
+    /// RX and TX sample rate. Device-specific default is used if None.
+    pub fs: Option<f64>,
+    /// RX channel number.
+    pub rx_ch: Option<usize>,
+    /// TX channel number.
+    pub tx_ch: Option<usize>,
     /// Hardware-specific I/O configuration
     pub io_cfg: SoapySdrIoCfg,
 }
@@ -105,6 +121,15 @@ pub struct SoapySdrDto {
     pub rx_freq: f64,
     pub tx_freq: f64,
     pub ppm_err: Option<f64>,
+
+    pub device: Option<String>,
+
+    pub rx_antenna: Option<String>,
+    pub tx_antenna: Option<String>,
+
+    pub sample_rate: Option<f64>,
+    pub rx_channel: Option<usize>,
+    pub tx_channel: Option<usize>,
 
     pub iocfg_usrpb2xx: Option<UsrpB2xxDto>,
     pub iocfg_limesdr: Option<LimeSdrDto>,

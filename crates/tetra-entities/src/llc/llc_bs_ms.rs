@@ -147,13 +147,39 @@ impl Llc {
         }
     }
 
-    fn rx_tla_tlunitdata_req_bl(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_tla_tlunitdata_req_bl(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tlunitdata_req_bl");
-        let SapMsgInner::TlaTlUnitdataReqBl(_prim) = message.msg else {
+        let SapMsgInner::TlaTlUnitdataReqBl(mut prim) = message.msg else {
             panic!()
         };
 
-        unimplemented_log!("rx_tla_tlunitdata_req_bl");
+        let mut pdu_buf = BitBuffer::new_autoexpand(32);
+        let pdu = BlUdata { has_fcs: prim.fcs_flag };
+        pdu.to_bitbuf(&mut pdu_buf);
+        let sdu_len = prim.tl_sdu.get_len_remaining();
+        pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
+        pdu_buf.seek(0);
+        tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
+
+        queue.push_back(SapMsg {
+            sap: Sap::TmaSap,
+            src: self.entity(),
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: prim.req_handle,
+                pdu: pdu_buf,
+                main_address: prim.main_address,
+                link_id: prim.link_id,
+                endpoint_id: prim.endpoint_id,
+                stealing_permission: prim.stealing_permission,
+                subscriber_class: prim.subscriber_class,
+                air_interface_encryption: prim.air_interface_encryption,
+                stealing_repeats_flag: None,
+                data_category: prim.data_class_info,
+                chan_alloc: prim.chan_alloc,
+                tx_reporter: prim.tx_reporter.take(),
+            }),
+        });
     }
 
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
@@ -183,7 +209,6 @@ impl Llc {
                 sap: Sap::TmaSap,
                 src: self.entity(),
                 dest: TetraEntity::Umac,
-                dltime: message.dltime,
                 msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
                     req_handle: prim.req_handle,
                     pdu: pdu_buf,
@@ -204,7 +229,7 @@ impl Llc {
         }
 
         // If an ack still needs to be sent, get the relevant expected sequence number
-        let out_ack_n = self.get_out_ack_n_if_any(message.dltime.t, prim.main_address);
+        let out_ack_n = self.get_out_ack_n_if_any(self.dltime.t, prim.main_address);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
         let ns = self.get_next_send_seq(&prim.main_address);
@@ -227,7 +252,7 @@ impl Llc {
             pdu_buf.seek(0);
             tracing::debug!("-> {:?} sdu {}", pdu, pdu_buf.dump_bin());
             // Register that we expect an ACK back (acknowledged mode only)
-            self.register_expected_ack(message.dltime, prim.main_address, ns, prim.tx_reporter.clone());
+            self.register_expected_ack(self.dltime, prim.main_address, ns, prim.tx_reporter.clone());
         } else {
             // BL-DATA (unacknowledged, with or without FCS)
             let pdu = BlData {
@@ -247,7 +272,6 @@ impl Llc {
             sap: Sap::TmaSap,
             src: self.entity(),
             dest: TetraEntity::Umac,
-            dltime: message.dltime,
             msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
                 req_handle: prim.req_handle,
                 pdu: pdu_buf,
@@ -340,6 +364,7 @@ impl Llc {
 
     fn rx_tma_unitdata_ind_bl(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tma_unitdata_ind_bl");
+        let msg_dltime = self.dltime.add_timeslots(-2);
 
         // Get header bits (again) and prepare MLE message
         let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else {
@@ -413,13 +438,12 @@ impl Llc {
         // If ns is present, we need to send an ACK
         if let Some(ns) = ns {
             // Send ACK
-            self.schedule_outgoing_ack(message.dltime, prim.main_address, ns);
+            self.schedule_outgoing_ack(msg_dltime, prim.main_address, ns);
         }
 
         // if nr is present, we have received an ACK on a previous message
         if let Some(nr) = nr {
-            // let ul_time = message.dltime.add_timeslots(-2);
-            self.process_incoming_ack(message.dltime.t, prim.main_address, nr);
+            self.process_incoming_ack(msg_dltime.t, prim.main_address, nr);
         }
 
         if pdu_type == LlcPduType::BlAck || pdu_type == LlcPduType::BlAckFcs {
@@ -438,7 +462,7 @@ impl Llc {
             let m = TlaTlUnitdataIndBl {
                 // address_type: 0, // TODO FIXME
                 main_address: prim.main_address,
-                link_id: message.dltime.add_timeslots(-2).t as u32,
+                link_id: msg_dltime.t as u32,
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,
@@ -455,7 +479,6 @@ impl Llc {
                 sap: Sap::TlaSap,
                 src: TetraEntity::Llc,
                 dest: TetraEntity::Mle,
-                dltime: message.dltime,
                 msg: SapMsgInner::TlaTlUnitdataIndBl(m),
             }
         } else {
@@ -463,7 +486,7 @@ impl Llc {
             let m = TlaTlDataIndBl {
                 // address_type: 0, // TODO FIXME
                 main_address: prim.main_address,
-                link_id: message.dltime.add_timeslots(-2).t as u32,
+                link_id: msg_dltime.t as u32,
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,
@@ -480,7 +503,6 @@ impl Llc {
                 sap: Sap::TlaSap,
                 src: TetraEntity::Llc,
                 dest: TetraEntity::Mle,
-                dltime: message.dltime,
                 msg: SapMsgInner::TlaTlDataIndBl(m),
             }
         };
@@ -518,7 +540,7 @@ impl TetraEntityTrait for Llc {
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::TmaSap => {
@@ -553,10 +575,8 @@ impl TetraEntityTrait for Llc {
             pdu_buf.seek(0);
             tracing::debug!("-> {:?} {}", pdu, pdu_buf.dump_bin());
 
-            // We're sending an ACK for a received uplink message, however, we don't have that message here
-            // Since DL is two slots ahead of UL, we will correct that. We now have the dltime for reception
-            // of the original message.
-            let dltime = self.dltime.add_timeslots(-2);
+            // We're sending an ACK for a received uplink message; channel choice is
+            // carried explicitly by the channel allocation below.
             let chan_alloc = match steal {
                 true => {
                     let mut timeslots = [false; 4];
@@ -575,7 +595,6 @@ impl TetraEntityTrait for Llc {
                 sap: Sap::TmaSap,
                 src: TetraEntity::Llc,
                 dest: TetraEntity::Umac,
-                dltime,
                 msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
                     req_handle: 0, // TODO FIXME
                     pdu: pdu_buf,

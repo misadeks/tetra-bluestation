@@ -1,6 +1,6 @@
 use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, TrainingSequence};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TpUnitdataInd {
     pub train_type: TrainingSequence,
     pub burst_type: BurstType,
@@ -10,7 +10,7 @@ pub struct TpUnitdataInd {
     pub block: BitBuffer,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TpUnitdataReqSlot {
     pub train_type: TrainingSequence,
     pub burst_type: BurstType,

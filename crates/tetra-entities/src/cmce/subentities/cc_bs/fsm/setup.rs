@@ -54,7 +54,7 @@ impl CcBsSubentity {
         );
 
         // Signal UMAC to open DL+UL circuits.
-        Self::signal_umac_circuit_open(queue, &circuit, message.dltime, None, CircuitDlMediaSource::LocalLoopback);
+        Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None, CircuitDlMediaSource::LocalLoopback);
 
         // Build channel allocation timeslot mask for this call.
         let mut timeslots = [false; 4];
@@ -104,13 +104,12 @@ impl CcBsSubentity {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
-            dltime: message.dltime,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
                 sdu: connect_sdu,
                 handle: ul_handle,
                 endpoint_id: ul_endpoint_id,
                 link_id: ul_link_id,
-                layer2service: 0,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -154,12 +153,13 @@ impl CcBsSubentity {
                 pdu: d_setup,
                 dest_addr,
                 resend: true,
+                tx_receipt: None,
             },
         );
         let d_setup_ref = &self.cached_setups.get(&circuit.call_id).unwrap().pdu;
 
         let (setup_sdu, setup_chan_alloc) = Self::build_d_setup_prim(d_setup_ref, circuit.usage, circuit.ts, UlDlAssignment::Both);
-        let setup_msg = Self::build_sapmsg(setup_sdu, Some(setup_chan_alloc), message.dltime, dest_addr, None);
+        let setup_msg = Self::build_sapmsg(setup_sdu, Some(setup_chan_alloc), self.dltime, dest_addr, None);
         queue.push_back(setup_msg);
 
         // Track active group call.
@@ -176,21 +176,17 @@ impl CcBsSubentity {
             ),
         );
 
-        if brew::is_brew_gssi_routable(&self.config, dest_gssi) {
-            let msg = SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                dltime: message.dltime,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id: circuit.call_id,
-                    source_issi: calling_party.ssi,
-                    dest_gssi,
-                    ts: circuit.ts,
-                }),
-            };
-            queue.push_back(msg);
-        }
+        self.notify_floor_granted(
+            queue,
+            GroupFloorGrant {
+                call_id: circuit.call_id,
+                source_issi: calling_party.ssi,
+                dest_gssi,
+                ts: circuit.ts,
+            },
+            false,
+            BrewNotification::IfGroupRoutable(dest_gssi),
+        );
     }
 
     /// Handle U-SETUP for point-to-point (individual) duplex calls.
@@ -205,7 +201,10 @@ impl CcBsSubentity {
             panic!()
         };
 
-        let is_issi_address = pdu.called_party_type_identifier == 1 || pdu.called_party_type_identifier == 2;
+        let is_issi_address = matches!(
+            pdu.called_party_type_identifier,
+            PartyTypeIdentifier::Ssi | PartyTypeIdentifier::Tsi
+        );
         if !is_issi_address && !brew::is_active(&self.config) {
             tracing::warn!(
                 "U-SETUP P2P with non-ISSI called_party_type_identifier={} (rejecting, Brew disabled)",
@@ -215,7 +214,7 @@ impl CcBsSubentity {
         }
         if is_issi_address
             && (pdu.called_party_short_number_address.is_some()
-                || (pdu.called_party_extension.is_some() && pdu.called_party_type_identifier != 2))
+                || (pdu.called_party_extension.is_some() && pdu.called_party_type_identifier != PartyTypeIdentifier::Tsi))
         {
             tracing::warn!("U-SETUP P2P with invalid called party fields (short number/extension mismatch), rejecting");
             return;
@@ -251,7 +250,7 @@ impl CcBsSubentity {
             );
             let reject_call_id = self.circuits.get_next_call_id();
             let sdu = Self::build_d_release(reject_call_id, DisconnectCause::CalledPartyBusy);
-            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
             queue.push_back(msg);
             return;
         }
@@ -276,7 +275,7 @@ impl CcBsSubentity {
                     );
                     let call_id = self.circuits.get_next_call_id();
                     let sdu = Self::build_d_release(call_id, DisconnectCause::CongestionInInfrastructure);
-                    let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+                    let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
                     queue.push_back(msg);
                     return;
                 }
@@ -303,8 +302,7 @@ impl CcBsSubentity {
                         );
                         let call_id = self.circuits.get_next_call_id();
                         let sdu = Self::build_d_release(call_id, DisconnectCause::CongestionInInfrastructure);
-                        let msg =
-                            Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+                        let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
                         queue.push_back(msg);
                         return;
                     }
@@ -365,6 +363,7 @@ impl CcBsSubentity {
                 pdu: d_setup,
                 dest_addr: called_addr,
                 resend: false,
+                tx_receipt: None,
             },
         );
 
@@ -372,7 +371,7 @@ impl CcBsSubentity {
         let mut setup_sdu = BitBuffer::new_autoexpand(80);
         d_setup_ref.to_bitbuf(&mut setup_sdu).expect("Failed to serialize DSetup");
         setup_sdu.seek(0);
-        let setup_msg = Self::build_sapmsg(setup_sdu, None, message.dltime, called_addr, None);
+        let setup_msg = Self::build_sapmsg(setup_sdu, None, self.dltime, called_addr, None);
         queue.push_back(setup_msg);
 
         if let Err(err) = self.fsm_individual_create_setup_call(
@@ -440,7 +439,7 @@ impl CcBsSubentity {
             );
             let call_id = self.circuits.get_next_call_id();
             let sdu = Self::build_d_release(call_id, DisconnectCause::RequestedServiceNotAvailable);
-            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
             queue.push_back(msg);
             return;
         }
@@ -453,7 +452,7 @@ impl CcBsSubentity {
             );
             let call_id = self.circuits.get_next_call_id();
             let sdu = Self::build_d_release(call_id, DisconnectCause::RequestedServiceNotAvailable);
-            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
             queue.push_back(msg);
             return;
         }
@@ -466,7 +465,7 @@ impl CcBsSubentity {
             );
             let call_id = self.circuits.get_next_call_id();
             let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
-            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
             queue.push_back(msg);
             return;
         }
@@ -482,7 +481,7 @@ impl CcBsSubentity {
             );
             let call_id = self.circuits.get_next_call_id();
             let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
-            let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
             queue.push_back(msg);
             return;
         }
@@ -517,7 +516,7 @@ impl CcBsSubentity {
                     );
                     let call_id = self.circuits.get_next_call_id();
                     let sdu = Self::build_d_release(call_id, DisconnectCause::CongestionInInfrastructure);
-                    let msg = Self::build_sapmsg_direct(sdu, message.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
+                    let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
                     queue.push_back(msg);
                     return;
                 }
@@ -546,7 +545,6 @@ impl CcBsSubentity {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            dltime: message.dltime,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
                 brew_uuid,
                 call: network_call.clone(),

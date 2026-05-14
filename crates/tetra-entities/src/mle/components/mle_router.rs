@@ -3,18 +3,17 @@ use std::collections::HashMap;
 use tetra_core::{EndpointId, LinkId, MleHandle, TdmaTime, TetraAddress};
 
 pub struct MleConnState {
-    handle: MleHandle,
+    _handle: MleHandle,
     addr: TetraAddress,
     link_id: LinkId,
     endpoint_id: EndpointId,
-
     ts_created: TdmaTime,
     ts_last_used: TdmaTime,
 }
 
 pub struct MleRouter {
-    states: HashMap<u32, MleConnState>,
-    next_handle: u32,
+    states: HashMap<MleHandle, MleConnState>,
+    next_handle: MleHandle,
 }
 
 impl MleRouter {
@@ -25,36 +24,24 @@ impl MleRouter {
         }
     }
 
-    pub fn create_handle(&mut self, _addr: TetraAddress, _link_id: LinkId, _endpoint_id: EndpointId, _ts: TdmaTime) -> u32 {
+    pub fn create_handle(&mut self, _addr: TetraAddress, _link_id: LinkId, _endpoint_id: EndpointId, _ts: TdmaTime) -> MleHandle {
         let handle = self.next_handle;
-        // TODO FIXME: Re-enable handle insertion once we start using this
-        // let conn = MleConnState {
-        //     handle,
-        //     addr,
-        //     link_id,
-        //     endpoint_id,
-        //     ts_created: ts,
-        //     ts_last_used: ts,
-        // };
-        // self.states.insert(handle, conn);
+        // TODO: re-enable handle insertion once MLE handle routing is used.
         self.next_handle += 1;
         handle
     }
 
-    /// Resolve a handle, returning its associated address, link ID and endpoint ID
-    /// Internally, the router updates the element's last_used timestamp.
-    pub fn use_handle(&mut self, handle: u32, ts: TdmaTime) -> (TetraAddress, u32, u32) {
+    pub fn use_handle(&mut self, handle: MleHandle, ts: TdmaTime) -> (TetraAddress, LinkId, EndpointId) {
         if let Some(conn) = self.states.get_mut(&handle) {
-            conn.ts_last_used = ts; // Update last used timestamp
-            (conn.addr.clone(), conn.link_id, conn.endpoint_id)
+            conn.ts_last_used = ts;
+            (conn.addr, conn.link_id, conn.endpoint_id)
         } else {
-            // self.dump_mappings();
             tracing::warn!("Unknown MLE handle: {}", handle);
             (TetraAddress::issi(0), 0, 0)
         }
     }
 
-    pub fn delete_handle(&mut self, handle: u32) -> Option<MleConnState> {
+    pub fn delete_handle(&mut self, handle: MleHandle) -> Option<MleConnState> {
         self.states.remove(&handle)
     }
 
