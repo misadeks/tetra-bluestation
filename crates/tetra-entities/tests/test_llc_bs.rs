@@ -4,7 +4,11 @@ use common::ComponentTest;
 use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_pdus::cmce::pdus::u_connect::UConnect;
+use tetra_pdus::llc::pdus::bl_ack::BlAck;
+use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tla::TlaTlDataIndBl;
 use tetra_saps::tma::TmaUnitdataInd;
 
 #[test]
@@ -51,4 +55,60 @@ fn test_udata_with_broken_mm_payload() {
     // Evaluate results
     assert_eq!(sink_msgs.len(), 1);
     tracing::warn!("Validation of result not implemented");
+}
+
+#[test]
+fn test_bl_ack_with_piggyback_cmce_payload_is_forwarded() {
+    debug::setup_logging_verbose();
+
+    let mut pdu = BitBuffer::new_autoexpand(32);
+    BlAck { has_fcs: false, nr: 1 }.to_bitbuf(&mut pdu);
+    pdu.write_bits(MleProtocolDiscriminator::Cmce.into_raw(), 3);
+    UConnect {
+        call_identifier: 5,
+        hook_method_selection: true,
+        simplex_duplex_selection: true,
+        basic_service_information: None,
+        facility: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut pdu)
+    .expect("failed to serialize U-CONNECT");
+    pdu.seek(0);
+
+    let test_prim = TmaUnitdataInd {
+        pdu: Some(pdu),
+        main_address: TetraAddress::new(2200699, SsiType::Issi),
+        scrambling_code: 0,
+        endpoint_id: 0,
+        new_endpoint_id: None,
+        css_endpoint_id: None,
+        air_interface_encryption: 0,
+        chan_change_response_req: false,
+        chan_change_handle: None,
+        chan_info: None,
+    };
+    let test_sapmsg = SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(test_prim),
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Mle]);
+
+    test.submit_message(test_sapmsg);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::TlaTlDataIndBl(TlaTlDataIndBl { tl_sdu: Some(mut sdu), .. }) = sink_msgs[0].msg.clone() else {
+        panic!("expected TlaTlDataIndBl with piggyback payload");
+    };
+    assert_eq!(sdu.read_bits(3), Some(MleProtocolDiscriminator::Cmce.into_raw()));
+    let parsed = UConnect::from_bitbuf(&mut sdu).expect("forwarded U-CONNECT should parse");
+    assert_eq!(parsed.call_identifier, 5);
+    assert!(parsed.hook_method_selection);
+    assert!(parsed.simplex_duplex_selection);
 }

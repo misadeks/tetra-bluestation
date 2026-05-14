@@ -60,6 +60,15 @@ pub struct UmacBs {
     /// Timestamp of last received UL voice frame per timeslot (0-indexed: ts1..ts4).
     /// Used to detect UL inactivity when a radio disappears mid-transmission.
     last_ul_voice: [Option<TdmaTime>; 4],
+    /// Traffic-slot circuit closes are delayed until queued FACCH/STCH signalling
+    /// has had a scheduler turn to leave the BS.
+    pending_circuit_closes: [PendingCircuitClose; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingCircuitClose {
+    dl: bool,
+    ul: bool,
 }
 
 struct PendingStch {
@@ -87,6 +96,7 @@ impl UmacBs {
             // event_label_store: EventLabelStore::new(),
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
             last_ul_voice: [None; 4],
+            pending_circuit_closes: [PendingCircuitClose::default(); 4],
         }
     }
 
@@ -1113,29 +1123,28 @@ impl UmacBs {
                 // Same format as MCCH signaling, just in 124 bits instead of 268.
                 const STCH_CAP: usize = 124;
 
-                let usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
-                // Per ETSI 21.4.3.1: "The random access flag shall be used for the BS to
-                // acknowledge a successful random access so as to prevent the MS sending
-                // further random access requests."
-                // Set the flag if this address has a pending RA (dropped by
-                // dl_drop_all_except_stolen when leaving hangtime), or if the address
-                // is ISSI (direct CC-level response to a MAC-ACCESS).
+                // Per ETSI 21.4.3.1, random_access_flag acknowledges a successful
+                // random access. Do not set it for established traffic-channel FACCH
+                // signalling such as D-RELEASE.
                 let has_pending_ra = self.channel_scheduler.take_pending_ra_ack(ts, prim.main_address.ssi);
-                let is_random_access_response = has_pending_ra || prim.main_address.ssi_type == SsiType::Issi;
                 let mut mac_pdu = MacResource {
                     fill_bits: false,
                     pos_of_grant: 0,
                     encryption_mode: 0,
-                    random_access_flag: is_random_access_response,
+                    random_access_flag: has_pending_ra,
                     length_ind: 0,
                     addr: Some(prim.main_address),
                     event_label: None,
-                    usage_marker,
+                    // The CMCE chan_alloc on this path is an internal hint for
+                    // selecting the active traffic timeslot. Do not encode its
+                    // usage as a MAC usage marker on FACCH/STCH release signalling.
+                    usage_marker: None,
                     power_control_element: None,
                     slot_granting_element: None,
                     chan_alloc_element: None,
                 };
-                mac_pdu.update_len_and_fill_ind(sdu.get_len());
+                let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu.get_len());
+                tracing::debug!("rx_ul_tma_unitdata_req: FACCH MAC-RESOURCE ts {} {:?}", ts, mac_pdu);
 
                 let mut stch_block = BitBuffer::new(STCH_CAP);
                 mac_pdu.to_bitbuf(&mut stch_block);
@@ -1145,6 +1154,7 @@ impl UmacBs {
                 sdu.seek(0);
                 let sdu_len = sdu.get_len();
                 stch_block.copy_bits(&mut sdu, sdu_len);
+                fillbits::addition::write(&mut stch_block, Some(num_fill_bits));
                 // Remaining bits beyond length_ind are ignored by the receiver.
 
                 tracing::info!(
@@ -1418,12 +1428,35 @@ impl UmacBs {
     fn rx_control_circuit_close(&mut self, _queue: &mut MessageQueue, prim: CallControl) {
         let CallControl::Close(dir, ts) = prim else { panic!() };
 
-        // Direction::Both needs to be split into separate DL and UL close operations
+        // Traffic-channel call release often queues FACCH/STCH D-RELEASE and BL-ACK
+        // after CMCE has already requested circuit close. Keep ts2-4 alive until the
+        // scheduler has had a turn to drain those stealing blocks.
+        if (2..=4).contains(&ts) {
+            match dir {
+                Direction::Both => {
+                    self.pending_circuit_closes[ts as usize - 1].dl = true;
+                    self.pending_circuit_closes[ts as usize - 1].ul = true;
+                }
+                Direction::Dl => self.pending_circuit_closes[ts as usize - 1].dl = true,
+                Direction::Ul => self.pending_circuit_closes[ts as usize - 1].ul = true,
+                Direction::None => {
+                    tracing::warn!("rx_control_circuit_close: Direction::None, ignoring");
+                    return;
+                }
+            }
+            tracing::info!("  rx_control_circuit_close: Deferred {:?} circuit close for ts {}", dir, ts);
+            return;
+        }
+
+        self.close_circuit_now(dir, ts);
+    }
+
+    fn close_circuit_now(&mut self, dir: Direction, ts: u8) {
         let dirs: Vec<Direction> = match dir {
             Direction::Both => vec![Direction::Dl, Direction::Ul],
             d @ (Direction::Dl | Direction::Ul) => vec![d],
             Direction::None => {
-                tracing::warn!("rx_control_circuit_close: Direction::None, ignoring");
+                tracing::warn!("close_circuit_now: Direction::None, ignoring");
                 return;
             }
         };
@@ -1431,7 +1464,6 @@ impl UmacBs {
         for d in dirs {
             match self.channel_scheduler.close_circuit(d, ts) {
                 Some(_) => {
-                    // Clear UL inactivity timer when closing a UL circuit
                     if d == Direction::Ul && (1..=4).contains(&ts) {
                         self.last_ul_voice[ts as usize - 1] = None;
                     }
@@ -1440,6 +1472,29 @@ impl UmacBs {
                 None => {
                     tracing::warn!("  rx_control_circuit_close: No {:?} circuit to close for ts {}", d, ts);
                 }
+            }
+        }
+    }
+
+    fn process_pending_circuit_closes(&mut self) {
+        for ts in 2..=4u8 {
+            let idx = ts as usize - 1;
+            let pending = self.pending_circuit_closes[idx];
+            if !pending.dl && !pending.ul {
+                continue;
+            }
+
+            if self.channel_scheduler.has_pending_stealing(ts) {
+                tracing::debug!("process_pending_circuit_closes: waiting for FACCH/STCH drain on ts {}", ts);
+                continue;
+            }
+
+            self.pending_circuit_closes[idx] = PendingCircuitClose::default();
+            if pending.dl {
+                self.close_circuit_now(Direction::Dl, ts);
+            }
+            if pending.ul {
+                self.close_circuit_now(Direction::Ul, ts);
             }
         }
     }
@@ -1456,6 +1511,10 @@ impl UmacBs {
 
             // Only check traffic timeslots with an active UL circuit.
             if !self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                continue;
+            }
+
+            if self.pending_circuit_closes[idx].ul {
                 continue;
             }
 
@@ -1603,6 +1662,8 @@ impl TetraEntityTrait for UmacBs {
         };
         tracing::trace!("UmacBs tick: Pushing finalized timeslot to LMAC: {:?}", s);
         queue.push_back(s);
+
+        self.process_pending_circuit_closes();
     }
 }
 

@@ -257,13 +257,50 @@ impl Llc {
             panic!()
         };
 
-        // Use unacknowledged mode (BL-UDATA) when:
-        // 1. STCH (stolen half-slot) has no established LLC link.
-        // 2. GSSI-addressed messages: per ETSI EN 300 392-2, group-addressed
-        //    signaling on SCH/F must use BL-UDATA because there is no
-        //    established LLC link with individual group members. Using BL-DATA
-        //    causes radios (e.g. Sepura) to silently discard frames when the
-        //    ns sequence number doesn't match their V(R).
+        // If this is a traffic-channel response to an uplink BL-DATA PDU, carry
+        // the TL-SDU on the BL-ACK instead of sending an empty BL-ACK followed by
+        // BL-UDATA. This matches the TL-DATA response primitive: the response
+        // payload is not explicitly acknowledged by the peer entity.
+        if prim.stealing_permission {
+            if let Some(out_ack_n) = self.get_out_ack_seq_if_any(prim.main_address) {
+                let mut pdu_buf = BitBuffer::new_autoexpand(32);
+                let pdu = BlAck {
+                    has_fcs: prim.fcs_flag,
+                    nr: out_ack_n,
+                };
+                pdu.to_bitbuf(&mut pdu_buf);
+                let sdu_len = prim.tl_sdu.get_len_remaining();
+                pdu_buf.copy_bits(&mut prim.tl_sdu, sdu_len);
+                pdu_buf.seek(0);
+                tracing::debug!("-> {:?} piggyback sdu {}", pdu, pdu_buf.dump_bin());
+
+                let sapmsg = SapMsg {
+                    sap: Sap::TmaSap,
+                    src: self.entity(),
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                        req_handle: prim.req_handle,
+                        pdu: pdu_buf,
+                        main_address: prim.main_address,
+                        link_id: prim.link_id,
+                        endpoint_id: prim.endpoint_id,
+                        stealing_permission: prim.stealing_permission,
+                        subscriber_class: prim.subscriber_class,
+                        air_interface_encryption: prim.air_interface_encryption,
+                        stealing_repeats_flag: prim.stealing_repeats_flag,
+                        data_category: prim.data_class_info,
+                        chan_alloc: prim.chan_alloc,
+                        tx_reporter: prim.tx_reporter.take(),
+                    }),
+                };
+                self.outbound_udata_messages.push_back(sapmsg);
+                return;
+            }
+        }
+
+        // Use unacknowledged mode (BL-UDATA) when there is no pending uplink
+        // ACK to piggyback onto, or for GSSI-addressed group messages without an
+        // individual LLC link.
         if prim.stealing_permission || prim.main_address.ssi_type == SsiType::Gssi {
             let mut pdu_buf = BitBuffer::new_autoexpand(32);
             let pdu = BlUdata { has_fcs: false };
@@ -532,10 +569,33 @@ impl Llc {
         }
 
         if pdu_type == LlcPduType::BlAck || pdu_type == LlcPduType::BlAckFcs {
-            // No payload, no need to do anything further
-            if pdu.get_len_remaining() > 4 {
-                tracing::warn!("BL-ACK PDU with unexpected payload, ignoring extra bits: {}", pdu.dump_bin());
+            if pdu.get_len_remaining() == 0 {
+                return;
             }
+            // BL-ACK TL-SDU(piggyback data) is used for sending U-Alert
+            tracing::debug!("BL-ACK PDU carrying a payload: {}", pdu.dump_bin());
+            pdu.set_raw_start(pdu.get_raw_pos());
+            let m = TlaTlDataIndBl {
+                main_address: prim.main_address,
+                link_id: 0,
+                endpoint_id: prim.endpoint_id,
+                new_endpoint_id: prim.new_endpoint_id,
+                css_endpoint_id: prim.css_endpoint_id,
+                tl_sdu: Some(pdu),
+                scrambling_code: prim.scrambling_code,
+                fcs_flag: has_fcs,
+                air_interface_encryption: prim.air_interface_encryption,
+                chan_change_resp_req: prim.chan_change_response_req,
+                chan_change_handle: prim.chan_change_handle,
+                chan_info: prim.chan_info,
+                req_handle: 0, // TODO FIXME
+            };
+            queue.push_back(SapMsg {
+                sap: Sap::TlaSap,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::TlaTlDataIndBl(m),
+            });
             return;
         }
 

@@ -171,7 +171,7 @@ impl BsChannelScheduler {
         !self.has_pending_stealing(ts)
     }
 
-    fn has_pending_stealing(&self, ts: u8) -> bool {
+    pub fn has_pending_stealing(&self, ts: u8) -> bool {
         let slot = ts as usize - 1;
         self.dltx_queues
             .get(slot)
