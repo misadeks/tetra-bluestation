@@ -244,6 +244,37 @@ impl CcBsSubentity {
             .map(|(call_id, _)| *call_id);
 
         let Some(call_id) = call_id else {
+            let individual_floor = self.individual_calls.iter().find_map(|(&call_id, call)| {
+                if !call.is_active() || !call.is_simplex() {
+                    return None;
+                }
+
+                match call.floor_holder {
+                    Some(issi) if issi == call.calling_addr.ssi && call.calling_ts == ts => Some((call_id, call.calling_addr)),
+                    Some(issi) if issi == call.called_addr.ssi && call.called_ts == ts => Some((call_id, call.called_addr)),
+                    _ => None,
+                }
+            });
+
+            if let Some((call_id, sender)) = individual_floor {
+                tracing::warn!(
+                    "UL inactivity timeout on ts={}, forcing simplex individual TX ceased for call_id={}",
+                    ts,
+                    call_id
+                );
+                self.fsm_on_u_tx_ceased(
+                    queue,
+                    sender,
+                    UTxCeased {
+                        call_identifier: call_id,
+                        facility: None,
+                        dm_ms_address: None,
+                        proprietary: None,
+                    },
+                );
+                return;
+            }
+
             tracing::debug!("UL inactivity timeout on ts={} but no active transmitting call found", ts);
             return;
         };

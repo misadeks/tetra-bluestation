@@ -276,6 +276,32 @@ impl BrewEntity {
                         }),
                     });
                 }
+                BrewEvent::CircuitSimplexGranted { uuid, grant, permission } => {
+                    self.circuit_sessions.insert(uuid);
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
+                            brew_uuid: uuid,
+                            grant,
+                            permission,
+                        }),
+                    });
+                }
+                BrewEvent::CircuitSimplexIdle { uuid, grant, permission } => {
+                    self.circuit_sessions.insert(uuid);
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
+                            brew_uuid: uuid,
+                            grant,
+                            permission,
+                        }),
+                    });
+                }
                 BrewEvent::CircuitRelease { uuid, cause } => {
                     if self.drop_network_circuit(uuid) {
                         queue.push_back(SapMsg {
@@ -948,6 +974,34 @@ impl TetraEntityTrait for BrewEntity {
                 self.circuit_sessions.insert(brew_uuid);
                 if self.connected {
                     let _ = self.command_sender.send(BrewCommand::SendConnectConfirm {
+                        uuid: brew_uuid,
+                        grant,
+                        permission,
+                    });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
+                brew_uuid,
+                grant,
+                permission,
+            }) => {
+                self.circuit_sessions.insert(brew_uuid);
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendSimplexGranted {
+                        uuid: brew_uuid,
+                        grant,
+                        permission,
+                    });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
+                brew_uuid,
+                grant,
+                permission,
+            }) => {
+                self.circuit_sessions.insert(brew_uuid);
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendSimplexIdle {
                         uuid: brew_uuid,
                         grant,
                         permission,

@@ -116,8 +116,19 @@ impl CcBsSubentity {
         }
     }
 
-    pub(super) fn build_sapmsg_stealing(sdu: BitBuffer, _dltime: TdmaTime, address: TetraAddress, ts: u8, usage: Option<u8>) -> SapMsg {
-        // For FACCH stealing on traffic channel, must specify target timeslot
+    pub(super) fn build_sapmsg_stealing(sdu: BitBuffer, dltime: TdmaTime, address: TetraAddress, ts: u8, usage: Option<u8>) -> SapMsg {
+        Self::build_sapmsg_stealing_ul_dl(sdu, dltime, address, ts, usage, UlDlAssignment::Both)
+    }
+
+    pub(super) fn build_sapmsg_stealing_ul_dl(
+        sdu: BitBuffer,
+        _dltime: TdmaTime,
+        address: TetraAddress,
+        ts: u8,
+        usage: Option<u8>,
+        ul_dl_assigned: UlDlAssignment,
+    ) -> SapMsg {
+        // For FACCH stealing on traffic channel, must specify target timeslot.
         let mut timeslots = [false; 4];
         timeslots[(ts - 1) as usize] = true;
         let chan_alloc = CmceChanAllocReq {
@@ -125,7 +136,7 @@ impl CcBsSubentity {
             carrier: None,
             timeslots,
             alloc_type: ChanAllocType::Replace,
-            ul_dl_assigned: UlDlAssignment::Both,
+            ul_dl_assigned,
         };
 
         SapMsg {
@@ -625,19 +636,14 @@ impl CcBsSubentity {
         //     // We do not implement explicit hook transitions yet; force hook_method_selection=false in responses.
         //     unimplemented_log!("Hook method selection requested, forcing hook_method_selection=false");
         // };
-        // Duplex supported only for P2P calls. Group/broadcast remain simplex only.
-        if pdu.basic_service_information.communication_type == CommunicationType::P2p {
-            if !pdu.simplex_duplex_selection {
-                unimplemented_log!("Simplex P2P calls not supported");
-                supported = false;
-            }
-        } else if pdu.simplex_duplex_selection {
+        // Duplex is supported only for P2P calls. P2P supports both simplex and duplex.
+        if pdu.basic_service_information.communication_type != CommunicationType::P2p && pdu.simplex_duplex_selection {
             unimplemented_log!(
                 "Duplex only supported for P2P calls (comm_type={})",
                 pdu.basic_service_information.communication_type
             );
             supported = false;
-        };
+        }
         // if pdu.basic_service_information != 0xFC {
         //     // TODO FIXME implement parsing
         //     tracing::error!("Basic service information not supported: {}", pdu.basic_service_information);

@@ -1111,12 +1111,24 @@ impl UmacBs {
         // CRITICAL: DL STCH uses MAC-RESOURCE (124-bit half-slot), NOT MAC-U-SIGNAL (UL-only).
         if prim.stealing_permission {
             // Determine the target traffic timeslot for FACCH stealing.
-            // If chan_alloc specifies a timeslot, use it; otherwise fall back to first active DL circuit.
-            let traffic_ts = prim
+            // If chan_alloc specifies a timeslot, use it only when there is an
+            // active DL traffic path that can actually drain the STCH queue.
+            // Otherwise fall back to normal MCCH signalling below.
+            let requested_ts = prim
                 .chan_alloc
                 .as_ref()
-                .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
-                .or_else(|| (2..=4u8).find(|&t| self.channel_scheduler.circuit_is_active(Direction::Dl, t)));
+                .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8));
+            let traffic_ts = match requested_ts {
+                Some(ts) if self.channel_scheduler.can_deliver_stealing(ts) => Some(ts),
+                Some(ts) => {
+                    tracing::warn!(
+                        "rx_ul_tma_unitdata_req: stealing requested for ts {} without active DL circuit, falling back to MCCH",
+                        ts
+                    );
+                    None
+                }
+                None => (2..=4u8).find(|&t| self.channel_scheduler.can_deliver_stealing(t)),
+            };
 
             if let Some(ts) = traffic_ts {
                 // Build MAC-RESOURCE PDU for the STCH half-slot (124 type1 bits).
@@ -1239,11 +1251,6 @@ impl UmacBs {
             // DL voice from Brew/upper layer → schedule for DL transmission
             SapMsgInner::TmdCircuitDataReq(prim) => {
                 let ts = prim.ts;
-                // Refresh UL inactivity timer when DL voice is being fed (network call scenario).
-                // This prevents false timeout when Brew is the speaker and no UL radio is transmitting.
-                if (1..=4).contains(&ts) && self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
-                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
-                }
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
                     self.channel_scheduler.dl_schedule_tmd(ts, prim.data);
                 } else {
@@ -1416,11 +1423,6 @@ impl UmacBs {
             };
             self.channel_scheduler.create_circuit(d, c);
 
-            // Start UL inactivity timer when opening a UL circuit
-            if d == Direction::Ul && (1..=4).contains(&ts) {
-                self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
-            }
-
             tracing::debug!("  rx_control_circuit_open: Setup {:?} circuit for ts {}", d, ts);
         }
     }
@@ -1526,7 +1528,7 @@ impl UmacBs {
             // Check if we've exceeded the inactivity threshold
             let timed_out = match self.last_ul_voice[idx] {
                 Some(t) => t.age(self.dltime) > UL_INACTIVITY_TIMESLOTS,
-                None => false, // Initialized at circuit open; shouldn't be None here
+                None => false,
             };
 
             if timed_out {
@@ -1571,6 +1573,12 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 }
             }
+            CallControl::RemoteFloorGranted { ts, .. } => {
+                self.channel_scheduler.set_hangtime(ts, false);
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = None;
+                }
+            }
             CallControl::CallEnded { ts, .. } => {
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
@@ -1589,6 +1597,8 @@ impl UmacBs {
             | CallControl::NetworkCircuitAlert { .. }
             | CallControl::NetworkCircuitConnectRequest { .. }
             | CallControl::NetworkCircuitConnectConfirm { .. }
+            | CallControl::NetworkCircuitSimplexGranted { .. }
+            | CallControl::NetworkCircuitSimplexIdle { .. }
             | CallControl::NetworkCircuitMediaReady { .. }
             | CallControl::NetworkCircuitDtmf { .. }
             | CallControl::NetworkCircuitRelease { .. } => {

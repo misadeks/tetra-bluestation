@@ -179,6 +179,10 @@ impl BsChannelScheduler {
             .unwrap_or(false)
     }
 
+    pub fn can_deliver_stealing(&self, ts: u8) -> bool {
+        (2..=4).contains(&ts) && self.circuits.is_active(Direction::Dl, ts)
+    }
+
     fn generate_hangtime_idle_schf(&self) -> BitBuffer {
         // Full-slot SCH/F carrying a Null PDU (idle).
         let mut buf = BitBuffer::new(SCH_F_CAP);
@@ -906,6 +910,7 @@ impl BsChannelScheduler {
     /// Return first queued grant.
     /// If none; return first in-progress fragmented message.
     /// If none; return first to-be-transmitted resource.
+    /// If none; return a stale stealing block so the signalling path can discard it.
     /// If none, return None.
     pub fn dl_take_prioritized_sched_item(&mut self, ts: TdmaTime) -> Option<DlSchedElem> {
         if ts.f == 18 {
@@ -929,6 +934,10 @@ impl BsChannelScheduler {
 
         // Return Resources last
         if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Resource(_, _, _))) {
+            return Some(q.remove(i));
+        }
+
+        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Stealing(..))) {
             return Some(q.remove(i));
         }
 
@@ -1481,6 +1490,19 @@ mod tests {
         sched
     }
 
+    fn test_circuit(direction: Direction, ts: u8) -> Circuit {
+        Circuit {
+            direction,
+            ts,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::LocalLoopback,
+        }
+    }
+
     #[test]
     fn test_halfslot_grants() {
         let mut sched = get_testing_slotter();
@@ -1622,19 +1644,7 @@ mod tests {
             ssi_type: SsiType::Issi,
             ssi: 2200699,
         };
-        sched.create_circuit(
-            Direction::Dl,
-            Circuit {
-                direction: Direction::Dl,
-                ts: 3,
-                peer_ts: None,
-                usage: 4,
-                circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
-                speech_service: Some(0),
-                etee_encrypted: false,
-                dl_media_source: CircuitDlMediaSource::LocalLoopback,
-            },
-        );
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 3));
         let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
         let sdu = BitBuffer::new(0);
 
@@ -1642,6 +1652,49 @@ mod tests {
 
         assert_eq!(sched.dltx_queues[0].len(), 1);
         assert_eq!(sched.dltx_queues[2].len(), 0);
+    }
+
+    #[test]
+    fn test_stealing_requires_active_dl_traffic_slot() {
+        let mut sched = get_testing_slotter();
+
+        assert!(!sched.can_deliver_stealing(2));
+
+        sched.create_circuit(Direction::Ul, test_circuit(Direction::Ul, 2));
+        assert!(!sched.can_deliver_stealing(2));
+
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 2));
+        assert!(sched.can_deliver_stealing(2));
+    }
+
+    #[test]
+    fn test_non_traffic_stealing_is_discarded() {
+        let mut sched = get_testing_slotter();
+
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None);
+        assert!(sched.has_pending_stealing(2));
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 2, f: 1, m: 1, h: 0 })
+                .is_none()
+        );
+        assert!(!sched.has_pending_stealing(2));
+    }
+
+    #[test]
+    fn test_frame_18_keeps_stealing_queued() {
+        let mut sched = get_testing_slotter();
+
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None);
+        assert!(sched.has_pending_stealing(2));
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 2, f: 18, m: 1, h: 0 })
+                .is_none()
+        );
+        assert!(sched.has_pending_stealing(2));
     }
 
     #[test]

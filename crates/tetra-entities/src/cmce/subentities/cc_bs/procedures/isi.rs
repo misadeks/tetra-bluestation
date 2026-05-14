@@ -79,6 +79,7 @@ impl CcBsSubentity {
 
         let communication = CommunicationType::try_from(call.communication as u64).unwrap_or(CommunicationType::P2p);
         let simplex_duplex = call.duplex != 0;
+        let hook_method_selection = call.method != 0;
 
         let circuit_called = {
             let mut state = self.config.state_write();
@@ -139,10 +140,16 @@ impl CcBsSubentity {
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }),
         });
 
+        let setup_transmission_grant = if simplex_duplex {
+            TransmissionGrant::NotGranted
+        } else {
+            TransmissionGrant::GrantedToOtherUser
+        };
+
         let d_setup = DSetup {
             call_identifier: call_id,
             call_time_out: call_timeout,
-            hook_method_selection: true,
+            hook_method_selection,
             simplex_duplex_selection: simplex_duplex,
             basic_service_information: BasicServiceInformation {
                 circuit_mode_type: circuit_mode,
@@ -151,7 +158,7 @@ impl CcBsSubentity {
                 slots_per_frame: None,
                 speech_service: Some(call.service),
             },
-            transmission_grant: TransmissionGrant::NotGranted,
+            transmission_grant: setup_transmission_grant,
             transmission_request_permission: false,
             call_priority: call.priority,
             notification_indicator: None,
@@ -209,6 +216,8 @@ impl CcBsSubentity {
                 brew_uuid: Some(brew_uuid),
                 network_call: Some(call),
                 connect_request_sent: false,
+                floor_holder: None,
+                queued_tx_demand: None,
             },
         ) {
             match err {
@@ -264,6 +273,7 @@ impl CcBsSubentity {
             call_info.destination,
             call_info.number
         );
+        let is_simplex = call.is_simplex();
 
         if let Err(err) = self.fsm_individual_set_network_call(call_id, call_info.clone()) {
             match err {
@@ -350,24 +360,52 @@ impl CcBsSubentity {
         };
         Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None, CircuitDlMediaSource::SwMI);
 
-        if let Err(err) = self.fsm_individual_transition_to_active(call_id) {
-            match err {
-                IndividualTransitionError::UnknownCall(_) => {
-                    tracing::warn!("CMCE: Brew connect request activation unknown call_id={}", call_id);
+        let activated = match self.fsm_individual_transition_to_active(call_id) {
+            Ok(()) => true,
+            Err(err) => {
+                match err {
+                    IndividualTransitionError::UnknownCall(_) => {
+                        tracing::warn!("CMCE: Brew connect request activation unknown call_id={}", call_id);
+                    }
+                    IndividualTransitionError::InvalidTransition { state, .. } => {
+                        tracing::warn!(
+                            "CMCE: Brew connect request activation rejected call_id={} from state {:?}",
+                            call_id,
+                            state
+                        );
+                    }
+                    IndividualTransitionError::MissingBrewUuid(_)
+                    | IndividualTransitionError::DuplicateCall(_)
+                    | IndividualTransitionError::NotBrewOriginated(_)
+                    | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
                 }
-                IndividualTransitionError::InvalidTransition { state, .. } => {
-                    tracing::warn!(
-                        "CMCE: Brew connect request activation rejected call_id={} from state {:?}",
-                        call_id,
-                        state
-                    );
-                }
-                IndividualTransitionError::MissingBrewUuid(_)
-                | IndividualTransitionError::DuplicateCall(_)
-                | IndividualTransitionError::NotBrewOriginated(_)
-                | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
+                false
             }
+        };
+
+        if activated && is_simplex {
+            if let Some(call_state) = self.individual_calls.get_mut(&call_id) {
+                let holder = call_state.calling_addr;
+                call_state.grant_floor(holder);
+            }
+            self.notify_floor_granted(
+                queue,
+                GroupFloorGrant {
+                    call_id,
+                    source_issi: call.calling_addr.ssi,
+                    dest_gssi: call.called_addr.ssi,
+                    ts: call.calling_ts,
+                },
+                true,
+                BrewNotification::Never,
+            );
         }
+
+        let remote_grant = if is_simplex {
+            TransmissionGrant::GrantedToOtherUser
+        } else {
+            TransmissionGrant::Granted
+        };
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -375,7 +413,7 @@ impl CcBsSubentity {
             dest: TetraEntity::Brew,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
                 brew_uuid,
-                grant: 0,
+                grant: remote_grant.into_raw() as u8,
                 permission: 0,
             }),
         });
@@ -435,13 +473,28 @@ impl CcBsSubentity {
             return;
         };
 
+        let is_simplex = call.is_simplex();
+        let remote_grant = TransmissionGrant::try_from((grant & 0x03) as u64).unwrap_or(TransmissionGrant::Granted);
+        let local_grant = if is_simplex {
+            match remote_grant {
+                TransmissionGrant::Granted => TransmissionGrant::GrantedToOtherUser,
+                TransmissionGrant::GrantedToOtherUser => TransmissionGrant::Granted,
+                TransmissionGrant::RequestQueued => TransmissionGrant::RequestQueued,
+                TransmissionGrant::NotGranted => TransmissionGrant::NotGranted,
+            }
+        } else {
+            remote_grant
+        };
+
         tracing::info!(
-            "CMCE: Brew connect confirm uuid={} call_id={} grant={} permission={}",
+            "CMCE: Brew connect confirm uuid={} call_id={} remote_grant={} local_grant={:?} permission={}",
             brew_uuid,
             call_id,
             grant,
+            local_grant,
             permission
         );
+        let ul_dl_assigned = UlDlAssignment::Both;
 
         let mut called_timeslots = [false; 4];
         called_timeslots[call.called_ts as usize - 1] = true;
@@ -450,14 +503,13 @@ impl CcBsSubentity {
             alloc_type: ChanAllocType::Replace,
             carrier: None,
             timeslots: called_timeslots,
-            ul_dl_assigned: UlDlAssignment::Both,
+            ul_dl_assigned,
         };
 
-        let grant_enum = TransmissionGrant::try_from((grant & 0x03) as u64).unwrap_or(TransmissionGrant::Granted);
         let d_connect_ack = DConnectAcknowledge {
             call_identifier: call_id,
             call_time_out: CallTimeout::T5m.into_raw() as u8,
-            transmission_grant: grant_enum.into_raw() as u8,
+            transmission_grant: local_grant.into_raw() as u8,
             transmission_request_permission: permission != 0,
             notification_indicator: None,
             facility: None,
@@ -517,22 +569,59 @@ impl CcBsSubentity {
         };
         Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None, CircuitDlMediaSource::SwMI);
 
-        if let Err(err) = self.fsm_individual_transition_to_active(call_id) {
-            match err {
-                IndividualTransitionError::UnknownCall(_) => {
-                    tracing::warn!("CMCE: Brew connect confirm activation unknown call_id={}", call_id);
+        let activated = match self.fsm_individual_transition_to_active(call_id) {
+            Ok(()) => true,
+            Err(err) => {
+                match err {
+                    IndividualTransitionError::UnknownCall(_) => {
+                        tracing::warn!("CMCE: Brew connect confirm activation unknown call_id={}", call_id);
+                    }
+                    IndividualTransitionError::InvalidTransition { state, .. } => {
+                        tracing::warn!(
+                            "CMCE: Brew connect confirm activation rejected call_id={} from state {:?}",
+                            call_id,
+                            state
+                        );
+                    }
+                    IndividualTransitionError::MissingBrewUuid(_)
+                    | IndividualTransitionError::DuplicateCall(_)
+                    | IndividualTransitionError::NotBrewOriginated(_)
+                    | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
                 }
-                IndividualTransitionError::InvalidTransition { state, .. } => {
-                    tracing::warn!(
-                        "CMCE: Brew connect confirm activation rejected call_id={} from state {:?}",
-                        call_id,
-                        state
+                false
+            }
+        };
+
+        if activated && is_simplex {
+            match local_grant {
+                TransmissionGrant::Granted => {
+                    if let Some(call_state) = self.individual_calls.get_mut(&call_id) {
+                        let holder = call_state.called_addr;
+                        call_state.grant_floor(holder);
+                    }
+                    self.notify_floor_granted(
+                        queue,
+                        GroupFloorGrant {
+                            call_id,
+                            source_issi: call.called_addr.ssi,
+                            dest_gssi: call.calling_addr.ssi,
+                            ts: call.called_ts,
+                        },
+                        true,
+                        BrewNotification::Never,
                     );
                 }
-                IndividualTransitionError::MissingBrewUuid(_)
-                | IndividualTransitionError::DuplicateCall(_)
-                | IndividualTransitionError::NotBrewOriginated(_)
-                | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
+                TransmissionGrant::GrantedToOtherUser => {
+                    if let Some(call_state) = self.individual_calls.get_mut(&call_id) {
+                        let holder = call_state.calling_addr;
+                        call_state.grant_floor(holder);
+                    }
+                }
+                TransmissionGrant::RequestQueued | TransmissionGrant::NotGranted => {
+                    if let Some(call_state) = self.individual_calls.get_mut(&call_id) {
+                        call_state.release_floor();
+                    }
+                }
             }
         }
 

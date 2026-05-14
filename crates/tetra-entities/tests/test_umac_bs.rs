@@ -2,12 +2,138 @@ mod common;
 
 use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_core::{BitBuffer, Direction, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
+use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tmd::TmdCircuitDataReq;
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use crate::common::ComponentTest;
+
+fn open_shared_voice_circuit(ts: u8) -> SapMsg {
+    SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            ts,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::SwMI,
+        })),
+    }
+}
+
+#[test]
+fn test_opening_shared_circuit_does_not_start_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        !sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "Opening an UL-capable circuit must not imply that local uplink voice is expected"
+    );
+}
+
+#[test]
+fn test_floor_grant_starts_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+            call_id: 1,
+            source_issi: 1000001,
+            dest_gssi: 1000002,
+            ts: 2,
+        }),
+    });
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "A local floor grant should still arm stuck-uplink detection"
+    );
+}
+
+#[test]
+fn test_network_downlink_voice_does_not_start_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.submit_message(SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq { ts: 2, data: vec![0; 36] }),
+    });
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        !sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "Remote downlink media must not arm local stuck-uplink detection"
+    );
+}
+
+#[test]
+fn test_remote_floor_grant_resumes_traffic_without_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id: 1, ts: 2 }),
+    });
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::RemoteFloorGranted { call_id: 1, ts: 2 }),
+    });
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        !sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "Remote floor grants must resume traffic mode without arming local stuck-uplink detection"
+    );
+}
 
 #[test]
 fn test_in_fragmented_sch_hu_and_sch_f() {

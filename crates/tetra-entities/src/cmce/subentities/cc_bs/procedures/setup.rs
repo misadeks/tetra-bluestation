@@ -443,7 +443,11 @@ impl CcBsSubentity {
             hook_method_selection: pdu.hook_method_selection,
             simplex_duplex_selection: pdu.simplex_duplex_selection,
             basic_service_information: pdu.basic_service_information.clone(),
-            transmission_grant: TransmissionGrant::NotGranted,
+            transmission_grant: if pdu.simplex_duplex_selection {
+                TransmissionGrant::NotGranted
+            } else {
+                TransmissionGrant::GrantedToOtherUser
+            },
             transmission_request_permission: false,
             call_priority: pdu.call_priority,
             notification_indicator: None,
@@ -501,6 +505,8 @@ impl CcBsSubentity {
                 brew_uuid: None,
                 network_call: None,
                 connect_request_sent: false,
+                floor_holder: None,
+                queued_tx_demand: None,
             },
         ) {
             match err {
@@ -727,6 +733,8 @@ impl CcBsSubentity {
                 brew_uuid: Some(brew_uuid),
                 network_call: Some(network_call),
                 connect_request_sent: false,
+                floor_holder: None,
+                queued_tx_demand: None,
             },
         ) {
             match err {

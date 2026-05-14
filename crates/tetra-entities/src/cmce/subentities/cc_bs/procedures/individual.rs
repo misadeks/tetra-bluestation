@@ -409,11 +409,14 @@ impl CcBsSubentity {
         let calling_usage = call_snapshot.calling_usage;
         let called_usage = call_snapshot.called_usage;
         let simplex_duplex = call_snapshot.simplex_duplex;
+        let is_simplex = !simplex_duplex;
 
         let Some(cached) = self.cached_setups.get(&call_id) else {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
             return;
         };
+        let calling_has_initial_floor = is_simplex && cached.pdu.transmission_grant == TransmissionGrant::GrantedToOtherUser;
+        let (calling_ul_dl, called_ul_dl) = (UlDlAssignment::Both, UlDlAssignment::Both);
 
         let mut calling_timeslots = [false; 4];
         calling_timeslots[calling_ts as usize - 1] = true;
@@ -424,104 +427,26 @@ impl CcBsSubentity {
             alloc_type: ChanAllocType::Replace,
             carrier: None,
             timeslots: calling_timeslots,
-            ul_dl_assigned: UlDlAssignment::Both,
+            ul_dl_assigned: calling_ul_dl,
         };
         let chan_alloc_called = CmceChanAllocReq {
             usage: Some(called_usage),
             alloc_type: ChanAllocType::Replace,
             carrier: None,
             timeslots: called_timeslots,
-            ul_dl_assigned: UlDlAssignment::Both,
+            ul_dl_assigned: called_ul_dl,
         };
         tracing::debug!(
-            "P2P chan_alloc: calling ts={} usage={} slots={:?}, called ts={} usage={} slots={:?}",
+            "P2P chan_alloc: calling ts={} usage={} slots={:?} ul_dl={}, called ts={} usage={} slots={:?} ul_dl={}",
             calling_ts,
             calling_usage,
             calling_timeslots,
+            chan_alloc_calling.ul_dl_assigned,
             called_ts,
             called_usage,
-            called_timeslots
+            called_timeslots,
+            chan_alloc_called.ul_dl_assigned
         );
-
-        let d_connect = DConnect {
-            call_identifier: call_id,
-            call_time_out: CallTimeout::T5m,
-            hook_method_selection: true,
-            simplex_duplex_selection: simplex_duplex,
-            transmission_grant: TransmissionGrant::Granted,
-            transmission_request_permission: false,
-            call_ownership: false,
-            call_priority: None,
-            basic_service_information: None,
-            temporary_address: None,
-            notification_indicator: None,
-            facility: None,
-            proprietary: None,
-        };
-
-        tracing::info!("-> {:?}", d_connect);
-        let mut connect_sdu = BitBuffer::new_autoexpand(30);
-        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
-        connect_sdu.seek(0);
-
-        let connect_msg = SapMsg {
-            sap: Sap::LcmcSap,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Mle,
-            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
-                sdu: connect_sdu,
-                handle: calling_handle,
-                endpoint_id: calling_endpoint_id,
-                link_id: calling_link_id,
-                layer2service: Layer2Service::Todo,
-                pdu_prio: 0,
-                layer2_qos: 0,
-                stealing_permission: false,
-                stealing_repeats_flag: false,
-                chan_alloc: Some(chan_alloc_calling),
-                main_address: calling_addr,
-                tx_reporter: None,
-            }),
-        };
-        queue.push_back(connect_msg);
-
-        let d_connect_ack = DConnectAcknowledge {
-            call_identifier: call_id,
-            call_time_out: CallTimeout::T5m.into_raw() as u8,
-            transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
-            transmission_request_permission: false,
-            notification_indicator: None,
-            facility: None,
-            proprietary: None,
-        };
-
-        tracing::info!("-> {:?}", d_connect_ack);
-        let mut ack_sdu = BitBuffer::new_autoexpand(28);
-        d_connect_ack
-            .to_bitbuf(&mut ack_sdu)
-            .expect("Failed to serialize DConnectAcknowledge");
-        ack_sdu.seek(0);
-
-        let ack_msg = SapMsg {
-            sap: Sap::LcmcSap,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Mle,
-            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
-                sdu: ack_sdu,
-                handle,
-                endpoint_id,
-                link_id,
-                layer2service: Layer2Service::Todo,
-                pdu_prio: 0,
-                layer2_qos: 0,
-                stealing_permission: false,
-                stealing_repeats_flag: false,
-                chan_alloc: Some(chan_alloc_called),
-                main_address: called_addr,
-                tx_reporter: None,
-            }),
-        };
-        queue.push_back(ack_msg);
 
         let circuit_calling = CmceCircuit {
             ts_created: self.dltime,
@@ -566,19 +491,186 @@ impl CcBsSubentity {
             );
         }
 
-        if let Err(err) = self.fsm_individual_transition_to_active(call_id) {
-            match err {
-                IndividualTransitionError::UnknownCall(_) => {
-                    tracing::warn!("U-CONNECT activation failed, unknown call_id={}", call_id);
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m,
+            hook_method_selection: cached.pdu.hook_method_selection,
+            simplex_duplex_selection: simplex_duplex,
+            transmission_grant: if is_simplex {
+                if calling_has_initial_floor {
+                    TransmissionGrant::Granted
+                } else {
+                    TransmissionGrant::GrantedToOtherUser
                 }
-                IndividualTransitionError::InvalidTransition { state, .. } => {
-                    tracing::warn!("U-CONNECT activation rejected for call_id={} from state {:?}", call_id, state);
+            } else {
+                TransmissionGrant::Granted
+            },
+            transmission_request_permission: false,
+            call_ownership: true,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        tracing::info!("-> {:?}", d_connect);
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+        let connect_msg_stealing = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: calling_handle,
+                endpoint_id: calling_endpoint_id,
+                link_id: calling_link_id,
+                layer2service: Layer2Service::Todo,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: true,
+                stealing_repeats_flag: true,
+                chan_alloc: Some(chan_alloc_calling.clone()),
+                main_address: calling_addr,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(connect_msg_stealing);
+
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+        let connect_msg_fallback = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: calling_handle,
+                endpoint_id: calling_endpoint_id,
+                link_id: calling_link_id,
+                layer2service: Layer2Service::Todo,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: Some(chan_alloc_calling.clone()),
+                main_address: calling_addr,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(connect_msg_fallback);
+
+        let d_connect_ack = DConnectAcknowledge {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::T5m.into_raw() as u8,
+            transmission_grant: if is_simplex && calling_has_initial_floor {
+                TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+            } else {
+                TransmissionGrant::Granted.into_raw() as u8
+            },
+            transmission_request_permission: false,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        tracing::info!("-> {:?}", d_connect_ack);
+        let mut ack_sdu = BitBuffer::new_autoexpand(28);
+        d_connect_ack
+            .to_bitbuf(&mut ack_sdu)
+            .expect("Failed to serialize DConnectAcknowledge");
+        ack_sdu.seek(0);
+
+        let ack_msg_stealing = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: ack_sdu,
+                handle,
+                endpoint_id,
+                link_id,
+                layer2service: Layer2Service::Todo,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: true,
+                stealing_repeats_flag: true,
+                chan_alloc: Some(chan_alloc_called.clone()),
+                main_address: called_addr,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(ack_msg_stealing);
+
+        let mut ack_sdu = BitBuffer::new_autoexpand(28);
+        d_connect_ack
+            .to_bitbuf(&mut ack_sdu)
+            .expect("Failed to serialize DConnectAcknowledge");
+        ack_sdu.seek(0);
+        let ack_msg_fallback = SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: ack_sdu,
+                handle,
+                endpoint_id,
+                link_id,
+                layer2service: Layer2Service::Todo,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: Some(chan_alloc_called.clone()),
+                main_address: called_addr,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(ack_msg_fallback);
+
+        let activated = match self.fsm_individual_transition_to_active(call_id) {
+            Ok(()) => true,
+            Err(err) => {
+                match err {
+                    IndividualTransitionError::UnknownCall(_) => {
+                        tracing::warn!("U-CONNECT activation failed, unknown call_id={}", call_id);
+                    }
+                    IndividualTransitionError::InvalidTransition { state, .. } => {
+                        tracing::warn!("U-CONNECT activation rejected for call_id={} from state {:?}", call_id, state);
+                    }
+                    IndividualTransitionError::MissingBrewUuid(_)
+                    | IndividualTransitionError::DuplicateCall(_)
+                    | IndividualTransitionError::NotBrewOriginated(_)
+                    | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
                 }
-                IndividualTransitionError::MissingBrewUuid(_)
-                | IndividualTransitionError::DuplicateCall(_)
-                | IndividualTransitionError::NotBrewOriginated(_)
-                | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
+                false
             }
+        };
+
+        if activated && is_simplex {
+            let (speaker_addr, listener_addr, speaker_ts) = if calling_has_initial_floor {
+                (calling_addr, called_addr, calling_ts)
+            } else {
+                (called_addr, calling_addr, called_ts)
+            };
+            if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                call.grant_floor(speaker_addr);
+            }
+            self.notify_floor_granted(
+                queue,
+                GroupFloorGrant {
+                    call_id,
+                    source_issi: speaker_addr.ssi,
+                    dest_gssi: listener_addr.ssi,
+                    ts: speaker_ts,
+                },
+                true,
+                BrewNotification::Never,
+            );
         }
     }
 }

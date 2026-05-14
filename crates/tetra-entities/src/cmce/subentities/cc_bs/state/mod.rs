@@ -386,6 +386,10 @@ pub(super) struct IndividualCall {
     pub(super) network_call: Option<NetworkCircuitCall>,
     /// True once CONNECT_REQUEST has been sent for Brew-originated setup.
     pub(super) connect_request_sent: bool,
+    /// SSI of the current simplex floor holder. None for duplex calls or when no MS currently has the floor.
+    pub(super) floor_holder: Option<u32>,
+    /// One pending simplex floor request while another party is transmitting.
+    pub(super) queued_tx_demand: Option<TetraAddress>,
 }
 
 impl IndividualCall {
@@ -411,6 +415,54 @@ impl IndividualCall {
     #[inline]
     pub(super) fn is_active(&self) -> bool {
         self.state == IndividualCallState::Active
+    }
+
+    #[inline]
+    pub(super) fn is_simplex(&self) -> bool {
+        !self.simplex_duplex
+    }
+
+    #[inline]
+    pub(super) fn is_floor_held_by(&self, issi: u32) -> bool {
+        self.floor_holder == Some(issi)
+    }
+
+    pub(super) fn grant_floor(&mut self, holder: TetraAddress) {
+        self.floor_holder = Some(holder.ssi);
+        self.queued_tx_demand = None;
+    }
+
+    pub(super) fn release_floor(&mut self) {
+        self.floor_holder = None;
+        self.queued_tx_demand = None;
+    }
+
+    pub(super) fn queue_tx_demand(&mut self, requester: TetraAddress) -> TxDemandQueueResult {
+        if self.is_floor_held_by(requester.ssi) {
+            return TxDemandQueueResult::FromCurrentSpeaker;
+        }
+
+        match self.queued_tx_demand {
+            Some(existing) if existing.ssi == requester.ssi => TxDemandQueueResult::AlreadyQueuedBySameUser,
+            Some(_) => TxDemandQueueResult::QueueBusy,
+            None => {
+                self.queued_tx_demand = Some(requester);
+                TxDemandQueueResult::Queued
+            }
+        }
+    }
+
+    pub(super) fn cancel_queued_tx_demand(&mut self, requester: TetraAddress) -> bool {
+        if self.queued_tx_demand.is_some_and(|existing| existing.ssi == requester.ssi) {
+            self.queued_tx_demand = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn take_queued_tx_demand(&mut self) -> Option<TetraAddress> {
+        self.queued_tx_demand.take()
     }
 
     pub(super) fn activate(&mut self, now: TdmaTime) {

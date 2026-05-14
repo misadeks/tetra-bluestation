@@ -58,6 +58,12 @@ pub enum BrewEvent {
     /// Circuit/PBX/phone connect confirmed by network
     CircuitConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
 
+    /// Circuit/PBX/phone simplex floor granted by network
+    CircuitSimplexGranted { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// Circuit/PBX/phone simplex floor released by network
+    CircuitSimplexIdle { uuid: Uuid, grant: u8, permission: u8 },
+
     /// Circuit/PBX/phone call released by network
     CircuitRelease { uuid: Uuid, cause: u8 },
 
@@ -133,6 +139,12 @@ pub enum BrewCommand {
 
     /// Send circuit/PBX/phone CONNECT_CONFIRM
     SendConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// Send circuit/PBX/phone SIMPLEX_GRANTED
+    SendSimplexGranted { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// Send circuit/PBX/phone SIMPLEX_IDLE
+    SendSimplexIdle { uuid: Uuid, grant: u8, permission: u8 },
 
     /// Send circuit/PBX/phone CALL_RELEASE
     SendCallRelease { uuid: Uuid, cause: u8 },
@@ -461,6 +473,32 @@ impl<T: NetworkTransport> BrewWorker<T> {
                             );
                         }
                     }
+                    BrewCommand::SendSimplexGranted { uuid, grant, permission } => {
+                        let msg = build_simplex_granted(&uuid, grant, permission);
+                        if let Err(e) = self.transport.send_reliable(&msg) {
+                            tracing::error!("BrewWorker: failed to send SIMPLEX_GRANTED: {}", e);
+                        } else {
+                            tracing::debug!(
+                                "BrewWorker: sent SIMPLEX_GRANTED uuid={} grant={} permission={}",
+                                uuid,
+                                grant,
+                                permission
+                            );
+                        }
+                    }
+                    BrewCommand::SendSimplexIdle { uuid, grant, permission } => {
+                        let msg = build_simplex_idle(&uuid, grant, permission);
+                        if let Err(e) = self.transport.send_reliable(&msg) {
+                            tracing::error!("BrewWorker: failed to send SIMPLEX_IDLE: {}", e);
+                        } else {
+                            tracing::debug!(
+                                "BrewWorker: sent SIMPLEX_IDLE uuid={} grant={} permission={}",
+                                uuid,
+                                grant,
+                                permission
+                            );
+                        }
+                    }
                     BrewCommand::SendCallRelease { uuid, cause } => {
                         let msg = build_call_release(&uuid, cause);
                         if let Err(e) = self.transport.send_reliable(&msg) {
@@ -642,6 +680,40 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     });
                 } else {
                     tracing::warn!("BrewWorker: CONNECT_CONFIRM with unexpected payload uuid={}", cc.identifier);
+                }
+            }
+            CALL_STATE_SIMPLEX_GRANTED => {
+                if let BrewCallPayload::CircularGrant(grant) = cc.payload {
+                    tracing::info!(
+                        "BrewWorker: SIMPLEX_GRANTED uuid={} grant={} permission={}",
+                        cc.identifier,
+                        grant.grant,
+                        grant.permission
+                    );
+                    let _ = self.event_sender.send(BrewEvent::CircuitSimplexGranted {
+                        uuid: cc.identifier,
+                        grant: grant.grant,
+                        permission: grant.permission,
+                    });
+                } else {
+                    tracing::warn!("BrewWorker: SIMPLEX_GRANTED with unexpected payload uuid={}", cc.identifier);
+                }
+            }
+            CALL_STATE_SIMPLEX_IDLE => {
+                if let BrewCallPayload::CircularGrant(grant) = cc.payload {
+                    tracing::info!(
+                        "BrewWorker: SIMPLEX_IDLE uuid={} grant={} permission={}",
+                        cc.identifier,
+                        grant.grant,
+                        grant.permission
+                    );
+                    let _ = self.event_sender.send(BrewEvent::CircuitSimplexIdle {
+                        uuid: cc.identifier,
+                        grant: grant.grant,
+                        permission: grant.permission,
+                    });
+                } else {
+                    tracing::warn!("BrewWorker: SIMPLEX_IDLE with unexpected payload uuid={}", cc.identifier);
                 }
             }
             CALL_STATE_GROUP_IDLE => {

@@ -572,15 +572,29 @@ pub fn build_setup_reject(session_uuid: &Uuid, cause: u8) -> Vec<u8> {
     buf
 }
 
-/// Build CONNECT_CONFIRM with grant payload.
-pub fn build_connect_confirm(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+fn build_circular_grant(call_state: u8, session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
     let mut buf = Vec::with_capacity(20);
     buf.push(BREW_CLASS_CALL_CONTROL);
-    buf.push(CALL_STATE_CONNECT_CONFIRM);
+    buf.push(call_state);
     buf.extend_from_slice(session_uuid.as_bytes());
     buf.push(grant);
     buf.push(permission);
     buf
+}
+
+/// Build CONNECT_CONFIRM with grant payload.
+pub fn build_connect_confirm(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    build_circular_grant(CALL_STATE_CONNECT_CONFIRM, session_uuid, grant, permission)
+}
+
+/// Build SIMPLEX_GRANTED with grant payload.
+pub fn build_simplex_granted(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    build_circular_grant(CALL_STATE_SIMPLEX_GRANTED, session_uuid, grant, permission)
+}
+
+/// Build SIMPLEX_IDLE with grant payload.
+pub fn build_simplex_idle(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    build_circular_grant(CALL_STATE_SIMPLEX_IDLE, session_uuid, grant, permission)
 }
 
 /// Build CALL_RELEASE with cause payload.
@@ -878,6 +892,38 @@ mod tests {
             panic!("Expected CallControl message");
         };
         assert_eq!(cc.call_state, CALL_STATE_CONNECT_CONFIRM);
+        let BrewCallPayload::CircularGrant(grant) = cc.payload else {
+            panic!("Expected CircularGrant payload");
+        };
+        assert_eq!(grant.grant, 1);
+        assert_eq!(grant.permission, 0);
+    }
+
+    #[test]
+    fn test_parse_simplex_granted() {
+        let uuid = Uuid::new_v4();
+        let data = build_simplex_granted(&uuid, 0, 1);
+        let msg = parse_brew_message(&data).unwrap();
+        let BrewMessage::CallControl(cc) = msg else {
+            panic!("Expected CallControl message");
+        };
+        assert_eq!(cc.call_state, CALL_STATE_SIMPLEX_GRANTED);
+        let BrewCallPayload::CircularGrant(grant) = cc.payload else {
+            panic!("Expected CircularGrant payload");
+        };
+        assert_eq!(grant.grant, 0);
+        assert_eq!(grant.permission, 1);
+    }
+
+    #[test]
+    fn test_parse_simplex_idle() {
+        let uuid = Uuid::new_v4();
+        let data = build_simplex_idle(&uuid, 1, 0);
+        let msg = parse_brew_message(&data).unwrap();
+        let BrewMessage::CallControl(cc) = msg else {
+            panic!("Expected CallControl message");
+        };
+        assert_eq!(cc.call_state, CALL_STATE_SIMPLEX_IDLE);
         let BrewCallPayload::CircularGrant(grant) = cc.payload else {
             panic!("Expected CircularGrant payload");
         };

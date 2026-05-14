@@ -1,7 +1,410 @@
 use super::super::dtmf::{DtmfKind, decode_dtmf, pack_type3_bits_to_bytes};
 use super::*;
 
+#[derive(Clone, Copy)]
+struct IndividualFloorParty {
+    addr: TetraAddress,
+    ts: u8,
+    usage: u8,
+}
+
 impl CcBsSubentity {
+    fn individual_floor_parties(call: &IndividualCall, party: TetraAddress) -> Option<(IndividualFloorParty, IndividualFloorParty)> {
+        if party.ssi == call.calling_addr.ssi {
+            Some((
+                IndividualFloorParty {
+                    addr: call.calling_addr,
+                    ts: call.calling_ts,
+                    usage: call.calling_usage,
+                },
+                IndividualFloorParty {
+                    addr: call.called_addr,
+                    ts: call.called_ts,
+                    usage: call.called_usage,
+                },
+            ))
+        } else if party.ssi == call.called_addr.ssi {
+            Some((
+                IndividualFloorParty {
+                    addr: call.called_addr,
+                    ts: call.called_ts,
+                    usage: call.called_usage,
+                },
+                IndividualFloorParty {
+                    addr: call.calling_addr,
+                    ts: call.calling_ts,
+                    usage: call.calling_usage,
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn individual_floor_party_is_local(call: &IndividualCall, party: IndividualFloorParty) -> bool {
+        !(call.calling_over_brew && party.addr.ssi == call.calling_addr.ssi
+            || call.called_over_brew && party.addr.ssi == call.called_addr.ssi)
+    }
+
+    fn send_individual_d_tx_granted(
+        &self,
+        queue: &mut MessageQueue,
+        call: &IndividualCall,
+        call_id: u16,
+        target: IndividualFloorParty,
+        transmission_grant: TransmissionGrant,
+        transmitting_party_issi: Option<u32>,
+        ul_dl_assigned: UlDlAssignment,
+    ) {
+        if !Self::individual_floor_party_is_local(call, target) {
+            tracing::trace!(
+                "Skipping local D-TX GRANTED for remote individual party call_id={} ISSI {}",
+                call_id,
+                target.addr.ssi
+            );
+            return;
+        }
+
+        let d_tx_granted = DTxGranted {
+            call_identifier: call_id,
+            transmission_grant: transmission_grant.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: transmitting_party_issi.map(|_| 1),
+            transmitting_party_address_ssi: transmitting_party_issi.map(|issi| issi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+
+        tracing::info!(
+            "FSM -> D-TX GRANTED (individual simplex, {}) call_id={} to ISSI {} ul_dl={}",
+            transmission_grant,
+            call_id,
+            target.addr.ssi,
+            ul_dl_assigned
+        );
+        let mut sdu = BitBuffer::new_autoexpand(50);
+        d_tx_granted.to_bitbuf(&mut sdu).expect("Failed to serialize DTxGranted");
+        sdu.seek(0);
+
+        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, self.dltime, target.addr, target.ts, Some(target.usage), ul_dl_assigned);
+        queue.push_back(msg);
+    }
+
+    fn send_individual_d_tx_ceased(&self, queue: &mut MessageQueue, call: &IndividualCall, call_id: u16, target: IndividualFloorParty) {
+        if !Self::individual_floor_party_is_local(call, target) {
+            tracing::trace!(
+                "Skipping local D-TX CEASED for remote individual party call_id={} ISSI {}",
+                call_id,
+                target.addr.ssi
+            );
+            return;
+        }
+
+        let d_tx_ceased = DTxCeased {
+            call_identifier: call_id,
+            transmission_request_permission: false,
+            notification_indicator: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+
+        tracing::info!(
+            "FSM -> D-TX CEASED (individual simplex) call_id={} to ISSI {}",
+            call_id,
+            target.addr.ssi
+        );
+        let mut sdu = BitBuffer::new_autoexpand(30);
+        d_tx_ceased.to_bitbuf(&mut sdu).expect("Failed to serialize DTxCeased");
+        sdu.seek(0);
+
+        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, self.dltime, target.addr, target.ts, Some(target.usage), UlDlAssignment::Dl);
+        queue.push_back(msg);
+    }
+
+    fn notify_individual_floor_granted(
+        &self,
+        queue: &mut MessageQueue,
+        call: &IndividualCall,
+        call_id: u16,
+        speaker: IndividualFloorParty,
+        listener: IndividualFloorParty,
+    ) {
+        self.notify_floor_granted(
+            queue,
+            GroupFloorGrant {
+                call_id,
+                source_issi: speaker.addr.ssi,
+                dest_gssi: listener.addr.ssi,
+                ts: speaker.ts,
+            },
+            true,
+            BrewNotification::Never,
+        );
+
+        if Self::individual_floor_party_is_local(call, speaker)
+            && let Some(brew_uuid) = call.brew_uuid
+            && (call.calling_over_brew || call.called_over_brew)
+        {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
+                    brew_uuid,
+                    grant: TransmissionGrant::Granted.into_raw() as u8,
+                    permission: 0,
+                }),
+            });
+        }
+    }
+
+    fn notify_individual_floor_released(
+        &self,
+        queue: &mut MessageQueue,
+        call: &IndividualCall,
+        call_id: u16,
+        speaker: IndividualFloorParty,
+    ) {
+        self.notify_floor_released(queue, CallTimeslot { call_id, ts: speaker.ts }, true, BrewNotification::Never);
+
+        if Self::individual_floor_party_is_local(call, speaker)
+            && let Some(brew_uuid) = call.brew_uuid
+            && (call.calling_over_brew || call.called_over_brew)
+        {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
+                    brew_uuid,
+                    grant: TransmissionGrant::NotGranted.into_raw() as u8,
+                    permission: 0,
+                }),
+            });
+        }
+    }
+
+    fn brew_individual_floor_parties(call: &IndividualCall) -> Option<(IndividualFloorParty, IndividualFloorParty)> {
+        if call.calling_over_brew && !call.called_over_brew {
+            Self::individual_floor_parties(call, call.calling_addr)
+        } else if call.called_over_brew && !call.calling_over_brew {
+            Self::individual_floor_parties(call, call.called_addr)
+        } else {
+            None
+        }
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_circuit_simplex_granted(
+        &mut self,
+        queue: &mut MessageQueue,
+        brew_uuid: uuid::Uuid,
+        grant: u8,
+        permission: u8,
+    ) {
+        let Some((call_id, call_snapshot)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!(
+                "CMCE: Brew SIMPLEX_GRANTED for unknown uuid={} grant={} permission={}",
+                brew_uuid,
+                grant,
+                permission
+            );
+            return;
+        };
+
+        if !call_snapshot.is_active() || !call_snapshot.is_simplex() {
+            tracing::trace!(
+                "CMCE: ignoring Brew SIMPLEX_GRANTED uuid={} call_id={} active={} simplex={}",
+                brew_uuid,
+                call_id,
+                call_snapshot.is_active(),
+                call_snapshot.is_simplex()
+            );
+            return;
+        }
+
+        let remote_grant = TransmissionGrant::try_from((grant & 0x03) as u64).unwrap_or(TransmissionGrant::Granted);
+        if remote_grant != TransmissionGrant::Granted {
+            tracing::trace!(
+                "CMCE: ignoring Brew SIMPLEX_GRANTED uuid={} call_id={} grant={:?}",
+                brew_uuid,
+                call_id,
+                remote_grant
+            );
+            return;
+        }
+
+        let Some((remote_party, local_party)) = Self::brew_individual_floor_parties(&call_snapshot) else {
+            tracing::debug!(
+                "CMCE: Brew SIMPLEX_GRANTED uuid={} call_id={} without one Brew party",
+                brew_uuid,
+                call_id
+            );
+            return;
+        };
+
+        if let Some(call) = self.individual_calls.get_mut(&call_id) {
+            call.grant_floor(remote_party.addr);
+        }
+
+        tracing::info!(
+            "CMCE: Brew SIMPLEX_GRANTED uuid={} call_id={} remote_issi={} local_issi={}",
+            brew_uuid,
+            call_id,
+            remote_party.addr.ssi,
+            local_party.addr.ssi
+        );
+        self.send_individual_d_tx_granted(
+            queue,
+            &call_snapshot,
+            call_id,
+            local_party,
+            TransmissionGrant::GrantedToOtherUser,
+            Some(remote_party.addr.ssi),
+            UlDlAssignment::Dl,
+        );
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::RemoteFloorGranted {
+                call_id,
+                ts: local_party.ts,
+            }),
+        });
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_circuit_simplex_idle(
+        &mut self,
+        queue: &mut MessageQueue,
+        brew_uuid: uuid::Uuid,
+        grant: u8,
+        permission: u8,
+    ) {
+        let Some((call_id, call_snapshot)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!(
+                "CMCE: Brew SIMPLEX_IDLE for unknown uuid={} grant={} permission={}",
+                brew_uuid,
+                grant,
+                permission
+            );
+            return;
+        };
+
+        if !call_snapshot.is_active() || !call_snapshot.is_simplex() {
+            tracing::trace!(
+                "CMCE: ignoring Brew SIMPLEX_IDLE uuid={} call_id={} active={} simplex={}",
+                brew_uuid,
+                call_id,
+                call_snapshot.is_active(),
+                call_snapshot.is_simplex()
+            );
+            return;
+        }
+
+        let Some((remote_party, local_party)) = Self::brew_individual_floor_parties(&call_snapshot) else {
+            tracing::debug!(
+                "CMCE: Brew SIMPLEX_IDLE uuid={} call_id={} without one Brew party",
+                brew_uuid,
+                call_id
+            );
+            return;
+        };
+
+        if !call_snapshot.is_floor_held_by(remote_party.addr.ssi) {
+            tracing::trace!(
+                "CMCE: ignoring Brew SIMPLEX_IDLE uuid={} call_id={} floor_holder={:?}",
+                brew_uuid,
+                call_id,
+                call_snapshot.floor_holder
+            );
+            return;
+        }
+
+        tracing::info!(
+            "CMCE: Brew SIMPLEX_IDLE uuid={} call_id={} remote_issi={} grant={} permission={}",
+            brew_uuid,
+            call_id,
+            remote_party.addr.ssi,
+            grant,
+            permission
+        );
+
+        let queued_request = self
+            .individual_calls
+            .get_mut(&call_id)
+            .and_then(IndividualCall::take_queued_tx_demand);
+
+        if let Some(requester) = queued_request {
+            let Some((requester_party, former_speaker_party)) = Self::individual_floor_parties(&call_snapshot, requester) else {
+                tracing::warn!(
+                    "CMCE: Brew SIMPLEX_IDLE call_id={} had queued non-participant ISSI {}, dropping request",
+                    call_id,
+                    requester.ssi
+                );
+                if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                    call.release_floor();
+                }
+                self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, local_party);
+                self.notify_floor_released(
+                    queue,
+                    CallTimeslot {
+                        call_id,
+                        ts: local_party.ts,
+                    },
+                    true,
+                    BrewNotification::Never,
+                );
+                return;
+            };
+
+            if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                call.grant_floor(requester);
+            }
+
+            self.send_individual_d_tx_granted(
+                queue,
+                &call_snapshot,
+                call_id,
+                requester_party,
+                TransmissionGrant::Granted,
+                Some(requester_party.addr.ssi),
+                UlDlAssignment::Ul,
+            );
+            self.send_individual_d_tx_granted(
+                queue,
+                &call_snapshot,
+                call_id,
+                former_speaker_party,
+                TransmissionGrant::GrantedToOtherUser,
+                Some(requester_party.addr.ssi),
+                UlDlAssignment::Dl,
+            );
+            self.notify_individual_floor_granted(queue, &call_snapshot, call_id, requester_party, former_speaker_party);
+            return;
+        }
+
+        if let Some(call) = self.individual_calls.get_mut(&call_id) {
+            call.release_floor();
+        }
+        self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, local_party);
+        self.notify_floor_released(
+            queue,
+            CallTimeslot {
+                call_id,
+                ts: local_party.ts,
+            },
+            true,
+            BrewNotification::Never,
+        );
+    }
+
     /// Handle parsed U-SETUP and dispatch into group/individual FSM paths.
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_setup(
         &mut self,
@@ -43,8 +446,100 @@ impl CcBsSubentity {
     ) {
         let call_id = pdu.call_identifier;
 
-        if self.individual_calls.contains_key(&call_id) {
-            tracing::debug!("U-TX CEASED for individual call_id={}, ignoring", call_id);
+        if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
+            if !call_snapshot.is_active() {
+                tracing::debug!("U-TX CEASED for inactive individual call_id={}, ignoring", call_id);
+                return;
+            }
+
+            if !call_snapshot.is_simplex() {
+                tracing::debug!("U-TX CEASED for duplex individual call_id={}, ignoring", call_id);
+                return;
+            }
+
+            let Some((sender_party, peer_party)) = Self::individual_floor_parties(&call_snapshot, sender) else {
+                tracing::warn!(
+                    "U-TX CEASED for individual call_id={} from non-participant ISSI {}, ignoring",
+                    call_id,
+                    sender.ssi
+                );
+                return;
+            };
+
+            if call_snapshot.floor_holder.is_some() && !call_snapshot.is_floor_held_by(sender.ssi) {
+                if let Some(call) = self.individual_calls.get_mut(&call_id)
+                    && call.cancel_queued_tx_demand(sender)
+                {
+                    tracing::info!(
+                        "U-TX CEASED (individual simplex) call_id={} from queued ISSI {}, cancelled queued request",
+                        call_id,
+                        sender.ssi
+                    );
+                    return;
+                }
+
+                tracing::debug!(
+                    "U-TX CEASED (individual simplex) call_id={} from ISSI {} without floor holder match {:?}, ignoring",
+                    call_id,
+                    sender.ssi,
+                    call_snapshot.floor_holder
+                );
+                return;
+            }
+
+            let queued_request = self
+                .individual_calls
+                .get_mut(&call_id)
+                .and_then(IndividualCall::take_queued_tx_demand);
+
+            if let Some(requester) = queued_request {
+                let Some((requester_party, former_speaker_party)) = Self::individual_floor_parties(&call_snapshot, requester) else {
+                    tracing::warn!(
+                        "U-TX CEASED individual call_id={} had queued non-participant ISSI {}, dropping request",
+                        call_id,
+                        requester.ssi
+                    );
+                    if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                        call.release_floor();
+                    }
+                    self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, sender_party);
+                    self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, peer_party);
+                    self.notify_individual_floor_released(queue, &call_snapshot, call_id, sender_party);
+                    return;
+                };
+
+                if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                    call.grant_floor(requester);
+                }
+
+                self.send_individual_d_tx_granted(
+                    queue,
+                    &call_snapshot,
+                    call_id,
+                    requester_party,
+                    TransmissionGrant::Granted,
+                    Some(requester_party.addr.ssi),
+                    UlDlAssignment::Ul,
+                );
+                self.send_individual_d_tx_granted(
+                    queue,
+                    &call_snapshot,
+                    call_id,
+                    former_speaker_party,
+                    TransmissionGrant::GrantedToOtherUser,
+                    Some(requester_party.addr.ssi),
+                    UlDlAssignment::Dl,
+                );
+                self.notify_individual_floor_granted(queue, &call_snapshot, call_id, requester_party, former_speaker_party);
+                return;
+            }
+
+            self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, sender_party);
+            self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, peer_party);
+            if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                call.release_floor();
+            }
+            self.notify_individual_floor_released(queue, &call_snapshot, call_id, sender_party);
             return;
         }
 
@@ -88,8 +583,94 @@ impl CcBsSubentity {
     ) {
         let call_id = pdu.call_identifier;
 
-        if self.individual_calls.contains_key(&call_id) {
-            tracing::debug!("U-TX DEMAND for individual call_id={}, ignoring", call_id);
+        if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
+            if !call_snapshot.is_active() {
+                tracing::debug!("U-TX DEMAND for inactive individual call_id={}, ignoring", call_id);
+                return;
+            }
+
+            if !call_snapshot.is_simplex() {
+                tracing::debug!("U-TX DEMAND for duplex individual call_id={}, ignoring", call_id);
+                return;
+            }
+
+            let Some((requester_party, peer_party)) = Self::individual_floor_parties(&call_snapshot, requesting_party) else {
+                tracing::warn!(
+                    "U-TX DEMAND for individual call_id={} from non-participant ISSI {}, ignoring",
+                    call_id,
+                    requesting_party.ssi
+                );
+                return;
+            };
+
+            tracing::info!(
+                "U-TX DEMAND (individual simplex) call_id={} from ISSI {} priority={} floor_holder={:?}",
+                call_id,
+                requesting_party.ssi,
+                pdu.tx_demand_priority,
+                call_snapshot.floor_holder
+            );
+
+            match call_snapshot.floor_holder {
+                None => {
+                    if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                        call.grant_floor(requesting_party);
+                    }
+                    self.send_individual_d_tx_granted(
+                        queue,
+                        &call_snapshot,
+                        call_id,
+                        requester_party,
+                        TransmissionGrant::Granted,
+                        Some(requesting_party.ssi),
+                        UlDlAssignment::Ul,
+                    );
+                    self.send_individual_d_tx_granted(
+                        queue,
+                        &call_snapshot,
+                        call_id,
+                        peer_party,
+                        TransmissionGrant::GrantedToOtherUser,
+                        Some(requesting_party.ssi),
+                        UlDlAssignment::Dl,
+                    );
+                    self.notify_individual_floor_granted(queue, &call_snapshot, call_id, requester_party, peer_party);
+                }
+                Some(holder) if holder == requesting_party.ssi => {
+                    self.send_individual_d_tx_granted(
+                        queue,
+                        &call_snapshot,
+                        call_id,
+                        requester_party,
+                        TransmissionGrant::Granted,
+                        Some(requesting_party.ssi),
+                        UlDlAssignment::Ul,
+                    );
+                }
+                Some(holder) => {
+                    let queue_result = self
+                        .individual_calls
+                        .get_mut(&call_id)
+                        .map(|call| call.queue_tx_demand(requesting_party))
+                        .unwrap_or(TxDemandQueueResult::QueueBusy);
+
+                    let grant = match queue_result {
+                        TxDemandQueueResult::Queued | TxDemandQueueResult::AlreadyQueuedBySameUser => TransmissionGrant::RequestQueued,
+                        TxDemandQueueResult::QueueBusy => TransmissionGrant::NotGranted,
+                        TxDemandQueueResult::FromCurrentSpeaker => TransmissionGrant::Granted,
+                    };
+
+                    self.send_individual_d_tx_granted(
+                        queue,
+                        &call_snapshot,
+                        call_id,
+                        requester_party,
+                        grant,
+                        Some(holder),
+                        UlDlAssignment::Dl,
+                    );
+                }
+            }
             return;
         }
 

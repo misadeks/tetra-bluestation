@@ -91,6 +91,9 @@ pub enum CallControl {
         dest_gssi: u32,
         ts: u8,
     },
+    /// Remote floor granted: a network/Brew speaker has been given transmission permission.
+    /// Sent to UMAC to exit hangtime without arming local stuck-uplink detection.
+    RemoteFloorGranted { call_id: u16, ts: u8 },
     /// Floor released: speaker stopped transmitting (entering hangtime).
     /// Sent to UMAC to enter hangtime signalling mode and to Brew to stop forwarding audio.
     FloorReleased { call_id: u16, ts: u8 },
@@ -133,6 +136,10 @@ pub enum CallControl {
     NetworkCircuitConnectRequest { brew_uuid: uuid::Uuid, call: NetworkCircuitCall },
     /// Circuit-call connect confirm from local side
     NetworkCircuitConnectConfirm { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
+    /// Circuit-call simplex floor grant
+    NetworkCircuitSimplexGranted { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
+    /// Circuit-call simplex floor idle/release
+    NetworkCircuitSimplexIdle { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
     /// Circuit-call media is active on this local timeslot
     NetworkCircuitMediaReady { brew_uuid: uuid::Uuid, call_id: u16, ts: u8 },
     /// Circuit-call INFO/DTMF payload from MS to SwMI/Brew
