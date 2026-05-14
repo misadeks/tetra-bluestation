@@ -108,7 +108,7 @@ fn test_sds_local_delivery() {
 }
 
 #[test]
-fn test_sds_nonlocal_dest_dropped() {
+fn test_sds_brew_forward() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -123,7 +123,6 @@ fn test_sds_nonlocal_dest_dropped() {
         jitter_initial_latency_frames: 0,
         feature_sds_enabled: true,
         whitelisted_ssis: None,
-        pbx_gateway_issis: None,
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
 
@@ -131,38 +130,17 @@ fn test_sds_nonlocal_dest_dropped() {
     let sinks = vec![TetraEntity::Mle, TetraEntity::Brew];
     test.populate_entities(components, sinks);
 
-    // Do NOT register dest ISSI. U-SDS forwarding to Brew is intentionally disabled for now.
+    // Do NOT register dest ISSI — should forward to Brew
     let msg = build_u_sds_data_msg(1000001, 5000001, 0x1234);
     test.submit_message(msg);
     test.run_stack(Some(1));
 
     let sink_msgs = test.dump_sinks();
     let brew_count = count_brew_sds(&sink_msgs);
-    assert_eq!(brew_count, 0, "Should not forward U-SDS to Brew for non-local ISSI");
+    assert!(brew_count > 0, "Expected CmceSdsData at Brew sink for non-local ISSI");
 
     let d_sds_count = count_d_sds_data(&sink_msgs);
     assert_eq!(d_sds_count, 0, "Should not deliver locally when dest is not registered");
-}
-
-#[test]
-fn test_pbx_gateway_issi_is_tetrapack_routable() {
-    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
-    config.brew = Some(CfgBrew {
-        host: "core.tetrapack.online".into(),
-        port: 3000,
-        tls: false,
-        username: None,
-        password: None,
-        reconnect_delay: Duration::from_secs(1),
-        jitter_initial_latency_frames: 0,
-        feature_sds_enabled: true,
-        whitelisted_ssis: None,
-        pbx_gateway_issis: Some(vec![294003]),
-    });
-    let test = ComponentTest::from_config(config, None);
-
-    assert!(tetra_entities::net_brew::is_brew_issi_routable(&test.config, 294003));
-    assert!(!tetra_entities::net_brew::is_brew_issi_routable(&test.config, 294004));
 }
 
 #[test]
@@ -347,7 +325,6 @@ fn test_u_status_brew_forward() {
         jitter_initial_latency_frames: 0,
         feature_sds_enabled: true,
         whitelisted_ssis: None,
-        pbx_gateway_issis: None,
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
 
