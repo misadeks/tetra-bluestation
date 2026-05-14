@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// The three states a transmit reporter can be in.
+/// The three states a transmit receipt can be in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxState {
     /// Message is queued but not yet sent over the air.
@@ -28,7 +28,7 @@ impl TxState {
     }
 }
 
-/// A transmit reporter kept by the originator (e.g. CMCE) to query whether the
+/// A transmit receipt kept by the originator (e.g. CMCE) to query whether the
 /// message was sent and/or acknowledged.
 ///
 /// State machine (transitions driven by the paired [`TxSignal`]):
@@ -47,9 +47,9 @@ impl TxState {
 ///   Transmitted is the final state.
 /// ```
 
-/// The reporting handle carried alongside the PDU down
+/// The reporting half of a transmit receipt, carried alongside the PDU down
 /// through MAC and LLC. These layers call the `mark_*` methods to drive state
-/// transitions that cloned [`TxReporter`] handles can observe.
+/// transitions that the paired [`TxReceipt`] can observe.
 #[derive(Debug, Clone)]
 pub struct TxReporter {
     expects_ack: bool,

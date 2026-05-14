@@ -2,12 +2,13 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, CfgTelemetry, PhyBackend, StackState};
+use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
 
 use super::sec_brew::CfgBrew;
+use super::sec_telemetry::CfgTelemetry;
 
-/// Wrapper for a string that should be treated as a secret. Display and Debug redact
-/// the actual value to prevent accidental logging of credentials.
+/// Wrapper for a string that should be treated as a secret. Display and Debug will redact the actual value,
+/// to prevent accidental logging of secrets.
 #[derive(Clone)]
 pub struct SecretField {
     pub val: String,
@@ -76,23 +77,9 @@ impl StackConfig {
         // Check input device settings
         match self.phy_io.backend {
             PhyBackend::SoapySdr => {
-                let Some(ref soapy_cfg) = self.phy_io.soapysdr else {
+                if self.phy_io.soapysdr.is_none() {
                     return Err("soapysdr configuration must be provided for Soapysdr backend");
                 };
-
-                // Legacy configs may name a hardware profile explicitly; newer
-                // configs can rely on generic device detection/settings.
-                let config_count = [
-                    soapy_cfg.io_cfg.iocfg_usrpb2xx.is_some(),
-                    soapy_cfg.io_cfg.iocfg_limesdr.is_some(),
-                    soapy_cfg.io_cfg.iocfg_sxceiver.is_some(),
-                ]
-                .iter()
-                .filter(|&&x| x)
-                .count();
-                if config_count > 1 {
-                    return Err("soapysdr backend accepts at most one legacy hardware configuration");
-                }
             }
             PhyBackend::None => {} // For testing
             PhyBackend::Undefined => {
@@ -136,6 +123,7 @@ impl StackConfig {
             return Err("ms_txpwr_max_cell must be 0-7 (3 bits)");
         }
 
+        // Validate timezone if configured
         if let Some(ref tz) = self.cell.timezone {
             if tz.parse::<chrono_tz::Tz>().is_err() {
                 return Err("Invalid IANA timezone name in cell.timezone");
@@ -156,11 +144,7 @@ pub struct SharedConfig {
 }
 
 impl SharedConfig {
-    pub fn from_config(cfg: StackConfig) -> Self {
-        Self::from_parts(cfg, StackState::default())
-    }
-
-    pub fn from_parts<S: Into<Option<StackState>>>(cfg: StackConfig, state: S) -> Self {
+    pub fn from_parts(cfg: StackConfig, state: Option<StackState>) -> Self {
         // Check config for validity before returning the SharedConfig object
         match cfg.validate() {
             Ok(_) => {}
@@ -169,7 +153,7 @@ impl SharedConfig {
 
         Self {
             cfg: Arc::new(cfg),
-            state: Arc::new(RwLock::new(state.into().unwrap_or_default())),
+            state: Arc::new(RwLock::new(state.unwrap_or_default())),
         }
     }
 

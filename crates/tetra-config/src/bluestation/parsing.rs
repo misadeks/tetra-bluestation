@@ -8,18 +8,23 @@ use toml::Value;
 
 use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, net_dto_to_cfg};
 
-use super::config::{SharedConfig, StackConfig, StackMode};
+use super::config::{StackConfig, StackMode};
 use super::sec_brew::{CfgBrewDto, apply_brew_patch};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
-use super::{PhyIoDto, StackState, phy_dto_to_cfg};
+use super::{PhyIoDto, phy_dto_to_cfg};
 
-/// Build `SharedConfig` from a TOML configuration file
-pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error::Error>> {
+/// Build `StackConfig` from a TOML configuration file
+pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::Error>> {
     let root: TomlConfigRoot = toml::from_str(toml_str)?;
 
     // Various sanity checks
-    if root.config_version != "0.5" && root.config_version != "0.6" {
-        return Err(format!("Unrecognized config_version: {}, expect 0.5 or 0.6", root.config_version).into());
+    let expected_config_version = "0.6";
+    if !root.config_version.eq(expected_config_version) {
+        return Err(format!(
+            "Unrecognized config_version: {}, expect {}",
+            root.config_version, expected_config_version
+        )
+        .into());
     }
     if !root.extra.is_empty() {
         return Err(format!("Unrecognized top-level fields: {:?}", sorted_keys(&root.extra)).into());
@@ -52,15 +57,10 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
         }
     }
 
+    // Optional telemetry section
     if let Some(ref telemetry) = root.telemetry {
         if !telemetry.extra.is_empty() {
             return Err(format!("Unrecognized fields in telemetry config: {:?}", sorted_keys(&telemetry.extra)).into());
-        }
-    }
-
-    if let Some(ref command) = root.command {
-        if !command.extra.is_empty() {
-            return Err(format!("Unrecognized fields in command config: {:?}", sorted_keys(&command.extra)).into());
         }
     }
 
@@ -88,14 +88,11 @@ pub fn from_toml_str(toml_str: &str) -> Result<SharedConfig, Box<dyn std::error:
         cfg.control = Some(apply_control_patch(command)?);
     }
 
-    // Mutable runtime state
-    let state = StackState::default();
-
-    Ok(SharedConfig::from_parts(cfg, state))
+    Ok(cfg)
 }
 
 /// Build `SharedConfig` from any reader.
-pub fn from_reader<R: Read>(reader: R) -> Result<SharedConfig, Box<dyn std::error::Error>> {
+pub fn from_reader<R: Read>(reader: R) -> Result<StackConfig, Box<dyn std::error::Error>> {
     let mut contents = String::new();
     let mut reader = BufReader::new(reader);
     reader.read_to_string(&mut contents)?;
@@ -103,7 +100,7 @@ pub fn from_reader<R: Read>(reader: R) -> Result<SharedConfig, Box<dyn std::erro
 }
 
 /// Build `SharedConfig` from a file path.
-pub fn from_file<P: AsRef<Path>>(path: P) -> Result<SharedConfig, Box<dyn std::error::Error>> {
+pub fn from_file<P: AsRef<Path>>(path: P) -> Result<StackConfig, Box<dyn std::error::Error>> {
     let f = File::open(path)?;
     let r = BufReader::new(f);
     let cfg = from_reader(r)?;

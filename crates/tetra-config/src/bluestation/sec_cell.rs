@@ -56,7 +56,8 @@ pub struct CfgCellInfo {
 
     pub local_ssi_ranges: SortedDisjointSsiRanges,
 
-    /// IANA timezone name. When set, enables D-NWRK-BROADCAST time broadcasting.
+    /// IANA timezone name (e.g. "Europe/Amsterdam"). When set, enables D-NWRK-BROADCAST
+    /// time broadcasting so MSs can synchronize their clocks.
     pub timezone: Option<String>,
 }
 
@@ -141,8 +142,9 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
     }
 }
 
-/// Default local SSI ranges are defined as 0-90 (inclusive), which fits the
-/// TetraPack configuration. Users can override this if needed.
+/// Default local SSI ranges are defined as 0-90 (inclusive), which fits the TetraPack configuration.
+/// This helps prevent excessive flows of unroutable traffic to TetraPack, and can be overridden
+/// by users if needed.
 fn default_tetrapack_local_ranges() -> SortedDisjointSsiRanges {
-    SortedDisjointSsiRanges::from_vec_ssirange(vec![SsiRange { start: 0, end: 91 }])
+    SortedDisjointSsiRanges::from_vec_ssirange(vec![SsiRange::new(0, 90)])
 }

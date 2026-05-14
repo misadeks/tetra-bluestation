@@ -314,7 +314,7 @@ fn test_ul_inactivity_timeout_releases_group_floor_once() {
 
 #[test]
 fn test_cc_ingress_drops_wrong_message_shape_without_panicking() {
-    let shared = SharedConfig::from_config(ComponentTest::get_default_test_config(StackMode::Bs));
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
     let mut cc = CcBsSubentity::new(shared);
     let mut queue = MessageQueue::new();
 

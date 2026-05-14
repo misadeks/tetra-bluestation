@@ -85,7 +85,7 @@ impl TetraEntityTrait for CmceMs {
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
         // There is only one SAP for CMCE
         assert!(message.sap == Sap::LcmcSap);

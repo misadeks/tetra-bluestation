@@ -9,7 +9,6 @@ pub const STACK_VERSION: &str = const_format::formatcp!("{}-{}", env!("CARGO_PKG
 
 pub mod address;
 pub mod bitbuffer;
-pub mod control;
 pub mod debug;
 pub mod direction;
 pub mod freqs;
@@ -35,22 +34,3 @@ pub use tdma_time::TdmaTime;
 pub use tetra_common::*;
 pub use timeslot_alloc::*;
 pub use tx_receipt::*;
-
-/// Handle assigned by MLE to primitives for MM/CMCE/SNDCP
-pub type MleHandle = u32;
-
-pub type LinkId = u32;
-
-/// The endpoint identifiers between the MLE and LLC, and between the LLC and MAC, refer to the MAC resource that is
-/// currently used for that service. These identifiers may be local. There shall be a unique correspondence between the
-/// endpoint identifier and the physical allocation (timeslot or timeslots) used in the MAC. (This correspondence is known
-/// only within the MAC.) More than one advanced link may use one MAC resource.
-/// In the current implementation, the endpoint_id is just the timeslot number used by the MAC.
-pub type EndpointId = u32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PhysicalChannel {
-    Tp,
-    Cp,
-    Unallocated,
-}

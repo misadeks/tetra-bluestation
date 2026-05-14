@@ -1,4 +1,5 @@
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
+use crate::net_telemetry::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
@@ -13,6 +14,7 @@ use super::subentities::ss_bs::SsBsSubentity;
 
 pub struct CmceBs {
     config: SharedConfig,
+    telemetry: Option<TelemetrySink>,
     control: Option<ControlEndpoint>,
 
     cc: CcBsSubentity,
@@ -21,13 +23,10 @@ pub struct CmceBs {
 }
 
 impl CmceBs {
-    pub fn new(config: SharedConfig) -> Self {
-        Self::with_control(config, None)
-    }
-
-    pub fn with_control(config: SharedConfig, control: Option<ControlEndpoint>) -> Self {
+    pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         Self {
             config: config.clone(),
+            telemetry,
             control,
             sds: SdsBsSubentity::new(config.clone()),
             cc: CcBsSubentity::new(config.clone()),
@@ -92,17 +91,18 @@ impl TetraEntityTrait for CmceBs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         // Propagate tick to subentities
         self.cc.tick_start(queue, ts);
-        self.sds.tick_start(ts);
 
-        if let Some(control) = &self.control {
-            while let Some(command) = control.try_recv() {
-                match command {
-                    command @ ControlCommand::SendSds { handle, .. } => {
-                        let success = self.sds.rx_sds_from_control(queue, command);
-                        control.respond(ControlResponse::SendSdsResponse { handle, success });
+        // Process incoming control commands, if control link is enabled
+        if let Some(cep) = &self.control {
+            while let Some(cmd) = cep.try_recv() {
+                match cmd {
+                    ControlCommand::SendSds { handle, .. } => {
+                        let success = self.sds.rx_sds_from_control(queue, cmd);
+                        let response = ControlResponse::SendSdsResponse { handle, success };
+                        cep.respond(response);
                     }
-                    other => {
-                        tracing::warn!("CMCE: unsupported control command {:?}", other);
+                    _ => {
+                        panic!("Unsupported command {:?}", cmd);
                     }
                 }
             }
@@ -111,7 +111,7 @@ impl TetraEntityTrait for CmceBs {
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%self.dltime, "rx_prim: {:?}", message);
+        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::LcmcSap => match message.msg {

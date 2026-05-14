@@ -25,6 +25,7 @@ pub struct CfgBrew {
 
     /// Set to true when SDS between local and Brew clients is enabled
     pub feature_sds_enabled: bool,
+    /// If present, restrict Brew calls to these remote SSIs
     pub whitelisted_ssis: Option<Vec<u32>>,
     /// Optional PBX gateway ISSIs that should be routable over Brew even if they don't match normal Tetrapack ISSI constraints.
     pub pbx_gateway_issis: Option<Vec<u32>>,
@@ -50,11 +51,14 @@ pub struct CfgBrewDto {
     #[serde(default)]
     pub jitter_initial_latency_frames: u8,
 
+    /// If present, restrict Brew calls to these remote SSIs
+    pub whitelisted_ssis: Option<Vec<u32>>,
+
     /// Set to true when SDS between local and Brew clients is enabled
     #[serde(default = "default_brew_feature_sds_enabled")]
     pub feature_sds_enabled: bool,
 
-    pub whitelisted_ssis: Option<Vec<u32>>,
+    /// Optional PBX gateway ISSIs that should be routable over Brew even if they don't match normal Tetrapack ISSI constraints.
     pub pbx_gateway_issis: Option<Vec<u32>>,
 
     #[serde(flatten)]

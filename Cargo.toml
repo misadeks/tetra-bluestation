@@ -11,11 +11,9 @@ members = [
     
     # Binaries
     "bins/bluestation-bs",
-    "bins/pdu-tool",
-    "bins/net-tnmm-test",
-    "bins/net-tnmm-test-quic",
-    "bins/bluestation-control",
-    "bins/bluestation-telemetry",
+    #"bins/bluestation-telemetry",
+    #"bins/bluestation-control",
+    #"bins/pdu-tool",
 ]
 
 [workspace.package]
@@ -39,7 +37,7 @@ num-complex = "0.4.6"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 rustfft = "6.4.0"
-soapysdr = "0.4.4"
+soapysdr = "0.5.0"
 rand = "0.9.2"
 clap = { version = "4.5.53", features = ["derive"] }
 tracing = { version = "0.1.41", features = ["std"] }
