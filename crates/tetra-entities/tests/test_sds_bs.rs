@@ -123,6 +123,7 @@ fn test_sds_brew_forward() {
         jitter_initial_latency_frames: 0,
         feature_sds_enabled: true,
         whitelisted_ssis: None,
+        pbx_gateway_issis: None,
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
 
@@ -325,6 +326,7 @@ fn test_u_status_brew_forward() {
         jitter_initial_latency_frames: 0,
         feature_sds_enabled: true,
         whitelisted_ssis: None,
+        pbx_gateway_issis: None,
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
 

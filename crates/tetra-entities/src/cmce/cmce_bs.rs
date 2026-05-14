@@ -6,8 +6,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{Sap, TdmaTime, unimplemented_log};
 use tetra_saps::{SapMsg, SapMsgInner};
 
-use tetra_pdus::cmce::enums::cmce_pdu_type_ul::CmcePduTypeUl;
-
+use super::components::pc_bs::{ControlRoute, LcmcRoute, PcBs};
 use super::subentities::cc_bs::CcBsSubentity;
 use super::subentities::sds_bs::SdsBsSubentity;
 use super::subentities::ss_bs::SsBsSubentity;
@@ -17,6 +16,7 @@ pub struct CmceBs {
     telemetry: Option<TelemetrySink>,
     control: Option<ControlEndpoint>,
 
+    pc: PcBs,
     cc: CcBsSubentity,
     sds: SdsBsSubentity,
     ss: SsBsSubentity,
@@ -28,6 +28,7 @@ impl CmceBs {
             config: config.clone(),
             telemetry,
             control,
+            pc: PcBs::new(),
             sds: SdsBsSubentity::new(config.clone()),
             cc: CcBsSubentity::new(config.clone()),
             ss: SsBsSubentity::new(),
@@ -37,42 +38,24 @@ impl CmceBs {
     pub fn rx_lcmc_mle_unitdata_ind(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_lcmc_mle_unitdata_ind");
 
-        // Handle the incoming unit data indication
-        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            panic!();
-        };
-        let Some(bits) = prim.sdu.peek_bits(5) else {
-            tracing::warn!("insufficient bits: {}", prim.sdu.dump_bin());
-            return;
-        };
-        let Ok(pdu_type) = CmcePduTypeUl::try_from(bits) else {
-            tracing::warn!("invalid pdu type: {} in {}", bits, prim.sdu.dump_bin());
+        let Some(route) = self.pc.route_lcmc_unitdata_ind(&mut message) else {
             return;
         };
 
-        match pdu_type {
-            CmcePduTypeUl::UAlert
-            | CmcePduTypeUl::UConnect
-            | CmcePduTypeUl::UDisconnect
-            | CmcePduTypeUl::UInfo
-            | CmcePduTypeUl::URelease
-            | CmcePduTypeUl::USetup
-            | CmcePduTypeUl::UTxCeased
-            | CmcePduTypeUl::UTxDemand
-            | CmcePduTypeUl::UCallRestore => {
-                self.cc.route_xx_deliver(_queue, message);
+        match route {
+            LcmcRoute::CcRd => {
+                self.cc.route_rd_deliver(_queue, message);
             }
-            CmcePduTypeUl::UStatus => {
+            LcmcRoute::SdsStatus => {
                 self.sds.route_status_deliver(_queue, message);
             }
-            CmcePduTypeUl::USdsData => {
+            LcmcRoute::SdsRf => {
                 self.sds.route_rf_deliver(_queue, message);
             }
-            CmcePduTypeUl::UFacility => {
-                unimplemented_log!("{:?}", pdu_type);
-                // self.ss.route_xx_deliver(_queue, message);
+            LcmcRoute::SsRe => {
+                self.ss.route_re_deliver(_queue, message);
             }
-            CmcePduTypeUl::CmceFunctionNotSupported => {
+            LcmcRoute::Unsupported(pdu_type) => {
                 unimplemented_log!("{:?}", pdu_type);
             }
         };
@@ -122,17 +105,20 @@ impl TetraEntityTrait for CmceBs {
                     panic!("Unexpected message on LcmcSap: {:?}", message.msg);
                 }
             },
-            Sap::Control => match message.msg {
-                SapMsgInner::CmceCallControl(_) => {
+            Sap::Control => match self.pc.route_control(&message) {
+                ControlRoute::CcRa => {
                     self.cc.rx_call_control(queue, message);
                 }
-                SapMsgInner::MmSubscriberUpdate(update) => {
+                ControlRoute::CcSubscriberUpdate => {
+                    let SapMsgInner::MmSubscriberUpdate(update) = message.msg else {
+                        unreachable!();
+                    };
                     self.cc.handle_subscriber_update(queue, update);
                 }
-                SapMsgInner::CmceSdsData(_) => {
+                ControlRoute::SdsRc => {
                     self.sds.rx_sds_from_brew(queue, message);
                 }
-                _ => {
+                ControlRoute::Unsupported => {
                     panic!("Unexpected control message: {:?}", message.msg);
                 }
             },

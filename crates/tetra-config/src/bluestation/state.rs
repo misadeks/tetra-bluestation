@@ -29,6 +29,12 @@ impl SubscriberRegistry {
         self.subscribers.contains_key(&issi)
     }
 
+    pub fn registered_issis(&self) -> Vec<u32> {
+        let mut issis = self.subscribers.keys().copied().collect::<Vec<_>>();
+        issis.sort_unstable();
+        issis
+    }
+
     /// Tolerant registration; if ISSI already registered, we overwrite it with a fresh Subscriber struct
     pub fn register(&mut self, issi: u32) {
         self.deregister(issi); // Clean up any existing registration to prevent stale affiliations

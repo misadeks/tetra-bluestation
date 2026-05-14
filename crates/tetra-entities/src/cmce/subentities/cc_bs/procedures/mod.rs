@@ -2,7 +2,8 @@ use super::*;
 
 mod group;
 mod individual;
-mod network;
+mod isi;
+mod restoration;
 mod setup;
 mod uplink;
 

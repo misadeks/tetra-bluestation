@@ -59,15 +59,19 @@ impl CcBsSubentity {
                     CircuitMgrCmd::SendClose(call_id, circuit) => {
                         tracing::warn!("need to send CLOSE for call id {}", call_id);
                         let ts = circuit.ts;
+                        // Safety circuit expiry is not a setup timeout. Do not report it to
+                        // handsets as ExpiryOfTimer, which many radios render as "No answer".
+                        let disconnect_cause = DisconnectCause::SwmiRequestedDisconnection;
+
                         // Get our cached D-SETUP, build D-RELEASE and send
                         if let Some(cached) = self.cached_setups.get(&call_id) {
-                            let sdu = Self::build_d_release_from_d_setup(&cached.pdu, DisconnectCause::ExpiryOfTimer);
+                            let sdu = Self::build_d_release_from_d_setup(&cached.pdu, disconnect_cause);
                             let prim = Self::build_sapmsg(sdu, None, self.dltime, cached.dest_addr, None);
                             queue.push_back(prim);
 
                             if let Some(ind_call) = self.individual_calls.get(&call_id) {
                                 if !ind_call.calling_over_brew {
-                                    let sdu_calling = Self::build_d_release_from_d_setup(&cached.pdu, DisconnectCause::ExpiryOfTimer);
+                                    let sdu_calling = Self::build_d_release_from_d_setup(&cached.pdu, disconnect_cause);
                                     let prim_calling = SapMsg {
                                         sap: Sap::LcmcSap,
                                         src: TetraEntity::Cmce,
@@ -94,7 +98,7 @@ impl CcBsSubentity {
                             tracing::warn!("No cached D-SETUP for call id {} during timer-close", call_id);
                             if let Some(ind_call) = self.individual_calls.get(&call_id) {
                                 if !ind_call.calling_over_brew {
-                                    let sdu_calling = Self::build_d_release(call_id, DisconnectCause::ExpiryOfTimer);
+                                    let sdu_calling = Self::build_d_release(call_id, disconnect_cause);
                                     let prim_calling = if ind_call.is_active() {
                                         Self::build_sapmsg_stealing(
                                             sdu_calling,
@@ -115,7 +119,7 @@ impl CcBsSubentity {
                                     };
                                     queue.push_back(prim_calling);
                                 } else if !ind_call.called_over_brew {
-                                    let sdu_called = Self::build_d_release(call_id, DisconnectCause::ExpiryOfTimer);
+                                    let sdu_called = Self::build_d_release(call_id, disconnect_cause);
                                     let prim_called = if ind_call.is_active() {
                                         Self::build_sapmsg_stealing(
                                             sdu_called,
@@ -147,11 +151,17 @@ impl CcBsSubentity {
                             if (ind_call.called_over_brew || ind_call.calling_over_brew)
                                 && let Some(brew_uuid) = ind_call.brew_uuid
                             {
-                                self.notify_network_circuit_release(queue, brew_uuid, DisconnectCause::ExpiryOfTimer);
+                                self.notify_network_circuit_release(queue, brew_uuid, disconnect_cause);
                             }
                         }
 
                         // Clean up call state
+                        if let Some(call) = self.active_calls.get_mut(&call_id) {
+                            call.begin_release(disconnect_cause);
+                        }
+                        if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                            call.begin_release(disconnect_cause);
+                        }
                         self.cached_setups.remove(&call_id);
                         self.active_calls.remove(&call_id);
                         self.individual_calls.remove(&call_id);
@@ -175,7 +185,7 @@ impl CcBsSubentity {
 
         for call_id in expired_group_calls {
             tracing::info!("Call timeout expired for group call_id={}, releasing", call_id);
-            self.release_group_call(queue, call_id, DisconnectCause::ExpiryOfTimer);
+            self.release_group_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
         }
 
         let expired_individual_calls: Vec<u16> = self
@@ -186,7 +196,7 @@ impl CcBsSubentity {
 
         for call_id in expired_individual_calls {
             tracing::info!("Call timeout expired for individual call_id={}, releasing", call_id);
-            self.release_individual_call(queue, call_id, DisconnectCause::ExpiryOfTimer);
+            self.release_individual_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
         }
     }
 
@@ -220,7 +230,7 @@ impl CcBsSubentity {
 
         for call_id in expired {
             tracing::info!("Hangtime expired for call_id={}, releasing", call_id);
-            self.release_group_call(queue, call_id, DisconnectCause::ExpiryOfTimer);
+            self.release_group_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
         }
     }
 

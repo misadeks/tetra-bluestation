@@ -7,6 +7,7 @@ use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+use tetra_saps::control::call_control::CallControl;
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::control::enums::communication_type::CommunicationType;
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
@@ -93,6 +94,52 @@ fn build_u_setup_msg(calling_issi: u32, dest_gssi: u32) -> SapMsg {
     }
 }
 
+/// Helper: build a U-SETUP SAP message for an individual call.
+fn build_individual_u_setup_msg(calling_issi: u32, called_issi: u32) -> SapMsg {
+    let u_setup = USetup {
+        area_selection: 0,
+        hook_method_selection: true,
+        simplex_duplex_selection: true,
+        basic_service_information: BasicServiceInformation {
+            circuit_mode_type: CircuitModeType::TchS,
+            encryption_flag: false,
+            communication_type: CommunicationType::P2p,
+            slots_per_frame: None,
+            speech_service: Some(0),
+        },
+        request_to_transmit_send_data: false,
+        call_priority: 0,
+        clir_control: 0,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
+        called_party_ssi: Some(called_issi as u64),
+        called_party_short_number_address: None,
+        called_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    };
+
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    u_setup.to_bitbuf(&mut sdu).expect("Failed to serialize USetup");
+    sdu.seek(0);
+
+    SapMsg {
+        sap: Sap::LcmcSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+            sdu,
+            handle: 1,
+            endpoint_id: 1,
+            link_id: 1,
+            received_tetra_address: TetraAddress::new(calling_issi, SsiType::Issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        }),
+    }
+}
+
 /// Extract tx_reporters from D-SETUP messages in the sink output.
 /// D-SETUPs are identified as LcmcMleUnitdataReq with a chan_alloc that has a usage field.
 fn extract_d_setup_reporters(msgs: &mut Vec<SapMsg>) -> Vec<tetra_core::TxReporter> {
@@ -120,6 +167,38 @@ fn count_d_setups(msgs: &[SapMsg]) -> usize {
                     if prim.chan_alloc.as_ref().is_some_and(|ca| ca.usage.is_some()))
         })
         .count()
+}
+
+#[test]
+fn test_individual_setup_uses_central_subscriber_registry_for_local_destination() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    let calling_issi = 1000001;
+    let called_issi = 1000002;
+    test.config.state_write().subscribers.register(called_issi);
+
+    test.submit_message(build_individual_u_setup_msg(calling_issi, called_issi));
+    test.run_stack(Some(1));
+
+    let msgs = test.dump_sinks();
+    assert!(
+        count_d_setups(&msgs) > 0,
+        "Expected local D-SETUP for centrally registered called ISSI"
+    );
+    assert!(
+        !msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { .. })
+        )),
+        "Local registered ISSI should not be routed over Brew"
+    );
 }
 
 /// Test that late-entry D-SETUP re-sends are throttled when the previous

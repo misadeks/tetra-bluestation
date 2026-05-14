@@ -1,5 +1,11 @@
 use super::*;
 
+/// ANF-ISIIC/ANF-ISIGC-adjacent procedures for the local network bridge.
+///
+/// The implementation still speaks the internal Brew control protocol, not
+/// ETSI PSS1/ROSE ISI PDUs. The split is intentional: individual-call and
+/// group-call interworking belongs beside CC procedures, while PC remains the
+/// CMCE route discriminator.
 impl CcBsSubentity {
     /// Handle network-initiated circuit setup request (Brew -> local called MS).
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_circuit_setup_request(
@@ -28,13 +34,14 @@ impl CcBsSubentity {
             return;
         }
 
-        if !self.subscriber_groups.contains_key(&called_addr.ssi) {
+        if !self.is_locally_registered_issi(called_addr.ssi) {
             tracing::info!(
-                "CMCE: rejecting Brew setup request uuid={} src={} dst={} number='{}' (called ISSI not registered locally)",
+                "CMCE: rejecting Brew setup request uuid={} src={} dst={} number='{}' (called ISSI not registered locally, known registry ISSIs={:?})",
                 brew_uuid,
                 call.source_issi,
                 call.destination,
-                call.number
+                call.number,
+                self.known_local_issis()
             );
             queue.push_back(SapMsg {
                 sap: Sap::Control,
@@ -192,6 +199,7 @@ impl CcBsSubentity {
                 called_usage: usage,
                 simplex_duplex,
                 state: IndividualCallState::IncomingSetupPending,
+                formal_state: CcFormalState::Idle.after(CcFormalEvent::SetupRequest),
                 setup_timer_started: Some(self.dltime),
                 setup_timeout: Some(CallTimeoutSetupPhase::T60s),
                 active_timer_started: None,

@@ -73,6 +73,73 @@ pub(super) enum GroupCallState {
     NoActiveSpeaker { since: TdmaTime },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CcFormalState {
+    Idle,
+    Setup,
+    Active,
+    Disconnect,
+    Release,
+    Restore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CcFormalEvent {
+    SetupRequest,
+    SetupComplete,
+    DisconnectRequest,
+    ModifyRequest,
+    ReleaseRequest,
+    RestoreRequest,
+    RestoreComplete,
+    RestoreReject,
+    TimerExpired,
+    CleanupComplete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CcFormalTransitionError {
+    pub(super) state: CcFormalState,
+    pub(super) event: CcFormalEvent,
+}
+
+impl CcFormalState {
+    pub(super) fn transition(self, event: CcFormalEvent) -> Result<CcFormalState, CcFormalTransitionError> {
+        let next = match (self, event) {
+            (CcFormalState::Idle, CcFormalEvent::SetupRequest) => CcFormalState::Setup,
+            (CcFormalState::Setup, CcFormalEvent::SetupComplete) => CcFormalState::Active,
+            (CcFormalState::Setup, CcFormalEvent::ReleaseRequest | CcFormalEvent::TimerExpired) => CcFormalState::Release,
+            (CcFormalState::Active, CcFormalEvent::ModifyRequest) => CcFormalState::Active,
+            (CcFormalState::Active, CcFormalEvent::DisconnectRequest) => CcFormalState::Disconnect,
+            (CcFormalState::Active, CcFormalEvent::ReleaseRequest | CcFormalEvent::TimerExpired) => CcFormalState::Release,
+            (CcFormalState::Active, CcFormalEvent::RestoreRequest) => CcFormalState::Restore,
+            (CcFormalState::Disconnect, CcFormalEvent::ReleaseRequest | CcFormalEvent::TimerExpired) => CcFormalState::Release,
+            (CcFormalState::Restore, CcFormalEvent::RestoreComplete) => CcFormalState::Active,
+            (CcFormalState::Restore, CcFormalEvent::RestoreReject | CcFormalEvent::ReleaseRequest | CcFormalEvent::TimerExpired) => {
+                CcFormalState::Release
+            }
+            (CcFormalState::Release, CcFormalEvent::CleanupComplete) => CcFormalState::Idle,
+            _ => return Err(CcFormalTransitionError { state: self, event }),
+        };
+
+        Ok(next)
+    }
+
+    #[inline]
+    pub(super) fn after(self, event: CcFormalEvent) -> CcFormalState {
+        self.transition(event)
+            .unwrap_or_else(|err| panic!("invalid CMCE CC formal transition: {:?} + {:?}", err.state, err.event))
+    }
+}
+
+impl GroupCallState {
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn formal_state(self) -> CcFormalState {
+        CcFormalState::Active
+    }
+}
+
 /// Tracks an active group call (local or network-initiated)
 #[derive(Clone)]
 pub(super) struct ActiveCall {
@@ -85,6 +152,8 @@ pub(super) struct ActiveCall {
     pub(super) usage: u8,
     /// True if someone is currently transmitting
     pub(super) tx_active: bool,
+    /// Formal CMCE CC state for this call leg. Absence from active_calls means Idle.
+    pub(super) formal_state: CcFormalState,
     /// When PTT was released (for hangtime). None if transmitting.
     pub(super) hangtime_start: Option<TdmaTime>,
     /// One pending floor request while another user is transmitting.
@@ -113,6 +182,9 @@ impl ActiveCall {
             ts,
             usage,
             tx_active: true,
+            formal_state: CcFormalState::Idle
+                .after(CcFormalEvent::SetupRequest)
+                .after(CcFormalEvent::SetupComplete),
             hangtime_start: None,
             queued_tx_demand: None,
             brew_uuid: None,
@@ -137,6 +209,9 @@ impl ActiveCall {
             ts,
             usage,
             tx_active: true,
+            formal_state: CcFormalState::Idle
+                .after(CcFormalEvent::SetupRequest)
+                .after(CcFormalEvent::SetupComplete),
             hangtime_start: None,
             queued_tx_demand: None,
             brew_uuid: Some(brew_uuid),
@@ -206,6 +281,38 @@ impl ActiveCall {
     pub(super) fn take_queued_tx_demand(&mut self) -> Option<TetraAddress> {
         self.queued_tx_demand.take()
     }
+
+    pub(super) fn begin_release(&mut self, cause: DisconnectCause) {
+        let event = match cause {
+            DisconnectCause::ExpiryOfTimer => CcFormalEvent::TimerExpired,
+            _ => CcFormalEvent::ReleaseRequest,
+        };
+        self.formal_state = match self.formal_state.transition(event) {
+            Ok(next) => next,
+            Err(_) if self.formal_state == CcFormalState::Release => CcFormalState::Release,
+            Err(_) => CcFormalState::Release,
+        };
+    }
+
+    pub(super) fn begin_disconnect(&mut self) {
+        if self.formal_state == CcFormalState::Active {
+            self.formal_state = self.formal_state.after(CcFormalEvent::DisconnectRequest);
+        }
+    }
+
+    pub(super) fn begin_restore(&mut self) -> Result<(), CcFormalTransitionError> {
+        self.formal_state = self.formal_state.transition(CcFormalEvent::RestoreRequest)?;
+        Ok(())
+    }
+
+    pub(super) fn complete_restore(&mut self) {
+        self.formal_state = self.formal_state.after(CcFormalEvent::RestoreComplete);
+    }
+
+    pub(super) fn apply_modify(&mut self) -> Result<(), CcFormalTransitionError> {
+        self.formal_state = self.formal_state.transition(CcFormalEvent::ModifyRequest)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +337,19 @@ pub(super) enum IndividualCallState {
     Active,
 }
 
+impl IndividualCallState {
+    #[inline]
+    pub(super) fn formal_state(self) -> CcFormalState {
+        match self {
+            IndividualCallState::CallSetupPending
+            | IndividualCallState::IncomingSetupPending
+            | IndividualCallState::IncomingSetupWaitNetworkAck
+            | IndividualCallState::IncomingAlerting => CcFormalState::Setup,
+            IndividualCallState::Active => CcFormalState::Active,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct IndividualCall {
     pub(super) calling_addr: TetraAddress,
@@ -246,6 +366,8 @@ pub(super) struct IndividualCall {
     pub(super) called_usage: u8,
     pub(super) simplex_duplex: bool,
     pub(super) state: IndividualCallState,
+    /// Formal CMCE CC state for this call leg. Absence from individual_calls means Idle.
+    pub(super) formal_state: CcFormalState,
     /// Start instant for setup timeout (T301/T302 equivalent on BS side).
     pub(super) setup_timer_started: Option<TdmaTime>,
     /// Setup timeout value used while the call is not active.
@@ -292,11 +414,44 @@ impl IndividualCall {
     }
 
     pub(super) fn activate(&mut self, now: TdmaTime) {
+        self.formal_state = self.formal_state.after(CcFormalEvent::SetupComplete);
         self.state = IndividualCallState::Active;
         self.setup_timer_started = None;
         self.setup_timeout = None;
         self.active_timer_started = Some(now);
         self.connect_request_sent = false;
+    }
+
+    pub(super) fn begin_disconnect(&mut self) {
+        if self.formal_state == CcFormalState::Active {
+            self.formal_state = self.formal_state.after(CcFormalEvent::DisconnectRequest);
+        }
+    }
+
+    pub(super) fn begin_release(&mut self, cause: DisconnectCause) {
+        let event = match cause {
+            DisconnectCause::ExpiryOfTimer => CcFormalEvent::TimerExpired,
+            _ => CcFormalEvent::ReleaseRequest,
+        };
+        self.formal_state = match self.formal_state.transition(event) {
+            Ok(next) => next,
+            Err(_) if self.formal_state == CcFormalState::Release => CcFormalState::Release,
+            Err(_) => CcFormalState::Release,
+        };
+    }
+
+    pub(super) fn begin_restore(&mut self) -> Result<(), CcFormalTransitionError> {
+        self.formal_state = self.formal_state.transition(CcFormalEvent::RestoreRequest)?;
+        Ok(())
+    }
+
+    pub(super) fn complete_restore(&mut self) {
+        self.formal_state = self.formal_state.after(CcFormalEvent::RestoreComplete);
+    }
+
+    pub(super) fn apply_modify(&mut self) -> Result<(), CcFormalTransitionError> {
+        self.formal_state = self.formal_state.transition(CcFormalEvent::ModifyRequest)?;
+        Ok(())
     }
 
     #[inline]
@@ -328,5 +483,49 @@ impl IndividualCall {
             return false;
         };
         started.age(now) > limit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CcFormalEvent, CcFormalState};
+
+    #[test]
+    fn formal_cc_setup_active_release_flow() {
+        let setup = CcFormalState::Idle.transition(CcFormalEvent::SetupRequest).unwrap();
+        assert_eq!(setup, CcFormalState::Setup);
+
+        let active = setup.transition(CcFormalEvent::SetupComplete).unwrap();
+        assert_eq!(active, CcFormalState::Active);
+
+        let release = active.transition(CcFormalEvent::ReleaseRequest).unwrap();
+        assert_eq!(release, CcFormalState::Release);
+
+        let idle = release.transition(CcFormalEvent::CleanupComplete).unwrap();
+        assert_eq!(idle, CcFormalState::Idle);
+    }
+
+    #[test]
+    fn formal_cc_disconnect_release_flow() {
+        let disconnect = CcFormalState::Active.transition(CcFormalEvent::DisconnectRequest).unwrap();
+        assert_eq!(disconnect, CcFormalState::Disconnect);
+
+        let release = disconnect.transition(CcFormalEvent::ReleaseRequest).unwrap();
+        assert_eq!(release, CcFormalState::Release);
+    }
+
+    #[test]
+    fn formal_cc_restoration_success_and_failure_flows() {
+        let restore = CcFormalState::Active.transition(CcFormalEvent::RestoreRequest).unwrap();
+        assert_eq!(restore, CcFormalState::Restore);
+        assert_eq!(restore.transition(CcFormalEvent::RestoreComplete).unwrap(), CcFormalState::Active);
+        assert_eq!(restore.transition(CcFormalEvent::RestoreReject).unwrap(), CcFormalState::Release);
+    }
+
+    #[test]
+    fn formal_cc_rejects_invalid_shortcuts() {
+        assert!(CcFormalState::Idle.transition(CcFormalEvent::SetupComplete).is_err());
+        assert!(CcFormalState::Setup.transition(CcFormalEvent::RestoreRequest).is_err());
+        assert!(CcFormalState::Release.transition(CcFormalEvent::RestoreComplete).is_err());
     }
 }

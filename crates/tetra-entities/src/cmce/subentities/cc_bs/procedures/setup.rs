@@ -1,6 +1,74 @@
 use super::*;
 
 impl CcBsSubentity {
+    fn reject_setup_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        message: &SapMsg,
+        target: TetraAddress,
+        cause: DisconnectCause,
+        reason: &str,
+    ) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            tracing::warn!("CMCE: cannot reject setup on non-LCMC message: {}", reason);
+            return;
+        };
+
+        let call_id = self.circuits.get_next_call_id();
+        tracing::info!(
+            "CMCE: rejecting U-SETUP from ISSI {} call_id={} cause={} ({})",
+            target.ssi,
+            call_id,
+            cause,
+            reason
+        );
+        let sdu = Self::build_d_release(call_id, cause);
+        let msg = Self::build_sapmsg_direct(sdu, self.dltime, target, prim.handle, prim.link_id, prim.endpoint_id);
+        queue.push_back(msg);
+    }
+
+    fn setup_collision_cause(&self, calling_issi: u32, called_issi: Option<u32>) -> Option<(u16, IndividualCallState, DisconnectCause)> {
+        if let Some((call_id, state)) = self.find_individual_call_by_issi(calling_issi) {
+            return Some((call_id, state, DisconnectCause::ConcurrentSetUpNotSupported));
+        }
+
+        let called_issi = called_issi?;
+        self.find_individual_call_by_issi(called_issi)
+            .map(|(call_id, state)| (call_id, state, DisconnectCause::CalledPartyBusy))
+    }
+
+    fn abort_individual_setup(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        target: TetraAddress,
+        handle: u32,
+        link_id: u32,
+        endpoint_id: u32,
+        allocated_timeslots: &[u8],
+        cause: DisconnectCause,
+    ) {
+        tracing::info!("CMCE: aborting unsuccessful individual setup call_id={} cause={}", call_id, cause);
+        let sdu = Self::build_d_release(call_id, cause);
+        queue.push_back(Self::build_sapmsg_direct(sdu, self.dltime, target, handle, link_id, endpoint_id));
+
+        self.cached_setups.remove(&call_id);
+        self.individual_calls.remove(&call_id);
+
+        let mut released = Vec::new();
+        for &ts in allocated_timeslots {
+            if released.contains(&ts) {
+                continue;
+            }
+            released.push(ts);
+
+            if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, ts) {
+                Self::signal_umac_circuit_close(queue, circuit, self.dltime);
+            }
+            self.release_timeslot(ts);
+        }
+    }
+
     /// Handle U-SETUP for group calls (non-P2P communication types).
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_setup_group(
         &mut self,
@@ -210,6 +278,13 @@ impl CcBsSubentity {
                 "U-SETUP P2P with non-ISSI called_party_type_identifier={} (rejecting, Brew disabled)",
                 pdu.called_party_type_identifier
             );
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::RequestedServiceNotAvailable,
+                "non-ISSI destination requires Brew",
+            );
             return;
         }
         if is_issi_address
@@ -217,6 +292,13 @@ impl CcBsSubentity {
                 || (pdu.called_party_extension.is_some() && pdu.called_party_type_identifier != PartyTypeIdentifier::Tsi))
         {
             tracing::warn!("U-SETUP P2P with invalid called party fields (short number/extension mismatch), rejecting");
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::UnknownTetraIdentity,
+                "invalid called party fields",
+            );
             return;
         }
 
@@ -224,6 +306,13 @@ impl CcBsSubentity {
         let has_external_number = pdu.external_subscriber_number.is_some() || pdu.called_party_short_number_address.is_some();
         if called_ssi == 0 && !has_external_number {
             tracing::warn!("U-SETUP P2P without called ISSI/number, ignoring");
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::UnknownTetraIdentity,
+                "missing called party identity",
+            );
             return;
         }
 
@@ -235,23 +324,26 @@ impl CcBsSubentity {
             return;
         }
 
-        if !self.subscriber_groups.contains_key(&called_addr.ssi) {
+        if !self.is_locally_registered_issi(called_addr.ssi) {
+            tracing::info!(
+                "CMCE: called ISSI {} not registered locally (known registry ISSIs={:?}), routing U-SETUP over Brew",
+                called_addr.ssi,
+                self.known_local_issis()
+            );
             self.fsm_on_u_setup_p2p_over_brew(queue, message, pdu, calling_party, called_addr);
             return;
         }
 
-        if let Some((active_call_id, state)) = self.find_individual_call_by_issi(called_addr.ssi) {
+        if let Some((active_call_id, state, cause)) = self.setup_collision_cause(calling_party.ssi, Some(called_addr.ssi)) {
             tracing::info!(
-                "CMCE: rejecting U-SETUP P2P from ISSI {} to ISSI {} (called party busy in call_id={} state={:?})",
+                "CMCE: rejecting U-SETUP P2P from ISSI {} to ISSI {} (collision call_id={} state={:?} cause={})",
                 calling_party.ssi,
                 called_addr.ssi,
                 active_call_id,
-                state
+                state,
+                cause
             );
-            let reject_call_id = self.circuits.get_next_call_id();
-            let sdu = Self::build_d_release(reject_call_id, DisconnectCause::CalledPartyBusy);
-            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-            queue.push_back(msg);
+            self.reject_setup_request(queue, message, calling_party, cause, "individual setup collision");
             return;
         }
 
@@ -273,10 +365,14 @@ impl CcBsSubentity {
                         called_addr.ssi,
                         e
                     );
-                    let call_id = self.circuits.get_next_call_id();
-                    let sdu = Self::build_d_release(call_id, DisconnectCause::CongestionInInfrastructure);
-                    let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-                    queue.push_back(msg);
+                    drop(state);
+                    self.reject_setup_request(
+                        queue,
+                        message,
+                        calling_party,
+                        DisconnectCause::CongestionInInfrastructure,
+                        "failed to allocate calling circuit",
+                    );
                     return;
                 }
             };
@@ -300,10 +396,14 @@ impl CcBsSubentity {
                             called_addr.ssi,
                             e
                         );
-                        let call_id = self.circuits.get_next_call_id();
-                        let sdu = Self::build_d_release(call_id, DisconnectCause::CongestionInInfrastructure);
-                        let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-                        queue.push_back(msg);
+                        drop(state);
+                        self.reject_setup_request(
+                            queue,
+                            message,
+                            calling_party,
+                            DisconnectCause::CongestionInInfrastructure,
+                            "failed to allocate called circuit",
+                        );
                         return;
                     }
                 }
@@ -391,6 +491,7 @@ impl CcBsSubentity {
                 called_usage,
                 simplex_duplex: pdu.simplex_duplex_selection,
                 state: IndividualCallState::CallSetupPending,
+                formal_state: CcFormalState::Idle.after(CcFormalEvent::SetupRequest),
                 setup_timer_started: Some(self.dltime),
                 setup_timeout: Some(CallTimeoutSetupPhase::T60s),
                 active_timer_started: None,
@@ -405,9 +506,29 @@ impl CcBsSubentity {
             match err {
                 IndividualTransitionError::DuplicateCall(_) => {
                     tracing::warn!("CMCE: duplicate call_id={} while creating local P2P setup", call_id);
+                    self.abort_individual_setup(
+                        queue,
+                        call_id,
+                        calling_party,
+                        prim.handle,
+                        prim.link_id,
+                        prim.endpoint_id,
+                        &[calling_ts, called_ts],
+                        DisconnectCause::NoIdleCcEntity,
+                    );
                 }
                 IndividualTransitionError::InvalidTransition { state, .. } => {
                     tracing::warn!("CMCE: local P2P setup call_id={} creation rejected for state {:?}", call_id, state);
+                    self.abort_individual_setup(
+                        queue,
+                        call_id,
+                        calling_party,
+                        prim.handle,
+                        prim.link_id,
+                        prim.endpoint_id,
+                        &[calling_ts, called_ts],
+                        DisconnectCause::IncompatibleTrafficCase,
+                    );
                 }
                 IndividualTransitionError::UnknownCall(_)
                 | IndividualTransitionError::MissingBrewUuid(_)
@@ -437,10 +558,25 @@ impl CcBsSubentity {
                 calling_party.ssi,
                 called_addr.ssi
             );
-            let call_id = self.circuits.get_next_call_id();
-            let sdu = Self::build_d_release(call_id, DisconnectCause::RequestedServiceNotAvailable);
-            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-            queue.push_back(msg);
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::RequestedServiceNotAvailable,
+                "Brew disabled",
+            );
+            return;
+        }
+
+        if let Some((active_call_id, state, cause)) = self.setup_collision_cause(calling_party.ssi, None) {
+            tracing::info!(
+                "CMCE: rejecting U-SETUP P2P over Brew from ISSI {} (collision call_id={} state={:?} cause={})",
+                calling_party.ssi,
+                active_call_id,
+                state,
+                cause
+            );
+            self.reject_setup_request(queue, message, calling_party, cause, "individual setup collision");
             return;
         }
 
@@ -450,10 +586,13 @@ impl CcBsSubentity {
                 calling_party.ssi,
                 called_addr.ssi
             );
-            let call_id = self.circuits.get_next_call_id();
-            let sdu = Self::build_d_release(call_id, DisconnectCause::RequestedServiceNotAvailable);
-            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-            queue.push_back(msg);
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::RequestedServiceNotAvailable,
+                "backhaul disconnected",
+            );
             return;
         }
 
@@ -463,10 +602,13 @@ impl CcBsSubentity {
                 calling_party.ssi,
                 called_addr.ssi
             );
-            let call_id = self.circuits.get_next_call_id();
-            let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
-            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-            queue.push_back(msg);
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::CalledPartyNotReachable,
+                "source ISSI not Brew-routable",
+            );
             return;
         }
 
@@ -479,10 +621,13 @@ impl CcBsSubentity {
                 calling_party.ssi,
                 network_call.destination
             );
-            let call_id = self.circuits.get_next_call_id();
-            let sdu = Self::build_d_release(call_id, DisconnectCause::CalledPartyNotReachable);
-            let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-            queue.push_back(msg);
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::CalledPartyNotReachable,
+                "destination ISSI not Brew-routable",
+            );
             return;
         }
 
@@ -514,10 +659,14 @@ impl CcBsSubentity {
                         called_addr.ssi,
                         e
                     );
-                    let call_id = self.circuits.get_next_call_id();
-                    let sdu = Self::build_d_release(call_id, DisconnectCause::CongestionInInfrastructure);
-                    let msg = Self::build_sapmsg_direct(sdu, self.dltime, calling_party, prim.handle, prim.link_id, prim.endpoint_id);
-                    queue.push_back(msg);
+                    drop(state);
+                    self.reject_setup_request(
+                        queue,
+                        message,
+                        calling_party,
+                        DisconnectCause::CongestionInInfrastructure,
+                        "failed to allocate Brew-routed circuit",
+                    );
                     return;
                 }
             }
@@ -568,6 +717,7 @@ impl CcBsSubentity {
                 called_usage: usage,
                 simplex_duplex: pdu.simplex_duplex_selection,
                 state: IndividualCallState::CallSetupPending,
+                formal_state: CcFormalState::Idle.after(CcFormalEvent::SetupRequest),
                 setup_timer_started: Some(self.dltime),
                 setup_timeout: Some(CallTimeoutSetupPhase::T60s),
                 active_timer_started: None,
@@ -582,9 +732,29 @@ impl CcBsSubentity {
             match err {
                 IndividualTransitionError::DuplicateCall(_) => {
                     tracing::warn!("CMCE: duplicate call_id={} while creating Brew P2P setup", call_id);
+                    self.abort_individual_setup(
+                        queue,
+                        call_id,
+                        calling_party,
+                        prim.handle,
+                        prim.link_id,
+                        prim.endpoint_id,
+                        &[ts],
+                        DisconnectCause::NoIdleCcEntity,
+                    );
                 }
                 IndividualTransitionError::InvalidTransition { state, .. } => {
                     tracing::warn!("CMCE: Brew P2P setup call_id={} creation rejected for state {:?}", call_id, state);
+                    self.abort_individual_setup(
+                        queue,
+                        call_id,
+                        calling_party,
+                        prim.handle,
+                        prim.link_id,
+                        prim.endpoint_id,
+                        &[ts],
+                        DisconnectCause::IncompatibleTrafficCase,
+                    );
                 }
                 IndividualTransitionError::UnknownCall(_)
                 | IndividualTransitionError::MissingBrewUuid(_)

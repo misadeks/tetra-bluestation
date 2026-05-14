@@ -17,6 +17,7 @@ pub(in crate::cmce::subentities::cc_bs) enum IndividualTransitionError {
     InvalidTransition {
         call_id: u16,
         state: IndividualCallState,
+        formal_state: CcFormalState,
         event: IndividualEvent,
     },
     MissingBrewUuid(u16),
@@ -28,37 +29,31 @@ impl CcBsSubentity {
     fn validate_individual_transition(
         call_id: u16,
         state: IndividualCallState,
+        formal_state: CcFormalState,
         event: IndividualEvent,
     ) -> Result<(), IndividualTransitionError> {
-        let allowed = matches!(
-            (state, event),
-            (IndividualCallState::CallSetupPending, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::IncomingSetupWaitNetworkAck, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::CallSetupPending, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::IncomingSetupWaitNetworkAck, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::CallSetupPending, IndividualEvent::MarkConnectRequestSent)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::MarkConnectRequestSent)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::MarkConnectRequestSent)
-                | (
-                    IndividualCallState::IncomingSetupWaitNetworkAck,
-                    IndividualEvent::MarkConnectRequestSent
+        let detail_matches_formal = state.formal_state() == formal_state;
+        let allowed = detail_matches_formal
+            && matches!(
+                (formal_state, event),
+                (
+                    CcFormalState::Setup,
+                    IndividualEvent::BindCalledContext
+                        | IndividualEvent::SetNetworkCall
+                        | IndividualEvent::MarkConnectRequestSent
+                        | IndividualEvent::Alert
+                        | IndividualEvent::Connect
                 )
-                | (IndividualCallState::CallSetupPending, IndividualEvent::Alert)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::Alert)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::Alert)
-                | (IndividualCallState::CallSetupPending, IndividualEvent::Connect)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::Connect)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::Connect)
-                | (IndividualCallState::IncomingSetupWaitNetworkAck, IndividualEvent::Connect)
-        );
+            );
         if allowed {
             Ok(())
         } else {
-            Err(IndividualTransitionError::InvalidTransition { call_id, state, event })
+            Err(IndividualTransitionError::InvalidTransition {
+                call_id,
+                state,
+                formal_state,
+                event,
+            })
         }
     }
 
@@ -74,10 +69,12 @@ impl CcBsSubentity {
         if !matches!(
             call.state,
             IndividualCallState::CallSetupPending | IndividualCallState::IncomingSetupPending
-        ) {
+        ) || call.formal_state != CcFormalState::Setup
+        {
             return Err(IndividualTransitionError::InvalidTransition {
                 call_id,
                 state: call.state,
+                formal_state: call.formal_state,
                 event: IndividualEvent::CreateSetup,
             });
         }
@@ -97,7 +94,12 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::BindCalledContext)?;
+        Self::validate_individual_transition(
+            call_id,
+            call_snapshot.state,
+            call_snapshot.formal_state,
+            IndividualEvent::BindCalledContext,
+        )?;
 
         if let Some(call) = self.individual_calls.get_mut(&call_id)
             && call.called_handle.is_none()
@@ -118,7 +120,12 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::SetNetworkCall)?;
+        Self::validate_individual_transition(
+            call_id,
+            call_snapshot.state,
+            call_snapshot.formal_state,
+            IndividualEvent::SetNetworkCall,
+        )?;
 
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
             call.network_call = Some(network_call);
@@ -135,7 +142,12 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::MarkConnectRequestSent)?;
+        Self::validate_individual_transition(
+            call_id,
+            call_snapshot.state,
+            call_snapshot.formal_state,
+            IndividualEvent::MarkConnectRequestSent,
+        )?;
 
         if !call_snapshot.calling_over_brew {
             return Err(IndividualTransitionError::NotBrewOriginated(call_id));
@@ -163,7 +175,7 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::Alert)?;
+        Self::validate_individual_transition(call_id, call_snapshot.state, call_snapshot.formal_state, IndividualEvent::Alert)?;
 
         if let Some((handle, link_id, endpoint_id)) = called_handle_ctx {
             self.fsm_individual_bind_called_context(call_id, handle, link_id, endpoint_id)?;
@@ -209,7 +221,7 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::Connect)?;
+        Self::validate_individual_transition(call_id, call_snapshot.state, call_snapshot.formal_state, IndividualEvent::Connect)?;
 
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
             call.activate(self.dltime);
@@ -438,7 +450,7 @@ impl CcBsSubentity {
             simplex_duplex_selection: simplex_duplex,
             transmission_grant: TransmissionGrant::Granted,
             transmission_request_permission: false,
-            call_ownership: true,
+            call_ownership: false,
             call_priority: None,
             basic_service_information: None,
             temporary_address: None,

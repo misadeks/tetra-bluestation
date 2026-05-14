@@ -14,6 +14,7 @@ pub(in crate::cmce::subentities::cc_bs) enum GroupTransitionError {
     InvalidTransition {
         call_id: u16,
         state: GroupCallState,
+        formal_state: CcFormalState,
         event: GroupEvent,
     },
     NotCurrentSpeaker {
@@ -25,21 +26,40 @@ pub(in crate::cmce::subentities::cc_bs) enum GroupTransitionError {
 }
 
 impl CcBsSubentity {
-    fn validate_group_transition(call_id: u16, state: GroupCallState, event: GroupEvent) -> Result<(), GroupTransitionError> {
-        let allowed = matches!(
-            (state, event),
-            (GroupCallState::Transmitting, GroupEvent::TxDemand)
-                | (GroupCallState::NoActiveSpeaker { .. }, GroupEvent::TxDemand)
-                | (GroupCallState::Transmitting, GroupEvent::TxCeased)
-                | (GroupCallState::Transmitting, GroupEvent::NetworkCallStart)
-                | (GroupCallState::NoActiveSpeaker { .. }, GroupEvent::NetworkCallStart)
-                | (GroupCallState::Transmitting, GroupEvent::NetworkCallEnd)
-                | (GroupCallState::NoActiveSpeaker { .. }, GroupEvent::NetworkCallEnd)
-        );
+    fn validate_group_transition(
+        call_id: u16,
+        state: GroupCallState,
+        formal_state: CcFormalState,
+        event: GroupEvent,
+    ) -> Result<(), GroupTransitionError> {
+        let allowed = state.formal_state() == formal_state
+            && matches!(
+                (formal_state, state, event),
+                (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::TxDemand)
+                    | (CcFormalState::Active, GroupCallState::NoActiveSpeaker { .. }, GroupEvent::TxDemand)
+                    | (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::TxCeased)
+                    | (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::NetworkCallStart)
+                    | (
+                        CcFormalState::Active,
+                        GroupCallState::NoActiveSpeaker { .. },
+                        GroupEvent::NetworkCallStart
+                    )
+                    | (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::NetworkCallEnd)
+                    | (
+                        CcFormalState::Active,
+                        GroupCallState::NoActiveSpeaker { .. },
+                        GroupEvent::NetworkCallEnd
+                    )
+            );
         if allowed {
             Ok(())
         } else {
-            Err(GroupTransitionError::InvalidTransition { call_id, state, event })
+            Err(GroupTransitionError::InvalidTransition {
+                call_id,
+                state,
+                formal_state,
+                event,
+            })
         }
     }
 
@@ -93,7 +113,8 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::TxDemand)?;
+        let formal_state = call.formal_state;
+        Self::validate_group_transition(call_id, state, formal_state, GroupEvent::TxDemand)?;
 
         let ts = call.ts;
         let dest_ssi = call.dest_gssi;
@@ -182,7 +203,8 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::TxCeased)?;
+        let formal_state = call.formal_state;
+        Self::validate_group_transition(call_id, state, formal_state, GroupEvent::TxCeased)?;
 
         if !call.is_current_speaker(sender.ssi) {
             return Err(GroupTransitionError::NotCurrentSpeaker {
@@ -264,7 +286,8 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::NetworkCallStart)?;
+        let formal_state = call.formal_state;
+        Self::validate_group_transition(call_id, state, formal_state, GroupEvent::NetworkCallStart)?;
 
         call.grant_floor(source_issi, None);
         call.brew_uuid = Some(brew_uuid);
@@ -318,7 +341,7 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::NetworkCallEnd)?;
+        Self::validate_group_transition(call_id, state, call.formal_state, GroupEvent::NetworkCallEnd)?;
 
         if matches!(state, GroupCallState::Transmitting) {
             if let Some(active_call) = self.active_calls.get_mut(&call_id) {

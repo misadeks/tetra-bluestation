@@ -18,6 +18,26 @@ impl CcBsSubentity {
         self.config = config;
     }
 
+    pub(super) fn is_locally_registered_issi(&self, issi: u32) -> bool {
+        let cmce_known = self.subscriber_groups.contains_key(&issi);
+        let registry_known = self.config.state_read().subscribers.is_registered(issi);
+
+        if cmce_known != registry_known {
+            tracing::warn!(
+                "CMCE: subscriber registry mismatch issi={} cmce_known={} registry_known={}",
+                issi,
+                cmce_known,
+                registry_known
+            );
+        }
+
+        registry_known
+    }
+
+    pub(super) fn known_local_issis(&self) -> Vec<u32> {
+        self.config.state_read().subscribers.registered_issis()
+    }
+
     pub(super) fn build_d_setup_prim(pdu: &DSetup, usage: u8, ts: u8, ul_dl: UlDlAssignment) -> (BitBuffer, CmceChanAllocReq) {
         tracing::debug!("-> {:?}", pdu);
 
@@ -147,6 +167,82 @@ impl CcBsSubentity {
 
     pub(super) fn build_d_release_from_d_setup(d_setup_pdu: &DSetup, disconnect_cause: DisconnectCause) -> BitBuffer {
         Self::build_d_release(d_setup_pdu.call_identifier, disconnect_cause)
+    }
+
+    pub(super) fn build_d_disconnect(call_identifier: u16, disconnect_cause: DisconnectCause) -> BitBuffer {
+        let pdu = DDisconnect {
+            call_identifier,
+            disconnect_cause,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+        tracing::info!("-> {:?}", pdu);
+
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DDisconnect");
+        sdu.seek(0);
+        sdu
+    }
+
+    pub(super) fn build_d_disconnect_from_d_setup(d_setup_pdu: &DSetup, disconnect_cause: DisconnectCause) -> BitBuffer {
+        Self::build_d_disconnect(d_setup_pdu.call_identifier, disconnect_cause)
+    }
+
+    pub(super) fn build_d_call_restore(
+        call_identifier: u16,
+        transmission_grant: TransmissionGrant,
+        call_status: Option<CallStatus>,
+    ) -> BitBuffer {
+        let pdu = DCallRestore {
+            call_identifier,
+            transmission_grant: transmission_grant.into_raw() as u8,
+            transmission_request_permission: false,
+            reset_call_time_out_timer_t310_: true,
+            new_call_identifier: None,
+            call_time_out: None,
+            call_status: call_status.map(CallStatus::into_raw),
+            modify: None,
+            notification_indicator: None,
+            facility: None,
+            temporary_address: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        tracing::info!("-> {:?}", pdu);
+
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DCallRestore");
+        sdu.seek(0);
+        sdu
+    }
+
+    pub(super) fn build_d_info(call_identifier: u16, modify: Option<u64>, call_status: Option<CallStatus>, reset_t310: bool) -> BitBuffer {
+        let pdu = DInfo {
+            call_identifier,
+            reset_call_time_out_timer_t310_: reset_t310,
+            poll_request: false,
+            new_call_identifier: None,
+            call_time_out: None,
+            call_time_out_set_up_phase_t301_t302_: None,
+            call_ownership: None,
+            modify,
+            call_status: call_status.map(CallStatus::into_raw),
+            temporary_address: None,
+            notification_indicator: None,
+            poll_response_percentage: None,
+            poll_response_number: None,
+            dtmf: None,
+            facility: None,
+            poll_response_addresses: None,
+            proprietary: None,
+        };
+        tracing::info!("-> {:?}", pdu);
+
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DInfo");
+        sdu.seek(0);
+        sdu
     }
 
     pub(super) fn has_listener(&self, gssi: u32) -> bool {
@@ -482,80 +578,6 @@ impl CcBsSubentity {
         !network_call.number.is_empty() || pdu.external_subscriber_number.is_some() || pdu.called_party_short_number_address.is_some()
     }
 
-    pub(super) fn send_d_disconnect_individual(
-        &mut self,
-        queue: &mut MessageQueue,
-        call_id: u16,
-        call_snapshot: &IndividualCall,
-        sender: TetraAddress,
-        disconnect_cause: DisconnectCause,
-    ) {
-        let target_addr = if sender.ssi == call_snapshot.calling_addr.ssi {
-            Some(call_snapshot.called_addr)
-        } else if sender.ssi == call_snapshot.called_addr.ssi {
-            Some(call_snapshot.calling_addr)
-        } else {
-            tracing::warn!(
-                "U-DISCONNECT/U-RELEASE (individual) call_id={} from unexpected ISSI {} (calling {}, called {})",
-                call_id,
-                sender.ssi,
-                call_snapshot.calling_addr.ssi,
-                call_snapshot.called_addr.ssi
-            );
-            None
-        };
-
-        let Some(target_addr) = target_addr else {
-            return;
-        };
-
-        let target_ts = if target_addr.ssi == call_snapshot.calling_addr.ssi {
-            call_snapshot.calling_ts
-        } else {
-            call_snapshot.called_ts
-        };
-
-        let d_disconnect = DDisconnect {
-            call_identifier: call_id,
-            disconnect_cause,
-            notification_indicator: None,
-            facility: None,
-            proprietary: None,
-        };
-        tracing::info!("-> {:?} (to ISSI {})", d_disconnect, target_addr.ssi);
-
-        let mut sdu = BitBuffer::new_autoexpand(32);
-        d_disconnect.to_bitbuf(&mut sdu).expect("Failed to serialize DDisconnect");
-        sdu.seek(0);
-
-        let msg = if call_snapshot.state == IndividualCallState::Active {
-            let usage = if target_addr.ssi == call_snapshot.calling_addr.ssi {
-                Some(call_snapshot.calling_usage)
-            } else {
-                Some(call_snapshot.called_usage)
-            };
-            Self::build_sapmsg_stealing(sdu, self.dltime, target_addr, target_ts, usage)
-        } else if target_addr.ssi == call_snapshot.calling_addr.ssi {
-            Self::build_sapmsg_direct(
-                sdu,
-                self.dltime,
-                target_addr,
-                call_snapshot.calling_handle,
-                call_snapshot.calling_link_id,
-                call_snapshot.calling_endpoint_id,
-            )
-        } else if let (Some(handle), Some(link_id), Some(endpoint_id)) = (
-            call_snapshot.called_handle,
-            call_snapshot.called_link_id,
-            call_snapshot.called_endpoint_id,
-        ) {
-            Self::build_sapmsg_direct(sdu, self.dltime, target_addr, handle, link_id, endpoint_id)
-        } else {
-            Self::build_sapmsg(sdu, None, self.dltime, target_addr, None)
-        };
-        queue.push_back(msg);
-    }
-
     pub(super) fn signal_umac_circuit_open(
         queue: &mut MessageQueue,
         call: &CmceCircuit,
@@ -700,6 +722,10 @@ impl CcBsSubentity {
 
     /// Release a group call: send D-RELEASE, close circuits, clean up state
     pub(super) fn release_group_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
+        if let Some(call) = self.active_calls.get_mut(&call_id) {
+            call.begin_release(disconnect_cause);
+        }
+
         let Some(cached) = self.cached_setups.get(&call_id) else {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
             return;
@@ -743,6 +769,30 @@ impl CcBsSubentity {
 
     /// Release an individual call: send D-RELEASE to both parties, close circuits, clean up state
     pub(super) fn release_individual_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
+        self.release_individual_call_inner(queue, call_id, disconnect_cause, None);
+    }
+
+    pub(super) fn release_individual_call_from_u_disconnect(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        disconnect_cause: DisconnectCause,
+        disconnecting_issi: u32,
+    ) {
+        self.release_individual_call_inner(queue, call_id, disconnect_cause, Some(disconnecting_issi));
+    }
+
+    fn release_individual_call_inner(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        disconnect_cause: DisconnectCause,
+        _disconnecting_issi: Option<u32>,
+    ) {
+        if let Some(call) = self.individual_calls.get_mut(&call_id) {
+            call.begin_release(disconnect_cause);
+        }
+
         let Some(call) = self.individual_calls.remove(&call_id) else {
             tracing::warn!("No individual call for call_id={}", call_id);
             return;
@@ -755,6 +805,10 @@ impl CcBsSubentity {
 
         if call.is_active() {
             // Deliver on traffic channel via FACCH stealing so the MS is still listening.
+            // EN 300 392-2 14.5.1.3.1 allows the SwMI to inform the other MS
+            // with either D-DISCONNECT or D-RELEASE. Use D-RELEASE for both legs
+            // here so neither MS has to complete a U-RELEASE exchange while the
+            // traffic circuits are being torn down.
             // Send twice to reduce "no response" due to occasional STCH loss.
             for _ in 0..2 {
                 let sdu_calling = if let Some(cached) = self.cached_setups.get(&call_id) {

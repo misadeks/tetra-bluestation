@@ -1,7 +1,13 @@
 use super::*;
 
+/// Local bridge entry points for ISI-style interworking.
+///
+/// EN 300 392-3-2 models individual call interworking as ANF-ISIIC, while
+/// EN 300 392-3-3 models group call interworking as ANF-ISIGC. The current
+/// Brew transport is not PSS1/ROSE ISI, but these handlers keep the network
+/// side at the CC boundary instead of spreading it through CMCE PC routing.
 impl CcBsSubentity {
-    pub(super) fn find_brew_individual_call(&self, brew_uuid: uuid::Uuid) -> Option<(u16, IndividualCall)> {
+    pub(in crate::cmce::subentities::cc_bs) fn find_brew_individual_call(&self, brew_uuid: uuid::Uuid) -> Option<(u16, IndividualCall)> {
         self.individual_calls
             .iter()
             .find(|(_, c)| (c.called_over_brew || c.calling_over_brew) && c.brew_uuid == Some(brew_uuid))
@@ -89,7 +95,11 @@ impl CcBsSubentity {
             tracing::debug!("CMCE: Brew release for unknown uuid={} cause={}", brew_uuid, cause);
             return;
         };
-        let mapped = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection);
+        let mapped = if cause == 0 {
+            DisconnectCause::UserRequestedDisconnection
+        } else {
+            DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection)
+        };
         tracing::info!(
             "CMCE: Brew release uuid={} call_id={} cause={} ({:?})",
             brew_uuid,

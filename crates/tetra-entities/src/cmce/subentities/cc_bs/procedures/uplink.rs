@@ -117,31 +117,67 @@ impl CcBsSubentity {
     }
 
     /// Handle parsed U-INFO.
-    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_info(&mut self, queue: &mut MessageQueue, pdu: UInfo) {
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_info(
+        &mut self,
+        queue: &mut MessageQueue,
+        sender: TetraAddress,
+        handle: u32,
+        link_id: u32,
+        endpoint_id: u32,
+        pdu: UInfo,
+    ) {
         let call_id = pdu.call_identifier;
         let Some(call) = self.individual_calls.get(&call_id).cloned() else {
-            tracing::trace!("U-INFO for unknown/non-individual call_id={}, ignoring", call_id);
+            tracing::warn!("U-INFO for unknown/non-individual call_id={}, rejecting", call_id);
+            let sdu = Self::build_d_release(call_id, DisconnectCause::InvalidCallIdentifier);
+            queue.push_back(Self::build_sapmsg_direct(sdu, self.dltime, sender, handle, link_id, endpoint_id));
             return;
         };
 
-        if !call.called_over_brew && !call.calling_over_brew {
-            tracing::trace!("U-INFO call_id={} is local individual call, no Brew forwarding", call_id);
+        if !call.is_active() {
+            tracing::debug!(
+                "U-INFO for non-active individual call_id={} state={:?}, ignoring",
+                call_id,
+                call.state
+            );
             return;
         }
 
-        let Some(brew_uuid) = call.brew_uuid else {
-            tracing::warn!("U-INFO call_id={} marked Brew-routed but missing brew_uuid", call_id);
-            return;
-        };
+        if let Some(call_mut) = self.individual_calls.get_mut(&call_id) {
+            call_mut.active_timer_started = Some(self.dltime);
+        }
+
+        if pdu.facility.is_some() || pdu.proprietary.is_some() {
+            unimplemented_log!(
+                "U-INFO facility/proprietary not supported call_id={} facility={} proprietary={}",
+                call_id,
+                pdu.facility.is_some(),
+                pdu.proprietary.is_some()
+            );
+        }
+
+        if let Some(modify) = pdu.modify {
+            self.fsm_on_u_info_modify(queue, sender, &call, call_id, modify);
+        }
 
         let Some(dtmf) = pdu.dtmf.as_ref() else {
             tracing::trace!(
-                "U-INFO call_id={} has no DTMF element (modify={:?} facility={} proprietary={}), ignoring",
+                "U-INFO call_id={} has no DTMF element (modify={:?} facility={} proprietary={})",
                 call_id,
                 pdu.modify,
                 pdu.facility.is_some(),
                 pdu.proprietary.is_some()
             );
+            return;
+        };
+
+        if !call.called_over_brew && !call.calling_over_brew {
+            tracing::trace!("U-INFO call_id={} is local individual call; DTMF is not forwarded", call_id);
+            return;
+        }
+
+        let Some(brew_uuid) = call.brew_uuid else {
+            tracing::warn!("U-INFO call_id={} marked Brew-routed but missing brew_uuid", call_id);
             return;
         };
 
@@ -225,21 +261,72 @@ impl CcBsSubentity {
         }
     }
 
+    fn fsm_on_u_info_modify(&mut self, queue: &mut MessageQueue, sender: TetraAddress, call: &IndividualCall, call_id: u16, modify: u64) {
+        if call.called_over_brew || call.calling_over_brew {
+            unimplemented_log!("U-INFO modify over Brew not supported call_id={} modify=0x{:03x}", call_id, modify);
+            return;
+        }
+
+        if let Some(call_mut) = self.individual_calls.get_mut(&call_id)
+            && call_mut.apply_modify().is_err()
+        {
+            tracing::debug!("U-INFO modify rejected by formal FSM call_id={}", call_id);
+            return;
+        }
+
+        let (target_addr, target_ts, target_usage) = if sender.ssi == call.calling_addr.ssi {
+            (call.called_addr, call.called_ts, call.called_usage)
+        } else if sender.ssi == call.called_addr.ssi {
+            (call.calling_addr, call.calling_ts, call.calling_usage)
+        } else {
+            tracing::warn!(
+                "U-INFO modify call_id={} from unexpected ISSI {} (calling {}, called {})",
+                call_id,
+                sender.ssi,
+                call.calling_addr.ssi,
+                call.called_addr.ssi
+            );
+            return;
+        };
+
+        tracing::info!(
+            "CMCE: forwarding U-INFO modify call_id={} modify=0x{:03x} from ISSI {} to ISSI {}",
+            call_id,
+            modify,
+            sender.ssi,
+            target_addr.ssi
+        );
+        let sdu = Self::build_d_info(call_id, Some(modify), Some(CallStatus::Callcontinue), true);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, target_addr, target_ts, Some(target_usage));
+        queue.push_back(msg);
+    }
+
     /// Handle parsed U-RELEASE.
-    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_release(&mut self, queue: &mut MessageQueue, sender: TetraAddress, pdu: URelease) {
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_release(
+        &mut self,
+        queue: &mut MessageQueue,
+        sender: TetraAddress,
+        handle: u32,
+        link_id: u32,
+        endpoint_id: u32,
+        pdu: URelease,
+    ) {
         let call_id = pdu.call_identifier;
         let disconnect_cause = pdu.disconnect_cause;
 
         tracing::info!("U-RELEASE: call_id={} cause={}", call_id, disconnect_cause);
-        if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
+        if self.individual_calls.contains_key(&call_id) {
             tracing::info!("U-RELEASE (individual) call_id={} cause={}", call_id, disconnect_cause);
-            let sender_is_called = sender.ssi == call_snapshot.called_addr.ssi;
-            if !call_snapshot.called_over_brew && !call_snapshot.calling_over_brew && (call_snapshot.is_active() || sender_is_called) {
-                self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause);
-            }
             self.release_individual_call(queue, call_id, disconnect_cause);
-        } else {
+        } else if self.active_calls.contains_key(&call_id) || self.cached_setups.contains_key(&call_id) {
             self.release_group_call(queue, call_id, disconnect_cause);
+        } else {
+            tracing::debug!(
+                "U-RELEASE for unknown call_id={} (likely duplicate), completing idempotently",
+                call_id
+            );
+            let sdu = Self::build_d_release(call_id, disconnect_cause);
+            queue.push_back(Self::build_sapmsg_direct(sdu, self.dltime, sender, handle, link_id, endpoint_id));
         }
     }
 
@@ -256,18 +343,29 @@ impl CcBsSubentity {
         let call_id = pdu.call_identifier;
         let disconnect_cause = pdu.disconnect_cause;
 
-        if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
+        if self.individual_calls.contains_key(&call_id) {
             tracing::info!("U-DISCONNECT (individual) call_id={} cause={}", call_id, disconnect_cause);
-            let sender_is_called = sender.ssi == call_snapshot.called_addr.ssi;
-            if !call_snapshot.called_over_brew && !call_snapshot.calling_over_brew && (call_snapshot.is_active() || sender_is_called) {
-                self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause);
+            if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                call.begin_disconnect();
             }
-            self.release_individual_call(queue, call_id, disconnect_cause);
+            self.release_individual_call_from_u_disconnect(queue, call_id, disconnect_cause, sender.ssi);
             return;
         }
 
         let Some(call) = self.active_calls.get(&call_id) else {
-            tracing::debug!("U-DISCONNECT for unknown call_id={} (likely duplicate)", call_id);
+            tracing::debug!(
+                "U-DISCONNECT for unknown call_id={} (likely duplicate), completing idempotently",
+                call_id
+            );
+            let sdu = Self::build_d_release(call_id, disconnect_cause);
+            queue.push_back(Self::build_sapmsg_direct(
+                sdu,
+                self.dltime,
+                sender,
+                ul_handle,
+                ul_link_id,
+                ul_endpoint_id,
+            ));
             return;
         };
 
@@ -275,6 +373,9 @@ impl CcBsSubentity {
 
         if is_call_owner {
             tracing::info!("U-DISCONNECT: call owner ISSI {} disconnecting call_id={}", sender.ssi, call_id);
+            if let Some(call) = self.active_calls.get_mut(&call_id) {
+                call.begin_disconnect();
+            }
             self.release_group_call(queue, call_id, DisconnectCause::UserRequestedDisconnection);
             return;
         }
