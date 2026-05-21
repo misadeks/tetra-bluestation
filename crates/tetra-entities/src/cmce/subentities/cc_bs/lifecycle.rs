@@ -73,6 +73,17 @@ impl CcBsSubentity {
         }
     }
 
+    pub(super) fn notify_remote_floor_granted(&self, queue: &mut MessageQueue, slot: CallTimeslot) {
+        Self::push_control(
+            queue,
+            TetraEntity::Umac,
+            CallControl::RemoteFloorGranted {
+                call_id: slot.call_id,
+                ts: slot.ts,
+            },
+        );
+    }
+
     pub(super) fn notify_floor_released(
         &self,
         queue: &mut MessageQueue,

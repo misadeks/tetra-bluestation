@@ -1,6 +1,8 @@
 mod common;
 
-use tetra_config::bluestation::StackMode;
+use std::time::Duration;
+
+use tetra_config::bluestation::{CfgBrew, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Direction, Sap, SsiType, TdmaTime, TetraAddress, TxState, debug};
 use tetra_pdus::cmce::enums::{
@@ -669,6 +671,90 @@ fn test_brew_simplex_granted_resumes_remote_downlink_without_ul_timer() {
                 if *source_issi == remote_issi
         )),
         "Remote Brew floor must not use local FloorGranted because that arms UL inactivity"
+    );
+}
+
+#[test]
+fn test_network_group_speaker_change_uses_remote_floor_grant() {
+    debug::setup_logging_verbose();
+
+    let gssi = 220;
+    let local_issi = 2200699;
+    let first_speaker = 2200107;
+    let second_speaker = 2200061;
+    let first_uuid = uuid::Uuid::parse_str("9179c03c-0489-4106-a246-5ccddf75e657").unwrap();
+    let second_uuid = uuid::Uuid::parse_str("ad740a0d-8ab9-43c1-a09c-72590f4d39de").unwrap();
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(CfgBrew {
+        host: "test.local".into(),
+        port: 3000,
+        tls: false,
+        username: None,
+        password: None,
+        reconnect_delay: Duration::from_secs(1),
+        jitter_initial_latency_frames: 0,
+        feature_sds_enabled: true,
+        whitelisted_ssis: None,
+        pbx_gateway_issis: None,
+    });
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, local_issi, gssi);
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallStart {
+            brew_uuid: first_uuid,
+            source_issi: first_speaker,
+            dest_gssi: gssi,
+            priority: 1,
+        }),
+    });
+    test.run_stack(Some(1));
+    let initial_msgs = test.dump_sinks();
+    let (call_id, ts) = initial_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
+                brew_uuid, call_id, ts, ..
+            }) if *brew_uuid == first_uuid => Some((*call_id, *ts)),
+            _ => None,
+        })
+        .expect("Expected first network call to become ready");
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallStart {
+            brew_uuid: second_uuid,
+            source_issi: second_speaker,
+            dest_gssi: gssi,
+            priority: 1,
+        }),
+    });
+    test.run_stack(Some(1));
+    let speaker_change_msgs = test.dump_sinks();
+
+    assert!(speaker_change_msgs.iter().any(|msg| matches!(
+        &msg.msg,
+        SapMsgInner::CmceCallControl(CallControl::RemoteFloorGranted { call_id: msg_call_id, ts: msg_ts })
+            if *msg_call_id == call_id && *msg_ts == ts
+    )));
+    assert!(
+        !speaker_change_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted { source_issi, .. })
+                if *source_issi == second_speaker
+        )),
+        "Network group speakers must not use local FloorGranted because that arms UL inactivity"
     );
 }
 

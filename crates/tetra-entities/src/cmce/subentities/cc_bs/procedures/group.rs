@@ -304,17 +304,7 @@ impl CcBsSubentity {
 
         self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts);
 
-        self.notify_floor_granted(
-            queue,
-            GroupFloorGrant {
-                call_id,
-                source_issi,
-                dest_gssi,
-                ts,
-            },
-            true,
-            BrewNotification::Never,
-        );
+        self.notify_remote_floor_granted(queue, CallTimeslot { call_id, ts });
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
