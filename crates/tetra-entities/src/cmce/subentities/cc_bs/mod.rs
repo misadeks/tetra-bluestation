@@ -47,7 +47,6 @@ mod lifecycle;
 mod pdu;
 mod procedures;
 mod routes;
-mod standard;
 mod state;
 mod timers;
 
