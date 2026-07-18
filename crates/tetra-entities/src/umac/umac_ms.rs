@@ -74,6 +74,12 @@ pub struct UmacMs {
     /// MS-MAC random access state machine (cl. 23.5.1.4). Decides *when* the
     /// queued `pending_uplink` block may be transmitted on an access opportunity.
     random_access: MsRandomAccess,
+
+    /// TEMPORARY DEBUG (not part of the ETSI protocol): guards the one-shot
+    /// `MS_FORCE_UPLINK` test trigger so it fires at most once. Remove together
+    /// with `debug_maybe_force_uplink` once MM registration (Phase 4) drives
+    /// real uplinks.
+    debug_uplink_fired: bool,
 }
 
 impl UmacMs {
@@ -91,6 +97,7 @@ impl UmacMs {
             pending_uplink: None,
             access_params: AccessParamStore::new(),
             random_access: MsRandomAccess::new(),
+            debug_uplink_fired: false,
         }
     }
 
@@ -705,8 +712,70 @@ impl UmacMs {
 
         // Drive the MS random access state machine against this slot's ACCESS-ASSIGN.
         if let Some(aa) = access_assign {
+            // TEMPORARY: allow a forced one-shot test uplink (env MS_FORCE_UPLINK)
+            // to be initiated just before we poll this slot's opportunity.
+            self.debug_maybe_force_uplink();
             self.drive_random_access(queue, &aa);
         }
+    }
+
+    /// TEMPORARY DEBUG TRIGGER — NOT part of the ETSI protocol; remove before
+    /// merge (together with the `debug_uplink_fired` field). When the process is
+    /// started with the environment variable `MS_FORCE_UPLINK` set, and once the
+    /// MS has camped (serving-cell scrambling code derived, Phase 2) and learned
+    /// code-A access parameters, this synthesizes a single dummy TM-SDU and
+    /// initiates exactly one MS-MAC random access attempt (cl. 23.5.1.4). Its
+    /// purpose is to exercise the uplink MAC/PHY TX chain (Phase 3d) on real
+    /// hardware against the BS before MM registration (Phase 4) exists to drive a
+    /// real uplink. The carried SDU is an arbitrary test pattern, NOT a valid L3
+    /// PDU: the BS is expected to decode the MAC-ACCESS header and log a
+    /// MAC-level uplink from our ISSI. Fires at most once.
+    fn debug_maybe_force_uplink(&mut self) {
+        if self.debug_uplink_fired {
+            return;
+        }
+        if std::env::var_os("MS_FORCE_UPLINK").is_none() {
+            return;
+        }
+        // Require a camped cell (scrambling code) and advertised code-A access
+        // rights — the same preconditions as a real uplink in `rx_tma_prim`.
+        let Some(scrambling_code) = self.scrambling_code else {
+            return;
+        };
+        let Some(params) = self.access_params.params_for(AccessCode::A).cloned() else {
+            return;
+        };
+        if self.random_access.is_active() {
+            return;
+        }
+
+        // Arbitrary 16-bit test pattern — deliberately NOT a spec L3 PDU.
+        let mut sdu = BitBuffer::from_bitstr("1010101001010101");
+        let issi = self.own_issi();
+        let Some(mac_block) = Self::build_mac_access_block(issi, &mut sdu) else {
+            tracing::warn!("MS_FORCE_UPLINK: stub SDU didn't fit a MAC-ACCESS burst");
+            return;
+        };
+        self.pending_uplink = Some(PendingUplink {
+            mac_block,
+            logical_channel: LogicalChannel::SchHu,
+            scrambling_code,
+        });
+        let pdu_prio = params.min_pdu_prio;
+        if let Err(e) = self
+            .random_access
+            .initiate(self.dltime, AccessCode::A, &params, pdu_prio, false)
+        {
+            tracing::warn!("MS_FORCE_UPLINK: random access not initiated: {:?}", e);
+            self.pending_uplink = None;
+            return;
+        }
+        self.debug_uplink_fired = true;
+        tracing::warn!(
+            "MS_FORCE_UPLINK: forcing ONE test MAC-ACCESS uplink for ISSI {} at dl {:?} (DEBUG, non-spec payload)",
+            issi,
+            self.dltime
+        );
     }
 
     /// Advance the random access state machine (cl. 23.5.1.4) for one downlink
