@@ -9,7 +9,9 @@
 //! Later slices build the random access state machine (first try / new access
 //! frame / re-try / abandon, cl. 23.5.1.4.5–.9) on top of this state.
 
+use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
 use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
+use tetra_pdus::umac::pdus::access_assign::{AccessAssign, AccessField};
 use tetra_pdus::umac::pdus::access_define::AccessDefine;
 
 /// The four random access codes (ETSI TS 100 392-2 Table 21.85, "Access code").
@@ -235,10 +237,165 @@ impl AccessParamStore {
     }
 }
 
+/// The access opportunity state of one uplink subslot, derived from an
+/// ACCESS-ASSIGN Access field (ETSI TS 100 392-2 cl. 21.5.1 / 23.5.1.4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubslotAccess {
+    /// The designated access code, if any. Meaningful only for "ongoing frame"
+    /// and frame-marker subslots; for reserved/CLCH subslots the access code has
+    /// no meaning (Table 21.85 note 1) and this is `None`.
+    pub access_code: Option<AccessCode>,
+    /// The base frame-length interpretation of this subslot.
+    pub frame_len: BaseFrameLength,
+}
+
+impl SubslotAccess {
+    /// A reserved subslot (not usable for access).
+    pub fn reserved() -> Self {
+        SubslotAccess {
+            access_code: None,
+            frame_len: BaseFrameLength::ReservedSubslot,
+        }
+    }
+
+    /// Whether this subslot is a usable access opportunity for `code`: it must
+    /// not be reserved or a CLCH (linearization) subslot, and its designated
+    /// access code must match (cl. 23.5.1.4.7 points d and e).
+    pub fn is_opportunity_for(&self, code: AccessCode) -> bool {
+        !self.frame_len.is_reserved() && self.access_code == Some(code)
+    }
+
+    /// Whether this subslot starts a new access frame for `code`, i.e. carries a
+    /// frame marker for that access code (cl. 23.5.1.4.6).
+    pub fn is_frame_marker_for(&self, code: AccessCode) -> bool {
+        self.frame_len.is_frame_marker() && self.access_code == Some(code)
+    }
+}
+
+/// The access rights conveyed by one ACCESS-ASSIGN PDU to the two subslots of
+/// the corresponding uplink slot (ETSI TS 100 392-2 cl. 23.5.1.4.2). The uplink
+/// slot is two timeslots after the downlink slot that carried the ACCESS-ASSIGN
+/// (cl. 9, note in 23.5.1.4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotAccessAssign {
+    pub subslot1: SubslotAccess,
+    pub subslot2: SubslotAccess,
+}
+
+impl SlotAccessAssign {
+    fn both_reserved() -> Self {
+        SlotAccessAssign {
+            subslot1: SubslotAccess::reserved(),
+            subslot2: SubslotAccess::reserved(),
+        }
+    }
+}
+
+fn subslot_from_field(af: &AccessField) -> SubslotAccess {
+    SubslotAccess {
+        access_code: AccessCode::from_raw(af.access_code),
+        frame_len: BaseFrameLength::from_raw(af.base_frame_len),
+    }
+}
+
+/// Interpret an ACCESS-ASSIGN PDU into the access rights for the two uplink
+/// subslots, per ETSI TS 100 392-2 cl. 23.5.1.4.2. `on_common_channel` is true
+/// when the MS is camped on its common control channel (currently always true
+/// for this MS implementation).
+///
+/// Rules implemented (cl. 23.5.1.4.2):
+/// - An MS on the CCCH treats an "Assigned only" uplink designation as both
+///   subslots reserved.
+/// - Two access fields: field 1 → subslot 1, field 2 → subslot 2, independently.
+/// - A single access field applies to both subslots per points a)–e):
+///   reserved → both reserved; CLCH → subslot 1 linearization, subslot 2
+///   reserved; ongoing frame → both ongoing; frame marker → subslot 1 marker,
+///   subslot 2 ongoing frame.
+/// - No access field (e.g. uplink traffic) → both subslots reserved.
+pub fn interpret_access_assign(aa: &AccessAssign, on_common_channel: bool) -> SlotAccessAssign {
+    // An MS on its common control channel regards an "Assigned only" uplink slot
+    // as reserved (cl. 23.5.1.4.2).
+    if on_common_channel && aa.ul_usage == AccessAssignUlUsage::AssignedOnly {
+        return SlotAccessAssign::both_reserved();
+    }
+
+    // Two access fields present: independent rights per subslot (header == 0).
+    if let (Some(af1), Some(af2)) = (aa.f1_af1, aa.f2_af2) {
+        return SlotAccessAssign {
+            subslot1: subslot_from_field(&af1),
+            subslot2: subslot_from_field(&af2),
+        };
+    }
+
+    // A single access field applies to both subslots per points a)–e).
+    if let Some(af) = aa.f2_af {
+        let code = AccessCode::from_raw(af.access_code);
+        let fl = BaseFrameLength::from_raw(af.base_frame_len);
+        let (s1, s2) = match fl {
+            BaseFrameLength::ReservedSubslot => (SubslotAccess::reserved(), SubslotAccess::reserved()),
+            BaseFrameLength::ClchSubslot => (
+                SubslotAccess {
+                    access_code: None,
+                    frame_len: BaseFrameLength::ClchSubslot,
+                },
+                SubslotAccess::reserved(),
+            ),
+            BaseFrameLength::OngoingFrame => {
+                let s = SubslotAccess {
+                    access_code: code,
+                    frame_len: BaseFrameLength::OngoingFrame,
+                };
+                (s, s)
+            }
+            BaseFrameLength::FrameMarker(_) => (
+                SubslotAccess { access_code: code, frame_len: fl },
+                SubslotAccess {
+                    access_code: code,
+                    frame_len: BaseFrameLength::OngoingFrame,
+                },
+            ),
+        };
+        return SlotAccessAssign { subslot1: s1, subslot2: s2 };
+    }
+
+    // No access field (uplink traffic) → both subslots reserved.
+    SlotAccessAssign::both_reserved()
+}
+
 #[cfg(test)]
 mod tests {
+    use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
+
     use super::*;
 
+    fn af(code: u8, base: u8) -> AccessField {
+        AccessField {
+            access_code: code,
+            base_frame_len: base,
+        }
+    }
+
+    fn aa_two_fields(af1: AccessField, af2: AccessField) -> AccessAssign {
+        AccessAssign {
+            _header: 0,
+            dl_usage: AccessAssignDlUsage::CommonControl,
+            ul_usage: AccessAssignUlUsage::CommonOnly,
+            f1_af1: Some(af1),
+            f2_af2: Some(af2),
+            f2_af: None,
+        }
+    }
+
+    fn aa_single_field(field: AccessField, ul_usage: AccessAssignUlUsage) -> AccessAssign {
+        AccessAssign {
+            _header: 1,
+            dl_usage: AccessAssignDlUsage::CommonControl,
+            ul_usage,
+            f1_af1: None,
+            f2_af2: None,
+            f2_af: Some(field),
+        }
+    }
     fn sysinfo_def_a() -> SysinfoDefaultDefForAccessCodeA {
         SysinfoDefaultDefForAccessCodeA {
             imm: 3,
@@ -330,5 +487,68 @@ mod tests {
         assert!(!p.is_available(), "Nu == 0 means access code not available (cl. 23.5.1.4.1)");
         let p = RandomAccessParams::from_access_define(&access_define(0, 1, 0));
         assert!(p.is_available());
+    }
+
+    #[test]
+    fn test_interpret_two_access_fields() {
+        // Header 0: field 1 → subslot 1, field 2 → subslot 2, independently
+        // (cl. 23.5.1.4.2). Code B (01), 2-subslot marker in subslot 1; code A
+        // (00) ongoing frame in subslot 2.
+        let aa = aa_two_fields(af(0b01, 0b0100), af(0b00, 0b0010));
+        let s = interpret_access_assign(&aa, true);
+        assert_eq!(s.subslot1.access_code, Some(AccessCode::B));
+        assert_eq!(s.subslot1.frame_len, BaseFrameLength::FrameMarker(2));
+        assert!(s.subslot1.is_frame_marker_for(AccessCode::B));
+        assert!(s.subslot1.is_opportunity_for(AccessCode::B));
+        assert!(!s.subslot1.is_opportunity_for(AccessCode::A));
+
+        assert_eq!(s.subslot2.access_code, Some(AccessCode::A));
+        assert_eq!(s.subslot2.frame_len, BaseFrameLength::OngoingFrame);
+        assert!(s.subslot2.is_opportunity_for(AccessCode::A));
+        assert!(!s.subslot2.is_frame_marker_for(AccessCode::A));
+    }
+
+    #[test]
+    fn test_interpret_single_field_reserved_and_clch() {
+        // Point b) reserved → both subslots reserved.
+        let s = interpret_access_assign(&aa_single_field(af(0, 0b0000), AccessAssignUlUsage::CommonAndAssigned), true);
+        assert!(s.subslot1.frame_len.is_reserved());
+        assert!(s.subslot2.frame_len.is_reserved());
+        assert!(!s.subslot1.is_opportunity_for(AccessCode::A));
+
+        // Point c) CLCH → subslot 1 linearization (not an opportunity), subslot
+        // 2 reserved.
+        let s = interpret_access_assign(&aa_single_field(af(0, 0b0001), AccessAssignUlUsage::CommonAndAssigned), true);
+        assert_eq!(s.subslot1.frame_len, BaseFrameLength::ClchSubslot);
+        assert!(!s.subslot1.is_opportunity_for(AccessCode::A));
+        assert_eq!(s.subslot2.frame_len, BaseFrameLength::ReservedSubslot);
+    }
+
+    #[test]
+    fn test_interpret_single_field_marker_and_ongoing() {
+        // Point e) frame marker → subslot 1 marker, subslot 2 ongoing frame,
+        // both for the same access code (code C = 10, 3-subslot marker = 0101).
+        let s = interpret_access_assign(&aa_single_field(af(0b10, 0b0101), AccessAssignUlUsage::CommonAndAssigned), true);
+        assert_eq!(s.subslot1.access_code, Some(AccessCode::C));
+        assert_eq!(s.subslot1.frame_len, BaseFrameLength::FrameMarker(3));
+        assert!(s.subslot1.is_frame_marker_for(AccessCode::C));
+        assert_eq!(s.subslot2.access_code, Some(AccessCode::C));
+        assert_eq!(s.subslot2.frame_len, BaseFrameLength::OngoingFrame);
+        assert!(s.subslot2.is_opportunity_for(AccessCode::C));
+        assert!(!s.subslot2.is_frame_marker_for(AccessCode::C));
+
+        // Point d) ongoing frame → both subslots ongoing for the same code.
+        let s = interpret_access_assign(&aa_single_field(af(0b00, 0b0010), AccessAssignUlUsage::CommonAndAssigned), true);
+        assert!(s.subslot1.is_opportunity_for(AccessCode::A));
+        assert!(s.subslot2.is_opportunity_for(AccessCode::A));
+    }
+
+    #[test]
+    fn test_interpret_assigned_only_on_common_is_reserved() {
+        // An MS on the CCCH treats "Assigned only" as both subslots reserved
+        // (cl. 23.5.1.4.2), even though the field would otherwise be usable.
+        let s = interpret_access_assign(&aa_single_field(af(0b00, 0b0100), AccessAssignUlUsage::AssignedOnly), true);
+        assert!(s.subslot1.frame_len.is_reserved());
+        assert!(s.subslot2.frame_len.is_reserved());
     }
 }
