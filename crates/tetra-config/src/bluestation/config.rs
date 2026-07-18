@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
+use crate::bluestation::{CfgCellInfo, CfgControl, CfgMs, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
 
 use super::sec_brew::CfgBrew;
 use super::sec_telemetry::CfgTelemetry;
@@ -60,6 +60,9 @@ pub struct StackConfig {
     pub phy_io: CfgPhyIo,
     pub net: CfgNetInfo,
     pub cell: CfgCellInfo,
+
+    /// Mobile Station configuration. Required when `stack_mode == Ms`.
+    pub ms: Option<CfgMs>,
 
     /// Brew protocol (TetraPack/BrandMeister) configuration
     pub brew: Option<CfgBrew>,
@@ -121,6 +124,19 @@ impl StackConfig {
 
         if self.cell.ms_txpwr_max_cell > 7 {
             return Err("ms_txpwr_max_cell must be 0-7 (3 bits)");
+        }
+
+        // MS mode requires an [ms] section with a valid own ISSI.
+        if self.stack_mode == StackMode::Ms {
+            let Some(ref ms) = self.ms else {
+                return Err("[ms] configuration section is required when stack_mode = \"Ms\"");
+            };
+            if ms.issi == 0 || ms.issi > 0xFF_FFFF {
+                return Err("ms.issi must be a valid 24-bit ISSI (1..=16777215)");
+            }
+            if ms.subscriber_class < 1 || ms.subscriber_class > 16 {
+                return Err("ms.subscriber_class must be in range 1-16");
+            }
         }
 
         // Validate timezone if configured

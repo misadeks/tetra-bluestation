@@ -1,9 +1,7 @@
-use crate::mle::components::mle_router::MleRouter;
-use crate::mle::components::network_time::encode_tetra_network_time;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
+use tetra_core::{BitBuffer, Sap, unimplemented_log};
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::lmm::LmmMleUnitdataInd;
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
@@ -14,19 +12,24 @@ use tetra_pdus::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
-use tetra_pdus::mle::pdus::d_nwrk_broadcast::DNwrkBroadcast;
 
+/// MS-side Mobile Link Entity.
+///
+/// Mirrors the current, compiled [`super::mle_bs::MleBs`] API (`SapMsg` has no
+/// `dltime`, `handle` is passed as `0`, the `MleRouter` connection map is not
+/// yet in use). It routes downlink TL-SDUs to MM/CMCE/SNDCP by MLE protocol
+/// discriminator, forwards uplink MM/CMCE PDUs down to LLC, and consumes the
+/// MLE broadcast primitives (SYNC / SYSINFO).
+///
+/// The SYNC/SYSINFO handlers are Phase 2 targets (initial cell selection,
+/// ETSI TS 100 392-2 clause 18.3.4.6); they are stubbed here.
 pub struct MleMs {
     config: SharedConfig,
-    router: MleRouter,
 }
 
 impl MleMs {
     pub fn new(config: SharedConfig) -> Self {
-        Self {
-            config,
-            router: MleRouter::new(),
-        }
+        Self { config }
     }
 
     fn rx_tla_mle_pdu(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
@@ -68,7 +71,7 @@ impl MleMs {
             }
             MlePduTypeDl::DNwrkBroadcastExt => {
                 unimplemented_log!("DNwrkBroadcastExt")
-            } // TODO FIXME CHECK this option and assocaited int
+            } // TODO FIXME CHECK this option and associated int
             MlePduTypeDl::DRestoreAck => {
                 unimplemented_log!("DRestoreAck")
             }
@@ -118,30 +121,23 @@ impl MleMs {
         // Dispatch to appropriate component (or to self if for MLE)
         match pdu_type {
             MleProtocolDiscriminator::Mm => {
-                let handle = self
-                    .router
-                    .create_handle(prim.main_address, prim.link_id, prim.endpoint_id, message.dltime);
                 let m = LmmMleUnitdataInd {
                     sdu,
-                    handle,
+                    handle: 0,
                     received_address: prim.main_address,
                 };
                 let msg = SapMsg {
                     sap: Sap::LmmSap,
-                    src: self.self_component,
+                    src: TetraEntity::Mle,
                     dest: TetraEntity::Mm,
-                    dltime: message.dltime,
                     msg: SapMsgInner::LmmMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Cmce => {
-                let handle = self
-                    .router
-                    .create_handle(prim.main_address, prim.link_id, prim.endpoint_id, message.dltime);
                 let m = LcmcMleUnitdataInd {
                     sdu,
-                    handle,
+                    handle: 0,
                     received_tetra_address: prim.main_address,
                     endpoint_id: prim.endpoint_id,
                     link_id: prim.link_id,
@@ -150,9 +146,8 @@ impl MleMs {
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
-                    src: self.self_component,
+                    src: TetraEntity::Mle,
                     dest: TetraEntity::Cmce,
-                    dltime: message.dltime,
                     msg: SapMsgInner::LcmcMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
@@ -168,9 +163,8 @@ impl MleMs {
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
-                    src: self.self_component,
+                    src: TetraEntity::Mle,
                     dest: TetraEntity::Cmce,
-                    dltime: message.dltime,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
@@ -211,31 +205,24 @@ impl MleMs {
         match pdu_type {
             MleProtocolDiscriminator::Mm => {
                 tracing::warn!("TM-UNITDATA for MM?"); // todo fixme find if ever used
-                let handle = self
-                    .router
-                    .create_handle(prim.main_address, prim.link_id, prim.endpoint_id, message.dltime);
                 let m = LmmMleUnitdataInd {
                     sdu,
-                    handle,
+                    handle: 0,
                     received_address: prim.main_address,
                 };
                 let msg = SapMsg {
                     sap: Sap::LmmSap,
-                    src: self.self_component,
+                    src: TetraEntity::Mle,
                     dest: TetraEntity::Mm,
-                    dltime: message.dltime,
                     msg: SapMsgInner::LmmMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Cmce => {
-                tracing::warn!("TM-UNITDATA for MM?"); // todo fixme find if ever used
-                let handle = self
-                    .router
-                    .create_handle(prim.main_address, prim.link_id, prim.endpoint_id, message.dltime);
+                tracing::warn!("TM-UNITDATA for CMCE?"); // todo fixme find if ever used
                 let m = LcmcMleUnitdataInd {
                     sdu,
-                    handle,
+                    handle: 0,
                     endpoint_id: prim.endpoint_id,
                     link_id: prim.link_id,
                     received_tetra_address: prim.main_address,
@@ -244,9 +231,8 @@ impl MleMs {
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
-                    src: self.self_component,
+                    src: TetraEntity::Mle,
                     dest: TetraEntity::Cmce,
-                    dltime: message.dltime,
                     msg: SapMsgInner::LcmcMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
@@ -262,9 +248,8 @@ impl MleMs {
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
-                    src: self.self_component,
+                    src: TetraEntity::Mle,
                     dest: TetraEntity::Cmce,
-                    dltime: message.dltime,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
                 queue.push_back(msg);
@@ -293,6 +278,8 @@ impl MleMs {
         }
     }
 
+    /// Phase 2 (ETSI TS 100 392-2 cl. 18.3.4): adopt SYSINFO parameters
+    /// (location area, subscriber class, BS service details) into shared state.
     pub fn rx_tlmb_tl_sysinfo_ind(&self, _queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlmb_tl_sysinfo_ind");
 
@@ -313,45 +300,11 @@ impl MleMs {
         };
 
         unimplemented_log!("rx_tlmb_tl_sysinfo_ind");
-        // let need_global_state_update = {
-        //     let cfg = self.config.read();
-
-        //     pdu.location_area != cfg.la_info.location_area
-        //     || pdu.subscriber_class != cfg.la_info.subscriber_class
-        //     || pdu.bs_service_details.registration != cfg.la_info.registration
-        //     || pdu.bs_service_details.deregistration != cfg.la_info.deregistration
-        //     || pdu.bs_service_details.priority_cell != cfg.la_info.priority_cell
-        //     || pdu.bs_service_details.no_minimum_mode != cfg.la_info.no_minimum_mode
-        //     || pdu.bs_service_details.migration != cfg.la_info.migration
-        //     || pdu.bs_service_details.system_wide_services != cfg.la_info.system_wide_services
-        //     || pdu.bs_service_details.voice_service != cfg.la_info.voice_service
-        //     || pdu.bs_service_details.circuit_mode_data_service != cfg.la_info.circuit_mode_data_service
-        //     || pdu.bs_service_details.sndcp_service != cfg.la_info.sndcp_service
-        //     || pdu.bs_service_details.aie_service != cfg.la_info.aie_service
-        //     || pdu.bs_service_details.advanced_link != cfg.la_info.advanced_link
-        // };
-
-        // if need_global_state_update {
-        //     let mut cfg = self.config.write();
-        //     cfg.la_info.location_area = pdu.location_area;
-        //     cfg.la_info.subscriber_class = pdu.subscriber_class;
-        //     cfg.la_info.registration = pdu.bs_service_details.registration;
-        //     cfg.la_info.deregistration = pdu.bs_service_details.deregistration;
-        //     cfg.la_info.priority_cell = pdu.bs_service_details.priority_cell;
-        //     cfg.la_info.no_minimum_mode = pdu.bs_service_details.no_minimum_mode;
-        //     cfg.la_info.migration = pdu.bs_service_details.migration;
-        //     cfg.la_info.system_wide_services = pdu.bs_service_details.system_wide_services;
-        //     cfg.la_info.voice_service = pdu.bs_service_details.voice_service;
-        //     cfg.la_info.circuit_mode_data_service = pdu.bs_service_details.circuit_mode_data_service;
-        //     cfg.la_info.sndcp_service = pdu.bs_service_details.sndcp_service;
-        //     cfg.la_info.aie_service = pdu.bs_service_details.aie_service;
-        //     cfg.la_info.advanced_link = pdu.bs_service_details.advanced_link;
-        //     tracing::info!("Updated TetraGlobalState: {:?}", pdu);
-        // } else {
-        //     tracing::trace!("rx_tlmb_tl_sysinfo_ind: TetraGlobalState update not required");
-        // }
     }
 
+    /// Phase 2 (ETSI TS 100 392-2 cl. 18.3.4): adopt SYNC parameters
+    /// (MCC/MNC, neighbour-cell broadcast, cell load, late entry) into shared
+    /// state and trigger initial cell selection.
     pub fn rx_tlmb_tl_sync_ind(&self, _queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlmb_tl_sync_ind");
 
@@ -372,56 +325,11 @@ impl MleMs {
         };
 
         unimplemented_log!("rx_tlmb_tl_sync_ind");
-
-        // let need_global_state_update = {
-        //     let cfg = self.config.read();
-        //         pdu.mcc  != cfg.la_info.mcc
-        //         || pdu.mnc  != cfg.la_info.mnc
-        //         || pdu.neighbor_cell_broadcast != cfg.la_info.neighbor_cell_broadcast
-        //         || pdu.cell_load_ca            != cfg.la_info.cell_load_ca
-        //         || pdu.late_entry_supported    != cfg.la_info.late_entry_supported
-        // };
-
-        // // Update global state if needed
-        // if need_global_state_update {
-        //     let mut cfg = self.config.write();
-        //     cfg.la_info.mcc                    = pdu.mcc;
-        //     cfg.la_info.mnc                    = pdu.mnc;
-        //     cfg.la_info.neighbor_cell_broadcast = pdu.neighbor_cell_broadcast;
-        //     cfg.la_info.cell_load_ca           = pdu.cell_load_ca;
-        //     cfg.la_info.late_entry_supported   = pdu.late_entry_supported;
-        //     tracing::info!("Updated TetraGlobalState: {:?}", pdu);
-
-        //     // TODO FIXME: This is ugly. We should pass the message through all the intermediate layers
-        //     let m = SapMsg {
-        //         sap: Sap::TlmcSap,
-        //         src: self.self_component,
-        //         dest: TetraComponent::Umac,
-        //         t_submit: message.t_submit,
-        //         msg: SapMsgInner::TlmcConfigureReq(
-        //             TlmcConfigureReq{
-        //                 valid_addresses: Some(TlmcValidAddress {
-        //                     mcc: cfg.la_info.mcc,
-        //                     mnc: cfg.la_info.mnc,
-        //                 }),
-        //                 ..Default::default()
-        //             }
-        //         )
-        //     };
-        //     queue.push_back(m);
-        // } else {
-        //     tracing::trace!("rx_tlmb_tl_sysinfo_ind: TetraGlobalState update not required");
-        // }
     }
 
     fn rx_tlmc_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
         tracing::trace!("rx_tlmc_prim");
         unimplemented!("rx_tlmc_prim");
-        // match &message.msg {
-        //     _ => {
-        //         panic!();
-        //     }
-        // }
     }
 
     fn rx_lmm_mle_unitdata_req(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -437,13 +345,10 @@ impl MleMs {
         pdu.copy_bits(&mut prim.sdu, sdu_len);
         pdu.seek(0);
 
-        // let (addr, link, endpoint) = self.router.use_handle(prim.handle, message.dltime);
-        // assert_eq!(addr.ssi, prim.address.ssi);
         let sapmsg = SapMsg {
             sap: Sap::TlaSap,
-            src: self.self_component,
+            src: TetraEntity::Mle,
             dest: TetraEntity::Llc,
-            dltime: message.dltime,
             msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
                 main_address: prim.address,
                 link_id: 0,
@@ -477,11 +382,6 @@ impl MleMs {
     fn rx_tlpd_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
         tracing::trace!("rx_tlpd_prim");
         unimplemented!("rx_tlpd_prim");
-        // match &message.msg {
-        //     _ => {
-        //         panic!();
-        //     }
-        // }
     }
 
     fn rx_lcmc_mle_unitdata_req(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -497,17 +397,13 @@ impl MleMs {
         pdu.copy_bits(&mut prim.sdu, sdu_len);
         pdu.seek(0);
 
-        // let (_addr, link, endpoint) = self.router.use_handle(prim.handle, message.dltime);
-        // assert_eq!(link, prim.link_id);
-        // assert_eq!(endpoint, prim.endpoint_id);
         // Take Channel Allocation Request if any
         let chan_alloc = prim.chan_alloc.take();
 
         let sapmsg = SapMsg {
             sap: Sap::TlaSap,
-            src: self.self_component,
+            src: TetraEntity::Mle,
             dest: TetraEntity::Llc,
-            dltime: message.dltime,
             msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
                 main_address: prim.main_address,
                 link_id: prim.link_id,
@@ -546,7 +442,6 @@ impl TetraEntityTrait for MleMs {
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::debug!("rx_prim: {:?}", message);
-        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
         match message.sap {
             Sap::TlaSap => {

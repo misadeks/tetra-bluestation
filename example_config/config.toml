@@ -155,6 +155,23 @@ local_ssi_ranges = [
 
 ###############################################################################
 
+###############################################################################
+
+# Mobile Station (MS) configuration.
+# REQUIRED when stack_mode = "Ms". Ignored in "Bs"/"Mon" modes.
+# The MS reuses net_info (home MCC/MNC) and cell_info (RF band/carrier/duplex)
+# for radio configuration; this section holds the MS identity and affiliation.
+
+# [ms]
+# Own Individual Short Subscriber Identity (ISSI), 24-bit (1..=16777215)
+# issi = 1000001
+# Subscriber class this MS belongs to (1-16), checked against the cell's advertised classes
+# subscriber_class = 1
+# Group identities (GSSIs) to attach to once registered. Empty for receive-only monitoring.
+# attach_groups = [1001, 1002]
+
+###############################################################################
+
 # Brew protocol: Connect to TetraPack/BrandMeister server via TETRA Homebrew Protocol.
 # All groups that radios attach to are forwarded to Brew as affiliations.
 # Uncomment this section to automatically load and use Brew entity

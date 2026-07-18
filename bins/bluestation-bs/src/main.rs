@@ -9,7 +9,7 @@ use tetra_entities::net_control::{
     CONTROL_HEARTBEAT_INTERVAL, CONTROL_HEARTBEAT_TIMEOUT, CONTROL_PROTOCOL_VERSION, CommandDispatcher, ControlWorker,
 };
 
-use tetra_config::bluestation::{PhyBackend, SharedConfig, StackConfig, parsing};
+use tetra_config::bluestation::{PhyBackend, SharedConfig, StackConfig, StackMode, parsing};
 use tetra_core::{TdmaTime, debug};
 use tetra_entities::MessageRouter;
 use tetra_entities::net_brew::entity::BrewEntity;
@@ -21,13 +21,18 @@ use tetra_entities::net_telemetry::{
 use tetra_entities::network::transports::websocket::{WebSocketTransport, WebSocketTransportConfig};
 use tetra_entities::{
     cmce::cmce_bs::CmceBs,
+    cmce::cmce_ms::CmceMs,
     llc::llc_bs_ms::Llc,
     lmac::lmac_bs::LmacBs,
+    lmac::lmac_ms::LmacMs,
     mle::mle_bs::MleBs,
+    mle::mle_ms::MleMs,
     mm::mm_bs::MmBs,
-    phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs},
+    mm::mm_ms::MmMs,
+    phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs, phy_ms::PhyMs},
     sndcp::sndcp_bs::Sndcp,
     umac::umac_bs::UmacBs,
+    umac::umac_ms::UmacMs,
 };
 
 /// Load configuration file
@@ -174,6 +179,56 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     (router, tsource, c_d)
 }
 
+/// Start mobile station stack.
+///
+/// Mirrors [`build_bs_stack`] but registers the MS-side entities and a
+/// receive-oriented [`PhyMs`]. Telemetry/control/Brew wiring is BS-oriented and
+/// intentionally omitted here for now (the MS MM/CMCE entities do not yet
+/// accept telemetry sinks); it returns the same tuple shape so `main` can treat
+/// both stacks uniformly.
+///
+/// NOTE (Phase 1): the MS must recover TDMA timing from the received SYNC burst
+/// (ETSI TS 100 392-2 clause 7) and drive the stack clock from RX. Until that
+/// RX-driven clock lands in `MessageRouter`, an initial time is set so the stack
+/// boots without panicking; `PhyMs` does not yet drive timing.
+fn build_ms_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
+    let mut router = MessageRouter::new(cfg.clone());
+
+    // Add suitable Phy component based on PhyIo type
+    match cfg.config().phy_io.backend {
+        PhyBackend::SoapySdr => {
+            // soapyio already maps StackMode::Ms to RX=downlink / TX=uplink.
+            let rxdev = RxTxDevSoapySdr::new(cfg);
+            let phy = PhyMs::new(cfg.clone(), rxdev);
+            router.register_entity(Box::new(phy));
+        }
+        _ => {
+            panic!("Unsupported PhyIo type: {:?}", cfg.config().phy_io.backend);
+        }
+    }
+
+    // Add remaining components
+    let lmac = LmacMs::new(cfg.clone());
+    let umac = UmacMs::new(cfg.clone());
+    let llc = Llc::new(cfg.clone());
+    let mle = MleMs::new(cfg.clone());
+    let mm = MmMs::new(cfg.clone());
+    let sndcp = Sndcp::new(cfg.clone());
+    let cmce = CmceMs::new(cfg.clone());
+    router.register_entity(Box::new(lmac));
+    router.register_entity(Box::new(umac));
+    router.register_entity(Box::new(llc));
+    router.register_entity(Box::new(mle));
+    router.register_entity(Box::new(mm));
+    router.register_entity(Box::new(sndcp));
+    router.register_entity(Box::new(cmce));
+
+    // Init network time (placeholder until RX-driven clock lands in Phase 1)
+    router.set_dl_time(TdmaTime::default());
+
+    (router, None, HashMap::new())
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -204,7 +259,14 @@ fn main() {
     let mut cfg = SharedConfig::from_parts(stack_cfg, None);
 
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
-    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg);
+    let (mut router, tsource, cdispatchers) = match cfg.config().stack_mode {
+        StackMode::Bs => build_bs_stack(&mut cfg),
+        StackMode::Ms => build_ms_stack(&mut cfg),
+        other => {
+            eprintln!("Unsupported stack_mode: {:?} (only \"Bs\" and \"Ms\" are implemented)", other);
+            std::process::exit(1);
+        }
+    };
 
     // Start Telemetry and Control threads, if enabled
     if let Some(telemetry_source) = tsource {

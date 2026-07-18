@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::Deserialize;
 use toml::Value;
 
-use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, net_dto_to_cfg};
+use crate::bluestation::{CellInfoDto, CfgControlDto, CfgMsDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, ms_dto_to_cfg, net_dto_to_cfg};
 
 use super::config::{StackConfig, StackMode};
 use super::sec_brew::{CfgBrewDto, apply_brew_patch};
@@ -64,6 +64,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     }
 
+    // Optional ms section (required when stack_mode = Ms; presence checked in validate())
+    if let Some(ref ms) = root.ms {
+        if !ms.extra.is_empty() {
+            return Err(format!("Unrecognized fields in ms config: {:?}", sorted_keys(&ms.extra)).into());
+        }
+    }
+
     // Build config from required and optional values
     let mut cfg = StackConfig {
         stack_mode: root.stack_mode,
@@ -71,6 +78,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         phy_io: phy_dto_to_cfg(root.phy_io),
         net: net_dto_to_cfg(root.net_info),
         cell: cell_dto_to_cfg(root.cell_info),
+        ms: root.ms.map(ms_dto_to_cfg),
         brew: None,
         telemetry: None,
         control: None,
@@ -128,6 +136,7 @@ struct TomlConfigRoot {
     brew: Option<CfgBrewDto>,
     telemetry: Option<CfgTelemetryDto>,
     command: Option<CfgControlDto>,
+    ms: Option<CfgMsDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,

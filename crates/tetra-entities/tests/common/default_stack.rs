@@ -1,4 +1,4 @@
-use tetra_config::bluestation::{CfgCellInfo, CfgNetInfo, CfgPhyIo, PhyBackend, StackConfig, StackMode};
+use tetra_config::bluestation::{CfgCellInfo, CfgMs, CfgNetInfo, CfgPhyIo, PhyBackend, StackConfig, StackMode};
 use tetra_core::{freqs::FreqInfo, ranges::SortedDisjointSsiRanges};
 
 /// Creates a default config for testing. It can still be modified as needed
@@ -16,6 +16,7 @@ pub fn default_test_config_bs() -> StackConfig {
         phy_io,
         net: net_info,
         cell: cell_info,
+        ms: None,
         brew: None,
         telemetry: None,
         control: None,
@@ -72,8 +73,17 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
     }
 }
 
+pub fn default_ms_info() -> CfgMs {
+    CfgMs {
+        issi: 1000001,
+        subscriber_class: 1,
+        attach_groups: vec![],
+    }
+}
+
 pub fn default_test_config_ms() -> StackConfig {
     let mut config = default_test_config_bs();
     config.stack_mode = StackMode::Ms;
+    config.ms = Some(default_ms_info());
     config
 }
