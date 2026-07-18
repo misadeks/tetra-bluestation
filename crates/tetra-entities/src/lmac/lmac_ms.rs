@@ -2,9 +2,11 @@ use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{PhyBlockNum, PhyBlockType, Sap, TdmaTime, unimplemented_log};
+use tetra_core::{BurstType, TrainingSequence};
 use tetra_saps::tmv::TmvUnitdataInd;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tp::TpUnitdataInd;
+use tetra_saps::tp::TpUnitdataReqSlot;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::lmac::components::{errorcontrol, scrambler};
@@ -234,6 +236,56 @@ impl LmacMs {
         }
     }
 
+    fn rx_tmv_unitdata_req_slot(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::debug!("rx_tmv_unitdata_req_slot");
+        let SapMsgInner::TmvUnitdataReq(prim) = &mut message.msg else {
+            panic!()
+        };
+
+        // The MS transmits a single uplink burst per granted (sub)slot. Unlike the
+        // BS downlink slot there is no BBK/AACH on the uplink, and a single access
+        // burst carries exactly one MAC block: SCH/HU on a Control Uplink Burst or
+        // SCH/F on a Normal Uplink Burst. ETSI TS 100 392-2 cl. 9.4.4.2 (uplink
+        // bursts), cl. 23.5 (MAC random/reserved access).
+        assert!(prim.bbk.is_none(), "rx_tmv_unitdata_req_slot: MS uplink has no BBK/AACH");
+        assert!(prim.blk2.is_none(), "rx_tmv_unitdata_req_slot: MS uplink burst carries a single block");
+        let blk1 = prim
+            .blk1
+            .take()
+            .expect("rx_tmv_unitdata_req_slot: blk1 must be present");
+
+        // Select uplink burst type + training sequence from the logical channel
+        // (cl. 9.4.4.2). SCH/F uses normal training sequence 1 (n), SCH/HU uses the
+        // extended training sequence (x).
+        let (burst_type, train_type) = match blk1.logical_channel {
+            LogicalChannel::SchF => (BurstType::NUB, TrainingSequence::NormalTrainSeq1),
+            LogicalChannel::SchHu => (BurstType::CUB, TrainingSequence::ExtendedTrainSeq),
+            other => panic!("rx_tmv_unitdata_req_slot: unsupported uplink logical channel {:?}", other),
+        };
+
+        // Channel-encode type1 -> type5: CRC16, convolutional encode, puncture,
+        // interleave and scramble (cl. 8.2 channel coding, cl. 8.2.5 scrambling).
+        // The uplink burst scrambling code is the serving cell's, already set from
+        // the received SYNC (same code used for downlink decode).
+        let type5 = errorcontrol::encode_cp(blk1);
+
+        let prim_phy = TpUnitdataReqSlot {
+            train_type,
+            burst_type,
+            bbk: None,
+            blk1: Some(type5),
+            blk2: None,
+        };
+
+        let m = SapMsg {
+            sap: Sap::TpSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Phy,
+            msg: SapMsgInner::TpUnitdataReq(prim_phy),
+        };
+        queue.push_back(m);
+    }
+
     fn rx_tmv_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tmv_prim");
 
@@ -242,7 +294,7 @@ impl LmacMs {
                 self.rx_tmv_configure_req(queue, message);
             }
             SapMsgInner::TmvUnitdataReq(_) => {
-                unimplemented_log!("TmvUnitdataReq")
+                self.rx_tmv_unitdata_req_slot(queue, message);
             }
             _ => {
                 panic!();
