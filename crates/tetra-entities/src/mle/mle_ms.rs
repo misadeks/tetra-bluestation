@@ -53,25 +53,18 @@ impl MleMs {
         }
     }
 
-    fn rx_tla_mle_pdu(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    /// Handle an MLE-internal PDU (MLE protocol discriminator == `Mle`).
+    ///
+    /// The caller has already read and consumed the 3-bit MLE protocol
+    /// discriminator (ETSI TS 100 392-2 cl. 18.5.21), so `sdu` is positioned at
+    /// the 3-bit MLE PDU type (cl. 18.5.20). This is reached for both
+    /// acknowledged (TL-DATA) and unacknowledged broadcast (TL-UNITDATA, e.g.
+    /// D-NWRK-BROADCAST on the BNCH) delivery.
+    fn rx_tla_mle_pdu(&mut self, _queue: &mut MessageQueue, mut sdu: BitBuffer) {
         tracing::trace!("rx_tla_mle_pdu");
 
-        // Extract tm_sdu from whatever primitive we have
-        let tm_sdu = {
-            match message.msg {
-                SapMsgInner::TlaTlDataIndBl(prim) => prim.tl_sdu,
-                _ => {
-                    panic!();
-                }
-            }
-        };
-        let Some(sdu) = tm_sdu else {
-            tracing::debug!("rx_tla_mle_pdu: no tm_sdu");
-            return;
-        };
-
-        // Determine which type of TL-SDU we have and call handler function
-        let Some(bits) = sdu.peek_bits(3) else {
+        // Read the MLE PDU type (cl. 18.5.20).
+        let Some(bits) = sdu.read_bits(3) else {
             tracing::warn!("insufficient bits: {}", sdu.dump_bin());
             return;
         };
@@ -191,7 +184,7 @@ impl MleMs {
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Mle => {
-                self.rx_tla_mle_pdu(queue, message);
+                self.rx_tla_mle_pdu(queue, sdu);
             }
             MleProtocolDiscriminator::TetraManagementEntity => {
                 unimplemented_log!("MleProtocolDiscriminator::TetraManagementEntity");
@@ -276,7 +269,7 @@ impl MleMs {
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Mle => {
-                self.rx_tla_mle_pdu(queue, message);
+                self.rx_tla_mle_pdu(queue, sdu);
             }
             MleProtocolDiscriminator::TetraManagementEntity => {
                 unimplemented_log!("MleProtocolDiscriminator::TetraManagementEntity");
