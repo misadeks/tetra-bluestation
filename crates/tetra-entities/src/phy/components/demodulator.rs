@@ -373,6 +373,19 @@ impl Demodulator {
         if timing_phase < SPS as RealSample { timing_phase } else { 0.0 }
     }
 
+    /// Sample-counter value corresponding to the beginning of hyperframe number
+    /// 0, as tracked by downlink synchronization. Returns `None` until the
+    /// demodulator has achieved downlink lock (`Mode::Dl`). Used to align an
+    /// uplink transmit modulator to the recovered air-interface timing so the
+    /// MS transmits its burst in the correct slot (ETSI TS 100 392-2 cl. 9.5).
+    pub fn synchronized_reference_time(&self) -> Option<SampleCount> {
+        if self.mode == Mode::Dl {
+            Some(self.reference_time)
+        } else {
+            None
+        }
+    }
+
     /// Synchronize an uplink demodulator to a downlink demodulator
     /// for simultaneous UL/DL monitoring.
     pub fn sync_to_demodulator(&mut self, demod: &Demodulator) {

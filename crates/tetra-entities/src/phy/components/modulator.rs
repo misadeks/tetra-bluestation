@@ -123,6 +123,22 @@ impl Modulator {
         }
         Ok(self.filter.sample(&CHANNEL_FILTER_TAPS, sample))
     }
+
+    /// Align this modulator to the air-interface timing recovered by the
+    /// downlink demodulator. `reference_time` is the sample-counter value at the
+    /// beginning of hyperframe number 0 (the same definition the demodulator
+    /// maintains), so `slot_begin` in [`Modulator::sample`] lands on the correct
+    /// hardware sample position for an absolute TDMA slot time.
+    ///
+    /// Only meaningful for [`Mode::Ul`]: the downlink modulator (BS) is the
+    /// timing master and generates its own clock from zero, so this is a no-op
+    /// for [`Mode::Dl`]. An MS must call this every TX block because the
+    /// demodulator continuously micro-adjusts its reference for sample slips.
+    pub fn set_reference_time(&mut self, reference_time: SampleCount) {
+        if self.mode == Mode::Ul {
+            self.reference_time = reference_time;
+        }
+    }
 }
 
 struct DqpskMapper {

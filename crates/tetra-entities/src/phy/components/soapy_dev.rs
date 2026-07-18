@@ -18,6 +18,14 @@ use super::fcfb;
 use super::modulator;
 use super::soapyio;
 
+/// Fixed sample offset added to the downlink-derived timing reference when
+/// aligning the MS uplink modulator. It absorbs the residual delay between the
+/// RX and TX signal chains (analog front end + DSP pipeline) and the MS timing
+/// advance (ETSI TS 100 392-2 cl. 9.5). Zero is the nominal starting point;
+/// this is the single knob to tune against a real base station if the burst
+/// lands slightly early/late in the uplink slot. Positive = transmit later.
+const MS_TX_SAMPLE_DELAY: SampleCount = 0;
+
 pub struct SdrConfig<'a> {
     /// SoapySDR device arguments
     pub dev_args: &'a [(&'a str, &'a str)],
@@ -150,9 +158,15 @@ impl RxTxDevSoapySdr {
     /// false if more data is needed
     /// or if it wants to wait before producing more.
     fn process_tx_block(&mut self, tx_slot: &[TxSlotBits]) -> Result<bool, RxTxDevError> {
+        // Read the current downlink timing reference (and RX block position)
+        // from the RX DSP first, so the immutable borrows end before we take a
+        // mutable borrow of the TX DSP. `dl_reference` aligns the MS uplink
+        // modulator to the recovered air-interface clock (see TxDsp::process_block).
+        let rx_block_count = self.rx_dsp.as_ref().map(|rx_dsp| rx_dsp.rx_block_count);
+        let dl_reference = self.rx_dsp.as_ref().and_then(|rx_dsp| rx_dsp.dl_reference_time());
         if let Some(tx_dsp) = &mut self.tx_dsp {
             if self.sdr.tx_possible() {
-                tx_dsp.process_block(&mut self.sdr, self.rx_dsp.as_ref().map(|rx_dsp| rx_dsp.rx_block_count), tx_slot)
+                tx_dsp.process_block(&mut self.sdr, rx_block_count, dl_reference, tx_slot)
             } else {
                 Ok(false)
             }
@@ -253,9 +267,18 @@ impl RxDsp {
         }
     }
 
+    /// Sample-counter reference (beginning of hyperframe number 0) of the first
+    /// synchronized downlink demodulator. Used to align the MS uplink transmit
+    /// modulator to the recovered air-interface timing. `None` until downlink
+    /// lock is achieved (before that, nothing is transmitted anyway).
+    fn dl_reference_time(&self) -> Option<SampleCount> {
+        self.monitors
+            .iter()
+            .find_map(|pair| pair.dl.demodulator.synchronized_reference_time())
+    }
+
     fn process_block(&mut self, sdr: &mut soapyio::SoapyIo) -> Result<bool, RxTxDevError> {
         self.receive_block(sdr)?;
-
         let fcfb_result = self.rx_fcfb.process(&self.rx_buffer[..], self.rx_block_count);
 
         let mut continue_processing = true;
@@ -395,8 +418,25 @@ impl TxDsp {
         &mut self,
         sdr: &mut soapyio::SoapyIo,
         latest_rx_block: Option<fcfb::BlockCount>,
+        dl_reference: Option<SampleCount>,
         tx_slot: &[TxSlotBits],
     ) -> Result<bool, RxTxDevError> {
+        // MS uplink: align the uplink modulator(s) to the downlink timing
+        // recovered by the RX demodulator, offset by the fixed RX->TX chain
+        // delay / timing advance. Without this the uplink modulator's timing
+        // reference stays at 0 while the burst time carries the base station's
+        // absolute (large) TDMA clock, so the burst is scheduled at an
+        // impossible far-future sample position and only silence is ever
+        // transmitted. This is a no-op for downlink (BS) modulators, which are
+        // the timing master. Re-applied every block because the demodulator
+        // continuously micro-adjusts its reference.
+        if let Some(reference_time) = dl_reference {
+            let aligned = reference_time + MS_TX_SAMPLE_DELAY;
+            for modulator in self.modulators.iter_mut() {
+                modulator.set_reference_time(aligned);
+            }
+        }
+
         let current_sample = sdr.tx_current_count()?;
         // Current time as block count
         let current_block = current_sample.div_euclid(self.fcfb.output_block_size() as SampleCount);
@@ -527,6 +567,10 @@ impl ModulatorChannel {
             upconverter,
             modulator: modulator::Modulator::new(mode),
         }
+    }
+
+    fn set_reference_time(&mut self, reference_time: SampleCount) {
+        self.modulator.set_reference_time(reference_time);
     }
 
     fn process(&mut self, fcfb: &mut fcfb::SynthesisOutputProcessor, block_count: fcfb::BlockCount, tx_slot: &TxSlotBits) -> bool {
