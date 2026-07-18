@@ -2,11 +2,12 @@ use std::panic;
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
+use tetra_core::{BitBuffer, PhyBlockNum, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
 use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
 use tetra_saps::tma::TmaUnitdataInd;
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+use tetra_saps::tmv::{TmvUnitdataReq, TmvUnitdataReqSlot};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::umac::enums::broadcast_type::BroadcastType;
@@ -23,7 +24,10 @@ use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
 
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::ms_defrag::MsDefrag;
-use crate::umac::subcomp::ms_random_access::AccessParamStore;
+use crate::umac::subcomp::ms_random_access::{
+    AccessCode, AccessParamStore, MsRandomAccess, RaAction, Subslot, ThreadRaRng,
+    interpret_access_assign,
+};
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 /// SCH/HU (Control Uplink Burst) type-1 MAC block length in bits (ETSI TS 100
@@ -66,6 +70,10 @@ pub struct UmacMs {
     /// Random access parameters advertised by the serving cell, per access code
     /// (ACCESS-DEFINE cl. 21.4.4.3 + SYSINFO default-A cl. 21.4.4.1).
     access_params: AccessParamStore,
+
+    /// MS-MAC random access state machine (cl. 23.5.1.4). Decides *when* the
+    /// queued `pending_uplink` block may be transmitted on an access opportunity.
+    random_access: MsRandomAccess,
 }
 
 impl UmacMs {
@@ -82,6 +90,7 @@ impl UmacMs {
             scrambling_code: None,
             pending_uplink: None,
             access_params: AccessParamStore::new(),
+            random_access: MsRandomAccess::new(),
         }
     }
 
@@ -344,6 +353,19 @@ impl UmacMs {
 
         if pdu.encryption_mode > 0 {
             unimplemented_log!("rx_mac_resource: Encryption mode > 0, not implemented");
+        }
+
+        // Feed the random access response detector (cl. 23.5.1.4.8): a
+        // MAC-RESOURCE addressed to our ISSI with the random access flag set
+        // acknowledges the request we sent, completing the access procedure.
+        if self.random_access.is_active() {
+            let addr_matches = pdu.addr.as_ref().is_some_and(|a| a.ssi == self.own_issi());
+            if let Some(RaAction::Succeeded) =
+                self.random_access.on_mac_resource(addr_matches, pdu.random_access_flag)
+            {
+                tracing::info!("random access: request acknowledged by BS (MAC-RESOURCE)");
+                self.pending_uplink = None;
+            }
         }
 
         // Compute len
@@ -624,7 +646,7 @@ impl UmacMs {
         unimplemented!("rx_supp");
     }
 
-    pub fn rx_tmv_aach(&self, queue: &mut MessageQueue, mut message: SapMsg) {
+    pub fn rx_tmv_aach(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tmv_aach");
 
         // TODO FIXME, more extensively store and process AACH state in both LMAC and UMAC
@@ -634,6 +656,9 @@ impl UmacMs {
             panic!()
         };
 
+        // Keep the parsed ACCESS-ASSIGN so we can drive the random access state
+        // machine (cl. 23.5.1.4) against this slot's uplink access rights.
+        let mut access_assign: Option<AccessAssign> = None;
         let is_traffic = if self.dltime.f != 18 {
             let pdu = match AccessAssign::from_bitbuf(&mut prim.pdu) {
                 Ok(pdu) => {
@@ -646,8 +671,12 @@ impl UmacMs {
                 }
             };
 
-            pdu.dl_usage.is_traffic()
+            let traffic = pdu.dl_usage.is_traffic();
+            access_assign = Some(pdu);
+            traffic
         } else {
+            // Frame 18 carries AccessAssignFr18 (no per-subslot access field, cl.
+            // 21.4.7.3), so it never designates a random access opportunity here.
             let _pdu = match AccessAssignFr18::from_bitbuf(&mut prim.pdu) {
                 Ok(pdu) => {
                     tracing::debug!("<- {:?}", pdu);
@@ -673,6 +702,88 @@ impl UmacMs {
         };
         // This message needs to be processed NOW since it affects the other blocks in this timeslot
         queue.push_prio(m, MessagePrio::Immediate);
+
+        // Drive the MS random access state machine against this slot's ACCESS-ASSIGN.
+        if let Some(aa) = access_assign {
+            self.drive_random_access(queue, &aa);
+        }
+    }
+
+    /// Advance the random access state machine (cl. 23.5.1.4) for one downlink
+    /// slot's ACCESS-ASSIGN and act on the resulting decision. No-op unless a
+    /// random access attempt is currently in progress.
+    fn drive_random_access(&mut self, queue: &mut MessageQueue, aa: &AccessAssign) {
+        if !self.random_access.is_active() {
+            return;
+        }
+
+        // Only access code A is currently issued by `initiate` (rx_tma_prim).
+        let code = AccessCode::A;
+        let Some(params) = self.access_params.params_for(code).cloned() else {
+            // Parameters were withdrawn since the attempt started; keep waiting.
+            return;
+        };
+
+        // The ACCESS-ASSIGN on the AACH designates the access rights of the
+        // uplink subslots of the slot two timeslots later (cl. 23.5.1.4.2). We
+        // are camped on the common control channel, where the per-slot AACH
+        // designation is authoritative, so any slot carrying a valid
+        // ACCESS-ASSIGN is treated as a potential opportunity (ul_slot_valid).
+        let assign = interpret_access_assign(aa, true);
+        let mut rng = ThreadRaRng;
+        let action =
+            self.random_access
+                .poll_downlink_slot(self.dltime, &assign, true, &params, &mut rng);
+
+        match action {
+            Some(RaAction::Transmit { ul_time, subslot }) => {
+                self.emit_uplink(queue, ul_time, subslot);
+            }
+            Some(RaAction::Failed(f)) => {
+                tracing::warn!("random access abandoned: {:?}", f);
+                // TODO (Phase 4): report the failure to LLC via TMA-REPORT.
+                self.pending_uplink = None;
+            }
+            Some(RaAction::Succeeded) | None => {}
+        }
+    }
+
+    /// Emit the queued uplink MAC block to LMAC for transmission on the granted
+    /// uplink slot. The block is kept in `pending_uplink` so it can be
+    /// retransmitted if the random access attempt has to retry (cl. 23.5.1.4.7).
+    fn emit_uplink(&mut self, queue: &mut MessageQueue, ul_time: TdmaTime, subslot: Subslot) {
+        let Some(pending) = self.pending_uplink.as_ref() else {
+            tracing::warn!("random access requested transmit but no pending uplink block");
+            return;
+        };
+
+        tracing::info!(
+            "random access: transmitting MAC-ACCESS at UL {:?} subslot {:?}",
+            ul_time,
+            subslot
+        );
+
+        let blk = TmvUnitdataReq {
+            mac_block: pending.mac_block.clone(),
+            logical_channel: pending.logical_channel,
+            scrambling_code: pending.scrambling_code,
+        };
+
+        // NOTE: the chosen subslot is not yet conveyed to LMAC/PHY (TmvUnitdataReqSlot
+        // has slot-level `ts` only). Phase 3d adds subslot keying in PhyMs.
+        let m = SapMsg {
+            sap: Sap::TmvSap,
+            src: self.self_component,
+            dest: TetraEntity::Lmac,
+            msg: SapMsgInner::TmvUnitdataReq(TmvUnitdataReqSlot {
+                ts: ul_time,
+                ul_phy_chan: PhysicalChannel::Cp,
+                blk1: Some(blk),
+                blk2: None,
+                bbk: None,
+            }),
+        };
+        queue.push_back(m);
     }
 
     pub fn rx_tmv_bsch(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -749,13 +860,7 @@ impl UmacMs {
             return;
         };
 
-        let issi = self
-            .config
-            .config()
-            .ms
-            .as_ref()
-            .expect("MS config section required in MS mode")
-            .issi;
+        let issi = self.own_issi();
 
         // Build a MAC-ACCESS carrying the TM-SDU for random access on SCH/HU
         // (Control Uplink Burst). ETSI TS 100 392-2 cl. 21.4.2.1, cl. 23.5.1.
@@ -772,13 +877,33 @@ impl UmacMs {
 
         // Queue for transmission at the next valid random-access opportunity.
         // The access-frame selection / randomised access algorithm
-        // (cl. 23.5.1.4) and the actual transmit are driven by the real-time
-        // uplink PHY (Phase 3d).
+        // (cl. 23.5.1.4) is driven by `drive_random_access` on each downlink
+        // AACH slot; the actual transmit is emitted to LMAC and (Phase 3d) PHY.
         self.pending_uplink = Some(PendingUplink {
             mac_block,
             logical_channel: LogicalChannel::SchHu,
             scrambling_code,
         });
+
+        // Initiate the MS-MAC random access procedure (cl. 23.5.1.4). Access
+        // code A is the default code available to all MSs (SYSINFO default-A,
+        // cl. 21.4.4.1). Without advertised parameters we cannot legally access.
+        let Some(params) = self.access_params.params_for(AccessCode::A).cloned() else {
+            tracing::warn!("rx_tma_prim: no access parameters for code A yet; dropping uplink SDU");
+            self.pending_uplink = None;
+            return;
+        };
+        // PDU priority is not yet carried by TMA-UNITDATA-REQ, so use the code's
+        // minimum so the priority gate passes. TODO: plumb the L3 PDU priority
+        // and emergency flag through the LLC/MAC primitives.
+        let pdu_prio = params.min_pdu_prio;
+        if let Err(e) = self
+            .random_access
+            .initiate(self.dltime, AccessCode::A, &params, pdu_prio, false)
+        {
+            tracing::warn!("rx_tma_prim: random access not initiated: {:?}; dropping uplink SDU", e);
+            self.pending_uplink = None;
+        }
     }
 
     /// Build a MAC-ACCESS type-1 MAC block (ETSI TS 100 392-2 cl. 21.4.2.1)
@@ -840,6 +965,16 @@ impl UmacMs {
     /// (Phase 3d).
     pub fn take_pending_uplink(&mut self) -> Option<PendingUplink> {
         self.pending_uplink.take()
+    }
+
+    /// The MS's own Individual Short Subscriber Identity (ISSI) from config.
+    fn own_issi(&self) -> u32 {
+        self.config
+            .config()
+            .ms
+            .as_ref()
+            .expect("MS config section required in MS mode")
+            .issi
     }
 
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
@@ -943,5 +1078,175 @@ impl TetraEntityTrait for UmacMs {
         // router's `ts` is a relative pacing clock in MS mode, so it is
         // intentionally not used here.
         self.dltime = self.dltime.add_timeslots(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tetra_config::bluestation::from_toml_str;
+    use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
+    use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
+    use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
+    use tetra_pdus::umac::pdus::access_assign::AccessField;
+
+    /// Minimal valid MS config (mirrors `example_config/config-ms.toml`); the
+    /// DL/UL frequencies must match what `cell_info` recomputes.
+    const MS_TOML: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+"#;
+
+    fn ms_umac() -> UmacMs {
+        let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
+        UmacMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// An ACCESS-ASSIGN granting an ongoing-frame random access opportunity for
+    /// access code A on both uplink subslots (single access field, header == 1;
+    /// base frame length 0b0010 = ongoing frame, cl. 21.4.7.2 / Table 21.85).
+    fn ongoing_a_assign() -> AccessAssign {
+        AccessAssign {
+            _header: 1,
+            dl_usage: AccessAssignDlUsage::CommonControl,
+            ul_usage: AccessAssignUlUsage::CommonOnly,
+            f1_af1: None,
+            f2_af2: None,
+            f2_af: Some(AccessField {
+                access_code: 0, // code A
+                base_frame_len: 0b0010,
+            }),
+        }
+    }
+
+    /// An "assigned only" ACCESS-ASSIGN: an MS on its common control channel
+    /// treats this as a reserved slot, i.e. no random access opportunity
+    /// (cl. 23.5.1.4.2).
+    fn reserved_assign() -> AccessAssign {
+        AccessAssign {
+            _header: 1,
+            dl_usage: AccessAssignDlUsage::CommonControl,
+            ul_usage: AccessAssignUlUsage::AssignedOnly,
+            f1_af1: None,
+            f2_af2: None,
+            f2_af: None,
+        }
+    }
+
+    /// Set up a UMAC with a queued uplink block and an active random access
+    /// attempt (IMM == 15 = immediate access), as after `rx_tma_prim`.
+    fn umac_with_active_attempt() -> UmacMs {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        umac.scrambling_code = Some(0x1234_5678);
+
+        umac.access_params.update_sysinfo_default_a(&SysinfoDefaultDefForAccessCodeA {
+            imm: 15,
+            wt: 6,
+            nu: 4,
+            fl_factor: false,
+            ts_ptr: 0,
+            min_pdu_prio: 0,
+        });
+
+        let mut sdu = BitBuffer::from_bitstr("0110100100011110001011010010");
+        let mac_block = UmacMs::build_mac_access_block(umac.own_issi(), &mut sdu).expect("SDU fits");
+        umac.pending_uplink = Some(PendingUplink {
+            mac_block,
+            logical_channel: LogicalChannel::SchHu,
+            scrambling_code: 0x1234_5678,
+        });
+
+        let p = umac.access_params.params_for(AccessCode::A).expect("params present").clone();
+        umac.random_access
+            .initiate(umac.dltime, AccessCode::A, &p, 0, false)
+            .expect("initiate succeeds");
+        assert!(umac.random_access.is_active());
+        umac
+    }
+
+    /// 3C-d: on a granting ACCESS-ASSIGN, the UMAC emits the queued MAC-ACCESS
+    /// block to LMAC as a TMV-UNITDATA request on SCH/HU at DL+2 timeslots.
+    #[test]
+    fn test_random_access_emits_uplink_on_opportunity() {
+        let mut umac = umac_with_active_attempt();
+        let mut q = MessageQueue::new();
+
+        umac.drive_random_access(&mut q, &ongoing_a_assign());
+
+        let msg = q.pop_front().expect("an uplink block should be emitted");
+        assert!(q.pop_front().is_none(), "exactly one message emitted");
+        assert_eq!(msg.dest, TetraEntity::Lmac);
+
+        let SapMsgInner::TmvUnitdataReq(slot) = msg.msg else {
+            panic!("expected TmvUnitdataReq");
+        };
+        assert_eq!(slot.ts, umac.dltime.add_timeslots(2), "uplink is DL + 2 timeslots");
+        let blk = slot.blk1.expect("blk1 carries the MAC-ACCESS");
+        assert_eq!(blk.logical_channel, LogicalChannel::SchHu);
+        assert_eq!(blk.scrambling_code, 0x1234_5678);
+        assert_eq!(blk.mac_block.get_len(), SCH_HU_TYPE1_BITS, "92-bit SCH/HU type-1 block");
+    }
+
+    /// 3C-d: a reserved (assigned-only) slot is not a random access opportunity,
+    /// so nothing is transmitted and the attempt stays active (cl. 23.5.1.4.2).
+    #[test]
+    fn test_reserved_slot_emits_nothing() {
+        let mut umac = umac_with_active_attempt();
+        let mut q = MessageQueue::new();
+
+        umac.drive_random_access(&mut q, &reserved_assign());
+
+        assert!(q.pop_front().is_none(), "no uplink on a reserved slot");
+        assert!(umac.random_access.is_active(), "attempt still pending");
+        assert!(umac.pending_uplink.is_some(), "queued block retained");
+    }
+
+    /// 3C-d: with no active attempt, a granting ACCESS-ASSIGN is ignored (the
+    /// state machine must have been initiated by an uplink request first).
+    #[test]
+    fn test_no_attempt_ignores_opportunity() {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let mut q = MessageQueue::new();
+
+        umac.drive_random_access(&mut q, &ongoing_a_assign());
+
+        assert!(q.pop_front().is_none(), "idle state machine emits nothing");
     }
 }
