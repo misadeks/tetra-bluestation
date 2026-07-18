@@ -165,7 +165,32 @@ fn test_sync() {
         tracing::info!("\nSink message: {:?}", msg);
     }
 
-    tracing::warn!("Validation of result not implemented");
+    // The full camp-on-cell loop must have fired end to end:
+    //   UMAC parses MAC-SYNC (cl. 21.4.4.2) -> forwards the D-MLE-SYNC SDU to MLE
+    //   -> MLE performs initial cell selection (cl. 18.3.4.6) and returns the
+    //   valid MCC/MNC over TL-CONFIGURE -> UMAC derives the scrambling code
+    //   (cl. 8.2.5 / 23.2.2) and pushes it, plus the recovered time, down to LMAC.
+    let mut got_time = false;
+    let mut scrambling_code = None;
+    for msg in msgs.iter() {
+        if let SapMsgInner::TmvConfigureReq(cfg) = &msg.msg {
+            if cfg.time.is_some() {
+                got_time = true;
+            }
+            if let Some(sc) = cfg.scrambling_code {
+                scrambling_code = Some(sc);
+            }
+        }
+    }
+
+    assert!(got_time, "UMAC should seed LMAC time from the BSCH");
+    // Test vector: CC=1, MCC=420, MNC=555
+    // scrambling = ((cc | (mnc << 6) | (mcc << 20)) << 2) | 3
+    assert_eq!(
+        scrambling_code,
+        Some(1_761_749_767),
+        "UMAC should derive and install the cell scrambling code"
+    );
 }
 
 #[test]

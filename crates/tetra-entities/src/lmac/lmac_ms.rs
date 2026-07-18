@@ -273,15 +273,18 @@ impl TetraEntityTrait for LmacMs {
         }
     }
 
-    fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
+    fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {
         // Reset current burst state
         self.cur_burst = CurBurst::default();
 
-        // Increase TDMA time if it has been set
+        // The MS maintains absolute downlink time locally: it is seeded from each
+        // SYNC burst (via TMV-CONFIGURE from UMAC, ETSI TS 100 392-2 cl. 7 /
+        // 21.4.4.2) and advanced one timeslot per received slot. The router's
+        // `ts` is a relative pacing clock in MS mode, so we self-advance rather
+        // than assert against it.
         if let Some(mod_time) = self.ts {
-            assert!(mod_time == ts, "time out of sync"); // TODO handle properly
             self.ts = Some(mod_time.add_timeslots(1));
-            tracing::debug!("tick: new TdmaTime: {:?}", self.ts.unwrap()); // Guaranteed in BS mode
+            tracing::debug!("tick: new TdmaTime: {:?}", self.ts.unwrap());
         }
     }
 }

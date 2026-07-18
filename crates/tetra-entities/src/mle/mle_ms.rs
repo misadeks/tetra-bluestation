@@ -6,12 +6,27 @@ use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::lmm::LmmMleUnitdataInd;
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
+use tetra_saps::tlmc::{TlmcConfigureReq, TlmcValidAddress};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
+
+/// Serving cell the MS has selected and camped on
+/// (ETSI TS 100 392-2 cl. 18.3.4). Populated from D-MLE-SYNC (cl. 18.4.2.1)
+/// and refined from D-MLE-SYSINFO (cl. 18.4.2.2).
+#[derive(Debug, Clone, Default)]
+struct ServingCell {
+    mcc: u16,
+    mnc: u16,
+    neighbor_cell_broadcast: u8,
+    cell_load_ca: u8,
+    late_entry_supported: bool,
+    location_area: Option<u16>,
+    subscriber_class: Option<u16>,
+}
 
 /// MS-side Mobile Link Entity.
 ///
@@ -21,15 +36,21 @@ use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
 /// discriminator, forwards uplink MM/CMCE PDUs down to LLC, and consumes the
 /// MLE broadcast primitives (SYNC / SYSINFO).
 ///
-/// The SYNC/SYSINFO handlers are Phase 2 targets (initial cell selection,
-/// ETSI TS 100 392-2 clause 18.3.4.6); they are stubbed here.
+/// The SYNC/SYSINFO handlers perform initial cell selection
+/// (ETSI TS 100 392-2 cl. 18.3.4.6) and drive the lower layers to derive the
+/// scrambling code for the selected cell.
 pub struct MleMs {
     config: SharedConfig,
+    /// The cell the MS is currently camped on, if any.
+    serving_cell: Option<ServingCell>,
 }
 
 impl MleMs {
     pub fn new(config: SharedConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            serving_cell: None,
+        }
     }
 
     fn rx_tla_mle_pdu(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
@@ -278,9 +299,9 @@ impl MleMs {
         }
     }
 
-    /// Phase 2 (ETSI TS 100 392-2 cl. 18.3.4): adopt SYSINFO parameters
-    /// (location area, subscriber class, BS service details) into shared state.
-    pub fn rx_tlmb_tl_sysinfo_ind(&self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    /// ETSI TS 100 392-2 cl. 18.3.4 / 18.4.2.2: adopt the SYSINFO parameters
+    /// (location area, subscriber class) for the serving cell.
+    pub fn rx_tlmb_tl_sysinfo_ind(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlmb_tl_sysinfo_ind");
 
         let SapMsgInner::TlmbSysinfoInd(inner) = &mut message.msg else {
@@ -288,7 +309,7 @@ impl MleMs {
         };
 
         // Parse the TL-SDU
-        let _pdu = match DMleSysinfo::from_bitbuf(&mut inner.tl_sdu) {
+        let pdu = match DMleSysinfo::from_bitbuf(&mut inner.tl_sdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
                 pdu
@@ -299,13 +320,32 @@ impl MleMs {
             }
         };
 
-        unimplemented_log!("rx_tlmb_tl_sysinfo_ind");
+        match self.serving_cell.as_mut() {
+            Some(cell) => {
+                let changed = cell.location_area != Some(pdu.location_area);
+                cell.location_area = Some(pdu.location_area);
+                cell.subscriber_class = Some(pdu.subscriber_class);
+                if changed {
+                    tracing::info!(
+                        "MLE: serving cell SYSINFO adopted: LA={} subscriber_class={:#x}",
+                        pdu.location_area,
+                        pdu.subscriber_class
+                    );
+                }
+            }
+            None => {
+                // SYSINFO can arrive before we have selected a cell from SYNC;
+                // there is nothing to attach it to yet.
+                tracing::debug!("rx_tlmb_tl_sysinfo_ind: SYSINFO before cell selection, ignoring");
+            }
+        }
     }
 
-    /// Phase 2 (ETSI TS 100 392-2 cl. 18.3.4): adopt SYNC parameters
-    /// (MCC/MNC, neighbour-cell broadcast, cell load, late entry) into shared
-    /// state and trigger initial cell selection.
-    pub fn rx_tlmb_tl_sync_ind(&self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    /// ETSI TS 100 392-2 cl. 18.3.4.6: initial cell selection. Adopt the cell
+    /// identity from D-MLE-SYNC (cl. 18.4.2.1) and configure the lower layers
+    /// with the valid MCC/MNC so the MAC can derive the scrambling code
+    /// (cl. 23.2.2 / 8.2.5).
+    pub fn rx_tlmb_tl_sync_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlmb_tl_sync_ind");
 
         let SapMsgInner::TlmbSyncInd(inner) = &mut message.msg else {
@@ -313,7 +353,7 @@ impl MleMs {
         };
 
         // Parse the TL-SDU
-        let _pdu = match DMleSync::from_bitbuf(&mut inner.tl_sdu) {
+        let pdu = match DMleSync::from_bitbuf(&mut inner.tl_sdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
                 pdu
@@ -324,7 +364,73 @@ impl MleMs {
             }
         };
 
-        unimplemented_log!("rx_tlmb_tl_sync_ind");
+        // Is this a different cell than the one we are currently camped on?
+        let newly_selected = self
+            .serving_cell
+            .as_ref()
+            .map(|c| c.mcc != pdu.mcc || c.mnc != pdu.mnc)
+            .unwrap_or(true);
+
+        // Adopt the cell identity, preserving any SYSINFO learned for the same cell.
+        let (location_area, subscriber_class) = if newly_selected {
+            (None, None)
+        } else {
+            let c = self.serving_cell.as_ref().unwrap();
+            (c.location_area, c.subscriber_class)
+        };
+        self.serving_cell = Some(ServingCell {
+            mcc: pdu.mcc,
+            mnc: pdu.mnc,
+            neighbor_cell_broadcast: pdu.neighbor_cell_broadcast,
+            cell_load_ca: pdu.cell_load_ca,
+            late_entry_supported: pdu.late_entry_supported,
+            location_area,
+            subscriber_class,
+        });
+
+        if !newly_selected {
+            // Already camped on this cell; the lower layers already have the
+            // scrambling code, so nothing further to do.
+            return;
+        }
+
+        tracing::info!(
+            "MLE: selected serving cell MCC={} MNC={} (late_entry={}, cell_load_ca={})",
+            pdu.mcc,
+            pdu.mnc,
+            pdu.late_entry_supported,
+            pdu.cell_load_ca
+        );
+
+        // Log if the cell does not match the configured home network. We do not
+        // reject it here: proper allowed-network handling is out of Phase 2 scope
+        // and must not be invented.
+        let cfg = self.config.config();
+        if pdu.mcc != cfg.net.mcc || pdu.mnc != cfg.net.mnc {
+            tracing::warn!(
+                "MLE: serving cell MCC/MNC {}/{} differs from configured {}/{}",
+                pdu.mcc,
+                pdu.mnc,
+                cfg.net.mcc,
+                cfg.net.mnc
+            );
+        }
+
+        // Configure layer 2 for the chosen cell (cl. 18.3.4.6 / 20.3.5.4.1c):
+        // provide the valid MCC/MNC so UMAC derives and installs the scrambling code.
+        let m = SapMsg {
+            sap: Sap::TlmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TlmcConfigureReq(TlmcConfigureReq {
+                valid_addresses: Some(TlmcValidAddress {
+                    mcc: pdu.mcc,
+                    mnc: pdu.mnc,
+                }),
+                ..Default::default()
+            }),
+        };
+        queue.push_back(m);
     }
 
     fn rx_tlmc_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {

@@ -32,7 +32,7 @@ pub struct TlmcValidAddress {
 /// TL-CONFIGURE request, confirm: this primitive shall be used to set up and configure the layer 2 according to the
 /// chosen cell parameters and the current state of the MS. It may also be used to provide the LLC and MAC with
 /// retransmission strategy in graceful service degradation mode. The parameters shall be as defined in table 20.36.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TlmcConfigureReq {
     pub threshold_values: Option<Todo>,
     pub distribution_on_18th_frame: Option<Todo>,

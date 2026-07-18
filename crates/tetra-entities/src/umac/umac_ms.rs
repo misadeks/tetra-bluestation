@@ -3,7 +3,7 @@ use std::panic;
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, PhyBlockNum, Sap, TdmaTime, Todo, unimplemented_log};
-use tetra_saps::tlmb::TlmbSysinfoInd;
+use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
 use tetra_saps::tma::TmaUnitdataInd;
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
@@ -597,14 +597,14 @@ impl UmacMs {
         queue.push_prio(m, MessagePrio::Immediate);
     }
 
-    pub fn rx_tmv_bsch(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    pub fn rx_tmv_bsch(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tmv_bsch");
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
             panic!()
         };
 
-        // Unpack and validate with expected state
-        let _pdu = match MacSync::from_bitbuf(&mut prim.pdu) {
+        // Parse the MAC-SYNC PDU carried by the BSCH (ETSI TS 100 392-2 cl. 21.4.4.2).
+        let pdu = match MacSync::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
                 pdu
@@ -615,87 +615,46 @@ impl UmacMs {
             }
         };
 
-        unimplemented_log!("can't update global state");
+        // Adopt the colour code. Together with the MCC/MNC provided by MLE over
+        // TLMC, it derives the scrambling code (cl. 23.2.2 / 8.2.5).
+        if self.cc != Some(pdu.colour_code) {
+            tracing::info!("rx_tmv_bsch: colour code {:?} -> {}", self.cc, pdu.colour_code);
+            self.cc = Some(pdu.colour_code);
+        }
 
-        // let netinfo_changed = {
-        //     let config_r = self.config.read();
-        //         mac_sync.system_code != config_r.la_info.system_code
-        //             || mac_sync.sharing_mode != config_r.la_info.sharing_mode
-        //             || mac_sync.ts_reserved_frames != config_r.la_info.ts_reserved_frames
-        //             || mac_sync.u_plane_dtx != config_r.la_info.u_plane_dtx
-        //             || mac_sync.frame_18_ext != config_r.la_info.frame_18_ext
-        // };
-        // // tracing::trace!("rx_tmv_bsch: netinfo_changed: {}, cc_changed: {}, tdma_time_changed: {}", netinfo_changed, cc_changed, tdma_time_changed);
+        // Seed the absolute downlink time from the SYNC burst (cl. 7 / 21.4.4.2).
+        // UMAC free-runs this between SYNC bursts (see `tick_start`) and re-seeds
+        // it here each frame 18.
+        self.dltime = pdu.time;
 
-        // // Update global state if needed
-        // if netinfo_changed  {
-        //     let mut config_w = self.config.write();
-        //     config_w.la_info.system_code = mac_sync.system_code;
-        //     // config_w.netinfo.colour_code = mac_sync.colour_code;
-        //     config_w.la_info.sharing_mode = mac_sync.sharing_mode;
-        //     config_w.la_info.ts_reserved_frames = mac_sync.ts_reserved_frames;
-        //     config_w.la_info.u_plane_dtx = mac_sync.u_plane_dtx;
-        //     config_w.la_info.frame_18_ext = mac_sync.frame_18_ext;
-        //     tracing::info!("rx_tmv_bsch: Updated TetraGlobalState: {:?}", mac_sync);
-        // }
+        // Push the recovered time down to LMAC so it classifies logical channels
+        // (BNCH / frame 18) and interprets AACH against the correct absolute time.
+        let m = SapMsg {
+            sap: Sap::TmvSap,
+            src: self.self_component,
+            dest: TetraEntity::Lmac,
+            msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
+                time: Some(pdu.time),
+                ..Default::default()
+            }),
+        };
+        queue.push_back(m);
 
-        // if mac_sync.time.t != message.t_submit.t || mac_sync.time.f != message.t_submit.f || mac_sync.time.m != message.t_submit.m {
-        //     // TODO warn/bail when really not in line with expected time
-        //     let t = TdmaTime{
-        //         t: mac_sync.time.t,
-        //         f: mac_sync.time.f,
-        //         m: mac_sync.time.m,
-        //         h: message.t_submit.h,
-        //     };
-        //     let m = SapMsg {
-        //         sap: Sap::TmvSap,
-        //         src: self.self_component,
-        //         dest: TetraComponent::Lmac,
-        //         t_submit: message.t_submit,
-        //         msg: SapMsgInner::TmvConfigureReq(
-        //             TmvConfigureReq{
-        //                 time: Some(t),
-        //                 .. Default::default()
-        //             }
-        //         )
-        //     };
-        //     tracing::info!("rx_tmv_bsch: Updated TdmaTime: {:?} -> {:?}", message.t_submit, t);
-        //     queue.push_back(m);
-        // }
-
-        // if Some(mac_sync.colour_code) != self.cc {
-        //     // Update scrambling code
-        //     tracing::info!("rx_tmv_bsch: Updated colour code: {:?} -> {:?}", self.cc, mac_sync.colour_code);
-        //     self.cc = Some(mac_sync.colour_code);
-        //     self.update_scrambing_and_submit_to_lmac(queue, &message);
-
-        // } else {
-        //     tracing::trace!("rx_tmv_bsch: Colour code unchanged: {:?}", self.cc);
-        // }
-
-        // // Take ownership of prim and sdu
-        // let prim = if let SapMsgInner::TmvUnitdataInd(inner) = message.msg {
-        //     inner
-        // } else {
-        //     panic!();
-        // };
-        // let tlsdu = prim.pdu;
-
-        // let m = SapMsg {
-        //     sap: Sap::TlmbSap,
-        //     src: TetraComponent::Umac,
-        //     dest: TetraComponent::Mle,
-        //     t_submit: message.t_submit,
-
-        //     msg: SapMsgInner::TlmbSyncInd(
-        //         TlmbSyncInd {
-        //             endpoint_id: 0,
-        //             tl_sdu: tlsdu
-        //         }
-        //     )
-        // };
-        // tracing::info!("rx_tmv_bsch: {:?}", m.msg);
-        // queue.push_back(m);
+        // Forward the remaining bits (the D-MLE-SYNC SDU, cl. 18.4.2.1) up to MLE
+        // for initial cell selection (cl. 18.3.4.6). MLE replies with a
+        // TL-CONFIGURE carrying the valid MCC/MNC, which lets us derive the
+        // scrambling code and submit it to LMAC.
+        let tlsdu = BitBuffer::from_bitbuffer_pos(&prim.pdu);
+        let m = SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Umac,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbSyncInd(TlmbSyncInd {
+                endpoint_id: 0,
+                tl_sdu: tlsdu,
+            }),
+        };
+        queue.push_back(m);
     }
 
     fn rx_tma_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
@@ -795,5 +754,14 @@ impl TetraEntityTrait for UmacMs {
                 panic!()
             }
         }
+    }
+
+    fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {
+        // The MS free-runs the absolute downlink time between SYNC bursts,
+        // advancing one timeslot per received slot. It is re-seeded from each
+        // BSCH in `rx_tmv_bsch` (ETSI TS 100 392-2 cl. 7 / 21.4.4.2). The
+        // router's `ts` is a relative pacing clock in MS mode, so it is
+        // intentionally not used here.
+        self.dltime = self.dltime.add_timeslots(1);
     }
 }
