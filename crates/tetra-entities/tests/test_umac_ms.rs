@@ -228,7 +228,38 @@ fn test_resource() {
     tracing::warn!("Validation of result not implemented");
 }
 
-/// Slice 3C: verify the MS uplink MAC-ACCESS block builder
+/// Regression test: a MAC-RESOURCE null PDU (length indication 00000 2,
+/// cl. 21.4.3.1 / Table 21.55) must be handled as downlink filler and dropped,
+/// not panic. An all-zero SCH/F block decodes as MAC-RESOURCE (mac_pdu_type 00)
+/// with length_ind 0 and address type "null PDU"; before the fix this hit the
+/// `Invalid length_ind 0` panic in `rx_mac_resource`.
+#[test]
+fn test_resource_null_pdu_does_not_panic() {
+    debug::setup_logging_verbose();
+    let mut test = ComponentTest::new(StackMode::Ms, None);
+    let components = vec![TetraEntity::Umac, TetraEntity::Llc, TetraEntity::Mle, TetraEntity::Cmce];
+    let sinks = vec![];
+    test.populate_entities(components, sinks);
+
+    // 268-bit SCH/F block, all zeros: mac_pdu_type=00 (MAC-RESOURCE),
+    // fill_bits=0, pos_of_grant=0, encryption_mode=00, random_access_flag=0,
+    // length_ind=000000 (null PDU), addr_type=000 (null PDU).
+    let m = SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: BitBuffer::from_bitstr(&"0".repeat(268)),
+            block_num: PhyBlockNum::Both,
+            logical_channel: LogicalChannel::SchF,
+            crc_pass: true,
+            scrambling_code: 0,
+        }),
+    };
+    test.submit_message(m);
+    // Must not panic; the null PDU is dropped and produces no LLC delivery.
+    test.deliver_all_messages();
+}
 /// (ETSI TS 100 392-2 cl. 21.4.2.1). Build a byte-aligned block (no fill bits),
 /// decode it back with `MacAccess::from_bitbuf`, and confirm the ISSI, length
 /// indication and recovered TM-SDU round-trip.

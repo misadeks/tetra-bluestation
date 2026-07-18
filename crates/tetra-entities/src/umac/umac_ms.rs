@@ -349,6 +349,13 @@ impl UmacMs {
         // Compute len
         let mut pdu_len_bits = {
             match pdu.length_ind {
+                0b000000 => {
+                    // Null PDU (length indication 00000 2, cl. 21.4.3.1 /
+                    // Table 21.55): the MAC PDU carries no TM-SDU, so its length
+                    // is the MAC header only. Handled as downlink filler below
+                    // (dropped, not passed to LLC).
+                    pdu.compute_header_len()
+                }
                 0b000001..0b111010 => {
                     // tracing::trace!("rx_mac_resource: length_ind {}", pdu.length_ind);
                     pdu.length_ind as usize * 8
