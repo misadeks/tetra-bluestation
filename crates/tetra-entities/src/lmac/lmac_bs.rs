@@ -357,6 +357,8 @@ impl LmacBs {
             bbk: None,
             blk1: None,
             blk2: None,
+            // BS downlink derives its TX time from the stack clock in PhyBs.
+            time: None,
         };
 
         // Encode blk1 and optionally blk2

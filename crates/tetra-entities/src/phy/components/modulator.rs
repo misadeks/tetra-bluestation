@@ -17,8 +17,14 @@ pub const SAMPLE_RATE: f64 = 18000.0 * SPS as f64;
 
 #[derive(PartialEq)]
 pub enum Mode {
-    /// Downlink modulation.
+    /// Downlink modulation: the burst fills the whole slot and is transmitted
+    /// continuously (BS is always on air).
     Dl,
+    /// Uplink modulation: a discontinuous burst (Normal or Control Uplink Burst)
+    /// positioned within the slot by its burst delay, with silence (ramp/guard)
+    /// outside the active part. Used by the MS. ETSI TS 100 392-2 cl. 9.4.3.4,
+    /// Table 9.2.
+    Ul,
 }
 
 pub struct Modulator {
@@ -76,6 +82,44 @@ impl Modulator {
                     }
                 }
             }
+            Mode::Ul => {
+                // Uplink burst timing (cl. 9.4.3.4): the symbol time of SN(n) is
+                // delayed by (n + d) symbol durations from the start of the slot.
+                // SN0 (n = 0) is the differential phase reference and carries no
+                // information. d is the burst delay from Table 9.2: 17 symbols for
+                // both the Normal Uplink Burst (SNmax = 231) and the Control
+                // Uplink Burst in subslot 1 (SNmax = 103). Symbols outside the
+                // active part are silence, so the shared antenna / PA is only
+                // driven during the burst.
+                const BURST_DELAY_SYMS: SampleCount = 17;
+
+                let sample_in_slot = sample_counter - slot_begin;
+                let snmax = tx_slot.slot.map_or(0, |bits| (bits.len() / 2) as SampleCount);
+
+                if sample_in_slot < BURST_DELAY_SYMS * SPS {
+                    // Before SN0: silence (also lets the pulse-shaping filter
+                    // settle before the active part).
+                } else if sample_in_slot >= SAMPLES_SLOT {
+                    // Slot is in the past; wait for the next burst.
+                    return Err(Error::NeedMoreData);
+                } else if let Some(bits) = tx_slot.slot {
+                    if sample_in_slot % SPS == 0 {
+                        // Symbol index relative to SN0.
+                        let sn = (sample_in_slot / SPS) - BURST_DELAY_SYMS;
+                        if sn == 0 {
+                            // SN0: reset the differential reference and emit the
+                            // reference symbol so SN1's phase transition is
+                            // decodable at the BS.
+                            self.dqpsk.reset_phase();
+                            sample = self.dqpsk.reference();
+                        } else if sn >= 1 && sn <= snmax {
+                            let i = (sn - 1) as usize;
+                            sample = self.dqpsk.symbol(bits[i * 2] != 0, bits[i * 2 + 1] != 0);
+                        }
+                        // sn > snmax: past the active part (guard), stay silent.
+                    }
+                }
+            }
         }
         Ok(self.filter.sample(&CHANNEL_FILTER_TAPS, sample))
     }
@@ -85,14 +129,35 @@ struct DqpskMapper {
     pub phase: i8,
 }
 
+/// π/4-DQPSK constellation: maps an accumulated phase (in multiples of π/4) to a
+/// constellation point. Generated in Python with:
+///   import numpy as np
+///   print(",\n".join("ComplexSample{ re: %9.6f, im: %9.6f }" % (v.real, v.imag)
+///       for v in np.exp(1j*np.linspace(0, np.pi*2, 8, endpoint=False))))
+const CONSTELLATION: [ComplexSample; 8] = [
+    ComplexSample { re: 1.000000, im: 0.000000 },
+    ComplexSample { re: 0.707107, im: 0.707107 },
+    ComplexSample { re: 0.000000, im: 1.000000 },
+    ComplexSample { re: -0.707107, im: 0.707107 },
+    ComplexSample { re: -1.000000, im: 0.000000 },
+    ComplexSample { re: -0.707107, im: -0.707107 },
+    ComplexSample { re: -0.000000, im: -1.000000 },
+    ComplexSample { re: 0.707107, im: -0.707107 },
+];
+
 impl DqpskMapper {
     pub fn new() -> Self {
         Self { phase: 0 }
     }
 
-    #[allow(dead_code)]
     pub fn reset_phase(&mut self) {
         self.phase = 0;
+    }
+
+    /// Constellation point for the current phase, without advancing it. Used to
+    /// emit the SN0 differential phase reference of an uplink burst.
+    pub fn reference(&self) -> ComplexSample {
+        CONSTELLATION[self.phase as usize]
     }
 
     pub fn symbol(&mut self, bit0: bool, bit1: bool) -> ComplexSample {
@@ -104,44 +169,6 @@ impl DqpskMapper {
                 (false, true) => 3,
             })
             & 7;
-        // Look-up table to map phase (in multiples of pi/4)
-        // to constellation points. Generated in Python with:
-        // import numpy as np
-        // print(",\n".join("ComplexSample{ re: %9.6f, im: %9.6f }" % (v.real, v.imag) for v in np.exp(1j*np.linspace(0, np.pi*2, 8, endpoint=False))))
-        const CONSTELLATION: [ComplexSample; 8] = [
-            ComplexSample {
-                re: 1.000000,
-                im: 0.000000,
-            },
-            ComplexSample {
-                re: 0.707107,
-                im: 0.707107,
-            },
-            ComplexSample {
-                re: 0.000000,
-                im: 1.000000,
-            },
-            ComplexSample {
-                re: -0.707107,
-                im: 0.707107,
-            },
-            ComplexSample {
-                re: -1.000000,
-                im: 0.000000,
-            },
-            ComplexSample {
-                re: -0.707107,
-                im: -0.707107,
-            },
-            ComplexSample {
-                re: -0.000000,
-                im: -1.000000,
-            },
-            ComplexSample {
-                re: 0.707107,
-                im: -0.707107,
-            },
-        ];
         CONSTELLATION[self.phase as usize]
     }
 }

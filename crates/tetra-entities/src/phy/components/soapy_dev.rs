@@ -8,6 +8,7 @@ use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 use tetra_pdus::phy::traits::rxtx_dev::TxSlotBits;
+use tetra_pdus::phy::traits::rxtx_dev::RfPath;
 
 use crate::phy::components::soapy_dev;
 
@@ -35,6 +36,9 @@ pub struct PhyConfig<'a> {
     pub bs_dl_frequencies: &'a [f64],
     /// Uplink carrier frequencies for a BS.
     pub bs_ul_frequencies: &'a [f64],
+    /// Uplink carrier frequencies for an MS to transmit on. Modulated with the
+    /// uplink burst timing (discontinuous bursts, ETSI TS 100 392-2 cl. 9.4.3.4).
+    pub ms_ul_frequencies: &'a [f64],
 }
 
 pub struct RxTxDevSoapySdr {
@@ -75,17 +79,22 @@ impl RxTxDevSoapySdr {
         // for the lifetime of the RxDsp/TxDsp construction below.
         let dl_freqs: [f64; 1];
         let ul_freqs: [f64; 1];
+        let ms_ul_freqs: [f64; 1];
         let monitor_freqs: [(f64, Option<f64>); 1];
 
         let phy_config = match config_guard.stack_mode {
             StackMode::Ms => {
-                // MS mode (Phase 1): receive-only downlink. Demodulate the DL
-                // carrier as a monitor; Mode::DlUnsynchronized -> Dl recovers
-                // slot timing from the synchronization training sequence
-                // (ETSI TS 100 392-2 clause 9.4.4.3.4). No uplink TX yet.
+                // MS mode: receive the downlink as a monitor (recovering slot
+                // timing from the synchronization training sequence, ETSI TS 100
+                // 392-2 cl. 9.4.4.3.4) and transmit discontinuous uplink bursts
+                // on the uplink carrier. Only random/reserved-access bursts are
+                // emitted, and only when granted, so the TX chain is otherwise
+                // idle.
                 monitor_freqs = [(dl_corrected, None)];
+                ms_ul_freqs = [ul_corrected];
                 soapy_dev::PhyConfig {
                     monitor_frequencies: &monitor_freqs,
+                    ms_ul_frequencies: &ms_ul_freqs,
                     ..Default::default()
                 }
             }
@@ -110,10 +119,12 @@ impl RxTxDevSoapySdr {
                 None
             },
 
-            // Only build a TX chain when there are carriers to modulate. In MS
-            // Phase 1 the SDR TX may be tuned (uplink) but nothing is
-            // transmitted, so no modulators are configured and no TX DSP runs.
-            tx_dsp: if sdr.tx_enabled() && !phy_config.bs_dl_frequencies.is_empty() {
+            // Only build a TX chain when there are carriers to modulate: BS
+            // downlink carriers or MS uplink carriers. In either case nothing is
+            // put on air unless a burst is actually scheduled.
+            tx_dsp: if sdr.tx_enabled()
+                && (!phy_config.bs_dl_frequencies.is_empty() || !phy_config.ms_ul_frequencies.is_empty())
+            {
                 Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
             } else {
                 None
@@ -170,6 +181,20 @@ impl RxTxDev for RxTxDevSoapySdr {
         } else {
             Ok(Default::default())
         }
+    }
+
+    fn set_rf_path(&mut self, path: RfPath) {
+        // Current hardware is full duplex (separate RX and TX chains), so the
+        // antenna does not need to be switched and this is intentionally a
+        // no-op beyond a trace.
+        //
+        // FUTURE (half-duplex front end): drive the antenna T/R changeover here,
+        // e.g. toggle a GPIO / RF-switch line so the shared antenna is connected
+        // to the PA for RfPath::Tx and to the LNA for RfPath::Rx. The SoapySDR
+        // GPIO API (`self.sdr` -> `Device::write_gpio`) or a board-specific
+        // control line is the intended extension point. Keep the switch settling
+        // time within the uplink guard period (ETSI TS 100 392-2 cl. 9.5).
+        tracing::trace!(?path, "set_rf_path (full-duplex: no antenna switching)");
     }
 }
 
@@ -353,6 +378,9 @@ impl TxDsp {
         let mut modulators = Vec::<ModulatorChannel>::new();
         for dl_freq in phy_config.bs_dl_frequencies {
             modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *dl_freq, modulator::Mode::Dl));
+        }
+        for ul_freq in phy_config.ms_ul_frequencies {
+            modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *ul_freq, modulator::Mode::Ul));
         }
 
         Self {

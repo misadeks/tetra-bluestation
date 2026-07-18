@@ -254,6 +254,12 @@ impl LmacMs {
             .take()
             .expect("rx_tmv_unitdata_req_slot: blk1 must be present");
 
+        // The upper MAC schedules the uplink burst in a specific granted slot
+        // (the random/reserved-access opportunity, cl. 23.5). Carry that absolute
+        // TDMA time down to the PHY so it can time the transmission; PhyMs cannot
+        // recover it otherwise (the BS downlink, by contrast, is clock-driven).
+        let ul_time = prim.ts;
+
         // Select uplink burst type + training sequence from the logical channel
         // (cl. 9.4.4.2). SCH/F uses normal training sequence 1 (n), SCH/HU uses the
         // extended training sequence (x).
@@ -275,6 +281,7 @@ impl LmacMs {
             bbk: None,
             blk1: Some(type5),
             blk2: None,
+            time: Some(ul_time),
         };
 
         let m = SapMsg {

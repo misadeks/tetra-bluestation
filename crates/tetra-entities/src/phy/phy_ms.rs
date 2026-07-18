@@ -1,12 +1,25 @@
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, unimplemented_log};
-use tetra_pdus::phy::traits::rxtx_dev::{RxBurstBits, RxTxDev};
+use tetra_pdus::phy::traits::rxtx_dev::{RfPath, RxBurstBits, RxTxDev, TxSlotBits};
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
 
-use crate::phy::components::{burst_consts::*, train_consts::TIMESLOT_TYPE4_BITS};
+use crate::phy::components::{burst_consts::*, slotter, train_consts::TIMESLOT_TYPE4_BITS};
 use crate::{MessageQueue, TetraEntityTrait};
+
+/// A fully-built uplink burst waiting to be transmitted in a specific slot.
+///
+/// Held between the `TpUnitdataReq` that produces it and the `drive_rx` call
+/// whose device transaction actually schedules it onto the air. The bits are the
+/// type-5 modulation bits of a Normal or Control Uplink Burst (SN1..SNmax); the
+/// modulator places them within the slot per the burst delay (cl. 9.4.3.4).
+struct PendingTx {
+    /// Absolute TDMA time of the granted uplink slot.
+    time: TdmaTime,
+    /// Uplink burst modulation bits (NUB or CUB).
+    burst: Vec<u8>,
+}
 
 /// MS-mode physical layer.
 ///
@@ -32,6 +45,16 @@ pub struct PhyMs<D: RxTxDev> {
     /// Whether downlink frame synchronization has been achieved.
     synced: bool,
 
+    /// Uplink burst awaiting transmission in a granted slot, if any. `None`
+    /// means the TX stream stays idle (silence) this cycle — the MS only puts
+    /// energy on air during a granted opportunity.
+    pending_tx: Option<PendingTx>,
+
+    /// Whether the antenna is currently switched to the TX path. Tracks the
+    /// half-duplex changeover hook so it is only toggled on transitions (no-op
+    /// on full-duplex hardware).
+    tx_path_active: bool,
+
     /// RX/TX device.
     rxtxdev: D,
 }
@@ -42,6 +65,8 @@ impl<D: RxTxDev> PhyMs<D> {
             config,
             dltime: TdmaTime::default(),
             synced: false,
+            pending_tx: None,
+            tx_path_active: false,
             rxtxdev,
         }
     }
@@ -139,6 +164,48 @@ impl<D: RxTxDev> PhyMs<D> {
             }
         }
     }
+
+    /// Build the modulation bits of an uplink burst from an LMAC transmit
+    /// request and tag it with the slot it must be sent in.
+    ///
+    /// The LMAC has already channel-encoded the MAC block to a type-5 block and
+    /// selected the burst type from the logical channel (SCH/F -> Normal Uplink
+    /// Burst, SCH/HU -> Control Uplink Burst; ETSI TS 100 392-2 cl. 9.4.4.2).
+    /// Here we lay the type-5 block into its burst fields around the training
+    /// sequence (the inverse of the BS uplink receiver) via
+    /// [`slotter::build_nub`] / [`slotter::build_cub`].
+    fn build_pending_tx(prim: tetra_saps::tp::TpUnitdataReqSlot) -> PendingTx {
+        let time = prim
+            .time
+            .expect("PhyMs uplink TpUnitdataReq must carry the granted slot time");
+
+        let mut type5 = prim.blk1.expect("PhyMs uplink burst must carry blk1");
+        type5.seek(0);
+
+        let burst: Vec<u8> = match prim.burst_type {
+            BurstType::NUB => {
+                // SCH/F: the type-5 block spans both half-slots (two 216-bit
+                // sub-blocks bkn1/bkn2), split either side of the normal training
+                // sequence (cl. 9.4.4.2.4 / Table 9.5).
+                let mut blk1 = [0u8; NUB_BLK_BITS];
+                let mut blk2 = [0u8; NUB_BLK_BITS];
+                type5.to_bitarr(&mut blk1);
+                type5.to_bitarr(&mut blk2);
+                slotter::build_nub(prim.train_type, &blk1, &blk2).to_vec()
+            }
+            BurstType::CUB => {
+                // SCH/HU random/reserved access: a single 168-bit control block
+                // split either side of the extended training sequence
+                // (cl. 9.4.4.2.1 / Table 9.3).
+                let mut blk = [0u8; CUB_BLK_BITS * 2];
+                type5.to_bitarr(&mut blk);
+                slotter::build_cub(&blk).to_vec()
+            }
+            other => panic!("PhyMs: unsupported uplink burst type {:?}", other),
+        };
+
+        PendingTx { time, burst }
+    }
 }
 
 impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
@@ -150,9 +217,19 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
         tracing::debug!("rx_prim: {:?}", message);
 
         match message.sap {
-            // Uplink transmit requests (later phase).
+            // Uplink transmit request: build the burst and hold it until the
+            // next device transaction schedules it in its granted slot. We do
+            // not touch the radio here; drive_rx owns the TX timing.
             Sap::TpSap => {
-                unimplemented_log!("PhyMs TpSap (uplink transmit) not implemented yet");
+                let SapMsgInner::TpUnitdataReq(prim) = message.msg else {
+                    panic!("PhyMs TpSap expected TpUnitdataReq, got {:?}", message.msg);
+                };
+                let pending = Self::build_pending_tx(prim);
+                tracing::debug!(ts = %pending.time, bits = pending.burst.len(), "PhyMs: queued uplink burst");
+                if self.pending_tx.is_some() {
+                    tracing::warn!("PhyMs: overwriting an uplink burst that was not yet transmitted");
+                }
+                self.pending_tx = Some(pending);
             }
             Sap::TpcSap => {
                 unimplemented_log!("PhyMs TpcSap not implemented yet");
@@ -171,12 +248,36 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
     /// clause 7). While unsynchronized, `rxtx_timeslot` keeps consuming RX
     /// samples internally until the synchronization training sequence is found,
     /// so this naturally paces the loop from the air interface.
+    ///
+    /// When an uplink burst is pending it is handed to the device in the same
+    /// transaction, scheduled at its granted slot time. The TX stream stays open
+    /// but only carries energy during that slot; the rest of the time an empty
+    /// TX slot is passed so the modulator emits silence.
     fn drive_rx(&mut self, queue: &mut MessageQueue) -> Option<TdmaTime> {
         let mut recovered: Option<TdmaTime> = None;
         let mut has_burst = false;
 
+        // Only present a TX slot when there is a burst to send ("TX only when
+        // needed"). The borrow of `self.pending_tx` is confined to this block so
+        // the pending burst can be retired afterwards.
         {
-            let rx = self.rxtxdev.rxtx_timeslot(&[]).expect("Got error from rxtx_timeslot");
+            let tx_slots: Vec<TxSlotBits> = match &self.pending_tx {
+                Some(pending) => vec![TxSlotBits {
+                    time: pending.time,
+                    slot: Some(&pending.burst),
+                    ..Default::default()
+                }],
+                None => Vec::new(),
+            };
+
+            // Half-duplex antenna changeover: point the front end at the PA
+            // while a burst is queued. No-op on full-duplex hardware.
+            if !tx_slots.is_empty() && !self.tx_path_active {
+                self.rxtxdev.set_rf_path(RfPath::Tx);
+                self.tx_path_active = true;
+            }
+
+            let rx = self.rxtxdev.rxtx_timeslot(&tx_slots).expect("Got error from rxtx_timeslot");
 
             // The MS configures a single downlink demodulator, but the device
             // may return several entries (e.g. an unused uplink slot); process
@@ -196,8 +297,188 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 self.synced = true;
                 tracing::info!(ts = %self.dltime, "PhyMs: downlink synchronized");
             }
+
+            // Retire the pending burst once its slot has passed (the device has
+            // already produced the TX signal ahead of the current time) and hand
+            // the antenna back to RX.
+            if self.tx_path_active {
+                let sent = self
+                    .pending_tx
+                    .as_ref()
+                    .map_or(true, |pending| time.to_int() > pending.time.to_int());
+                if sent {
+                    self.pending_tx = None;
+                    self.rxtxdev.set_rf_path(RfPath::Rx);
+                    self.tx_path_active = false;
+                }
+            }
         }
 
         recovered
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tetra_config::bluestation::{SharedConfig, from_toml_str};
+    use tetra_pdus::phy::traits::rxtx_dev::{RxBurstBits, RxSlotBits, RxTxDevError};
+    use tetra_saps::tp::TpUnitdataReqSlot;
+
+    /// Minimal valid MS config (mirrors `example_config/config-ms.toml`).
+    const MS_TOML: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+"#;
+
+    /// A mock RX/TX device that records what the PHY asked the radio to do and
+    /// replays a programmable downlink time, so PhyMs uplink scheduling can be
+    /// tested without any SDR.
+    #[derive(Default)]
+    struct MockRxTx {
+        /// One entry per `rxtx_timeslot` call: the uplink burst that was
+        /// presented as `(slot time, burst bits)`, or `None` if the TX slot was
+        /// empty (no burst to send).
+        tx_calls: Vec<Option<(TdmaTime, Vec<u8>)>>,
+        /// Antenna path switches, in the order they were requested.
+        rf_path: Vec<RfPath>,
+        /// Downlink TDMA time the next `rxtx_timeslot` call reports.
+        next_time: TdmaTime,
+    }
+
+    impl RxTxDev for MockRxTx {
+        fn rxtx_timeslot(&mut self, tx_slot: &[TxSlotBits]) -> Result<Vec<Option<RxSlotBits<'_>>>, RxTxDevError> {
+            let record = tx_slot
+                .first()
+                .map(|s| (s.time, s.slot.map(<[u8]>::to_vec).unwrap_or_default()));
+            self.tx_calls.push(record);
+
+            let time = self.next_time;
+            Ok(vec![Some(RxSlotBits {
+                time,
+                // NotFound => drive_rx recovers the time but does not try to
+                // split a (non-existent) full downlink burst.
+                slot: RxBurstBits {
+                    train_type: TrainingSequence::NotFound,
+                    bits: &[],
+                },
+                ..Default::default()
+            })])
+        }
+
+        fn set_rf_path(&mut self, path: RfPath) {
+            self.rf_path.push(path);
+        }
+    }
+
+    fn phy_ms(dev: MockRxTx) -> PhyMs<MockRxTx> {
+        let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
+        PhyMs::new(SharedConfig::from_parts(cfg, None), dev)
+    }
+
+    /// A TP-UNITDATA request carrying a SCH/HU control block for `time`.
+    fn cub_uplink_req(time: TdmaTime) -> SapMsg {
+        let type5 = BitBuffer::from_bitarr(&[0u8; CUB_BLK_BITS * 2]);
+        SapMsg {
+            sap: Sap::TpSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Phy,
+            msg: SapMsgInner::TpUnitdataReq(TpUnitdataReqSlot {
+                train_type: TrainingSequence::ExtendedTrainSeq,
+                burst_type: BurstType::CUB,
+                bbk: None,
+                blk1: Some(type5),
+                blk2: None,
+                time: Some(time),
+            }),
+        }
+    }
+
+    /// With no pending uplink burst, the PHY presents an empty TX slot (silence)
+    /// and never switches the antenna. "TX only when needed."
+    #[test]
+    fn test_no_burst_transmits_nothing() {
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        phy.drive_rx(&mut queue);
+
+        assert_eq!(phy.rxtxdev.tx_calls, vec![None], "empty TX slot when nothing pending");
+        assert!(phy.rxtxdev.rf_path.is_empty(), "no antenna switch without a burst");
+    }
+
+    /// A queued uplink burst is presented to the device in its granted slot, the
+    /// antenna is switched to TX, and once the downlink time passes the slot the
+    /// burst is retired and the antenna handed back to RX.
+    #[test]
+    fn test_pending_burst_scheduled_then_retired() {
+        let base = TdmaTime::default();
+        let ul_time = base.add_timeslots(2);
+
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        // Upper layers request an uplink transmission.
+        phy.rx_prim(&mut queue, cub_uplink_req(ul_time));
+        assert!(phy.pending_tx.is_some(), "burst queued by rx_prim");
+
+        // Downlink still before the granted slot: burst is presented, antenna
+        // switched to TX, burst kept pending.
+        phy.rxtxdev.next_time = base.add_timeslots(1);
+        phy.drive_rx(&mut queue);
+        let call0 = phy.rxtxdev.tx_calls[0].as_ref().expect("burst presented on first drive");
+        assert_eq!(call0.0.to_int(), ul_time.to_int(), "scheduled at the granted slot time");
+        assert_eq!(call0.1.len(), CUB_BURST_BITS, "control uplink burst bits");
+        assert_eq!(phy.rxtxdev.rf_path, vec![RfPath::Tx]);
+        assert!(phy.pending_tx.is_some(), "kept pending until slot passes");
+
+        // Downlink now past the granted slot: burst still presented this cycle,
+        // then retired and antenna returned to RX.
+        phy.rxtxdev.next_time = ul_time.add_timeslots(1);
+        phy.drive_rx(&mut queue);
+        assert!(phy.rxtxdev.tx_calls[1].is_some(), "burst presented while still pending");
+        assert!(phy.pending_tx.is_none(), "burst retired after slot passed");
+        assert_eq!(phy.rxtxdev.rf_path, vec![RfPath::Tx, RfPath::Rx]);
+
+        // Nothing pending anymore: empty TX slot, no further antenna switching.
+        phy.rxtxdev.next_time = ul_time.add_timeslots(2);
+        phy.drive_rx(&mut queue);
+        assert!(phy.rxtxdev.tx_calls[2].is_none(), "TX idle once burst is gone");
+        assert_eq!(phy.rxtxdev.rf_path, vec![RfPath::Tx, RfPath::Rx], "no extra switches");
     }
 }
