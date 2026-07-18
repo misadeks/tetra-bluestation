@@ -1,0 +1,102 @@
+# TETRA BlueStation - Mobile Station (MS) configuration
+# Camps on / connects to the BS described by the matching BS config.
+#
+# Direction note: DL and UL are ABSOLUTE frequencies (independent of Bs/Ms mode).
+#   - tx_freq  -> dl_freq (BS transmits, MS RECEIVES) = 439.825 MHz
+#   - rx_freq  -> ul_freq (MS transmits, BS receives) = 430.425 MHz
+# The MS keeps the same tx_freq/rx_freq and cell_info as the BS; the PHY layer
+# handles the RX(DL)/TX(UL) direction. Validation recomputes DL/UL from
+# cell_info and requires them to match tx_freq/rx_freq exactly.
+#   band 4: 400_000_000 + main_carrier 1593 * 25_000            = 439_825_000 (DL)
+#   DL - custom_duplex_spacing 9_400_000                        = 430_425_000 (UL)
+
+config_version = "0.6"
+
+# Stack operation mode: "Bs" (Base Station), "Ms" (Mobile Station), or "Mon" (Monitor)
+stack_mode = "Ms"
+
+# Uncomment to record debug log. Files get large quickly and add system load.
+# debug_log = "./verbose_log.txt"
+
+###############################################################################
+
+# PHY layer i/o configuration
+
+[phy_io]
+
+# Input type: set to SoapySdr. May allow for future non-soapy RF backends.
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+# Transmit tx(dl) and rx(ul) frequencies in Hz. Kept identical to the BS:
+# the MS receives on tx_freq (DL) and (later) transmits on rx_freq (UL).
+tx_freq = 439825000
+rx_freq = 430425000
+
+ppm_err = 0 # Adjust if your SDR has a non-negligible tuning error
+
+# SDR device selection. Check with SoapySDRUtil --find / --probe.
+device = "driver=sx"
+
+# Sample rate. SXceiver defaults to 600kHz.
+sample_rate = 600000
+
+# SXceiver antennas.
+rx_antenna = "RX"
+tx_antenna = "TX"
+
+# RX gains for receiving the BS downlink. Reduce if the front-end overloads
+# when close to the BS.
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+
+# TX gains. MS uplink transmission is NOT active in the current receive-only
+# build (uplink/registration land in later phases), so these are kept low to
+# avoid any accidental drive. Raise them only once uplink TX is implemented
+# and you know your MS RF chain (PA MAX 21 on the mixer if using the IT PA).
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+# Optional file i/o (debug):
+# dl_input_file = "./dl_input.bin"   # read DL RF samples from file instead of SDR
+# ul_rx_file    = "./ul_output.bin"  # save received RF samples to file
+
+###############################################################################
+
+# Network Information - must match the BS to recognize the network.
+[net_info]
+# Mobile Country Code (MCC)
+mcc = 901
+# Mobile Network Code (MNC)
+mnc = 9999
+
+# Cell Information - RF band/carrier/duplex the MS tunes to. Must match the BS.
+[cell_info]
+freq_band = 4                       # 400MHz band
+main_carrier = 1593                 # 400_000_000 + 1593 * 25kHz = 439.825 MHz DL
+duplex_spacing = 7                  # duplex table index (overridden by custom below)
+custom_duplex_spacing = 9400000     # 9.4 MHz DL-UL spacing (matches the BS)
+freq_offset = 0                     # Offset from carrier. Options: 0, 6250, -6250, 12500.
+reverse_operation = false           # False: UL below DL. True: UL above DL.
+
+# Location Area identifier
+location_area = 1
+
+# Colour code, distinguishes adjacent cells on the same frequency.
+colour_code = 1
+
+###############################################################################
+
+# Mobile Station (MS) identity/affiliation. REQUIRED when stack_mode = "Ms".
+[ms]
+# Own Individual Short Subscriber Identity (ISSI), 24-bit (1..=16777215).
+# CHANGE THIS to your MS's own address before uplink/registration phases.
+issi = 1000001
+
+# Subscriber class this MS belongs to (1-16). Checked against the cell's
+# advertised subscriber-class bitmask (D-MLE-SYSINFO, EN 300 392-2 18.4.2.2).
+subscriber_class = 1
+
+# Group identities (GSSIs) to attach to once registered. Empty = receive-only
+# monitoring (no uplink), which matches the current phase.
+attach_groups = []
