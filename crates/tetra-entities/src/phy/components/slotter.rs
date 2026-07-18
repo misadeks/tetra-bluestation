@@ -193,6 +193,68 @@ pub fn build_ndb(
     type5
 }
 
+/// Constructs a Normal Uplink Burst (NUB) from two type-5 blocks
+/// (ETSI TS 100 392-2 clause 9.4.4.2.4, Table 9.5, π/4-DQPSK). The NUB is used
+/// by an MS to transmit control or traffic messages to the BS on a reserved
+/// (full) slot.
+///
+/// The training sequence marks whether `blk1`/`blk2` form one full-slot logical
+/// channel (SCH/F, `NormalTrainSeq1` → n) or two half-slot channels
+/// (`NormalTrainSeq2` → p), per clause 9.4.4.3.2. This mirrors the inverse
+/// split performed by [`super::super::phy_bs::PhyBs`] on receive.
+/// blk1: 216-bit scrambled type-5 block-1 bits (bkn1)
+/// blk2: 216-bit scrambled type-5 block-2 bits (bkn2)
+pub fn build_nub(train_seq: TrainingSequence, blk1: &[u8; NUB_BLK_BITS], blk2: &[u8; NUB_BLK_BITS]) -> [u8; NUB_BURST_BITS] {
+    let mut type5 = [0u8; NUB_BURST_BITS];
+
+    // BN 1-4: tail bits (clause 9.4.4.3.5)
+    type5[0..NUB_BLK1_OFFSET].copy_from_slice(&bitseq::t);
+    // BN 5-220: scrambled block 1 bits (bkn1)
+    type5[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS].copy_from_slice(blk1);
+    // BN 221-242: normal training sequence (clause 9.4.4.3.2)
+    match train_seq {
+        TrainingSequence::NormalTrainSeq1 => {
+            type5[NUB_TRAINING_OFFSET..NUB_BLK2_OFFSET].copy_from_slice(&bitseq::n);
+        }
+        TrainingSequence::NormalTrainSeq2 => {
+            type5[NUB_TRAINING_OFFSET..NUB_BLK2_OFFSET].copy_from_slice(&bitseq::p);
+        }
+        _ => panic!("build_nub: invalid training sequence {:?}", train_seq),
+    }
+    // BN 243-458: scrambled block 2 bits (bkn2)
+    type5[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS].copy_from_slice(blk2);
+    // BN 459-462: tail bits (clause 9.4.4.3.5)
+    type5[NUB_TAILBITS_OFFSET..NUB_BURST_BITS].copy_from_slice(&bitseq::t);
+
+    type5
+}
+
+/// Constructs a Control Uplink Burst (CB) from a single 168-bit type-5 control
+/// block (ETSI TS 100 392-2 clause 9.4.4.2.1, Table 9.3, π/4-DQPSK). The CB is
+/// used by an MS to transmit control messages (e.g. MAC random access,
+/// SCH/HU) to the BS in a subslot.
+///
+/// The 168 scrambled control bits are split into cb(1..84) and cb(85..168)
+/// either side of the 30-bit extended training sequence (clause 9.4.4.3.3),
+/// matching the inverse recombination in [`super::super::phy_bs::PhyBs`].
+/// blk: 168-bit scrambled type-5 control block bits (cb)
+pub fn build_cub(blk: &[u8; CUB_BLK_BITS * 2]) -> [u8; CUB_BURST_BITS] {
+    let mut type5 = [0u8; CUB_BURST_BITS];
+
+    // BN 1-4: tail bits (clause 9.4.4.3.5)
+    type5[0..CUB_BLK1_OFFSET].copy_from_slice(&bitseq::t);
+    // BN 5-88: scrambled control bits cb(1..84)
+    type5[CUB_BLK1_OFFSET..CUB_BLK1_OFFSET + CUB_BLK_BITS].copy_from_slice(&blk[..CUB_BLK_BITS]);
+    // BN 89-118: extended training sequence (clause 9.4.4.3.3)
+    type5[CUB_TRAINING_OFFSET..CUB_BLK2_OFFSET].copy_from_slice(&bitseq::x);
+    // BN 119-202: scrambled control bits cb(85..168)
+    type5[CUB_BLK2_OFFSET..CUB_BLK2_OFFSET + CUB_BLK_BITS].copy_from_slice(&blk[CUB_BLK_BITS..]);
+    // BN 203-206: tail bits (clause 9.4.4.3.5)
+    type5[CUB_TAILBITS_OFFSET..CUB_BURST_BITS].copy_from_slice(&bitseq::t);
+
+    type5
+}
+
 #[cfg(test)]
 mod tests {
     use tetra_core::bitbuffer::BitBuffer;
@@ -200,6 +262,45 @@ mod tests {
     use crate::phy::components::train_consts::*;
 
     use super::*;
+
+    /// NUB round-trip: build a Normal Uplink Burst and verify each spec field
+    /// (tail, bkn1, training, bkn2, tail) lands at the offsets the BS decoder
+    /// (`phy_bs`) reads (ETSI TS 100 392-2 Table 9.5).
+    #[test]
+    fn test_build_nub_roundtrip() {
+        let blk1: [u8; NUB_BLK_BITS] = std::array::from_fn(|i| (i % 2) as u8);
+        let blk2: [u8; NUB_BLK_BITS] = std::array::from_fn(|i| ((i + 1) % 2) as u8);
+
+        let burst = build_nub(TrainingSequence::NormalTrainSeq1, &blk1, &blk2);
+
+        assert_eq!(burst.len(), NUB_BURST_BITS);
+        assert_eq!(&burst[0..NUB_BLK1_OFFSET], &bitseq::t);
+        assert_eq!(&burst[NUB_BLK1_OFFSET..NUB_BLK1_OFFSET + NUB_BLK_BITS], &blk1);
+        assert_eq!(&burst[NUB_TRAINING_OFFSET..NUB_BLK2_OFFSET], &bitseq::n);
+        assert_eq!(&burst[NUB_BLK2_OFFSET..NUB_BLK2_OFFSET + NUB_BLK_BITS], &blk2);
+        assert_eq!(&burst[NUB_TAILBITS_OFFSET..NUB_BURST_BITS], &bitseq::t);
+
+        // NormalTrainSeq2 selects the p training sequence (SCH/HD half-slots).
+        let burst2 = build_nub(TrainingSequence::NormalTrainSeq2, &blk1, &blk2);
+        assert_eq!(&burst2[NUB_TRAINING_OFFSET..NUB_BLK2_OFFSET], &bitseq::p);
+    }
+
+    /// CB round-trip: build a Control Uplink Burst and verify the 168 control
+    /// bits split cb(1..84) / cb(85..168) around the extended training sequence
+    /// at the offsets the BS decoder reads (ETSI TS 100 392-2 Table 9.3).
+    #[test]
+    fn test_build_cub_roundtrip() {
+        let blk: [u8; CUB_BLK_BITS * 2] = std::array::from_fn(|i| (i % 2) as u8);
+
+        let burst = build_cub(&blk);
+
+        assert_eq!(burst.len(), CUB_BURST_BITS);
+        assert_eq!(&burst[0..CUB_BLK1_OFFSET], &bitseq::t);
+        assert_eq!(&burst[CUB_BLK1_OFFSET..CUB_BLK1_OFFSET + CUB_BLK_BITS], &blk[..CUB_BLK_BITS]);
+        assert_eq!(&burst[CUB_TRAINING_OFFSET..CUB_BLK2_OFFSET], &bitseq::x);
+        assert_eq!(&burst[CUB_BLK2_OFFSET..CUB_BLK2_OFFSET + CUB_BLK_BITS], &blk[CUB_BLK_BITS..]);
+        assert_eq!(&burst[CUB_TAILBITS_OFFSET..CUB_BURST_BITS], &bitseq::t);
+    }
 
     #[test]
     fn test_build_sdb_1() {
