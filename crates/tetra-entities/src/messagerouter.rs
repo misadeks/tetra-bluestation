@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::{TdmaTime, tetra_entities::TetraEntity};
 use tetra_saps::SapMsg;
 
@@ -149,7 +149,11 @@ impl MessageRouter {
     /// - LLC sends down all outstanding BL-ACKs
     /// - UMAC finalizes any resources for ts and sends down to LMAC
     ///
-    pub fn tick_end(&mut self) {
+    /// For BS mode (`increment_time = true`) the TDMA time is a free-running
+    /// counter advanced one timeslot per tick. For RX-driven modes
+    /// (`increment_time = false`) time is instead set from the recovered
+    /// downlink slot, so it must not be advanced here.
+    fn run_tick_end(&mut self, increment_time: bool) {
         tracing::debug!("############################ end-of-tick ############################");
 
         // Llc should send down outstanding BL-ACKs
@@ -178,14 +182,34 @@ impl MessageRouter {
         }
         self.deliver_all_messages();
 
-        // Increment the TDMA time if set
-        self.ts = self.ts.add_timeslots(1);
+        // Increment the TDMA time if set (BS mode only).
+        if increment_time {
+            self.ts = self.ts.add_timeslots(1);
+        }
+    }
+
+    /// End-of-tick for BS mode: advances the free-running TDMA clock.
+    pub fn tick_end(&mut self) {
+        self.run_tick_end(true);
     }
 
     /// Runs the full stack either forever or for a specified number of ticks.
     /// If `running` is provided, the loop will exit when the flag is set to false
     /// (e.g. by a Ctrl+C signal handler), allowing entities to be dropped cleanly.
     pub fn run_stack(&mut self, num_ticks: Option<usize>, running: Option<Arc<AtomicBool>>) {
+        // MS mode is receive-timed: the PHY recovers the clock from the
+        // downlink. BS mode is transmit-timed: the PHY's blocking TX call paces
+        // the stack and the clock free-runs.
+        if matches!(self._config.config().stack_mode, StackMode::Ms) {
+            self.run_stack_ms(num_ticks, running);
+        } else {
+            self.run_stack_bs(num_ticks, running);
+        }
+    }
+
+    /// BS run loop: the PHY's blocking `rxtx_timeslot` (driven each tick by the
+    /// UMAC scheduler) paces the stack, and the TDMA clock free-runs.
+    fn run_stack_bs(&mut self, num_ticks: Option<usize>, running: Option<Arc<AtomicBool>>) {
         let mut ticks: usize = 0;
 
         loop {
@@ -206,7 +230,58 @@ impl MessageRouter {
             }
 
             // Send tick_end event and process final messages
-            self.tick_end();
+            self.run_tick_end(true);
+
+            // Check if we should stop
+            ticks += 1;
+            if let Some(num_ticks) = num_ticks {
+                if ticks >= num_ticks {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// MS run loop: the PHY blocks on the downlink and returns the TDMA time
+    /// recovered from the received slot (ETSI TS 100 392-2 clause 7). That
+    /// recovered time drives the stack clock; there is no free-running
+    /// increment because RX advances time.
+    fn run_stack_ms(&mut self, num_ticks: Option<usize>, running: Option<Arc<AtomicBool>>) {
+        let mut ticks: usize = 0;
+
+        loop {
+            // Check if we've been asked to stop (e.g. Ctrl+C)
+            if let Some(ref flag) = running {
+                if !flag.load(Ordering::Relaxed) {
+                    eprintln!("\n[INFO] Shutting down gracefully...");
+                    break;
+                }
+            }
+
+            // Block on the downlink until the PHY produces a demodulated slot.
+            // The recovered TDMA time becomes the stack clock for this tick.
+            let recovered = if let Some(phy) = self.entities.get_mut(&TetraEntity::Phy) {
+                phy.drive_rx(&mut self.msg_queue)
+            } else {
+                None
+            };
+
+            let Some(ts) = recovered else {
+                // Still searching for the downlink; no slot to process yet.
+                continue;
+            };
+            self.ts = ts;
+
+            // Send tick_start event
+            self.tick_start();
+
+            // Deliver messages until queue empty
+            while self.get_msgqueue_len() > 0 {
+                self.deliver_all_messages();
+            }
+
+            // Send tick_end event without advancing the clock (RX drives time).
+            self.run_tick_end(false);
 
             // Check if we should stop
             ticks += 1;

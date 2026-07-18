@@ -2,7 +2,7 @@
 //! between SDR device and modulator/demodulator code.
 
 use rustfft;
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, StackMode};
 
 use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
@@ -49,7 +49,6 @@ impl RxTxDevSoapySdr {
     pub fn new(cfg: &SharedConfig) -> Self {
         let mut fft_planner = rustfft::FftPlanner::new();
 
-        // TODO FIXME currently no MS and MON support in the below statement; need to fix
         let config_guard = cfg.config();
         let soapy_cfg = config_guard
             .as_ref()
@@ -72,10 +71,34 @@ impl RxTxDevSoapySdr {
             ul_corrected / 1e6
         );
 
-        let phy_config = soapy_dev::PhyConfig {
-            bs_dl_frequencies: &[dl_corrected],
-            bs_ul_frequencies: &[ul_corrected],
-            ..Default::default()
+        // Frequency bindings are held here so the PhyConfig slices stay valid
+        // for the lifetime of the RxDsp/TxDsp construction below.
+        let dl_freqs: [f64; 1];
+        let ul_freqs: [f64; 1];
+        let monitor_freqs: [(f64, Option<f64>); 1];
+
+        let phy_config = match config_guard.stack_mode {
+            StackMode::Ms => {
+                // MS mode (Phase 1): receive-only downlink. Demodulate the DL
+                // carrier as a monitor; Mode::DlUnsynchronized -> Dl recovers
+                // slot timing from the synchronization training sequence
+                // (ETSI TS 100 392-2 clause 9.4.4.3.4). No uplink TX yet.
+                monitor_freqs = [(dl_corrected, None)];
+                soapy_dev::PhyConfig {
+                    monitor_frequencies: &monitor_freqs,
+                    ..Default::default()
+                }
+            }
+            _ => {
+                // BS mode: transmit on the downlink, demodulate the uplink.
+                dl_freqs = [dl_corrected];
+                ul_freqs = [ul_corrected];
+                soapy_dev::PhyConfig {
+                    bs_dl_frequencies: &dl_freqs,
+                    bs_ul_frequencies: &ul_freqs,
+                    ..Default::default()
+                }
+            }
         };
 
         let mut sdr = soapyio::SoapyIo::new(cfg).unwrap();
@@ -87,7 +110,10 @@ impl RxTxDevSoapySdr {
                 None
             },
 
-            tx_dsp: if sdr.tx_enabled() {
+            // Only build a TX chain when there are carriers to modulate. In MS
+            // Phase 1 the SDR TX may be tuned (uplink) but nothing is
+            // transmitted, so no modulators are configured and no TX DSP runs.
+            tx_dsp: if sdr.tx_enabled() && !phy_config.bs_dl_frequencies.is_empty() {
                 Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
             } else {
                 None
