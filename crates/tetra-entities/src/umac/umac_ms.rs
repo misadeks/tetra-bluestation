@@ -2,9 +2,9 @@ use std::panic;
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, PhyBlockNum, Sap, TdmaTime, Todo, unimplemented_log};
+use tetra_core::{BitBuffer, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
 use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
-use tetra_saps::tma::TmaUnitdataInd;
+use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -13,6 +13,7 @@ use tetra_pdus::umac::enums::broadcast_type::BroadcastType;
 use tetra_pdus::umac::enums::mac_pdu_type::MacPduType;
 use tetra_pdus::umac::pdus::access_assign::AccessAssign;
 use tetra_pdus::umac::pdus::access_assign_fr18::AccessAssignFr18;
+use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_frag_dl::MacFragDl;
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
@@ -22,6 +23,23 @@ use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::ms_defrag::MsDefrag;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
+
+/// SCH/HU (Control Uplink Burst) type-1 MAC block length in bits (ETSI TS 100
+/// 392-2, SCH/HU coding parameters).
+const SCH_HU_TYPE1_BITS: usize = 92;
+
+/// A MAC block built and queued for uplink transmission, awaiting a valid
+/// access opportunity. ETSI TS 100 392-2 cl. 23.5 (MAC access). The random
+/// access slot-selection algorithm (cl. 23.5.1.4) that decides *when* to send
+/// this, and the actual transmission, are driven by the real-time uplink PHY
+/// (Phase 3d).
+#[derive(Debug, Clone)]
+pub struct PendingUplink {
+    /// The full type-1 MAC block (e.g. 92-bit SCH/HU), ready for LMAC encode.
+    pub mac_block: BitBuffer,
+    pub logical_channel: LogicalChannel,
+    pub scrambling_code: u32,
+}
 
 pub struct UmacMs {
     // config: Option<SharedConfig>,
@@ -38,6 +56,10 @@ pub struct UmacMs {
     cc: Option<u8>,
     /// Derived from mcc/mnc, and passed to lmac
     scrambling_code: Option<u32>,
+
+    /// MAC block queued for uplink transmission, awaiting an access opportunity
+    /// (cl. 23.5). Consumed by the uplink PHY driver (Phase 3d).
+    pending_uplink: Option<PendingUplink>,
 }
 
 impl UmacMs {
@@ -52,6 +74,7 @@ impl UmacMs {
             mnc: None,
             cc: None,
             scrambling_code: None,
+            pending_uplink: None,
         }
     }
 
@@ -657,9 +680,111 @@ impl UmacMs {
         queue.push_back(m);
     }
 
-    fn rx_tma_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
+    fn rx_tma_prim(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tma_prim");
-        unimplemented!();
+        let SapMsgInner::TmaUnitdataReq(mut prim) = message.msg else {
+            panic!("rx_tma_prim: unexpected primitive");
+        };
+
+        // The MS can only transmit once it has camped on a cell and derived the
+        // serving-cell scrambling code from SYNC (Phase 2). Without it we cannot
+        // channel-encode an uplink burst.
+        let Some(scrambling_code) = self.scrambling_code else {
+            tracing::warn!("rx_tma_prim: no scrambling code yet (not camped), dropping uplink SDU");
+            return;
+        };
+
+        let issi = self
+            .config
+            .config()
+            .ms
+            .as_ref()
+            .expect("MS config section required in MS mode")
+            .issi;
+
+        // Build a MAC-ACCESS carrying the TM-SDU for random access on SCH/HU
+        // (Control Uplink Burst). ETSI TS 100 392-2 cl. 21.4.2.1, cl. 23.5.1.
+        let sdu_len = prim.pdu.get_len();
+        let Some(mac_block) = Self::build_mac_access_block(issi, &mut prim.pdu) else {
+            tracing::warn!(
+                "rx_tma_prim: SDU ({} bits) too large for a single MAC-ACCESS burst; uplink fragmentation not implemented",
+                sdu_len
+            );
+            return;
+        };
+
+        tracing::debug!("rx_tma_prim: queued MAC-ACCESS uplink for ISSI {} ({} SDU bits)", issi, sdu_len);
+
+        // Queue for transmission at the next valid random-access opportunity.
+        // The access-frame selection / randomised access algorithm
+        // (cl. 23.5.1.4) and the actual transmit are driven by the real-time
+        // uplink PHY (Phase 3d).
+        self.pending_uplink = Some(PendingUplink {
+            mac_block,
+            logical_channel: LogicalChannel::SchHu,
+            scrambling_code,
+        });
+    }
+
+    /// Build a MAC-ACCESS type-1 MAC block (ETSI TS 100 392-2 cl. 21.4.2.1)
+    /// carrying `sdu` for transmission on SCH/HU (Control Uplink Burst). The
+    /// block is addressed with the MS's own ISSI (the uplink MAC-ACCESS address
+    /// is always an ISSI, cl. 21.4.2.1). Returns the full 92-bit type-1 block
+    /// (MAC-ACCESS header + TM-SDU + fill bits), or `None` if the SDU does not
+    /// fit a single access burst (uplink fragmentation, cl. 21.4.3, not yet
+    /// implemented).
+    pub fn build_mac_access_block(issi: u32, sdu: &mut BitBuffer) -> Option<BitBuffer> {
+        let mut pdu = MacAccess {
+            fill_bits: false,
+            encrypted: false,
+            addr: Some(TetraAddress {
+                ssi_type: SsiType::Issi,
+                ssi: issi,
+            }),
+            event_label: None,
+            length_ind: Some(0),
+            frag_flag: None,
+            reservation_req: None,
+        };
+
+        // Measure the header length. The fill_bits flag and the length_ind
+        // value do not change the number of header bits.
+        let hdr_len = {
+            let mut scratch = BitBuffer::new(64);
+            pdu.to_bitbuf(&mut scratch);
+            scratch.get_pos()
+        };
+
+        let sdu_len = sdu.get_len();
+        let content_len = hdr_len + sdu_len;
+        // The length indication counts octets, so pad the content to the next
+        // byte boundary with fill bits (cl. 21.4.2.1 / 23.4.3 length indication).
+        let num_fill_bits = (8 - content_len % 8) % 8;
+        let total_len = content_len + num_fill_bits;
+        if total_len > SCH_HU_TYPE1_BITS {
+            return None; // Would require uplink fragmentation (deferred)
+        }
+
+        pdu.length_ind = Some((total_len / 8) as u8);
+        pdu.fill_bits = num_fill_bits != 0;
+
+        // Assemble the full 92-bit type-1 block: MAC-ACCESS header + TM-SDU +
+        // fill bits. Bits beyond the length indication are don't-care (left
+        // zeroed); the receiver ignores everything past length_ind octets.
+        let mut block = BitBuffer::new(SCH_HU_TYPE1_BITS);
+        pdu.to_bitbuf(&mut block);
+        sdu.seek(0);
+        block.copy_bits(sdu, sdu_len);
+        fillbits::addition::write(&mut block, Some(num_fill_bits));
+        block.seek(0);
+        Some(block)
+    }
+
+    /// Take the MAC block queued for uplink transmission, if any. Consumed by
+    /// the uplink PHY driver once a valid access opportunity is reached
+    /// (Phase 3d).
+    pub fn take_pending_uplink(&mut self) -> Option<PendingUplink> {
+        self.pending_uplink.take()
     }
 
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
