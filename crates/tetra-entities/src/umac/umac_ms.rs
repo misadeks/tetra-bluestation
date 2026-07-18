@@ -4,7 +4,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
 use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
-use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
+use tetra_saps::tma::TmaUnitdataInd;
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -13,6 +13,7 @@ use tetra_pdus::umac::enums::broadcast_type::BroadcastType;
 use tetra_pdus::umac::enums::mac_pdu_type::MacPduType;
 use tetra_pdus::umac::pdus::access_assign::AccessAssign;
 use tetra_pdus::umac::pdus::access_assign_fr18::AccessAssignFr18;
+use tetra_pdus::umac::pdus::access_define::AccessDefine;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_frag_dl::MacFragDl;
@@ -22,6 +23,7 @@ use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
 
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::ms_defrag::MsDefrag;
+use crate::umac::subcomp::ms_random_access::AccessParamStore;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 
 /// SCH/HU (Control Uplink Burst) type-1 MAC block length in bits (ETSI TS 100
@@ -60,6 +62,10 @@ pub struct UmacMs {
     /// MAC block queued for uplink transmission, awaiting an access opportunity
     /// (cl. 23.5). Consumed by the uplink PHY driver (Phase 3d).
     pending_uplink: Option<PendingUplink>,
+
+    /// Random access parameters advertised by the serving cell, per access code
+    /// (ACCESS-DEFINE cl. 21.4.4.3 + SYSINFO default-A cl. 21.4.4.1).
+    access_params: AccessParamStore,
 }
 
 impl UmacMs {
@@ -75,6 +81,7 @@ impl UmacMs {
             cc: None,
             scrambling_code: None,
             pending_uplink: None,
+            access_params: AccessParamStore::new(),
         }
     }
 
@@ -196,7 +203,7 @@ impl UmacMs {
 
     // message pos: start of broadcast frame
     // Will NOT advance pos but pass to underlying function
-    fn rx_broadcast(&self, queue: &mut MessageQueue, message: &mut SapMsg) {
+    fn rx_broadcast(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_broadcast");
 
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
@@ -211,14 +218,48 @@ impl UmacMs {
             BroadcastType::Sysinfo => {
                 self.rx_broadcast_sysinfo(queue, message);
             }
+            BroadcastType::AccessDefine => {
+                self.rx_broadcast_access_define(message);
+            }
             _ => {
                 panic!();
             }
         }
     }
 
+    // Parses an ACCESS-DEFINE PDU (ETSI TS 100 392-2 cl. 21.4.4.3) and adopts
+    // the random access parameters for the access code it defines
+    // (cl. 23.5.1.4.1).
+    fn rx_broadcast_access_define(&mut self, message: &mut SapMsg) {
+        tracing::trace!("rx_broadcast_access_define");
+        let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
+            panic!()
+        };
+
+        let pdu = match AccessDefine::from_bitbuf(&mut prim.pdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing AccessDefine: {:?} {}", e, prim.pdu.dump_bin());
+                return;
+            }
+        };
+
+        // An MS on its common control channel ignores ACCESS-DEFINE PDUs marked
+        // for an assigned control channel (cl. 23.5.1.4.1). The MS currently
+        // only camps on the common control channel.
+        if pdu.common_or_assigned_control {
+            tracing::trace!("rx_broadcast_access_define: ignoring assigned-control ACCESS-DEFINE");
+            return;
+        }
+
+        self.access_params.update_access_define(&pdu);
+    }
+
     // Parses the sysinfo pdu
-    fn rx_broadcast_sysinfo(&self, queue: &mut MessageQueue, message: &mut SapMsg) {
+    fn rx_broadcast_sysinfo(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_broadcast_sysinfo");
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
             panic!()
@@ -235,6 +276,13 @@ impl UmacMs {
                 return;
             }
         };
+
+        // Adopt the "default definition for access code A" if present
+        // (cl. 21.4.4.1 / 23.5.1.4.10). Ignored by the store once a "common"
+        // ACCESS-DEFINE for code A has been received.
+        if let Some(def) = &pdu.default_access_code {
+            self.access_params.update_sysinfo_default_a(def);
+        }
 
         // TODO FIXME adopt sysinfo info into global state
         if pdu.hyperframe_number.is_some() && pdu.hyperframe_number.unwrap() != self.dltime.h {
