@@ -48,9 +48,14 @@ impl DLocationUpdateReject {
         let reject_cause = buffer.read_field(5, "reject_cause")? as u8;
         // Type1
         let cipher_control = buffer.read_field(1, "cipher_control")? != 0;
-        // Conditional
-        unimplemented!();
-        let ciphering_parameters = if true { Some(0) } else { None };
+        // Conditional: "Ciphering parameters" (10 bits) is present only when
+        // "Cipher control" is set to "1" (ciphering on); absent otherwise
+        // (cl. 16.9.2.9, notes 1 and 2). Mirrors the encoder in to_bitbuf.
+        let ciphering_parameters = if cipher_control {
+            Some(buffer.read_field(10, "ciphering_parameters")?)
+        } else {
+            None
+        };
 
         // obit designates presence of any further type2, type3 or type4 fields
         let mut obit = delimiters::read_obit(buffer)?;

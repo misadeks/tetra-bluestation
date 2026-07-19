@@ -7,6 +7,7 @@ use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
+use tetra_pdus::mm::enums::reject_cause::RejectCause;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
@@ -14,18 +15,30 @@ use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 
-/// Number of downlink timeslots to wait for a location update response before
-/// retransmitting the U-LOCATION-UPDATE-DEMAND. One TDMA multiframe is 18 frames
-/// × 4 slots ≈ 1.02 s, so this is roughly 4 s — long enough for the MAC random
-/// access attempt (cl. 23.5.1.4, up to Nu retransmissions) plus the BS response
-/// to complete. This is an implementation guard around the MM registration
-/// procedure (cl. 16.4); it is not a value transmitted on air.
-const REGISTRATION_RETRY_SLOTS: u32 = 288;
+/// Timer T351 — "Registration response time" (ETSI TS 100 392-2 cl. 16.11.1.1):
+/// the maximum time MM waits for a response (D-LOCATION-UPDATE-ACCEPT /
+/// -PROCEEDING / -REJECT) to a registration request. The spec value is **10 s**.
+/// Expressed here in downlink timeslots: one TETRA timeslot lasts 85/6 ≈ 14.167 ms
+/// (cl. 9.4.4), so 10 s / 14.167 ms ≈ 706 slots. The MM `tick_start` hook is
+/// driven once per received downlink slot, so this is the on-air timer value, not
+/// an invented guard. On expiry MM may resend the demand (cl. 16.4.5).
+const T351_TIMEOUT_SLOTS: u32 = 706;
 
-/// Maximum number of U-LOCATION-UPDATE-DEMAND transmissions for one registration
-/// attempt before MM gives up and returns to idle (awaiting a fresh cell
-/// selection). Guards against transmitting forever on a cell that never answers.
+/// Implementation cap on how many times MM resends the U-LOCATION-UPDATE-DEMAND
+/// after successive T351 expiries before abandoning the attempt and returning to
+/// idle to await a fresh cell (re)selection. Clause 16.4.5 permits MM, on T351
+/// expiry, to "resend the U-LOCATION UPDATE DEMAND" and notes the MS "may wish to
+/// select a new serving cell before further registration attempts"; the spec does
+/// not fix a resend count, so this bound is an implementation choice (not an
+/// on-air value). It is distinct from N351 below, which counts *rejections*.
 const MAX_REGISTRATION_ATTEMPTS: u8 = 5;
+
+/// N351 — "Maximum system rejection count" (ETSI TS 100 392-2 cl. 16.11.2.1):
+/// when an MS has received N351 registration rejections of type "system rejection"
+/// without a successful registration on a system, it shall leave the system and
+/// shall not attempt to register again on that system until after a power cycle.
+/// N351 has a range 1..4 with a **default value of 4**.
+const N351_MAX_SYSTEM_REJECTIONS: u8 = 4;
 
 /// Number of downlink timeslots to keep the stack running after a U-ITSI DETACH
 /// has been queued at shutdown, so the MAC random-access procedure (cl. 23.5.1.4)
@@ -67,11 +80,20 @@ pub struct MmMs {
     config: SharedConfig,
     /// Registration procedure state (cl. 16.4).
     reg_state: RegState,
-    /// Downlink slots remaining before retransmitting the demand while in
-    /// `Registering`.
-    retry_countdown: u32,
+    /// Timer T351 (registration response time, cl. 16.11.1.1) countdown in
+    /// downlink slots. Started when a demand is sent, stopped on ACCEPT/REJECT.
+    /// On expiry MM may resend the demand (cl. 16.4.5).
+    t351_countdown: u32,
     /// Number of demands sent for the current registration attempt.
     attempts: u8,
+    /// Count of registration rejections of type "system rejection" received
+    /// without an intervening successful registration (cl. 16.11.2.1, N351).
+    /// When it reaches `N351_MAX_SYSTEM_REJECTIONS` the MS leaves the system.
+    system_rejection_count: u8,
+    /// Set once the MS has left the system after N351 system rejections
+    /// (cl. 16.11.2.1): no further registration is attempted on this system
+    /// until a power cycle (process restart).
+    left_system: bool,
     /// Downlink slots remaining to drain after sending a U-ITSI DETACH at
     /// shutdown, giving the MAC/PHY time to transmit it (cl. 16.6.1).
     detach_countdown: u32,
@@ -82,8 +104,10 @@ impl MmMs {
         Self {
             config,
             reg_state: RegState::Idle,
-            retry_countdown: 0,
+            t351_countdown: 0,
             attempts: 0,
+            system_rejection_count: 0,
+            left_system: false,
             detach_countdown: 0,
         }
     }
@@ -147,6 +171,12 @@ impl MmMs {
     /// LMM-ACTIVATE confirmation from MLE (cl. 17.3.2): a serving cell has been
     /// selected. Start the registration procedure if the cell requires it.
     fn rx_activate_conf(&mut self, queue: &mut MessageQueue, conf: &LmmMleActivateConf) {
+        if self.left_system {
+            // Left the system after N351 system rejections (cl. 16.11.2.1); no
+            // further registration until a power cycle (process restart).
+            tracing::debug!("MM: activate-conf received but MS left the system (N351); ignoring");
+            return;
+        }
         if !conf.registration_required {
             tracing::info!(
                 "MM: serving cell (LA={}) does not require registration; not registering",
@@ -231,7 +261,7 @@ impl MmMs {
         queue.push_back(m);
 
         self.reg_state = RegState::Registering;
-        self.retry_countdown = REGISTRATION_RETRY_SLOTS;
+        self.t351_countdown = T351_TIMEOUT_SLOTS;
         self.attempts += 1;
     }
 
@@ -358,20 +388,35 @@ impl MmMs {
                 attached
             );
         } else if !self.attach_groups().is_empty() {
+            // cl. 16.4.1.1: "In case the group identity location accept
+            // information element is not present in the D-LOCATION UPDATE ACCEPT
+            // PDU, the MS shall assume the group attachment/detachment failed.
+            // The MS shall treat the failure as equivalent to T353 timer expiry."
+            // The ITSI registration itself is still accepted; only the group
+            // attachment failed. (T353 handling / re-attach is part of the group
+            // identity procedures, cl. 16.8 — a later MM slice.)
             tracing::warn!(
-                "MM: registration accepted but SwMI returned no group identity location accept; \
-                 configured groups {:?} may not be affiliated",
+                "MM: registration accepted but no group identity location accept returned; \
+                 assuming group attachment failed (cl. 16.4.1.1, equivalent to T353 expiry) \
+                 for configured groups {:?}",
                 self.attach_groups()
             );
         }
 
+        // Successful registration: stop timer T351 (cl. 16.4.1.1) and clear the
+        // N351 system-rejection counter (cl. 16.11.2.1 counts rejections "without
+        // a successful registration").
         self.reg_state = RegState::Registered;
-        self.retry_countdown = 0;
+        self.t351_countdown = 0;
+        self.system_rejection_count = 0;
     }
 
-    /// Handle D-LOCATION-UPDATE-REJECT (cl. 16.9.2.9): the SwMI refused our
-    /// registration. Log the cause and abandon this attempt; a later cell
-    /// (re)selection re-arms the procedure.
+    /// Handle D-LOCATION-UPDATE-REJECT (cl. 16.9.2.9 / 16.4.1.1): the SwMI
+    /// refused our registration. Per cl. 16.4.1.1 the reject is acted upon only
+    /// while timer T351 (or T354) is active; MM stops T351/T352, then analyses
+    /// the reject cause and either re-tries, abandons the cell (awaiting cell
+    /// reselection), or — after N351 "system rejection" results — leaves the
+    /// system (cl. 16.11.2.1).
     fn rx_d_location_update_reject(&mut self, mut sdu: BitBuffer) {
         let pdu = match DLocationUpdateReject::from_bitbuf(&mut sdu) {
             Ok(pdu) => pdu,
@@ -380,14 +425,149 @@ impl MmMs {
                 return;
             }
         };
-        tracing::warn!(
-            "MM: <- D-LOCATION-UPDATE-REJECT type={:?} reject_cause={}: registration rejected",
-            pdu.location_update_type,
-            pdu.reject_cause
-        );
-        self.reg_state = RegState::Idle;
-        self.retry_countdown = 0;
+
+        // cl. 16.4.1.1: the reject is processed only if timer T351 (or T354) is
+        // active — i.e. we are awaiting a registration response. A stray reject
+        // outside a registration attempt is ignored.
+        if self.reg_state != RegState::Registering {
+            tracing::debug!(
+                "MM: <- D-LOCATION-UPDATE-REJECT with no registration outstanding (T351 not active); ignoring"
+            );
+            return;
+        }
+
+        // Stop timers T351 and T352 (cl. 16.4.1.1).
+        self.t351_countdown = 0;
+
+        let cause = RejectCause::try_from(pdu.reject_cause as u64);
+        match &cause {
+            Ok(c) => tracing::warn!(
+                "MM: <- D-LOCATION-UPDATE-REJECT type={:?} reject_cause={} ({})",
+                pdu.location_update_type,
+                pdu.reject_cause,
+                c
+            ),
+            Err(_) => tracing::warn!(
+                "MM: <- D-LOCATION-UPDATE-REJECT type={:?} unknown reject_cause={}",
+                pdu.location_update_type,
+                pdu.reject_cause
+            ),
+        }
+
+        // TNMM-REGISTRATION indication ("failure" + reject cause, cl. 16.4.1.1)
+        // would be issued to the user application here; there is no user-app
+        // consumer of the TNMM-SAP in this stack, so it is logged above.
+
+        let action = cause.map(Self::analyse_reject_cause).unwrap_or(RejectAction::Abandon);
+        match action {
+            RejectAction::Retry => {
+                if self.attempts < MAX_REGISTRATION_ATTEMPTS {
+                    tracing::info!(
+                        "MM: reject cause permits re-try; resending U-LOCATION-UPDATE-DEMAND (attempt {})",
+                        self.attempts + 1
+                    );
+                    // send_location_update_demand re-arms T351 and Registering.
+                    // (caller state already Registering)
+                    self.resend_after_reject();
+                } else {
+                    tracing::warn!(
+                        "MM: reject cause permits re-try but resend cap ({}) reached; abandoning",
+                        MAX_REGISTRATION_ATTEMPTS
+                    );
+                    self.reg_state = RegState::Idle;
+                }
+            }
+            RejectAction::Abandon => {
+                // The spec issues an MLE-UPDATE request (LA / cell-type / cell
+                // rejection) so MLE runs cell reselection (cl. 18.3.4.7). MLE-side
+                // reselection is a later slice; MM abandons this attempt and awaits
+                // the next LMM-ACTIVATE confirmation.
+                tracing::info!("MM: reject cause requires cell reselection / abandon; returning to idle");
+                self.reg_state = RegState::Idle;
+            }
+            RejectAction::SystemRejection => {
+                self.system_rejection_count = self.system_rejection_count.saturating_add(1);
+                if self.system_rejection_count >= N351_MAX_SYSTEM_REJECTIONS {
+                    tracing::error!(
+                        "MM: reached N351={} system rejections; leaving the system (cl. 16.11.2.1), \
+                         no further registration until power cycle",
+                        N351_MAX_SYSTEM_REJECTIONS
+                    );
+                    self.left_system = true;
+                } else {
+                    tracing::warn!(
+                        "MM: system rejection {}/{}; abandoning attempt, MLE cell reselection pending",
+                        self.system_rejection_count,
+                        N351_MAX_SYSTEM_REJECTIONS
+                    );
+                }
+                self.reg_state = RegState::Idle;
+            }
+        }
     }
+
+    /// Resend the U-LOCATION-UPDATE-DEMAND after a recoverable reject cause. Kept
+    /// separate from the timeout resend so the log context differs; both re-arm
+    /// T351 and increment the attempt count via `send_location_update_demand`.
+    fn resend_after_reject(&mut self) {
+        // A fresh MessageQueue is not available here; the reject handler is
+        // invoked from rx_lmm_mle_unitdata_ind which does not thread the queue
+        // down. The demand is instead re-sent from tick_start on the next slot by
+        // leaving reg_state = Registering with an expired T351. Setting the
+        // countdown to 0 makes tick_start resend immediately (cl. 16.4.5).
+        self.reg_state = RegState::Registering;
+        self.t351_countdown = 0;
+    }
+
+    /// Classify a D-LOCATION-UPDATE-REJECT cause into the action MM must take,
+    /// strictly per the reject-cause analysis in cl. 16.4.1.1. Causes not
+    /// enumerated there for normal registration (e.g. security/ciphering causes,
+    /// which belong to ETSI EN 300 392-7) are treated as `Abandon` and logged;
+    /// they are not counted as N351 "system rejections".
+    fn analyse_reject_cause(cause: RejectCause) -> RejectAction {
+        match cause {
+            // "may re-try registration after a suitable time" (else cell rejection).
+            RejectCause::Congestion | RejectCause::NetworkFailure => RejectAction::Retry,
+            // "the MS shall be allowed at least one registration re-try".
+            RejectCause::MandatoryElementError | RejectCause::MessageConsistencyError => {
+                RejectAction::Retry
+            }
+            // "cell type rejection" → MLE-UPDATE → cell reselection.
+            RejectCause::UseCaCellNotPermitted | RejectCause::UseDaCellNotPermitted => {
+                RejectAction::Abandon
+            }
+            // "LA rejection" → MLE-UPDATE → cell reselection.
+            RejectCause::LaNotAllowed
+            | RejectCause::ServiceNotSubscribed
+            | RejectCause::RoamingNotSupported => RejectAction::Abandon,
+            // "system rejection" type causes (counted against N351). Our MAC
+            // header carries the ISSI (no ASSI/(V)ASSI has been issued), so the
+            // ITSI/ATSI-unknown ASSI-retry branch does not apply.
+            RejectCause::ItsiAtsiUnknown
+            | RejectCause::IllegalMs
+            | RejectCause::MigrationNotSupported => RejectAction::SystemRejection,
+            // "not applicable to normal registration".
+            RejectCause::ForwardRegistrationFailure => RejectAction::Abandon,
+            // All other causes (LA unknown, and the security/ciphering causes
+            // defined in ETSI EN 300 392-7) are outside the scope of the normal
+            // registration reject analysis of cl. 16.4.1.1.
+            _ => RejectAction::Abandon,
+        }
+    }
+}
+
+/// Action MM takes after analysing a D-LOCATION-UPDATE-REJECT cause
+/// (ETSI TS 100 392-2 cl. 16.4.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectAction {
+    /// Recoverable cause — MM may re-try the registration.
+    Retry,
+    /// Cause requires abandoning the cell and awaiting cell reselection
+    /// (the spec's LA / cell-type / cell rejection MLE-UPDATE results).
+    Abandon,
+    /// A registration result of type "system rejection" — counts toward N351;
+    /// once N351 is reached the MS leaves the system (cl. 16.11.2.1).
+    SystemRejection,
 }
 
 impl TetraEntityTrait for MmMs {
@@ -407,25 +587,28 @@ impl TetraEntityTrait for MmMs {
             return;
         }
 
-        // Drive the registration retransmission timer (cl. 16.4). Only active
-        // while awaiting a response to a sent demand.
+        // Drive timer T351 (registration response time, cl. 16.11.1.1). Only
+        // active while awaiting a response to a sent demand. On expiry MM resends
+        // the U-LOCATION-UPDATE-DEMAND (cl. 16.4.5 permits resending), bounded by
+        // an implementation resend cap, after which it returns to idle to await a
+        // fresh cell (re)selection.
         if self.reg_state != RegState::Registering {
             return;
         }
-        if self.retry_countdown > 0 {
-            self.retry_countdown -= 1;
+        if self.t351_countdown > 0 {
+            self.t351_countdown -= 1;
             return;
         }
         if self.attempts >= MAX_REGISTRATION_ATTEMPTS {
             tracing::error!(
-                "MM: registration failed after {} attempts; abandoning until next cell (re)selection",
+                "MM: registration failed after {} attempts (T351 expiries); abandoning until next cell (re)selection",
                 self.attempts
             );
             self.reg_state = RegState::Idle;
             return;
         }
         tracing::warn!(
-            "MM: registration response timeout; retransmitting U-LOCATION-UPDATE-DEMAND (attempt {})",
+            "MM: T351 expired with no registration response; resending U-LOCATION-UPDATE-DEMAND (attempt {})",
             self.attempts + 1
         );
         self.send_location_update_demand(queue);
@@ -666,7 +849,7 @@ attach_groups = []
         assert_eq!(mm.reg_state, RegState::Registered);
 
         // No further retransmission even after the retry window elapses.
-        for _ in 0..=REGISTRATION_RETRY_SLOTS {
+        for _ in 0..=T351_TIMEOUT_SLOTS {
             mm.tick_start(&mut q, TdmaTime::default());
         }
         assert!(q.pop_front().is_none(), "registered MS must not retransmit");
@@ -681,13 +864,103 @@ attach_groups = []
         let _ = q.pop_front();
         assert_eq!(mm.attempts, 1);
 
-        // Countdown slots: no retransmit until the tick after it reaches zero.
-        for _ in 0..=REGISTRATION_RETRY_SLOTS {
+        // Countdown slots: no retransmit until the tick after T351 reaches zero.
+        for _ in 0..=T351_TIMEOUT_SLOTS {
             mm.tick_start(&mut q, TdmaTime::default());
         }
         let msg = q.pop_front().expect("demand retransmitted after timeout");
         assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
         assert_eq!(mm.attempts, 2);
+    }
+
+    /// Build a D-LOCATION-UPDATE-REJECT with the given raw reject cause.
+    fn build_reject(cause: u8) -> BitBuffer {
+        let pdu = DLocationUpdateReject {
+            location_update_type: LocationUpdateType::ItsiAttach,
+            reject_cause: cause,
+            cipher_control: false,
+            ciphering_parameters: None,
+            address_extension: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu
+    }
+
+    /// A recoverable reject cause (Congestion) makes MM resend the demand
+    /// (cl. 16.4.1.1: "may re-try registration"); attempt count increases.
+    #[test]
+    fn test_reject_recoverable_cause_retries() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        assert_eq!(mm.attempts, 1);
+
+        deliver_dl(&mut mm, &mut q, build_reject(RejectCause::Congestion as u8));
+        // Reject-driven resend is deferred to the next tick (T351 set to 0).
+        assert_eq!(mm.reg_state, RegState::Registering);
+        mm.tick_start(&mut q, TdmaTime::default());
+        let msg = q.pop_front().expect("demand resent after recoverable reject");
+        assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
+        assert_eq!(mm.attempts, 2);
+    }
+
+    /// An LA-rejection cause (LA not allowed) abandons the attempt → Idle,
+    /// awaiting a fresh cell (re)selection (cl. 16.4.1.1).
+    #[test]
+    fn test_reject_la_cause_abandons() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+
+        deliver_dl(&mut mm, &mut q, build_reject(RejectCause::LaNotAllowed as u8));
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(!mm.left_system);
+        // No resend on the next tick.
+        mm.tick_start(&mut q, TdmaTime::default());
+        assert!(q.pop_front().is_none());
+    }
+
+    /// After N351 "system rejection" causes (Illegal MS) without a successful
+    /// registration, the MS leaves the system and ignores further activate-confs
+    /// (cl. 16.11.2.1).
+    #[test]
+    fn test_reject_system_rejection_leaves_after_n351() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        for i in 1..=N351_MAX_SYSTEM_REJECTIONS {
+            mm.rx_activate_conf(&mut q, &activate_conf(true));
+            let _ = q.pop_front();
+            deliver_dl(&mut mm, &mut q, build_reject(RejectCause::IllegalMs as u8));
+            assert_eq!(mm.system_rejection_count, i);
+        }
+        assert!(mm.left_system, "MS must leave the system after N351 system rejections");
+        // Further cell selection must not trigger a new registration.
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none(), "no registration after leaving the system");
+    }
+
+    /// A successful registration clears the accumulated system-rejection count
+    /// (cl. 16.11.2.1 counts rejections "without a successful registration").
+    #[test]
+    fn test_accept_resets_system_rejection_count() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_reject(RejectCause::IllegalMs as u8));
+        assert_eq!(mm.system_rejection_count, 1);
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        assert_eq!(mm.system_rejection_count, 0);
     }
 
     /// On shutdown while registered, MM emits a valid, BS-parseable U-ITSI DETACH
