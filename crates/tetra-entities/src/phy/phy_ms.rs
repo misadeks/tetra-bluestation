@@ -205,22 +205,26 @@ impl<D: RxTxDev> PhyMs<D> {
     /// Minimum lead, in timeslots, that a scheduled uplink burst must keep
     /// ahead of the TX generation frontier.
     ///
-    /// This is a *floor*, not the actual lead. It is `0` so that a granted slot
-    /// which already lies ahead of the frontier is transmitted **at exactly
-    /// that slot**, with no frame-advance. Honouring the exact slot is required
-    /// for reserved access: the MAC-END-HU that completes an uplink
-    /// fragmentation must land in the precise BS-granted slot (`dltime + 2`,
-    /// ETSI TS 100 392-2 cl. 23.5.2 / 9.3.9), and the BS per-frame slot-owner
-    /// check rejects it otherwise. A burst is frame-advanced (see
-    /// [`Self::schedule_uplink_time`]) only when the frontier has genuinely
-    /// overrun the granted slot, which — for recurring random access — simply
-    /// moves it to the next occurrence of the same opportunity.
+    /// A burst is transmitted cleanly only if the frontier still sits *behind*
+    /// its slot start when the modulator produces it, so the modulator sweeps
+    /// from before SN0 (the π/4-DQPSK phase reference, `slot_begin + 68`
+    /// samples). With too little lead the frontier overruns the slot start
+    /// between scheduling and production and SN0 is clipped — the burst carries
+    /// no valid phase reference and the BS cannot decode it (hardware-observed:
+    /// a `2`-slot lead gives `ahead_samples ≈ +2779` and SN0 fires / the BS
+    /// acknowledges; `0` gives `ahead_samples ≈ −250`, SN0 clipped, silent).
+    /// `2` timeslots is the working margin.
     ///
-    /// The real safety margin against the frontier is provided upstream, by
-    /// keeping the MS uplink generation look-ahead small
-    /// (`MS_TX_LOOKAHEAD_BLOCKS`) so `dltime + 2` sits a fraction of a slot
-    /// ahead of the frontier in the first place.
-    const UPLINK_MIN_LEAD_SLOTS: i32 = 0;
+    /// KNOWN LIMITATION: this margin makes reserved-access slots (the MAC-END-HU
+    /// at the exact BS-granted `dltime + 2`, ETSI TS 100 392-2 cl. 23.5.2.2.2 /
+    /// 9.3.9) unreachable — the frontier plus this lead is already past that
+    /// fixed slot, so [`Self::schedule_uplink_time`] frame-advances it and it
+    /// misses the reserved slot. Contention random access is unaffected (its
+    /// opportunities recur). Closing this needs a reduction of the MS RX→TX
+    /// pipeline latency (an SDR-timing change), not any air-interface procedure
+    /// — TETRA has no timing-advance (propagation is absorbed by the uplink
+    /// guard period, cl. 9.4.3.4).
+    const UPLINK_MIN_LEAD_SLOTS: i32 = 2;
 
     /// Choose the absolute uplink slot to transmit a granted burst in.
     ///
@@ -591,10 +595,9 @@ attach_groups = []
     fn test_pending_burst_scheduled_then_retired() {
         let base = TdmaTime::default();
         // At rx_prim the PHY's dltime is the default `base`, so the granted
-        // opportunity is base+2. With the true frontier at `base`, base+2 is
-        // already ahead of the frontier (frontier_deficit < 0), so with
-        // UPLINK_MIN_LEAD_SLOTS(0) it is honoured at exactly that slot (no
-        // frame-advance).
+        // opportunity is base+2. With the true frontier at `base`, target =
+        // frontier + UPLINK_MIN_LEAD_SLOTS(2) = base+2 == the granted slot, so
+        // deficit is 0 and it is honoured at exactly that slot (no frame-advance).
         let ul_time = base.add_timeslots(2);
 
         let mut phy = phy_ms(MockRxTx::default());
