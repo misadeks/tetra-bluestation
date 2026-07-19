@@ -8,6 +8,7 @@
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::management::{ManagementCommand, ManagementResponse};
 use crate::tnmm::{
     TnmmAttachDetachGroupIdentityRequest, TnmmDeregistrationRequest, TnmmEnergySavingRequest,
     TnmmRegistrationRequest, TnmmStatusRequest,
@@ -58,6 +59,15 @@ pub enum ControlCommand {
     TnmmStatus { handle: u32, request: TnmmStatusRequest },
     /// TNMM-ENERGY SAVING request (Table 15.3, cl. 15.3.3.5) — dormant.
     TnmmEnergySaving { handle: u32, request: TnmmEnergySavingRequest },
+
+    // -----------------------------------------------------------------------
+    // Management / provisioning (Plane B, **NON-STANDARD**). Wraps the
+    // implementation-defined `crate::management` command set. Kept in its own
+    // variant so Plane B never mixes with the standardized TNMM-SAP (Plane A)
+    // on the wire. See `crate::management` for the standards disclaimer.
+    // -----------------------------------------------------------------------
+    /// Management command (non-standard stack provisioning / runtime-state read).
+    Management(ManagementCommand),
 }
 
 /// Response sent back to the remote command server after processing a [`Command`].
@@ -78,4 +88,8 @@ pub enum ControlResponse {
         accepted: bool,
         detail: Option<String>,
     },
+
+    /// Response to a management command (Plane B, **NON-STANDARD**). Wraps the
+    /// implementation-defined `crate::management` response set.
+    Management(ManagementResponse),
 }

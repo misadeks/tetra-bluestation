@@ -134,4 +134,41 @@ mod tests {
         // Use truncated bytes that cannot form a valid Command
         assert!(codec.decode_command(&[]).is_err());
     }
+
+    /// Plane B (non-standard) management command/response survive a JSON
+    /// round-trip over the reused control transport.
+    #[test]
+    fn test_roundtrip_json_management() {
+        use crate::management::{ManagementCommand, ManagementResponse, MsRuntimeState, RegistrationState};
+        use crate::tnmm::ServiceStatus;
+        let codec = ControlCodecJson;
+
+        let cmd = ControlCommand::Management(ManagementCommand::GetState { handle: 5 });
+        let decoded = codec.decode_command(&codec.encode_command(&cmd)).unwrap();
+        let ControlCommand::Management(ManagementCommand::GetState { handle }) = decoded else {
+            panic!("expected Management GetState");
+        };
+        assert_eq!(handle, 5);
+
+        let state = MsRuntimeState {
+            registration_state: RegistrationState::Registered,
+            service_status: ServiceStatus::InService,
+            own_issi: 1000001,
+            home_mcc: 901,
+            home_mnc: 9999,
+            serving_la: 1,
+            colour_code: 1,
+            attached_groups: vec![100, 200],
+        };
+        let resp = ControlResponse::Management(ManagementResponse::State {
+            handle: 5,
+            state: Box::new(state.clone()),
+        });
+        let decoded = codec.decode_response(&codec.encode_response(&resp)).unwrap();
+        let ControlResponse::Management(ManagementResponse::State { handle, state: got }) = decoded else {
+            panic!("expected Management State");
+        };
+        assert_eq!(handle, 5);
+        assert_eq!(*got, state);
+    }
 }

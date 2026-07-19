@@ -1130,6 +1130,12 @@ impl MmMs {
                     detail: Some("energy economy (cl. 16.7) not implemented".to_string()),
                 });
             }
+            // Management / provisioning (Plane B, **NON-STANDARD**). Served here
+            // because MM is the single writer of MS runtime state. See
+            // `crate::management` for the standards disclaimer.
+            ControlCommand::Management(mgmt) => {
+                self.handle_management_command(mgmt);
+            }
             // Non-TNMM commands are not addressed to MM(MS); log and drop.
             other => {
                 tracing::warn!("MM(MS): received non-TNMM control command with no MS handler, dropping: {:?}", other);
@@ -1213,6 +1219,63 @@ impl MmMs {
                     detail: Some("de-registration in progress".to_string()),
                 });
             }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Management / provisioning handlers (Plane B, **NON-STANDARD**).
+    //
+    // Implementation-defined stack provisioning + runtime-state reads. NOT part
+    // of any ETSI standard (see `crate::management`). Carried over the reused
+    // control transport in the dedicated `Management` variant.
+    // ----------------------------------------------------------------------
+
+    /// Handle one inbound management command (Plane B, non-standard).
+    fn handle_management_command(&mut self, cmd: crate::management::ManagementCommand) {
+        use crate::management::{ManagementCommand, ManagementResponse};
+        use crate::net_control::ControlResponse;
+        match cmd {
+            // Read-only runtime state snapshot; always serviceable.
+            ManagementCommand::GetState { handle } => {
+                let state = self.runtime_snapshot();
+                self.respond(ControlResponse::Management(ManagementResponse::State {
+                    handle,
+                    state: Box::new(state),
+                }));
+            }
+        }
+    }
+
+    /// Build an [`crate::management::MsRuntimeState`] snapshot from MM's own
+    /// state and the active configuration (Plane B, non-standard). MM is the
+    /// single writer of MS runtime state, so no locking is required.
+    fn runtime_snapshot(&self) -> crate::management::MsRuntimeState {
+        use crate::management::{MsRuntimeState, RegistrationState};
+        use crate::tnmm::ServiceStatus;
+
+        let registration_state = match self.reg_state {
+            RegState::Idle => RegistrationState::Idle,
+            RegState::Registering => RegistrationState::Registering,
+            RegState::Registered => RegistrationState::Registered,
+            RegState::Detaching => RegistrationState::Detaching,
+        };
+        // Derived service status: mirrors the vocabulary of the TNMM-SERVICE
+        // indication (Plane A) without asserting a standardized primitive.
+        let service_status = match self.reg_state {
+            RegState::Registered => ServiceStatus::InService,
+            RegState::Registering => ServiceStatus::InServiceWaitingForRegistration,
+            RegState::Idle | RegState::Detaching => ServiceStatus::OutOfService,
+        };
+        let cfg = self.config.config();
+        MsRuntimeState {
+            registration_state,
+            service_status,
+            own_issi: self.own_issi(),
+            home_mcc: cfg.net.mcc,
+            home_mnc: cfg.net.mnc,
+            serving_la: self.serving_la,
+            colour_code: cfg.cell.colour_code,
+            attached_groups: self.attach_groups(),
         }
     }
 }
@@ -2259,5 +2322,72 @@ attach_groups = []
             .collect();
         assert_eq!(acks.len(), 2);
         assert!(acks.iter().all(|(_, accepted)| !*accepted), "dormant requests not accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // T3: management / provisioning (Plane B, NON-STANDARD). Read-path slice:
+    // GetState returns an MS runtime-state snapshot built from MM state + config.
+    // -----------------------------------------------------------------------
+
+    /// Extract the last `Management(State{..})` response from a dispatcher.
+    fn last_state(dispatcher: &crate::net_control::CommandDispatcher) -> (u32, crate::management::MsRuntimeState) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::State { handle, state }) => Some((handle, *state)),
+                _ => None,
+            })
+            .expect("a Management State response")
+    }
+
+    /// GetState before any cell selection reports Idle / OutOfService and echoes
+    /// the configured identity/network/cell fields (non-standard Plane B).
+    #[test]
+    fn test_management_get_state_idle_snapshot() {
+        use crate::management::{ManagementCommand, RegistrationState};
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetState { handle: 71 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, state) = last_state(&dispatcher);
+        assert_eq!(handle, 71);
+        assert_eq!(state.registration_state, RegistrationState::Idle);
+        assert_eq!(state.service_status, ServiceStatus::OutOfService);
+        assert_eq!(state.own_issi, 1000001);
+        assert_eq!(state.home_mcc, 901);
+        assert_eq!(state.home_mnc, 9999);
+        assert_eq!(state.serving_la, 1);
+        assert_eq!(state.colour_code, 1);
+        assert!(state.attached_groups.is_empty());
+        // GetState is read-only: registration state must be untouched.
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none(), "GetState must not emit any PDU");
+    }
+
+    /// After successful registration, GetState reflects Registered / InService.
+    #[test]
+    fn test_management_get_state_registered_snapshot() {
+        use crate::management::{ManagementCommand, RegistrationState};
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        while q.pop_front().is_some() {}
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetState { handle: 72 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_handle, state) = last_state(&dispatcher);
+        assert_eq!(state.registration_state, RegistrationState::Registered);
+        assert_eq!(state.service_status, ServiceStatus::InService);
     }
 }

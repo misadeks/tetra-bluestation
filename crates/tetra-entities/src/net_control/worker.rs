@@ -122,6 +122,9 @@ impl<T: NetworkTransport> ControlWorker<T> {
             | ControlCommand::TnmmAttachDetachGroupIdentity { .. }
             | ControlCommand::TnmmStatus { .. }
             | ControlCommand::TnmmEnergySaving { .. } => TetraEntity::Mm,
+            // Management / provisioning (Plane B, non-standard) is served by MM,
+            // the single writer of MS runtime state and config-apply.
+            ControlCommand::Management(_) => TetraEntity::Mm,
         }
     }
 
@@ -239,6 +242,15 @@ mod tests {
             },
         };
         assert_eq!(ControlWorker::<MockTransport>::route_control_command(&energy), TetraEntity::Mm);
+    }
+
+    /// Management commands (Plane B, non-standard) are routed to Mobility
+    /// Management, the single writer of MS runtime state.
+    #[test]
+    fn test_route_management_to_mm() {
+        use crate::management::ManagementCommand;
+        let cmd = ControlCommand::Management(ManagementCommand::GetState { handle: 9 });
+        assert_eq!(ControlWorker::<MockTransport>::route_control_command(&cmd), TetraEntity::Mm);
     }
 
     #[test]
