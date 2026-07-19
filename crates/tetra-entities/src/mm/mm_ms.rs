@@ -1022,19 +1022,197 @@ impl MmMs {
 
     /// Drain and handle inbound external-interface commands (UI -> stack).
     ///
-    /// Wired in Phase T0 (MS interface enabler): the control endpoint is polled
-    /// once per downlink tick, mirroring `MmBs::tick_start`. No MS-side control
-    /// commands are defined yet — TNMM requests (ETSI TS 100 392-2 cl. 15.3) are
-    /// added in Phase T2 — so any command that arrives now is logged and
-    /// dropped rather than acted upon. Unlike the BS placeholder handler this
-    /// does not panic: commands originate from an external UI process and an
-    /// unexpected variant must not be able to crash the MS stack.
-    fn poll_control(&mut self, _queue: &mut MessageQueue) {
-        let Some(cep) = &self.control else {
+    /// The control endpoint is polled once per downlink tick (mirroring
+    /// `MmBs::tick_start`). Commands are drained first so the immutable borrow of
+    /// `self.control` is released before any handler mutates MM state.
+    ///
+    /// Unlike the BS placeholder handler this never panics: commands originate
+    /// from an external UI process and an unexpected/unsupported variant must not
+    /// be able to crash the MS stack.
+    fn poll_control(&mut self, queue: &mut MessageQueue) {
+        let mut commands = Vec::new();
+        if let Some(cep) = &self.control {
+            while let Some(cmd) = cep.try_recv() {
+                commands.push(cmd);
+            }
+        }
+        for cmd in commands {
+            self.handle_control_command(queue, cmd);
+        }
+    }
+
+    /// Send a control response back to the UI, if a control endpoint is wired.
+    fn respond(&self, response: crate::net_control::ControlResponse) {
+        if let Some(cep) = &self.control {
+            cep.respond(response);
+        }
+    }
+
+    /// Handle one inbound control command. TNMM-SAP requests (Plane A, cl. 15.3)
+    /// are acted upon here; the TNMM *result* is reported asynchronously through
+    /// the outbound TNMM-SAP indications/confirms on the telemetry channel
+    /// (cl. 15.3.2), so the control response only acknowledges whether MM acted.
+    fn handle_control_command(&mut self, queue: &mut MessageQueue, cmd: crate::net_control::ControlCommand) {
+        use crate::net_control::{ControlCommand, ControlResponse};
+        match cmd {
+            // TNMM-REGISTRATION request (Table 15.5, cl. 15.3.3.7): initiate
+            // attachment and registration of the terminal.
+            ControlCommand::TnmmRegistration { handle, request } => {
+                self.handle_tnmm_registration_request(queue, handle, &request);
+            }
+            // TNMM-DEREGISTRATION request (Table 15.2, cl. 15.3.3.2): cancel the
+            // registration. Reuses the shutdown de-registration path (cl. 16.6.1),
+            // which sends U-ITSI DETACH and emits TNMM-SERVICE "out of service".
+            ControlCommand::TnmmDeregistration { handle, request } => {
+                // Table 15.2 NOTE: with all attached ITSIs detached the ISSI/MCC/
+                // MNC need not be present. When present, they must select this
+                // MS's own ITSI (single-ITSI stack).
+                if let Some(issi) = request.issi {
+                    if issi != self.own_issi() {
+                        tracing::warn!(
+                            "MM(MS): TNMM-DEREGISTRATION for ISSI {} != own ISSI {}; ignoring",
+                            issi,
+                            self.own_issi()
+                        );
+                        self.respond(ControlResponse::TnmmAck {
+                            handle,
+                            accepted: false,
+                            detail: Some("ISSI does not match the configured ITSI".to_string()),
+                        });
+                        return;
+                    }
+                }
+                let acted = self.begin_deregistration(queue);
+                let detail = if acted { None } else { Some("not registered; nothing to detach".to_string()) };
+                self.respond(ControlResponse::TnmmAck { handle, accepted: true, detail });
+            }
+            // TNMM-ATTACH DETACH GROUP IDENTITY request (Table 15.1, cl. 15.3.3.1):
+            // the standalone U-ATTACH/DETACH GROUP IDENTITY procedure (cl. 16.9.3)
+            // is not implemented in this stack — group attachment is only carried
+            // bundled in the ITSI-attach registration (cl. 16.8.2). Documented
+            // deferral: accepted = false so the UI knows no action was taken.
+            ControlCommand::TnmmAttachDetachGroupIdentity { handle, request } => {
+                tracing::warn!(
+                    "MM(MS): TNMM-ATTACH DETACH GROUP IDENTITY request received but the standalone \
+                     group identity procedure (cl. 16.9.3) is not implemented; {} entrie(s) ignored",
+                    request.group_identity_request.len()
+                );
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some(
+                        "standalone group attach/detach (cl. 16.9.3) not implemented; \
+                         groups are attached at registration"
+                            .to_string(),
+                    ),
+                });
+            }
+            // TNMM-STATUS request (Table 15.7, cl. 15.3.3.9): selects direct mode
+            // / dual watch / energy economy — none implemented in this stack.
+            ControlCommand::TnmmStatus { handle, .. } => {
+                tracing::warn!(
+                    "MM(MS): TNMM-STATUS request received but direct mode / dual watch / energy \
+                     economy are not implemented; ignoring"
+                );
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("direct mode / dual watch / energy economy not implemented".to_string()),
+                });
+            }
+            // TNMM-ENERGY SAVING request (Table 15.3, cl. 15.3.3.5): dormant —
+            // the energy-economy procedure (cl. 16.7) is not implemented.
+            ControlCommand::TnmmEnergySaving { handle, .. } => {
+                tracing::warn!("MM(MS): TNMM-ENERGY SAVING request received but energy economy (cl. 16.7) is not implemented; ignoring");
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("energy economy (cl. 16.7) not implemented".to_string()),
+                });
+            }
+            // Non-TNMM commands are not addressed to MM(MS); log and drop.
+            other => {
+                tracing::warn!("MM(MS): received non-TNMM control command with no MS handler, dropping: {:?}", other);
+            }
+        }
+    }
+
+    /// Act on a TNMM-REGISTRATION request (Table 15.5). Validates the requested
+    /// ITSI against the configured one (single-ITSI stack) and, when the MS is
+    /// idle, initiates the ITSI-attach registration by sending a
+    /// U-LOCATION-UPDATE-DEMAND — the same path taken on serving-cell selection
+    /// (rx_activate_conf). The registration *result* is reported later through
+    /// the TNMM-REGISTRATION indication/confirm.
+    fn handle_tnmm_registration_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        handle: u32,
+        request: &crate::tnmm::TnmmRegistrationRequest,
+    ) {
+        use crate::net_control::ControlResponse;
+
+        // The request identifies the ITSI to register (ISSI + MNI). This stack
+        // manages a single configured ITSI, so a mismatch cannot be honoured.
+        let own_mcc = self.config.config().net.mcc;
+        let own_mnc = self.config.config().net.mnc;
+        if request.issi != self.own_issi() || request.mcc_of_issi != own_mcc || request.mnc_of_issi != own_mnc {
+            tracing::warn!(
+                "MM(MS): TNMM-REGISTRATION request for ITSI {}/{}/{} != configured {}/{}/{}; ignoring",
+                request.mcc_of_issi,
+                request.mnc_of_issi,
+                request.issi,
+                own_mcc,
+                own_mnc,
+                self.own_issi()
+            );
+            self.respond(ControlResponse::TnmmAck {
+                handle,
+                accepted: false,
+                detail: Some("ISSI/MNI does not match the configured ITSI".to_string()),
+            });
             return;
-        };
-        while let Some(cmd) = cep.try_recv() {
-            tracing::warn!("MM(MS): received control command with no MS handler yet, dropping: {:?}", cmd);
+        }
+
+        if self.left_system {
+            self.respond(ControlResponse::TnmmAck {
+                handle,
+                accepted: false,
+                detail: Some("MS left the system (N351); registration requires a restart".to_string()),
+            });
+            return;
+        }
+
+        match self.reg_state {
+            RegState::Idle => {
+                // Initiate the ITSI-attach registration. Note: MLE must have a
+                // serving cell for the demand to actually be transmitted; the
+                // demand reuses the exact air path of rx_activate_conf.
+                tracing::info!("MM(MS): TNMM-REGISTRATION request; initiating ITSI attach registration");
+                self.attempts = 0;
+                self.send_location_update_demand(queue);
+                self.respond(ControlResponse::TnmmAck { handle, accepted: true, detail: None });
+            }
+            RegState::Registering => {
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("registration already in progress".to_string()),
+                });
+            }
+            RegState::Registered => {
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("already registered".to_string()),
+                });
+            }
+            RegState::Detaching => {
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("de-registration in progress".to_string()),
+                });
+            }
         }
     }
 }
@@ -1882,5 +2060,204 @@ attach_groups = []
             )),
             "de-registration emits 'out of service'"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T2: TNMM-SAP requests (INBOUND, cl. 15.3.3). Drive requests through the
+    // wired control link (dispatcher = UI side) and assert MM's action + the
+    // TnmmAck transport response.
+    // -----------------------------------------------------------------------
+
+    /// Build the MS's own valid TNMM-REGISTRATION request (matching ITSI/MNI).
+    fn own_registration_request() -> crate::tnmm::TnmmRegistrationRequest {
+        use crate::tnmm::{RegistrationType, TnmmRegistrationRequest};
+        TnmmRegistrationRequest {
+            registration_type: RegistrationType::RegistrationToIndicatedCell,
+            required_cell_type_list: None,
+            preferred_cell_type_list: None,
+            preferred_la_list: None,
+            preferred_mcc_list: None,
+            preferred_mnc_list: None,
+            issi: MS_ISSI,
+            mcc_of_issi: 901,
+            mnc_of_issi: 9999,
+            energy_economy_mode: None,
+            group_identity_request: None,
+            group_identity_attach_detach_mode: None,
+        }
+    }
+
+    fn last_ack(dispatcher: &crate::net_control::CommandDispatcher) -> (bool, Option<String>) {
+        let resps = dispatcher.try_recv_responses();
+        let ack = resps
+            .into_iter()
+            .find_map(|r| match r {
+                crate::net_control::ControlResponse::TnmmAck { accepted, detail, .. } => Some((accepted, detail)),
+                _ => None,
+            })
+            .expect("a TnmmAck response");
+        ack
+    }
+
+    /// A TNMM-REGISTRATION request (Table 15.5) while idle initiates the ITSI
+    /// attach: MM sends a U-LOCATION-UPDATE-DEMAND and moves to Registering, and
+    /// acknowledges acceptance (cl. 15.3.3.7).
+    #[test]
+    fn test_tnmm_registration_request_triggers_demand() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmRegistration {
+            handle: 11,
+            request: Box::new(own_registration_request()),
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Registering);
+        let msg = q.pop_front().expect("registration demand queued");
+        assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
+        let (accepted, _detail) = last_ack(&dispatcher);
+        assert!(accepted, "registration request accepted");
+    }
+
+    /// A TNMM-REGISTRATION request for a different ITSI is rejected (single-ITSI
+    /// stack) with no state change.
+    #[test]
+    fn test_tnmm_registration_request_wrong_itsi_rejected() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let mut req = own_registration_request();
+        req.issi = MS_ISSI + 1;
+        dispatcher.send(ControlCommand::TnmmRegistration { handle: 12, request: Box::new(req) });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle, "no registration for a foreign ITSI");
+        assert!(q.pop_front().is_none(), "no demand for a foreign ITSI");
+        let (accepted, detail) = last_ack(&dispatcher);
+        assert!(!accepted);
+        assert!(detail.is_some());
+    }
+
+    /// A TNMM-DEREGISTRATION request (Table 15.2) while registered runs the
+    /// de-registration: MM sends U-ITSI DETACH, moves to Detaching, emits
+    /// TNMM-SERVICE "out of service", and acknowledges (cl. 15.3.3.2 / 16.6.1).
+    #[test]
+    fn test_tnmm_deregistration_request_detaches() {
+        use crate::tnmm::{ServiceStatus, TnmmDeregistrationRequest};
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        // Register first.
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        while q.pop_front().is_some() {}
+        let _ = drain(&source);
+
+        dispatcher.send(ControlCommand::TnmmDeregistration {
+            handle: 21,
+            request: TnmmDeregistrationRequest { issi: Some(MS_ISSI), mcc: None, mnc: None },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Detaching);
+        let msg = q.pop_front().expect("U-ITSI DETACH queued");
+        assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
+        let events = drain(&source);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
+            )),
+            "de-registration emits 'out of service'"
+        );
+        let (accepted, _detail) = last_ack(&dispatcher);
+        assert!(accepted);
+    }
+
+    /// A TNMM-DEREGISTRATION request while not registered is a no-op that is
+    /// acknowledged with a documented detail.
+    #[test]
+    fn test_tnmm_deregistration_request_when_not_registered() {
+        use crate::tnmm::TnmmDeregistrationRequest;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmDeregistration {
+            handle: 22,
+            request: TnmmDeregistrationRequest { issi: None, mcc: None, mnc: None },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none());
+        let (accepted, detail) = last_ack(&dispatcher);
+        assert!(accepted);
+        assert!(detail.is_some(), "documented 'nothing to detach' detail");
+    }
+
+    /// The standalone group attach/detach procedure (cl. 16.9.3) is not
+    /// implemented: a TNMM-ATTACH DETACH GROUP IDENTITY request is acknowledged
+    /// as not-accepted with a documented deferral, and changes no state.
+    #[test]
+    fn test_tnmm_group_identity_request_is_deferred() {
+        use crate::tnmm::{
+            ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
+            TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle: 31,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: 0x01,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                    class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                    group_identity_detachment_request: None,
+                }],
+                group_identity_report: None,
+            },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none());
+        let (accepted, detail) = last_ack(&dispatcher);
+        assert!(!accepted, "deferred procedure is not accepted");
+        assert!(detail.is_some());
+    }
+
+    /// Dormant primitives (STATUS / ENERGY SAVING requests) are acknowledged as
+    /// not-accepted with a documented reason and change no state.
+    #[test]
+    fn test_tnmm_status_and_energy_saving_requests_are_dormant() {
+        use crate::tnmm::{EnergyEconomyMode, TnmmEnergySavingRequest, TnmmStatusRequest};
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmStatus {
+            handle: 41,
+            request: TnmmStatusRequest { direct_mode: None, dual_watch: None, energy_economy_mode: None },
+        });
+        dispatcher.send(ControlCommand::TnmmEnergySaving {
+            handle: 42,
+            request: TnmmEnergySavingRequest { energy_economy_mode: EnergyEconomyMode::EnergyEconomyMode1 },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle);
+        let resps = dispatcher.try_recv_responses();
+        let acks: Vec<_> = resps
+            .into_iter()
+            .filter_map(|r| match r {
+                crate::net_control::ControlResponse::TnmmAck { handle, accepted, .. } => Some((handle, accepted)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acks.len(), 2);
+        assert!(acks.iter().all(|(_, accepted)| !*accepted), "dormant requests not accepted");
     }
 }

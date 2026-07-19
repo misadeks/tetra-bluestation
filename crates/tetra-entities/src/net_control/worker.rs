@@ -116,6 +116,12 @@ impl<T: NetworkTransport> ControlWorker<T> {
             ControlCommand::SendSds { .. } => TetraEntity::Cmce,
             ControlCommand::CommandA { .. } => TetraEntity::Mm,
             ControlCommand::TestCmdB { .. } => TetraEntity::Cmce,
+            // TNMM-SAP requests (cl. 15.3) are handled by Mobility Management.
+            ControlCommand::TnmmRegistration { .. }
+            | ControlCommand::TnmmDeregistration { .. }
+            | ControlCommand::TnmmAttachDetachGroupIdentity { .. }
+            | ControlCommand::TnmmStatus { .. }
+            | ControlCommand::TnmmEnergySaving { .. } => TetraEntity::Mm,
         }
     }
 
@@ -186,6 +192,53 @@ mod tests {
             payload: vec![],
         });
         assert_eq!(target, TetraEntity::Cmce);
+    }
+
+    /// All TNMM-SAP requests (cl. 15.3) are routed to Mobility Management.
+    #[test]
+    fn test_route_tnmm_requests_to_mm() {
+        use crate::tnmm::{
+            RegistrationType, TnmmDeregistrationRequest, TnmmEnergySavingRequest, TnmmRegistrationRequest,
+            TnmmStatusRequest,
+        };
+        let reg = ControlCommand::TnmmRegistration {
+            handle: 1,
+            request: Box::new(TnmmRegistrationRequest {
+                registration_type: RegistrationType::RegistrationToIndicatedCell,
+                required_cell_type_list: None,
+                preferred_cell_type_list: None,
+                preferred_la_list: None,
+                preferred_mcc_list: None,
+                preferred_mnc_list: None,
+                issi: 1,
+                mcc_of_issi: 1,
+                mnc_of_issi: 1,
+                energy_economy_mode: None,
+                group_identity_request: None,
+                group_identity_attach_detach_mode: None,
+            }),
+        };
+        assert_eq!(ControlWorker::<MockTransport>::route_control_command(&reg), TetraEntity::Mm);
+
+        let dereg = ControlCommand::TnmmDeregistration {
+            handle: 2,
+            request: TnmmDeregistrationRequest { issi: None, mcc: None, mnc: None },
+        };
+        assert_eq!(ControlWorker::<MockTransport>::route_control_command(&dereg), TetraEntity::Mm);
+
+        let status = ControlCommand::TnmmStatus {
+            handle: 3,
+            request: TnmmStatusRequest { direct_mode: None, dual_watch: None, energy_economy_mode: None },
+        };
+        assert_eq!(ControlWorker::<MockTransport>::route_control_command(&status), TetraEntity::Mm);
+
+        let energy = ControlCommand::TnmmEnergySaving {
+            handle: 4,
+            request: TnmmEnergySavingRequest {
+                energy_economy_mode: crate::tnmm::EnergyEconomyMode::StayAlive,
+            },
+        };
+        assert_eq!(ControlWorker::<MockTransport>::route_control_command(&energy), TetraEntity::Mm);
     }
 
     #[test]

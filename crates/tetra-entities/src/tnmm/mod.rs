@@ -439,3 +439,99 @@ pub struct TnmmEnergySavingConfirm {
     /// `Energy economy mode status` — M.
     pub energy_economy_mode_status: EnergyEconomyModeStatus,
 }
+
+// ===========================================================================
+// 15.3.3 Primitive parameter sets — INBOUND primitives (request)
+//
+// These carry the parameters marked for the Request column of the respective
+// tables (cl. 15.3.3). They are transported over the control channel as
+// `ControlCommand` variants (Phase T2). Request-only parameters that select
+// features not implemented in this stack (preferred cell/LA/MCC/MNC lists,
+// energy economy) are modelled for completeness with their spec-mandated
+// optionality, but are not acted upon (documented at the handler).
+// ===========================================================================
+
+/// TNMM-REGISTRATION **request** parameters (Table 15.5, Request column).
+///
+/// Used by the user application to initiate attachment and registration of the
+/// terminal (cl. 15.3.3.7).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+pub struct TnmmRegistrationRequest {
+    /// `Registration type` — M.
+    pub registration_type: RegistrationType,
+    /// `Required cell type list` — O.
+    pub required_cell_type_list: Option<Vec<CellType>>,
+    /// `Preferred cell type list` — O (Table 15.5, NOTE 4: if present with the
+    /// required list, must be a subset of it).
+    pub preferred_cell_type_list: Option<Vec<CellType>>,
+    /// `Preferred LA list` — O (Table 15.5, NOTE 2).
+    pub preferred_la_list: Option<Vec<u16>>,
+    /// `Preferred MCC list` — O (Table 15.5, NOTE 3).
+    pub preferred_mcc_list: Option<Vec<u16>>,
+    /// `Preferred MNC list` — O (Table 15.5, NOTE 3).
+    pub preferred_mnc_list: Option<Vec<u16>>,
+    /// `ISSI` — M.
+    pub issi: u32,
+    /// `MCC (of the ISSI)` — M.
+    pub mcc_of_issi: u16,
+    /// `MNC (of the ISSI)` — M.
+    pub mnc_of_issi: u16,
+    /// `Energy economy mode` — O (dormant).
+    pub energy_economy_mode: Option<EnergyEconomyMode>,
+    /// `Group identity request` — O.
+    pub group_identity_request: Option<Vec<GroupIdentityRequest>>,
+    /// `Group identity attach/detach mode` — O.
+    pub group_identity_attach_detach_mode: Option<GroupIdentityAttachDetachMode>,
+}
+
+/// TNMM-DEREGISTRATION **request** parameters (Table 15.2).
+///
+/// Cancels the registration (log-off / ITSI removal / power-off) (cl. 15.3.3.2).
+/// Per the table NOTE, when all attached ITSIs are detached the parameters need
+/// not be present — hence all are Optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+pub struct TnmmDeregistrationRequest {
+    /// `ISSI` — O.
+    pub issi: Option<u32>,
+    /// `MCC` — O.
+    pub mcc: Option<u16>,
+    /// `MNC` — O.
+    pub mnc: Option<u16>,
+}
+
+/// TNMM-ATTACH DETACH GROUP IDENTITY **request** parameters (Table 15.1,
+/// Request column). Activates/deactivates group identities or asks for a group
+/// report (cl. 15.3.3.1).
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+pub struct TnmmAttachDetachGroupIdentityRequest {
+    /// `Group identity attach detach mode` — M.
+    pub group_identity_attach_detach_mode: GroupIdentityAttachDetachMode,
+    /// `Group identity request` — M.
+    pub group_identity_request: Vec<GroupIdentityRequest>,
+    /// `Group identity report` — O.
+    pub group_identity_report: Option<GroupIdentityReport>,
+}
+
+/// TNMM-STATUS **request** parameters (Table 15.7, Request column). Requests
+/// various mobility management services (cl. 15.3.3.9).
+///
+/// Dormant: `direct_mode` (DMO), `dual_watch` and `energy_economy_mode` all
+/// select features not implemented in this stack, so a STATUS request is
+/// accepted but not acted upon (documented at the handler).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+pub struct TnmmStatusRequest {
+    /// `Direct mode` — O.
+    pub direct_mode: Option<DirectMode>,
+    /// `Dual watch` — O.
+    pub dual_watch: Option<DualWatch>,
+    /// `Energy economy mode` — O (dormant).
+    pub energy_economy_mode: Option<EnergyEconomyMode>,
+}
+
+/// TNMM-ENERGY SAVING **request** parameters (Table 15.3, Request column).
+/// Dormant (see [`TnmmEnergySavingIndication`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+pub struct TnmmEnergySavingRequest {
+    /// `Energy economy mode` — M.
+    pub energy_economy_mode: EnergyEconomyMode,
+}
