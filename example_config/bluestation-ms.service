@@ -1,0 +1,36 @@
+# Sample systemd unit for the TETRA BlueStation MS stack with supervisor-based
+# config-apply restart (NON-STANDARD, Plane B management interface).
+#
+# The MS management interface (external UI over the control transport) can stage
+# a new configuration (SetConfig, validated + written to the TOML file) and then
+# apply it (ApplyConfig). On ApplyConfig the stack performs its graceful
+# de-registration drain (U-ITSI DETACH, ETSI TS 100 392-2 cl. 16.6.1) and then
+# exits with code 75 (EXIT_RESTART). This unit tells systemd to treat that exit
+# code as a restart request, so the process is respawned and reloads the new
+# configuration from the same TOML file. A normal shutdown (Ctrl+C / SIGINT)
+# exits 0 and is NOT restarted.
+#
+# Adjust User/Group/paths for your deployment. Install to
+# /etc/systemd/system/bluestation-ms.service, then:
+#   systemctl daemon-reload && systemctl enable --now bluestation-ms
+
+[Unit]
+Description=TETRA BlueStation MS stack
+After=network.target
+
+[Service]
+Type=simple
+# Path to the bluestation-bs binary and the MS TOML config it should load.
+ExecStart=/usr/local/bin/bluestation-bs /etc/bluestation/config-ms.toml
+# Treat EXIT_RESTART (75) as a restart trigger for the config-apply flow, and
+# also restart on unexpected failures. A clean exit (0) stops the service.
+Restart=on-failure
+RestartForceExitStatus=75
+RestartSec=1
+# Recommended hardening / RF device access — tune for your SDR and user.
+# SoapySDR/USB device access typically needs the process to reach /dev/bus/usb.
+# User=bluestation
+# Group=plugdev
+
+[Install]
+WantedBy=multi-user.target

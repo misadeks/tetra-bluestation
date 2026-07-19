@@ -159,6 +159,7 @@ mod tests {
             serving_la: 1,
             colour_code: 1,
             attached_groups: vec![100, 200],
+            restart_required: false,
         };
         let resp = ControlResponse::Management(ManagementResponse::State {
             handle: 5,
@@ -170,5 +171,59 @@ mod tests {
         };
         assert_eq!(handle, 5);
         assert_eq!(*got, state);
+    }
+
+    /// Plane B (non-standard) config command/response variants survive a JSON
+    /// round-trip (GetConfig/SetConfig/ApplyConfig + Config/Ack).
+    #[test]
+    fn test_roundtrip_json_management_config() {
+        use crate::management::{ManagementCommand, ManagementResponse};
+        let codec = ControlCodecJson;
+
+        // SetConfig carries a TOML payload.
+        let cmd = ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 9,
+            toml: "config_version = \"0.6\"\n".to_string(),
+        });
+        let decoded = codec.decode_command(&codec.encode_command(&cmd)).unwrap();
+        let ControlCommand::Management(ManagementCommand::SetConfig { handle, toml }) = decoded else {
+            panic!("expected Management SetConfig");
+        };
+        assert_eq!(handle, 9);
+        assert_eq!(toml, "config_version = \"0.6\"\n");
+
+        // Config response.
+        let resp = ControlResponse::Management(ManagementResponse::Config {
+            handle: 9,
+            toml: "config_version = \"0.6\"\n".to_string(),
+        });
+        let decoded = codec.decode_response(&codec.encode_response(&resp)).unwrap();
+        let ControlResponse::Management(ManagementResponse::Config { handle, toml }) = decoded else {
+            panic!("expected Management Config");
+        };
+        assert_eq!(handle, 9);
+        assert!(toml.contains("config_version"));
+
+        // Ack response.
+        let resp = ControlResponse::Management(ManagementResponse::Ack {
+            handle: 9,
+            accepted: true,
+            restart_required: true,
+            message: "staged".to_string(),
+        });
+        let decoded = codec.decode_response(&codec.encode_response(&resp)).unwrap();
+        let ControlResponse::Management(ManagementResponse::Ack {
+            handle,
+            accepted,
+            restart_required,
+            message,
+        }) = decoded
+        else {
+            panic!("expected Management Ack");
+        };
+        assert_eq!(handle, 9);
+        assert!(accepted);
+        assert!(restart_required);
+        assert_eq!(message, "staged");
     }
 }

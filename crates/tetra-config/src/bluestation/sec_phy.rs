@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml::Value;
 
-use crate::bluestation::{CfgSoapySdr, SoapySdrDto};
+use crate::bluestation::{CfgSoapySdr, SoapySdrDto, cfg_to_soapy_dto};
 
 /// The PHY layer backend type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum PhyBackend {
     Undefined,
@@ -29,7 +29,7 @@ pub struct CfgPhyIo {
     pub soapysdr: Option<CfgSoapySdr>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct PhyIoDto {
     pub backend: PhyBackend,
 
@@ -40,7 +40,7 @@ pub struct PhyIoDto {
 
     pub soapysdr: Option<SoapySdrDto>,
 
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
 }
 
@@ -100,5 +100,18 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
         ul_input_file: src.ul_input_file,
         dl_input_file: src.dl_input_file,
         soapysdr,
+    }
+}
+
+/// Inverse of [`phy_dto_to_cfg`] for TOML write-back (Plane B, non-standard).
+pub fn cfg_to_phy_dto(cfg: &CfgPhyIo) -> PhyIoDto {
+    PhyIoDto {
+        backend: cfg.backend,
+        dl_tx_file: cfg.dl_tx_file.clone(),
+        ul_rx_file: cfg.ul_rx_file.clone(),
+        ul_input_file: cfg.ul_input_file.clone(),
+        dl_input_file: cfg.dl_input_file.clone(),
+        soapysdr: cfg.soapysdr.as_ref().map(cfg_to_soapy_dto),
+        extra: HashMap::new(),
     }
 }

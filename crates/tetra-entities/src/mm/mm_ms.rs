@@ -1,6 +1,9 @@
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
@@ -116,6 +119,31 @@ pub struct MmMs {
     /// indication/confirm can report "LA (where registered)" (Table 15.5).
     /// Defaults to the configured cell LA until a serving cell is selected.
     serving_la: u16,
+    /// Runtime plumbing needed by the Plane B management write/apply handlers
+    /// (config file path + process restart signalling). `None` in unit tests
+    /// and read-only deployments, in which case `SetConfig`/`ApplyConfig` are
+    /// refused gracefully rather than acted upon. **NON-STANDARD** (Plane B).
+    mgmt_ctx: Option<ManagementContext>,
+    /// UI hint (**NON-STANDARD**, Plane B): a configuration change has been
+    /// staged to disk via `SetConfig` that only takes effect after a controlled
+    /// restart (`ApplyConfig`). Surfaced in the runtime-state snapshot.
+    restart_required: bool,
+}
+
+/// Runtime plumbing for the Plane B management write/apply handlers
+/// (**NON-STANDARD**). Carries the on-disk config path to persist to and the
+/// process-level restart signalling shared with `main`.
+struct ManagementContext {
+    /// Path of the TOML config file that `SetConfig` writes and that the
+    /// supervisor-respawned process reloads at startup.
+    config_path: PathBuf,
+    /// Set by `ApplyConfig` to request the supervisor-driven restart; polled by
+    /// `main` after the stack run loop exits so it can exit with the documented
+    /// restart exit code.
+    restart_requested: Arc<AtomicBool>,
+    /// Cleared by `ApplyConfig` to break the stack run loop and begin the
+    /// graceful shutdown drain (the same `is_running` flag `main` owns).
+    is_running: Arc<AtomicBool>,
 }
 
 impl MmMs {
@@ -132,7 +160,25 @@ impl MmMs {
             left_system: false,
             detach_countdown: 0,
             serving_la,
+            mgmt_ctx: None,
+            restart_required: false,
         }
+    }
+
+    /// Install the Plane B management context (**NON-STANDARD**): the config
+    /// file path to persist `SetConfig` writes to, plus the shared restart /
+    /// running flags `main` uses to drive a controlled restart on `ApplyConfig`.
+    ///
+    /// Provided via a setter (not a `new()` parameter) so the many existing
+    /// test constructors are unaffected; when it is not installed the write /
+    /// apply management commands are refused gracefully.
+    pub fn set_management_context(
+        &mut self,
+        config_path: PathBuf,
+        restart_requested: Arc<AtomicBool>,
+        is_running: Arc<AtomicBool>,
+    ) {
+        self.mgmt_ctx = Some(ManagementContext { config_path, restart_requested, is_running });
     }
 
     /// Own Individual Short Subscriber Identity (ISSI) from the MS config
@@ -1153,7 +1199,7 @@ impl MmMs {
             // because MM is the single writer of MS runtime state. See
             // `crate::management` for the standards disclaimer.
             ControlCommand::Management(mgmt) => {
-                self.handle_management_command(mgmt);
+                self.handle_management_command(mgmt, queue);
             }
             // Non-TNMM commands are not addressed to MM(MS); log and drop.
             other => {
@@ -1250,7 +1296,7 @@ impl MmMs {
     // ----------------------------------------------------------------------
 
     /// Handle one inbound management command (Plane B, non-standard).
-    fn handle_management_command(&mut self, cmd: crate::management::ManagementCommand) {
+    fn handle_management_command(&mut self, cmd: crate::management::ManagementCommand, queue: &mut MessageQueue) {
         use crate::management::{ManagementCommand, ManagementResponse};
         use crate::net_control::ControlResponse;
         match cmd {
@@ -1262,7 +1308,164 @@ impl MmMs {
                     state: Box::new(state),
                 }));
             }
+            // Read the active configuration as canonical TOML (always serviceable).
+            ManagementCommand::GetConfig { handle } => {
+                let cfg = self.config.config();
+                match tetra_config::bluestation::to_toml_string(&cfg) {
+                    Ok(toml) => {
+                        self.respond(ControlResponse::Management(ManagementResponse::Config { handle, toml }));
+                    }
+                    Err(e) => {
+                        tracing::error!("MM(MS): failed to serialize active config: {e}");
+                        self.respond(ControlResponse::Management(ManagementResponse::Error {
+                            handle,
+                            message: format!("failed to serialize active config: {e}"),
+                        }));
+                    }
+                }
+            }
+            // Stage a new configuration: validate through the exact startup
+            // validator, then persist to disk. Structural changes take effect on
+            // the next `ApplyConfig`; the process is NOT bounced here.
+            ManagementCommand::SetConfig { handle, toml } => {
+                self.handle_set_config(handle, toml);
+            }
+            // Apply staged configuration: drain-and-restart under the external
+            // supervisor. Reuses the graceful de-registration drain (cl. 16.6.1).
+            ManagementCommand::ApplyConfig { handle } => {
+                self.handle_apply_config(handle, queue);
+            }
         }
+    }
+
+    /// Validate + persist a staged configuration (Plane B, non-standard).
+    ///
+    /// The payload is parsed through [`tetra_config::bluestation::from_toml_str`]
+    /// — the exact validator the stack runs at startup — so a config that would
+    /// fail to load is rejected here rather than bricking the radio on restart.
+    /// On success it is re-serialized to canonical form and written to the
+    /// config file, and `restart_required` is set so the UI shows a pending
+    /// restart. The running process keeps its current (old) config until an
+    /// explicit `ApplyConfig`.
+    fn handle_set_config(&mut self, handle: u32, toml: String) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+
+        let ctx = match &self.mgmt_ctx {
+            Some(ctx) => ctx,
+            None => {
+                tracing::warn!("MM(MS): SetConfig received but no management context installed; refusing");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: "configuration write-back is not available in this deployment".to_string(),
+                }));
+                return;
+            }
+        };
+
+        // 1) Validate: parse through the startup validator.
+        let parsed = match tetra_config::bluestation::from_toml_str(&toml) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!("MM(MS): SetConfig rejected invalid configuration: {e}");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: format!("configuration rejected: {e}"),
+                }));
+                return;
+            }
+        };
+
+        // 2) Normalize: re-serialize so the on-disk file is canonical and
+        //    provably re-parses to the validated config.
+        let normalized = match tetra_config::bluestation::to_toml_string(&parsed) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("MM(MS): SetConfig failed to normalize configuration: {e}");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: format!("configuration could not be serialized: {e}"),
+                }));
+                return;
+            }
+        };
+
+        // 3) Persist to the config file path.
+        let path = ctx.config_path.clone();
+        if let Err(e) = std::fs::write(&path, normalized) {
+            tracing::error!("MM(MS): SetConfig failed to write {}: {e}", path.display());
+            self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                handle,
+                accepted: false,
+                restart_required: self.restart_required,
+                message: format!("failed to write configuration file: {e}"),
+            }));
+            return;
+        }
+
+        self.restart_required = true;
+        tracing::info!("MM(MS): staged new configuration to {} (restart required to apply)", path.display());
+        self.respond(ControlResponse::Management(ManagementResponse::Ack {
+            handle,
+            accepted: true,
+            restart_required: true,
+            message: "configuration staged; apply (restart) required to take effect".to_string(),
+        }));
+    }
+
+    /// Apply staged configuration by draining and requesting a controlled
+    /// restart (Plane B, non-standard).
+    ///
+    /// This reuses the existing graceful shutdown path: if the MS is registered
+    /// it begins de-registration (U-ITSI DETACH, cl. 16.6.1) so the drain sends
+    /// it, then clears the shared `is_running` flag to break the stack run loop
+    /// and sets `restart_requested` so `main` exits with the restart exit code.
+    /// The external supervisor respawns the process with the new config. It does
+    /// **not** relaunch in-process (the SDR handle and thread graph are owned by
+    /// `main`).
+    fn handle_apply_config(&mut self, handle: u32, queue: &mut MessageQueue) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+
+        let ctx = match &self.mgmt_ctx {
+            Some(ctx) => ctx,
+            None => {
+                tracing::warn!("MM(MS): ApplyConfig received but no management context installed; refusing");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: "restart/apply is not available in this deployment".to_string(),
+                }));
+                return;
+            }
+        };
+
+        // Signal main to exit with the restart code once the loop unwinds, and
+        // clear the running flag to break the loop and start the drain.
+        ctx.restart_requested.store(true, Ordering::SeqCst);
+        ctx.is_running.store(false, Ordering::SeqCst);
+
+        // Reuse the graceful de-registration drain so a registered MS cleanly
+        // detaches before the restart (best-effort, cl. 16.6.1).
+        let detaching = self.begin_deregistration(queue);
+
+        tracing::info!(
+            "MM(MS): ApplyConfig -> restart requested (detach initiated: {}); supervisor will respawn with new config",
+            detaching
+        );
+        self.respond(ControlResponse::Management(ManagementResponse::Ack {
+            handle,
+            accepted: true,
+            restart_required: self.restart_required,
+            message: "restart initiated; the stack will de-register and respawn with the staged configuration".to_string(),
+        }));
     }
 
     /// Build an [`crate::management::MsRuntimeState`] snapshot from MM's own
@@ -1295,6 +1498,7 @@ impl MmMs {
             serving_la: self.serving_la,
             colour_code: cfg.cell.colour_code,
             attached_groups: self.attach_groups(),
+            restart_required: self.restart_required,
         }
     }
 }
@@ -2432,5 +2636,195 @@ attach_groups = []
         let (_handle, state) = last_state(&dispatcher);
         assert_eq!(state.registration_state, RegistrationState::Registered);
         assert_eq!(state.service_status, ServiceStatus::InService);
+    }
+
+    // -----------------------------------------------------------------------
+    // T3: management / provisioning (Plane B, NON-STANDARD). Write-path slice:
+    // GetConfig / SetConfig (validate+persist) / ApplyConfig (drain+restart).
+    // -----------------------------------------------------------------------
+
+    /// Extract the last `Management(Config{..})` response from a dispatcher.
+    fn last_config(dispatcher: &crate::net_control::CommandDispatcher) -> (u32, String) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::Config { handle, toml }) => Some((handle, toml)),
+                _ => None,
+            })
+            .expect("a Management Config response")
+    }
+
+    /// Extract the last `Management(Ack{..})` response from a dispatcher.
+    fn last_mgmt_ack(dispatcher: &crate::net_control::CommandDispatcher) -> (u32, bool, bool) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::Ack { handle, accepted, restart_required, .. }) => {
+                    Some((handle, accepted, restart_required))
+                }
+                _ => None,
+            })
+            .expect("a Management Ack response")
+    }
+
+    /// GetConfig returns canonical TOML that re-parses through the validator.
+    #[test]
+    fn test_management_get_config_roundtrips() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 80 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, toml) = last_config(&dispatcher);
+        assert_eq!(handle, 80);
+        let reparsed = from_toml_str(&toml).expect("GetConfig TOML must re-parse");
+        assert_eq!(reparsed.net.mcc, 901);
+        assert_eq!(reparsed.net.mnc, 9999);
+        assert_eq!(reparsed.ms.as_ref().unwrap().issi, 1000001);
+        // Read-only: no PDU emitted, state untouched.
+        assert!(q.pop_front().is_none());
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// SetConfig without an installed management context is refused gracefully
+    /// (accepted = false), never panics, and does not touch state.
+    #[test]
+    fn test_management_set_config_without_context_refused() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 81,
+            toml: MS_TOML.to_string(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 81);
+        assert!(!accepted, "no context => refused");
+        assert!(!restart_required);
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// SetConfig with a context validates + persists to disk and flags a pending
+    /// restart; the runtime snapshot then reports `restart_required = true`.
+    #[test]
+    fn test_management_set_config_persists_and_flags_restart() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-setcfg-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested.clone(), is_running.clone());
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 82,
+            toml: MS_TOML.to_string(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 82);
+        assert!(accepted, "valid config accepted");
+        assert!(restart_required, "restart flagged after staging");
+        // File written and re-parses.
+        let written = std::fs::read_to_string(&path).expect("config file written");
+        assert!(from_toml_str(&written).is_ok(), "persisted config must re-parse");
+        // SetConfig must NOT bounce the process.
+        assert!(is_running.load(std::sync::atomic::Ordering::SeqCst), "SetConfig must not stop the loop");
+        assert!(!restart_requested.load(std::sync::atomic::Ordering::SeqCst), "SetConfig must not request restart");
+        // Snapshot reflects the pending restart.
+        let snap = mm.runtime_snapshot();
+        assert!(snap.restart_required);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SetConfig rejects a config that fails the startup validator (accepted =
+    /// false) and does not write the file or flag a restart.
+    #[test]
+    fn test_management_set_config_rejects_invalid() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-badcfg-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested, is_running);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 83,
+            toml: "this = is not = valid toml {{{".to_string(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 83);
+        assert!(!accepted, "invalid config rejected");
+        assert!(!restart_required);
+        assert!(!path.exists(), "no file written for rejected config");
+        assert!(!mm.runtime_snapshot().restart_required);
+    }
+
+    /// ApplyConfig requests the controlled restart: sets the shared
+    /// `restart_requested` flag and clears `is_running` so `main` exits with the
+    /// restart code, and (when registered) initiates the detach drain.
+    #[test]
+    fn test_management_apply_config_requests_restart() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        // Register first so ApplyConfig exercises the detach drain.
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        while q.pop_front().is_some() {}
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-apply-{}.toml", std::process::id()));
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path, restart_requested.clone(), is_running.clone());
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::ApplyConfig { handle: 84 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 84);
+        assert!(accepted, "apply accepted");
+        assert!(restart_requested.load(std::sync::atomic::Ordering::SeqCst), "restart requested");
+        assert!(!is_running.load(std::sync::atomic::Ordering::SeqCst), "run loop stopped");
+        // Registered MS begins de-registration (U-ITSI DETACH) on apply.
+        assert_eq!(mm.reg_state, RegState::Detaching);
+    }
+
+    /// ApplyConfig without a management context is refused gracefully.
+    #[test]
+    fn test_management_apply_config_without_context_refused() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::ApplyConfig { handle: 85 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 85);
+        assert!(!accepted, "no context => refused");
+        assert_eq!(mm.reg_state, RegState::Idle);
     }
 }

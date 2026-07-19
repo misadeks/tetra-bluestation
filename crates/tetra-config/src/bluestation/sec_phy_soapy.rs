@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use toml::Value;
 
@@ -48,7 +48,7 @@ impl CfgSoapySdr {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct SoapySdrDto {
     pub rx_freq: f64,
     pub tx_freq: f64,
@@ -63,6 +63,32 @@ pub struct SoapySdrDto {
     pub rx_channel: Option<usize>,
     pub tx_channel: Option<usize>,
 
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
+}
+
+/// Inverse of the soapy mapping in `phy_dto_to_cfg` for TOML write-back
+/// (Plane B, non-standard). RX/TX frequencies map back to `rx_freq`/`tx_freq`;
+/// the `rx_gains`/`tx_gains` maps are re-expanded into `rx_gain_*` / `tx_gain_*`
+/// flattened keys (the gain-name is lower-cased, matching the loader).
+pub fn cfg_to_soapy_dto(s: &CfgSoapySdr) -> SoapySdrDto {
+    let mut extra: HashMap<String, Value> = HashMap::new();
+    for (name, val) in &s.rx_gains {
+        extra.insert(format!("rx_gain_{name}"), Value::Float(*val));
+    }
+    for (name, val) in &s.tx_gains {
+        extra.insert(format!("tx_gain_{name}"), Value::Float(*val));
+    }
+    SoapySdrDto {
+        rx_freq: s.ul_freq,
+        tx_freq: s.dl_freq,
+        ppm_err: Some(s.ppm_err),
+        device: s.device.clone(),
+        rx_antenna: s.rx_ant.clone(),
+        tx_antenna: s.tx_ant.clone(),
+        sample_rate: s.fs,
+        rx_channel: s.rx_ch,
+        tx_channel: s.tx_ch,
+        extra,
+    }
 }

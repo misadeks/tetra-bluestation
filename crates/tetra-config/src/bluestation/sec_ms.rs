@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use toml::Value;
 
@@ -28,13 +28,13 @@ pub struct CfgMs {
     pub attach_groups: Vec<u32>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct CfgMsDto {
     pub issi: u32,
     pub subscriber_class: Option<u8>,
     pub attach_groups: Option<Vec<u32>>,
 
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
 }
 
@@ -43,5 +43,15 @@ pub fn ms_dto_to_cfg(dto: CfgMsDto) -> CfgMs {
         issi: dto.issi,
         subscriber_class: dto.subscriber_class.unwrap_or(1),
         attach_groups: dto.attach_groups.unwrap_or_default(),
+    }
+}
+
+/// Inverse of [`ms_dto_to_cfg`] for TOML write-back (Plane B, non-standard).
+pub fn cfg_to_ms_dto(ms: &CfgMs) -> CfgMsDto {
+    CfgMsDto {
+        issi: ms.issi,
+        subscriber_class: Some(ms.subscriber_class),
+        attach_groups: Some(ms.attach_groups.clone()),
+        extra: HashMap::new(),
     }
 }

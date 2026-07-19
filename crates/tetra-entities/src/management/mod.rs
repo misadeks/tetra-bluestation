@@ -65,17 +65,40 @@ pub struct MsRuntimeState {
     pub colour_code: u8,
     /// GSSIs configured for attachment at registration (`[ms] attach_groups`).
     pub attached_groups: Vec<u32>,
+    /// True when a configuration change has been staged (via `SetConfig`) that
+    /// only takes effect after a controlled restart (`ApplyConfig`). Purely a
+    /// UI hint so the operator can see a "pending restart" indication.
+    pub restart_required: bool,
 }
 
 /// Management command (UI -> stack), **non-standard** Plane B.
 ///
 /// Carried inside `ControlCommand::Management`. `handle` is a transport-level
-/// correlation id so the UI can match responses. Write/apply commands
-/// (`SetConfig`, `ApplyConfig`) are added in a later slice.
+/// correlation id so the UI can match responses.
+///
+/// Config apply model is **HYBRID**: structural radio parameters (MCC/MNC,
+/// carrier/band/duplex, ISSI, SDR device) are staged to the on-disk TOML by
+/// `SetConfig` and only take effect on a controlled restart (`ApplyConfig`);
+/// operational TNMM actions (group attach/detach, energy saving,
+/// register/deregister) are carried on Plane A (`crate::tnmm`) and apply live.
 #[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
 pub enum ManagementCommand {
     /// Read the current MS runtime state (live/anytime).
     GetState { handle: u32 },
+    /// Read the active stack configuration, serialized as canonical TOML
+    /// (the same on-disk schema the stack loads at startup).
+    GetConfig { handle: u32 },
+    /// Stage a new stack configuration. The payload is a full TOML document in
+    /// the on-disk schema. It is validated through the exact startup validator
+    /// and, if valid, written to the config file; it does **not** bounce the
+    /// process. Structural changes need a subsequent `ApplyConfig` to take
+    /// effect (sets `restart_required`).
+    SetConfig { handle: u32, toml: String },
+    /// Apply staged configuration by performing a graceful de-registration
+    /// drain and then requesting a controlled process restart (the external
+    /// supervisor respawns the stack with the new config). No-op if nothing is
+    /// staged is still honored as an explicit restart request.
+    ApplyConfig { handle: u32 },
 }
 
 /// Management response (stack -> UI), **non-standard** Plane B.
@@ -85,6 +108,15 @@ pub enum ManagementCommand {
 pub enum ManagementResponse {
     /// Response to [`ManagementCommand::GetState`].
     State { handle: u32, state: Box<MsRuntimeState> },
+    /// Response to [`ManagementCommand::GetConfig`]: the active configuration
+    /// serialized as canonical TOML.
+    Config { handle: u32, toml: String },
+    /// Acknowledgement of a write/apply command.
+    ///
+    /// For `SetConfig`: `accepted` reflects whether the config validated and was
+    /// persisted; `restart_required` echoes whether a restart is now pending.
+    /// For `ApplyConfig`: `accepted` reflects whether a restart was initiated.
+    Ack { handle: u32, accepted: bool, restart_required: bool, message: String },
     /// A management command could not be served.
     Error { handle: u32, message: String },
 }
