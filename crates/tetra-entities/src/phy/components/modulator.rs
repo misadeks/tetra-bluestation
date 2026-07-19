@@ -112,6 +112,17 @@ impl Modulator {
                             // decodable at the BS.
                             self.dqpsk.reset_phase();
                             sample = self.dqpsk.reference();
+                            // Fires exactly once per burst, at the start of the
+                            // active part: definitive proof the uplink burst was
+                            // actually synthesized (not silence), plus its timing
+                            // alignment for tuning MS_TX_SAMPLE_DELAY.
+                            tracing::info!(
+                                ts = %tx_slot.time,
+                                slot_begin,
+                                sample_counter,
+                                snmax,
+                                "Modulator: uplink burst active part emitted (SN0)"
+                            );
                         } else if sn >= 1 && sn <= snmax {
                             let i = (sn - 1) as usize;
                             sample = self.dqpsk.symbol(bits[i * 2] != 0, bits[i * 2 + 1] != 0);
