@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic;
 
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, unimplemented_log};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
@@ -100,6 +100,41 @@ impl Llc {
             addr,
             ts: dltime.t,
         });
+    }
+
+    /// Whether this entity should acknowledge a received acknowledged-mode
+    /// basic-link PDU addressed to `addr`.
+    ///
+    /// In BS mode the BS is the peer endpoint for every MS uplink, so it always
+    /// acknowledges (unchanged behaviour). In MS mode the radio is receive-timed
+    /// and demodulates the *entire* downlink, so it also hears acknowledged
+    /// basic-link data (BL-DATA / BL-ADATA) addressed to *other* subscribers.
+    /// The acknowledged basic link is a point-to-point service addressed to an
+    /// individual MAC address (ETSI TS 100 392-2 cl. 22.2 / 23), and only the
+    /// addressed MS returns the BL-ACK — so an MS must acknowledge only frames
+    /// addressed to its own ISSI. Acknowledging another subscriber's traffic
+    /// would put spurious BL-ACK bursts on the uplink via random access.
+    ///
+    /// Frames carried under a non-individual identity (e.g. an event label /
+    /// usage marker assigned to this MS on an allocated channel) are allowed
+    /// through, since ownership there is established by the assignment rather
+    /// than the ISSI.
+    fn should_acknowledge(&self, addr: &TetraAddress) -> bool {
+        let cfg = self.config.config();
+        if cfg.stack_mode != StackMode::Ms {
+            return true;
+        }
+        let Some(ms) = cfg.ms.as_ref() else {
+            // MS section missing (misconfigured); preserve prior behaviour.
+            return true;
+        };
+        match addr.ssi_type {
+            // Individual subscriber identities: acknowledge only our own ISSI.
+            SsiType::Ssi | SsiType::Issi | SsiType::Ussi | SsiType::Smi => addr.ssi == ms.issi,
+            // Assigned / non-individual identities: not the overheard-traffic
+            // case; leave untouched.
+            _ => true,
+        }
     }
 
     /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number.
@@ -559,8 +594,18 @@ impl Llc {
         // If ns is present, we need to send an ACK
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
         if let Some(ns) = ns {
-            // Send ACK
-            self.schedule_outgoing_ack(msg_dltime, prim.main_address, ns);
+            // Only acknowledge frames addressed to us. In MS mode we overhear
+            // acknowledged basic-link data addressed to other subscribers on the
+            // shared downlink; acking those would emit spurious uplink BL-ACK
+            // bursts (see should_acknowledge). BS mode always acknowledges.
+            if self.should_acknowledge(&prim.main_address) {
+                self.schedule_outgoing_ack(msg_dltime, prim.main_address, ns);
+            } else {
+                tracing::debug!(
+                    "MS: not acknowledging basic-link data for {} (not our address); dropping ack",
+                    prim.main_address
+                );
+            }
         }
 
         // if nr is present, we have received an ACK on a previous message
@@ -903,3 +948,96 @@ impl TetraEntityTrait for Llc {
         had_activity
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tetra_config::bluestation::from_toml_str;
+
+    const OWN_ISSI: u32 = 1234567;
+    const OTHER_ISSI: u32 = 2200699;
+
+    const BASE_TOML: &str = r#"
+config_version = "0.6"
+stack_mode = "__MODE__"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1234567
+subscriber_class = 1
+attach_groups = []
+"#;
+
+    fn llc(mode: &str) -> Llc {
+        let toml = BASE_TOML.replace("__MODE__", mode);
+        let cfg = from_toml_str(&toml).expect("valid test config");
+        Llc::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// In MS mode, only acknowledged-mode frames addressed to our own ISSI are
+    /// acknowledged; frames overheard for another subscriber are not.
+    #[test]
+    fn test_ms_acknowledges_only_own_issi() {
+        let llc = llc("Ms");
+        assert!(
+            llc.should_acknowledge(&TetraAddress::new(OWN_ISSI, SsiType::Ssi)),
+            "own ISSI must be acknowledged"
+        );
+        assert!(
+            llc.should_acknowledge(&TetraAddress::new(OWN_ISSI, SsiType::Issi)),
+            "own ISSI (typed Issi) must be acknowledged"
+        );
+        assert!(
+            !llc.should_acknowledge(&TetraAddress::new(OTHER_ISSI, SsiType::Ssi)),
+            "another subscriber's traffic must NOT be acknowledged"
+        );
+    }
+
+    /// Non-individual identities (e.g. an event label assigned on a channel) are
+    /// left untouched in MS mode — this is not the overheard-traffic case.
+    #[test]
+    fn test_ms_allows_non_individual_identities() {
+        let llc = llc("Ms");
+        assert!(llc.should_acknowledge(&TetraAddress::new(42, SsiType::EventLabel)));
+        assert!(llc.should_acknowledge(&TetraAddress::new(99, SsiType::Gssi)));
+    }
+
+    /// In BS mode the BS is the endpoint for every uplink, so it acknowledges
+    /// regardless of address (behaviour unchanged).
+    #[test]
+    fn test_bs_always_acknowledges() {
+        let llc = llc("Bs");
+        assert!(llc.should_acknowledge(&TetraAddress::new(OWN_ISSI, SsiType::Ssi)));
+        assert!(llc.should_acknowledge(&TetraAddress::new(OTHER_ISSI, SsiType::Ssi)));
+    }
+}
+
