@@ -11,6 +11,8 @@ use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
+use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
+use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 
 /// Number of downlink timeslots to wait for a location update response before
 /// retransmitting the U-LOCATION-UPDATE-DEMAND. One TDMA multiframe is 18 frames
@@ -35,6 +37,13 @@ const MAX_REGISTRATION_ATTEMPTS: u8 = 5;
 /// so this is a bounded drain, not a wait for acknowledgement. It is an
 /// implementation guard, not a value transmitted on air.
 const DETACH_DRAIN_SLOTS: u32 = 144;
+
+/// Class of usage sent for each group attached at ITSI attach (ETSI TS 100 392-2
+/// cl. 16.10.6, Table 16.32; the raw 3-bit field value). Per the standard the
+/// class of usage "has meaning only for the user application" — the SwMI simply
+/// echoes it back in the accept — so a fixed value is spec-valid. Value 4 matches
+/// the reference (Motorola) radio observed attaching against this same BS.
+const GROUP_CLASS_OF_USAGE: u8 = 4;
 
 /// MS registration state (ETSI TS 100 392-2 cl. 16.4 location updating /
 /// ITSI attach).
@@ -90,6 +99,51 @@ impl MmMs {
             .issi
     }
 
+    /// Group identities (GSSIs) this MS is configured to attach to at
+    /// registration (ETSI TS 100 392-2 cl. 16.8 group identity attachment).
+    fn attach_groups(&self) -> Vec<u32> {
+        self.config
+            .config()
+            .ms
+            .as_ref()
+            .map(|ms| ms.attach_groups.clone())
+            .unwrap_or_default()
+    }
+
+    /// Build the group identity location demand element carried inside the
+    /// U-LOCATION-UPDATE-DEMAND at ITSI attach (cl. 16.10.24 / 16.8.2), from the
+    /// configured `attach_groups`. Returns `None` when no groups are configured
+    /// (the element is then omitted, as before).
+    ///
+    /// The attach/detach mode is set to "detach all currently attached group
+    /// identities and attach the group identities defined here" (cl. 16.10.17,
+    /// Table 16.49, value 1): at ITSI attach nothing is yet attached, so this
+    /// cleanly establishes exactly the configured set. Each group is an
+    /// attachment (`class_of_usage` present, `group_identity_detachment_uplink`
+    /// absent) carried as a plain GSSI (address type 0). This mirrors the
+    /// reference radio, which the BS accepts.
+    fn build_group_identity_location_demand(&self) -> Option<GroupIdentityLocationDemand> {
+        let groups = self.attach_groups();
+        if groups.is_empty() {
+            return None;
+        }
+        Some(GroupIdentityLocationDemand {
+            group_identity_attach_detach_mode: 1,
+            group_identity_uplink: Some(
+                groups
+                    .iter()
+                    .map(|&gssi| GroupIdentityUplink {
+                        class_of_usage: Some(GROUP_CLASS_OF_USAGE),
+                        group_identity_detachment_uplink: None,
+                        gssi: Some(gssi),
+                        address_extension: None,
+                        vgssi: None,
+                    })
+                    .collect(),
+            ),
+        })
+    }
+
     /// LMM-ACTIVATE confirmation from MLE (cl. 17.3.2): a serving cell has been
     /// selected. Start the registration procedure if the cell requires it.
     fn rx_activate_conf(&mut self, queue: &mut MessageQueue, conf: &LmmMleActivateConf) {
@@ -123,6 +177,11 @@ impl MmMs {
     fn send_location_update_demand(&mut self, queue: &mut MessageQueue) {
         let issi = self.own_issi();
 
+        // Attach the configured group identities as part of the ITSI attach
+        // (cl. 16.8.2): the SwMI affiliates the MS to these groups and will then
+        // forward group-addressed traffic to it. Omitted when none configured.
+        let group_identity_location_demand = self.build_group_identity_location_demand();
+
         // Minimal ITSI-attach demand: no ciphering, no optional elements. The
         // MS identity is carried by the MAC-layer source address, so the ssi
         // element is left absent (cl. 16.9.3.4 note 2 / BS accepts this).
@@ -136,7 +195,7 @@ impl MmMs {
             la_information: None,
             ssi: None,
             address_extension: None,
-            group_identity_location_demand: None,
+            group_identity_location_demand,
             group_report_response: None,
             authentication_uplink: None,
             extended_capabilities: None,
@@ -147,8 +206,9 @@ impl MmMs {
         pdu.to_bitbuf(&mut sdu).expect("U-LOCATION-UPDATE-DEMAND serialization");
         sdu.seek(0);
         tracing::info!(
-            "MM: -> U-LOCATION-UPDATE-DEMAND (ITSI attach) for ISSI {} sdu {}",
+            "MM: -> U-LOCATION-UPDATE-DEMAND (ITSI attach) for ISSI {}, attach_groups {:?} sdu {}",
             issi,
+            self.attach_groups(),
             sdu.dump_bin()
         );
 
@@ -274,6 +334,37 @@ impl MmMs {
             pdu.location_update_accept_type,
             pdu.ssi
         );
+
+        // Report the outcome of the group identity attachment requested in the
+        // demand (cl. 16.8.2 / 16.10.24). The SwMI returns the accepted groups
+        // (each carrying a group_identity_attachment) and/or rejected ones. We
+        // log the result for observability; RX group filtering continues to use
+        // the configured attach_groups (dynamic granted-set tracking is a future
+        // refinement).
+        if let Some(accept) = &pdu.group_identity_location_accept {
+            let attached: Vec<u32> = accept
+                .group_identity_downlink
+                .as_ref()
+                .map(|v| {
+                    v.iter()
+                        .filter(|g| g.group_identity_attachment.is_some())
+                        .filter_map(|g| g.gssi)
+                        .collect()
+                })
+                .unwrap_or_default();
+            tracing::info!(
+                "MM: group attachment result (accept_reject={}): attached GSSIs {:?}",
+                accept.group_identity_accept_reject,
+                attached
+            );
+        } else if !self.attach_groups().is_empty() {
+            tracing::warn!(
+                "MM: registration accepted but SwMI returned no group identity location accept; \
+                 configured groups {:?} may not be affiliated",
+                self.attach_groups()
+            );
+        }
+
         self.reg_state = RegState::Registered;
         self.retry_countdown = 0;
     }
@@ -435,6 +526,13 @@ attach_groups = []
         MmMs::new(SharedConfig::from_parts(cfg, None))
     }
 
+    fn ms_mm_with_groups(groups: &[u32]) -> MmMs {
+        let list = groups.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+        let toml = MS_TOML.replace("attach_groups = []", &format!("attach_groups = [{list}]"));
+        let cfg = from_toml_str(&toml).expect("valid MS test config");
+        MmMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
     fn activate_conf(registration_required: bool) -> LmmMleActivateConf {
         LmmMleActivateConf {
             registration_required,
@@ -512,6 +610,37 @@ attach_groups = []
         assert!(pdu.ciphering_parameters.is_none());
         assert!(pdu.class_of_ms.is_none());
         assert!(pdu.group_identity_location_demand.is_none());
+        assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
+    }
+
+    /// With groups configured, the ITSI-attach demand must carry a group identity
+    /// location demand element (cl. 16.8.2 / 16.10.24) attaching exactly those
+    /// GSSIs — mode 1 ("detach all + attach these"), each an attachment with a
+    /// class of usage — and it must round-trip through the BS parser.
+    #[test]
+    fn test_registration_demand_carries_group_attachment() {
+        let mut mm = ms_mm_with_groups(&[91, 220]);
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+
+        let msg = q.pop_front().expect("a demand must be emitted");
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        req.sdu.seek(0);
+        let pdu = ULocationUpdateDemand::from_bitbuf(&mut req.sdu).expect("BS must parse the demand");
+
+        let gild = pdu
+            .group_identity_location_demand
+            .expect("group identity location demand present");
+        assert_eq!(gild.group_identity_attach_detach_mode, 1);
+        let ul = gild.group_identity_uplink.expect("group entries present");
+        assert_eq!(ul.len(), 2);
+        let gssis: Vec<u32> = ul.iter().filter_map(|g| g.gssi).collect();
+        assert_eq!(gssis, vec![91, 220]);
+        assert!(ul.iter().all(|g| g.class_of_usage == Some(GROUP_CLASS_OF_USAGE)));
+        assert!(ul.iter().all(|g| g.group_identity_detachment_uplink.is_none()));
         assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
     }
 
