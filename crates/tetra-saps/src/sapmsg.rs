@@ -69,6 +69,10 @@ pub enum SapMsgInner {
     // LMM-SAP (MLE-MM)
     LmmMleUnitdataInd(LmmMleUnitdataInd),
     LmmMleUnitdataReq(LmmMleUnitdataReq),
+    /// MLE -> MM confirmation that a cell has been selected with the required
+    /// characteristics (ETSI TS 100 392-2 cl. 17.3.2). Carries whether the
+    /// serving cell requires registration (from D-MLE-SYSINFO, cl. 18.4.2.2).
+    LmmMleActivateConf(LmmMleActivateConf),
 
     // LCMC-SAP (MLE-CMCE)
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),

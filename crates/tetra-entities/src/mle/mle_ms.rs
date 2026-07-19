@@ -3,7 +3,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, unimplemented_log};
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
-use tetra_saps::lmm::LmmMleUnitdataInd;
+use tetra_saps::lmm::{LmmMleActivateConf, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcValidAddress};
@@ -26,6 +26,10 @@ struct ServingCell {
     late_entry_supported: bool,
     location_area: Option<u16>,
     subscriber_class: Option<u16>,
+    /// Whether registration is required/mandatory on this cell, from the
+    /// D-MLE-SYSINFO BS service details "registration" flag (cl. 18.4.2.2).
+    /// `None` until the first SYSINFO for this cell is received.
+    registration_required: Option<bool>,
 }
 
 /// MS-side Mobile Link Entity.
@@ -43,6 +47,11 @@ pub struct MleMs {
     config: SharedConfig,
     /// The cell the MS is currently camped on, if any.
     serving_cell: Option<ServingCell>,
+    /// Guards the one-shot MLE-ACTIVATE confirmation (cl. 17.3.2) to MM: set
+    /// once we have confirmed the currently selected cell to MM, reset when a
+    /// new cell is selected. Prevents re-triggering registration on every
+    /// repeated SYSINFO for the same cell.
+    activate_confirmed: bool,
 }
 
 impl MleMs {
@@ -50,6 +59,7 @@ impl MleMs {
         Self {
             config,
             serving_cell: None,
+            activate_confirmed: false,
         }
     }
 
@@ -294,7 +304,7 @@ impl MleMs {
 
     /// ETSI TS 100 392-2 cl. 18.3.4 / 18.4.2.2: adopt the SYSINFO parameters
     /// (location area, subscriber class) for the serving cell.
-    pub fn rx_tlmb_tl_sysinfo_ind(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    pub fn rx_tlmb_tl_sysinfo_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tlmb_tl_sysinfo_ind");
 
         let SapMsgInner::TlmbSysinfoInd(inner) = &mut message.msg else {
@@ -313,25 +323,69 @@ impl MleMs {
             }
         };
 
-        match self.serving_cell.as_mut() {
+        // ETSI cl. 18.4.2.2: the BS service details "registration" flag tells the
+        // MS whether registration is required on this cell.
+        let registration_required = pdu.bs_service_details.registration;
+
+        let confirm = match self.serving_cell.as_mut() {
             Some(cell) => {
                 let changed = cell.location_area != Some(pdu.location_area);
                 cell.location_area = Some(pdu.location_area);
                 cell.subscriber_class = Some(pdu.subscriber_class);
+                cell.registration_required = Some(registration_required);
                 if changed {
                     tracing::info!(
-                        "MLE: serving cell SYSINFO adopted: LA={} subscriber_class={:#x}",
+                        "MLE: serving cell SYSINFO adopted: LA={} subscriber_class={:#x} registration_required={}",
                         pdu.location_area,
-                        pdu.subscriber_class
+                        pdu.subscriber_class,
+                        registration_required,
                     );
+                }
+                // Confirm cell selection to MM exactly once per selected cell,
+                // now that both the SYNC identity and the SYSINFO parameters are
+                // known (cl. 18.3.4.6 completes selection; the confirmation is the
+                // LMM-ACTIVATE confirm primitive, cl. 17.3.2).
+                if self.activate_confirmed {
+                    None
+                } else {
+                    Some((pdu.location_area, registration_required))
                 }
             }
             None => {
                 // SYSINFO can arrive before we have selected a cell from SYNC;
                 // there is nothing to attach it to yet.
                 tracing::debug!("rx_tlmb_tl_sysinfo_ind: SYSINFO before cell selection, ignoring");
+                None
             }
+        };
+
+        if let Some((la, registration_required)) = confirm {
+            self.activate_confirmed = true;
+            self.send_mle_activate_conf(queue, la, registration_required);
         }
+    }
+
+    /// Send the LMM-ACTIVATE confirmation to MM (ETSI TS 100 392-2 cl. 17.3.2):
+    /// a cell has been selected with the required characteristics. `registration_required`
+    /// comes from the cell's D-MLE-SYSINFO BS service details and lets MM decide
+    /// whether to perform a location update (cl. 16.4).
+    fn send_mle_activate_conf(&mut self, queue: &mut MessageQueue, la: u16, registration_required: bool) {
+        tracing::info!(
+            "MLE: cell selection complete, confirming to MM (LA={}, registration_required={})",
+            la,
+            registration_required
+        );
+        let m = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Mm,
+            msg: SapMsgInner::LmmMleActivateConf(LmmMleActivateConf {
+                registration_required,
+                la,
+                cell_type: 0, // Todo (cl. 18): cell type not modelled yet
+            }),
+        };
+        queue.push_back(m);
     }
 
     /// ETSI TS 100 392-2 cl. 18.3.4.6: initial cell selection. Adopt the cell
@@ -365,11 +419,11 @@ impl MleMs {
             .unwrap_or(true);
 
         // Adopt the cell identity, preserving any SYSINFO learned for the same cell.
-        let (location_area, subscriber_class) = if newly_selected {
-            (None, None)
+        let (location_area, subscriber_class, registration_required) = if newly_selected {
+            (None, None, None)
         } else {
             let c = self.serving_cell.as_ref().unwrap();
-            (c.location_area, c.subscriber_class)
+            (c.location_area, c.subscriber_class, c.registration_required)
         };
         self.serving_cell = Some(ServingCell {
             mcc: pdu.mcc,
@@ -379,7 +433,15 @@ impl MleMs {
             late_entry_supported: pdu.late_entry_supported,
             location_area,
             subscriber_class,
+            registration_required,
         });
+
+        if newly_selected {
+            // A new cell was selected: MM must (re-)confirm and register on it.
+            // Re-arm the one-shot LMM-ACTIVATE confirmation (sent once SYSINFO
+            // for this cell arrives, cl. 17.3.2).
+            self.activate_confirmed = false;
+        }
 
         if !newly_selected {
             // Already camped on this cell; the lower layers already have the
