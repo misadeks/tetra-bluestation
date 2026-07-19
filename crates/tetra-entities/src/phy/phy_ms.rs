@@ -165,6 +165,35 @@ impl<D: RxTxDev> PhyMs<D> {
         }
     }
 
+    /// Number of timeslots the uplink leads... i.e. the granted uplink slot is
+    /// this many timeslots after the downlink slot that carried the grant. This
+    /// is the fixed TETRA duplex spacing (ETSI TS 100 392-2 cl. 9.5, "the uplink
+    /// ... is delayed by two timeslots relative to the downlink"), and is the
+    /// same offset UMAC's random access uses (`dltime.add_timeslots(2)`).
+    const UPLINK_TIMESLOT_OFFSET: i32 = 2;
+
+    /// Translate the granted uplink slot into the demodulator-local TDMA basis.
+    ///
+    /// The modulator times a burst as `reference_time + to_int(slot) *
+    /// SAMPLES_SLOT`, where `reference_time` is anchored to the demodulator's
+    /// *local* slot numbering (the first synchronized slot is numbered 0; see
+    /// `demodulator.rs`). UMAC, however, expresses the granted uplink slot in
+    /// the **network-absolute** TDMA time it decodes from each BSCH
+    /// (`umac_ms.rs`, MAC-SYNC cl. 21.4.4.2). Those two bases differ by the
+    /// network frame number in force when the MS synchronized (hundreds of
+    /// slots), so feeding the network time straight into the modulator places
+    /// the burst hundreds of slots into the future and only silence is emitted.
+    ///
+    /// Because every uplink is currently a random-access transmission at the
+    /// fixed DL+2 opportunity, the granted slot is unambiguously
+    /// `self.dltime + UPLINK_TIMESLOT_OFFSET` in the local basis, where
+    /// `self.dltime` is the just-demodulated downlink slot (kept in the local
+    /// basis by `drive_rx`). This is the same physical slot UMAC addressed, only
+    /// numbered in the basis the modulator understands.
+    fn local_uplink_time(&self) -> TdmaTime {
+        self.dltime.add_timeslots(Self::UPLINK_TIMESLOT_OFFSET)
+    }
+
     /// Build the modulation bits of an uplink burst from an LMAC transmit
     /// request and tag it with the slot it must be sent in.
     ///
@@ -174,11 +203,11 @@ impl<D: RxTxDev> PhyMs<D> {
     /// Here we lay the type-5 block into its burst fields around the training
     /// sequence (the inverse of the BS uplink receiver) via
     /// [`slotter::build_nub`] / [`slotter::build_cub`].
-    fn build_pending_tx(prim: tetra_saps::tp::TpUnitdataReqSlot) -> PendingTx {
-        let time = prim
-            .time
-            .expect("PhyMs uplink TpUnitdataReq must carry the granted slot time");
-
+    ///
+    /// `time` is the granted uplink slot expressed in the **demodulator-local**
+    /// TDMA basis (see [`Self::local_uplink_time`]), which is the basis the
+    /// modulator's `reference_time` is anchored to.
+    fn build_pending_tx(prim: tetra_saps::tp::TpUnitdataReqSlot, time: TdmaTime) -> PendingTx {
         let mut type5 = prim.blk1.expect("PhyMs uplink burst must carry blk1");
         type5.seek(0);
 
@@ -224,8 +253,19 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 let SapMsgInner::TpUnitdataReq(prim) = message.msg else {
                     panic!("PhyMs TpSap expected TpUnitdataReq, got {:?}", message.msg);
                 };
-                let pending = Self::build_pending_tx(prim);
-                tracing::debug!(ts = %pending.time, bits = pending.burst.len(), "PhyMs: queued uplink burst");
+                // The grant time UMAC supplies is in the network-absolute basis;
+                // reschedule it in the demodulator-local basis the modulator
+                // uses (see `local_uplink_time`).
+                let net_time = prim.time;
+                let local_time = self.local_uplink_time();
+                let pending = Self::build_pending_tx(prim, local_time);
+                tracing::debug!(
+                    local = %pending.time,
+                    network = ?net_time,
+                    dl = %self.dltime,
+                    bits = pending.burst.len(),
+                    "PhyMs: queued uplink burst (rescheduled network->local)"
+                );
                 if self.pending_tx.is_some() {
                     tracing::warn!("PhyMs: overwriting an uplink burst that was not yet transmitted");
                 }
