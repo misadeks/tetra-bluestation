@@ -713,16 +713,38 @@ impl UmacMs {
     /// slot's ACCESS-ASSIGN and act on the resulting decision. No-op unless a
     /// random access attempt is currently in progress.
     fn drive_random_access(&mut self, queue: &mut MessageQueue, aa: &AccessAssign) {
-        if !self.random_access.is_active() {
-            return;
-        }
-
-        // Only access code A is currently issued by `initiate` (rx_tma_prim).
+        // Access code A is the default code available to all MSs (SYSINFO
+        // default-A, cl. 21.4.4.1). Without advertised parameters we cannot
+        // legally access, so keep any queued uplink waiting until the BS
+        // broadcasts them (they arrive shortly after camping, via SYSINFO
+        // default-A or ACCESS-DEFINE).
         let code = AccessCode::A;
         let Some(params) = self.access_params.params_for(code).cloned() else {
-            // Parameters were withdrawn since the attempt started; keep waiting.
             return;
         };
+
+        // Start the random access procedure for a queued uplink block that has
+        // not been initiated yet (cl. 23.5.1.4). Initiation is deferred here
+        // from `rx_tma_prim` so an uplink queued before the access parameters
+        // were advertised is transmitted as soon as they arrive, rather than
+        // dropped. No-op when nothing is queued and no attempt is in progress.
+        if !self.random_access.is_active() {
+            if self.pending_uplink.is_none() {
+                return;
+            }
+            // PDU priority is not yet carried by TMA-UNITDATA-REQ, so use the
+            // code's minimum so the priority gate passes. TODO: plumb the L3
+            // PDU priority and emergency flag through the LLC/MAC primitives.
+            let pdu_prio = params.min_pdu_prio;
+            if let Err(e) = self
+                .random_access
+                .initiate(self.dltime, code, &params, pdu_prio, false)
+            {
+                tracing::warn!("drive_random_access: random access not initiated: {:?}; dropping uplink SDU", e);
+                self.pending_uplink = None;
+                return;
+            }
+        }
 
         // The ACCESS-ASSIGN on the AACH designates the access rights of the
         // uplink subslots of the slot two timeslots later (cl. 23.5.1.4.2). We
@@ -876,34 +898,21 @@ impl UmacMs {
         tracing::debug!("rx_tma_prim: queued MAC-ACCESS uplink for ISSI {} ({} SDU bits)", issi, sdu_len);
 
         // Queue for transmission at the next valid random-access opportunity.
-        // The access-frame selection / randomised access algorithm
-        // (cl. 23.5.1.4) is driven by `drive_random_access` on each downlink
-        // AACH slot; the actual transmit is emitted to LMAC and (Phase 3d) PHY.
+        // The MS-MAC random access procedure (cl. 23.5.1.4) — access-frame
+        // selection and the randomised access algorithm — is initiated and
+        // driven by `drive_random_access` on each downlink slot carrying a
+        // valid ACCESS-ASSIGN, once access parameters for code A have been
+        // advertised (SYSINFO default-A / ACCESS-DEFINE, cl. 21.4.4.1). Holding
+        // the block here rather than requiring the parameters to already be
+        // present avoids dropping the first uplink when the trigger — e.g. MM
+        // registration on cell selection — fires before the broadcast carrying
+        // the access parameters has been received. The actual transmit is
+        // emitted to LMAC and PHY from `drive_random_access`.
         self.pending_uplink = Some(PendingUplink {
             mac_block,
             logical_channel: LogicalChannel::SchHu,
             scrambling_code,
         });
-
-        // Initiate the MS-MAC random access procedure (cl. 23.5.1.4). Access
-        // code A is the default code available to all MSs (SYSINFO default-A,
-        // cl. 21.4.4.1). Without advertised parameters we cannot legally access.
-        let Some(params) = self.access_params.params_for(AccessCode::A).cloned() else {
-            tracing::warn!("rx_tma_prim: no access parameters for code A yet; dropping uplink SDU");
-            self.pending_uplink = None;
-            return;
-        };
-        // PDU priority is not yet carried by TMA-UNITDATA-REQ, so use the code's
-        // minimum so the priority gate passes. TODO: plumb the L3 PDU priority
-        // and emergency flag through the LLC/MAC primitives.
-        let pdu_prio = params.min_pdu_prio;
-        if let Err(e) = self
-            .random_access
-            .initiate(self.dltime, AccessCode::A, &params, pdu_prio, false)
-        {
-            tracing::warn!("rx_tma_prim: random access not initiated: {:?}; dropping uplink SDU", e);
-            self.pending_uplink = None;
-        }
     }
 
     /// Build a MAC-ACCESS type-1 MAC block (ETSI TS 100 392-2 cl. 21.4.2.1)
