@@ -150,6 +150,20 @@ impl Modulator {
             self.reference_time = reference_time;
         }
     }
+
+    /// Diagnostic helper: the sample-counter position of the beginning of the
+    /// slot for `tx_slot.time`, i.e. the `slot_begin` used in
+    /// [`Modulator::sample`]. Only meaningful for [`Mode::Ul`] (returns `None`
+    /// otherwise). Used to log where a pending uplink burst lands relative to
+    /// the TX generation window so the RX->TX timing (`MS_TX_SAMPLE_DELAY`) can
+    /// be diagnosed on hardware.
+    pub fn ul_slot_begin(&self, tx_slot: &TxSlotBits) -> Option<SampleCount> {
+        if self.mode == Mode::Ul {
+            Some(self.reference_time + TdmaTime::to_int(tx_slot.time) as SampleCount * SAMPLES_SLOT)
+        } else {
+            None
+        }
+    }
 }
 
 struct DqpskMapper {

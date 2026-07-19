@@ -3,6 +3,7 @@
 
 use rustfft;
 use tetra_config::bluestation::{SharedConfig, StackMode};
+use tetra_core::TdmaTime;
 
 use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
@@ -545,6 +546,9 @@ struct ModulatorChannel {
     buffer: fcfb::InputBuffer,
     /// How much of buffer is filled
     buffer_i: usize,
+    /// Last uplink burst time for which a placement diagnostic was logged, so
+    /// the per-block diagnostic fires at most once per queued burst.
+    diag_last_time: Option<TdmaTime>,
 }
 
 impl ModulatorChannel {
@@ -566,6 +570,7 @@ impl ModulatorChannel {
             buffer_i: 0,
             upconverter,
             modulator: modulator::Modulator::new(mode),
+            diag_last_time: None,
         }
     }
 
@@ -575,6 +580,31 @@ impl ModulatorChannel {
 
     fn process(&mut self, fcfb: &mut fcfb::SynthesisOutputProcessor, block_count: fcfb::BlockCount, tx_slot: &TxSlotBits) -> bool {
         let buf = self.buffer.buffer_in();
+
+        // Diagnostic: when an uplink burst is queued, log once per burst where
+        // its active part lands relative to the TX generation window. The
+        // modulator only emits when the TX sample counter sweeps through
+        // `slot_begin`; if `slot_begin` is already behind `block_first` when the
+        // block is generated the burst is perpetually "in the past" and only
+        // silence is transmitted (SN0 never fires). `ahead_samples` shows the
+        // sign/magnitude of the misalignment for tuning `MS_TX_SAMPLE_DELAY`.
+        if tx_slot.slot.is_some() && self.diag_last_time != Some(tx_slot.time) {
+            if let Some(slot_begin) = self.modulator.ul_slot_begin(tx_slot) {
+                let block_first = block_count as SampleCount * buf.len() as SampleCount;
+                let block_last = block_first + buf.len() as SampleCount;
+                tracing::info!(
+                    ts = %tx_slot.time,
+                    block_count,
+                    block_first,
+                    block_last,
+                    slot_begin,
+                    ahead_samples = slot_begin - block_first,
+                    "Modulator(Ul): pending burst vs TX generation window"
+                );
+                self.diag_last_time = Some(tx_slot.time);
+            }
+        }
+
         while self.buffer_i < buf.len() {
             // TODO: include delay of FCFB in sample count
             match self.modulator.sample(
