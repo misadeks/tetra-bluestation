@@ -153,6 +153,60 @@ impl TxReporter {
         self.mark(TxState::Transmitted, TxState::Lost);
     }
 
+    /// Panic-safe `Pending → Transmitted`: performs the transition only if the
+    /// reporter is currently `Pending`, otherwise it is a no-op. Returns whether
+    /// the transition happened.
+    ///
+    /// Unlike [`mark_transmitted`](Self::mark_transmitted) this never panics on
+    /// an already-marked reporter. It is used on the MS uplink path, where the
+    /// same TM-SDU can be presented to the MAC through paths that may already
+    /// have marked it (e.g. retransmission), and where a marking must never
+    /// crash the real-time RF process.
+    pub fn try_mark_transmitted(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TxState::Pending as u8,
+                TxState::Transmitted as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Panic-safe `Pending → Discarded`: performs the transition only if the
+    /// reporter is currently `Pending`, otherwise it is a no-op. Returns whether
+    /// the transition happened. See [`try_mark_transmitted`](Self::try_mark_transmitted).
+    pub fn try_mark_discarded(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TxState::Pending as u8,
+                TxState::Discarded as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    /// Panic-safe `Transmitted → Lost`: performs the transition only if the
+    /// reporter is currently `Transmitted`, otherwise it is a no-op. Returns
+    /// whether the transition happened.
+    ///
+    /// The MS acknowledged-mode give-up path can reach this with the reporter in
+    /// `Discarded` or `Pending` state (the last uplink attempt was dropped or is
+    /// still in flight), where [`mark_lost`](Self::mark_lost) would panic. For
+    /// the BS the reporter is always `Transmitted` at give-up, so behaviour is
+    /// unchanged.
+    pub fn try_mark_lost(&self) -> bool {
+        self.state
+            .compare_exchange(
+                TxState::Transmitted as u8,
+                TxState::Lost as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// Tricky function to re-use linked TxReporters. Resets state to the initial state.
     /// Be very careful when using this.
     pub fn reset(&self) {
@@ -209,5 +263,48 @@ mod tests {
         let receipt = TxReporter::new();
         let reporter = receipt.clone();
         reporter.mark_acknowledged(); // must be Transmitted first
+    }
+
+    #[test]
+    fn try_mark_transmitted_is_idempotent_no_panic() {
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
+        assert!(reporter.try_mark_transmitted());
+        // Second call is a no-op instead of panicking.
+        assert!(!reporter.try_mark_transmitted());
+        assert_eq!(receipt.get_state(), TxState::Transmitted);
+    }
+
+    #[test]
+    fn try_mark_discarded_only_from_pending() {
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
+        assert!(reporter.try_mark_discarded());
+        assert_eq!(receipt.get_state(), TxState::Discarded);
+        // Already discarded: no-op, no panic.
+        assert!(!reporter.try_mark_transmitted());
+        assert_eq!(receipt.get_state(), TxState::Discarded);
+    }
+
+    #[test]
+    fn try_mark_lost_only_from_transmitted() {
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
+        // From Pending: no-op (would panic with mark_lost).
+        assert!(!reporter.try_mark_lost());
+        assert_eq!(receipt.get_state(), TxState::Pending);
+        reporter.mark_transmitted();
+        assert!(reporter.try_mark_lost());
+        assert_eq!(receipt.get_state(), TxState::Lost);
+    }
+
+    #[test]
+    fn try_mark_lost_from_discarded_is_noop() {
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
+        reporter.mark_discarded();
+        // Give-up path on a dropped MS uplink must not panic.
+        assert!(!reporter.try_mark_lost());
+        assert_eq!(receipt.get_state(), TxState::Discarded);
     }
 }

@@ -2,7 +2,10 @@ use std::panic;
 
 use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, PhyBlockNum, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
+use tetra_core::{
+    BitBuffer, PhyBlockNum, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter,
+    unimplemented_log,
+};
 use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
 use tetra_saps::tma::TmaUnitdataInd;
 use tetra_saps::tmv::TmvConfigureReq;
@@ -59,6 +62,15 @@ pub struct PendingUplink {
     pub mac_block: BitBuffer,
     pub logical_channel: LogicalChannel,
     pub scrambling_code: u32,
+    /// Transmit receipt shared with the LLC acknowledged-mode outbound entry
+    /// (ETSI TS 100 392-2 cl. 22.3.2.3). The MS-MAC marks it *transmitted* once
+    /// the BS acknowledges the random access (MAC-RESOURCE, cl. 23.5.1.4.8) and
+    /// *discarded* if the access procedure is abandoned (cl. 23.5.1.4.9). This
+    /// drives the LLC T251/N252 retransmit-and-give-up machinery; without it an
+    /// acknowledged-mode uplink whose LLC N(R) ack is withheld by the BS would
+    /// wedge the basic link forever. `None` for the frag-start of a fragmented
+    /// transfer (the receipt travels with the completing MAC-END-HU instead).
+    pub tx_reporter: Option<TxReporter>,
 }
 
 /// The remaining TM-SDU of an uplink transfer that did not fit a single
@@ -72,6 +84,12 @@ pub struct UplinkFragment {
     /// TM-SDU bits after the first fragment, to be carried by the MAC-END-HU.
     pub remainder: BitBuffer,
     pub scrambling_code: u32,
+    /// Transmit receipt for the whole fragmented TM-SDU (see [`PendingUplink::tx_reporter`]).
+    /// The receipt travels with the completing fragment: the MS-MAC marks it
+    /// *transmitted* when the MAC-END-HU is emitted and *discarded* if the
+    /// remainder cannot be sent (no grant / unsupported allocation), so the LLC
+    /// retransmits the whole transfer.
+    pub tx_reporter: Option<TxReporter>,
 }
 
 pub struct UmacMs {
@@ -399,14 +417,24 @@ impl UmacMs {
                 self.random_access.on_mac_resource(addr_matches, pdu.random_access_flag)
             {
                 tracing::info!("random access: request acknowledged by BS (MAC-RESOURCE)");
-                self.pending_uplink = None;
+                let completed = self.pending_uplink.take();
 
                 // If the acknowledged request was the start of a fragmented
                 // uplink transfer (cl. 23.4.2.1.2), this MAC-RESOURCE also
                 // carries the subslot grant for the MAC-END-HU remainder
-                // (cl. 23.5.2 basic slot granting). Emit it now.
+                // (cl. 23.5.2 basic slot granting). Emit it now; the transmit
+                // receipt (held on the fragment) is marked there.
                 if self.pending_fragment.is_some() {
                     self.emit_mac_end_hu(queue, pdu.slot_granting_element.as_ref());
+                } else if let Some(pending) = completed {
+                    // Unfragmented: the whole TM-SDU is now delivered to the
+                    // BS-MAC. Mark the LLC transmit receipt so the acknowledged
+                    // basic link can start its ack-wait / retransmit timer
+                    // (cl. 22.3.2.3); panic-safe against an already-marked
+                    // receipt (a re-presented retransmission).
+                    if let Some(tx_reporter) = pending.tx_reporter {
+                        tx_reporter.try_mark_transmitted();
+                    }
                 }
             }
         }
@@ -832,8 +860,21 @@ impl UmacMs {
             }
             Some(RaAction::Failed(f)) => {
                 tracing::warn!("random access abandoned: {:?}", f);
-                // TODO (Phase 4): report the failure to LLC via TMA-REPORT.
-                self.pending_uplink = None;
+                // The MS-MAC exhausted its access attempts without the BS
+                // acknowledging (cl. 23.5.1.4.9). Signal the LLC that the MAC
+                // could not deliver this TM-SDU so the acknowledged basic link
+                // retransmits it (cl. 22.3.2.3); if a fragmented transfer, the
+                // receipt lives on the fragment.
+                if let Some(pending) = self.pending_uplink.take() {
+                    if let Some(tx_reporter) = pending.tx_reporter {
+                        tx_reporter.try_mark_discarded();
+                    }
+                }
+                if let Some(fragment) = self.pending_fragment.take() {
+                    if let Some(tx_reporter) = fragment.tx_reporter {
+                        tx_reporter.try_mark_discarded();
+                    }
+                }
             }
             Some(RaAction::Succeeded) | None => {}
         }
@@ -905,8 +946,11 @@ impl UmacMs {
         let Some(grant) = grant else {
             tracing::warn!(
                 "uplink fragmentation: frag-start acknowledged but MAC-RESOURCE carried no slot grant; \
-                 cannot send MAC-END-HU (MM will retransmit)"
+                 cannot send MAC-END-HU (LLC/MM will retransmit)"
             );
+            if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
+                tx_reporter.try_mark_discarded();
+            }
             return;
         };
 
@@ -920,6 +964,9 @@ impl UmacMs {
                     "uplink fragmentation: unsupported capacity allocation {:?}; dropping MAC-END-HU",
                     other
                 );
+                if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
+                    tx_reporter.try_mark_discarded();
+                }
                 return;
             }
         }
@@ -930,6 +977,9 @@ impl UmacMs {
                     "uplink fragmentation: unsupported granting delay {:?}; dropping MAC-END-HU",
                     other
                 );
+                if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
+                    tx_reporter.try_mark_discarded();
+                }
                 return;
             }
         }
@@ -940,6 +990,9 @@ impl UmacMs {
                  multi-slot fragmentation not implemented",
                 rem_len
             );
+            if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
+                tx_reporter.try_mark_discarded();
+            }
             return;
         };
 
@@ -989,6 +1042,14 @@ impl UmacMs {
             }),
         };
         queue.push_back(m);
+
+        // The whole fragmented TM-SDU is now handed to the PHY for transmission
+        // in the reserved slot. Mark the LLC transmit receipt so the
+        // acknowledged basic link starts its ack-wait/retransmit timer
+        // (cl. 22.3.2.3); panic-safe against a re-presented retransmission.
+        if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
+            tx_reporter.try_mark_transmitted();
+        }
     }
 
     pub fn rx_tmv_bsch(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -1067,6 +1128,10 @@ impl UmacMs {
 
         let issi = self.own_issi();
 
+        // The transmit receipt shared with the LLC acknowledged-mode outbound
+        // entry (cl. 22.3.2.3). Marking it drives the LLC retransmit/give-up
+        // logic; see PendingUplink::tx_reporter.
+        let tx_reporter = prim.tx_reporter.take();
         // Build a MAC-ACCESS carrying the TM-SDU for random access on SCH/HU
         // (Control Uplink Burst). ETSI TS 100 392-2 cl. 21.4.2.1, cl. 23.5.1.
         // If the TM-SDU is too large for a single access burst (> ~62 bits on a
@@ -1085,6 +1150,7 @@ impl UmacMs {
                     mac_block,
                     logical_channel: LogicalChannel::SchHu,
                     scrambling_code,
+                    tx_reporter,
                 });
                 tracing::debug!(
                     "rx_tma_prim: queued MAC-ACCESS uplink for ISSI {} ({} SDU bits)",
@@ -1107,14 +1173,19 @@ impl UmacMs {
                             remainder.get_len(),
                             issi
                         );
+                        // The receipt travels with the completing MAC-END-HU
+                        // (the whole TM-SDU is only "transmitted" once the
+                        // remainder is on air); the frag-start carries none.
                         self.pending_fragment = Some(UplinkFragment {
                             remainder,
                             scrambling_code,
+                            tx_reporter,
                         });
                         self.pending_uplink = Some(PendingUplink {
                             mac_block: frag_block,
                             logical_channel: LogicalChannel::SchHu,
                             scrambling_code,
+                            tx_reporter: None,
                         });
                     }
                     None => {
@@ -1594,6 +1665,7 @@ attach_groups = []
             mac_block,
             logical_channel: LogicalChannel::SchHu,
             scrambling_code: 0x1234_5678,
+            tx_reporter: None,
         });
 
         let p = umac.access_params.params_for(AccessCode::A).expect("params present").clone();
@@ -1663,9 +1735,11 @@ attach_groups = []
     fn test_grant_emits_mac_end_hu() {
         let mut umac = ms_umac();
         umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let reporter = TxReporter::new();
         umac.pending_fragment = Some(UplinkFragment {
             remainder: BitBuffer::from_bitstr(&"1".repeat(40)),
             scrambling_code: 0xABCD_1234,
+            tx_reporter: Some(reporter.clone()),
         });
         let mut q = MessageQueue::new();
 
@@ -1687,17 +1761,23 @@ attach_groups = []
         assert_eq!(blk.scrambling_code, 0xABCD_1234);
         assert_eq!(blk.mac_block.get_len(), SCH_HU_TYPE1_BITS, "92-bit SCH/HU type-1 block");
         assert!(umac.pending_fragment.is_none(), "fragment consumed");
+        // The LLC transmit receipt is marked transmitted so the acknowledged
+        // basic link starts its ack-wait/retransmit timer (cl. 22.3.2.3).
+        assert!(reporter.is_transmitted(), "MAC-END-HU emission marks the receipt transmitted");
     }
 
     /// A MAC-RESOURCE that carries no slot grant cannot complete the fragmented
-    /// transfer: nothing is transmitted and the fragment is dropped (MM
-    /// retransmits the whole demand).
+    /// transfer: nothing is transmitted and the fragment is dropped. The LLC
+    /// transmit receipt is marked discarded so the acknowledged basic link
+    /// retransmits the whole transfer (cl. 22.3.2.3).
     #[test]
     fn test_no_grant_drops_fragment() {
         let mut umac = ms_umac();
+        let reporter = TxReporter::new();
         umac.pending_fragment = Some(UplinkFragment {
             remainder: BitBuffer::from_bitstr(&"1".repeat(40)),
             scrambling_code: 0,
+            tx_reporter: Some(reporter.clone()),
         });
         let mut q = MessageQueue::new();
 
@@ -1705,6 +1785,7 @@ attach_groups = []
 
         assert!(q.pop_front().is_none(), "no uplink without a grant");
         assert!(umac.pending_fragment.is_none(), "fragment consumed even without a grant");
+        assert!(reporter.is_discarded(), "no-grant drop marks the receipt discarded");
     }
 
     // --- MS MAC receive filtering (ETSI TS 100 392-2 clause 23 addressing) ---
