@@ -1,3 +1,5 @@
+use crate::net_control::ControlEndpoint;
+use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
@@ -82,6 +84,14 @@ enum RegState {
 
 pub struct MmMs {
     config: SharedConfig,
+    /// OUTBOUND external-interface handle (stack -> UI): TNMM indications
+    /// (ETSI TS 100 392-2 cl. 15.3) are pushed here in later phases. Wired in
+    /// Phase T0; `None` when no telemetry endpoint is configured.
+    telemetry: Option<TelemetrySink>,
+    /// INBOUND external-interface handle (UI -> stack): TNMM requests
+    /// (cl. 15.3) are received here in later phases. Wired in Phase T0; `None`
+    /// when no control endpoint is configured.
+    control: Option<ControlEndpoint>,
     /// Registration procedure state (cl. 16.4).
     reg_state: RegState,
     /// Timer T351 (registration response time, cl. 16.11.1.1) countdown in
@@ -104,9 +114,11 @@ pub struct MmMs {
 }
 
 impl MmMs {
-    pub fn new(config: SharedConfig) -> Self {
+    pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         Self {
             config,
+            telemetry,
+            control,
             reg_state: RegState::Idle,
             t351_countdown: 0,
             attempts: 0,
@@ -787,8 +799,25 @@ impl MmMs {
             _ => RejectAction::Abandon,
         }
     }
-}
 
+    /// Drain and handle inbound external-interface commands (UI -> stack).
+    ///
+    /// Wired in Phase T0 (MS interface enabler): the control endpoint is polled
+    /// once per downlink tick, mirroring `MmBs::tick_start`. No MS-side control
+    /// commands are defined yet — TNMM requests (ETSI TS 100 392-2 cl. 15.3) are
+    /// added in Phase T2 — so any command that arrives now is logged and
+    /// dropped rather than acted upon. Unlike the BS placeholder handler this
+    /// does not panic: commands originate from an external UI process and an
+    /// unexpected variant must not be able to crash the MS stack.
+    fn poll_control(&mut self, _queue: &mut MessageQueue) {
+        let Some(cep) = &self.control else {
+            return;
+        };
+        while let Some(cmd) = cep.try_recv() {
+            tracing::warn!("MM(MS): received control command with no MS handler yet, dropping: {:?}", cmd);
+        }
+    }
+}
 /// Action MM takes after analysing a D-LOCATION-UPDATE-REJECT cause
 /// (ETSI TS 100 392-2 cl. 16.4.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,6 +842,11 @@ impl TetraEntityTrait for MmMs {
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
+        // Drain any inbound external-interface (UI -> stack) commands first.
+        // Phase T0 wires the endpoint but defines no MS control commands yet;
+        // TNMM requests (ETSI TS 100 392-2 cl. 15.3) are handled here in T2.
+        self.poll_control(queue);
+
         // While detaching at shutdown, count down the bounded drain that gives
         // the MAC/PHY time to transmit the U-ITSI DETACH (cl. 16.6.1).
         if self.reg_state == RegState::Detaching {
@@ -890,6 +924,7 @@ impl TetraEntityTrait for MmMs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_control::ControlCommand;
     use tetra_config::bluestation::from_toml_str;
     use tetra_saps::lmm::LmmMleUnitdataInd;
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
@@ -939,14 +974,14 @@ attach_groups = []
 
     fn ms_mm() -> MmMs {
         let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
-        MmMs::new(SharedConfig::from_parts(cfg, None))
+        MmMs::new(SharedConfig::from_parts(cfg, None), None, None)
     }
 
     fn ms_mm_with_groups(groups: &[u32]) -> MmMs {
         let list = groups.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
         let toml = MS_TOML.replace("attach_groups = []", &format!("attach_groups = [{list}]"));
         let cfg = from_toml_str(&toml).expect("valid MS test config");
-        MmMs::new(SharedConfig::from_parts(cfg, None))
+        MmMs::new(SharedConfig::from_parts(cfg, None), None, None)
     }
 
     fn activate_conf(registration_required: bool) -> LmmMleActivateConf {
@@ -1390,5 +1425,46 @@ attach_groups = []
         assert_eq!(mm.reg_state, RegState::Idle);
         assert!(!mm.deregistration_pending());
         assert!(q.pop_front().is_none(), "no PDU emitted when not registered");
+    }
+
+    // --- Phase T0: MS external-interface wiring (enabler; no TNMM behaviour) ---
+
+    /// Build an MS MM wired to a telemetry sink and a control endpoint, and
+    /// return the far ends (telemetry source + command dispatcher) so a test can
+    /// act as the external UI process.
+    fn ms_mm_wired() -> (MmMs, crate::net_telemetry::TelemetrySource, crate::net_control::CommandDispatcher) {
+        use crate::net_control::channel::make_control_link;
+        use crate::net_telemetry::telemetry_channel;
+        let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
+        let (sink, source) = telemetry_channel();
+        let (dispatcher, endpoint) = make_control_link();
+        let mm = MmMs::new(SharedConfig::from_parts(cfg, None), Some(sink), Some(endpoint));
+        (mm, source, dispatcher)
+    }
+
+    /// T0: `MmMs::new` accepts and stores the telemetry sink + control endpoint
+    /// (mirroring `MmBs`), so `build_ms_stack` can wire the external interface.
+    #[test]
+    fn test_ms_mm_accepts_telemetry_and_control() {
+        let (mm, _source, _dispatcher) = ms_mm_wired();
+        assert!(mm.telemetry.is_some(), "telemetry sink wired");
+        assert!(mm.control.is_some(), "control endpoint wired");
+    }
+
+    /// T0: MM drains the control endpoint each tick. No MS control command is
+    /// defined yet, so an inbound command must be consumed and dropped without
+    /// panicking or altering registration state (cl. 15.3 requests land in T2).
+    #[test]
+    fn test_ms_mm_drains_control_without_panic() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::CommandA { handle: 7, parameter: 1 });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        // Command consumed (nothing left for the endpoint to receive), state
+        // unchanged, and no uplink PDU produced as a side effect.
+        assert_eq!(mm.reg_state, RegState::Idle, "control command must not change reg state");
+        assert!(q.pop_front().is_none(), "no PDU emitted for an unhandled control command");
     }
 }

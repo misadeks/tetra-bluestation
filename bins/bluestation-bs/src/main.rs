@@ -182,10 +182,13 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
 /// Start mobile station stack.
 ///
 /// Mirrors [`build_bs_stack`] but registers the MS-side entities and a
-/// receive-oriented [`PhyMs`]. Telemetry/control/Brew wiring is BS-oriented and
-/// intentionally omitted here for now (the MS MM/CMCE entities do not yet
-/// accept telemetry sinks); it returns the same tuple shape so `main` can treat
-/// both stacks uniformly.
+/// receive-oriented [`PhyMs`]. As of Phase T0 the MS external interface
+/// (telemetry OUT + control IN) is wired here exactly as for the BS: a
+/// telemetry sink/source pair is built when `[telemetry]` is configured and a
+/// per-entity control link set when `[control]` is configured, and both are
+/// threaded into `MmMs` (the emit/handle point for TNMM indications/requests,
+/// ETSI TS 100 392-2 cl. 15.3). Brew remains BS-only and is intentionally not
+/// wired here.
 ///
 /// NOTE (Phase 1): the MS must recover TDMA timing from the received SYNC burst
 /// (ETSI TS 100 392-2 clause 7) and drive the stack clock from RX. Until that
@@ -207,12 +210,27 @@ fn build_ms_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
         }
     }
 
+    // Build telemetry sink/source, if enabled
+    let (tsink, tsource) = if cfg.config().telemetry.is_some() {
+        let (a, b) = telemetry_channel();
+        (Some(a), Some(b))
+    } else {
+        (None, None)
+    };
+
+    // Build control links, if enabled
+    let (mut c_d, mut c_e) = if cfg.config().control.is_some() {
+        build_all_control_links()
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
+
     // Add remaining components
     let lmac = LmacMs::new(cfg.clone());
     let umac = UmacMs::new(cfg.clone());
     let llc = Llc::new(cfg.clone());
     let mle = MleMs::new(cfg.clone());
-    let mm = MmMs::new(cfg.clone());
+    let mm = MmMs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
     let sndcp = Sndcp::new(cfg.clone());
     let cmce = CmceMs::new(cfg.clone());
     router.register_entity(Box::new(lmac));
@@ -223,10 +241,16 @@ fn build_ms_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     router.register_entity(Box::new(sndcp));
     router.register_entity(Box::new(cmce));
 
+    // Drop all command links that were not given to a TetraEntity
+    for (entity, dispatcher) in c_e.into_iter() {
+        drop(dispatcher);
+        c_d.remove(&entity);
+    }
+
     // Init network time (placeholder until RX-driven clock lands in Phase 1)
     router.set_dl_time(TdmaTime::default());
 
-    (router, None, HashMap::new())
+    (router, tsource, c_d)
 }
 
 #[derive(Parser, Debug)]
