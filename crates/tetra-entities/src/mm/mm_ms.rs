@@ -586,6 +586,25 @@ impl MmMs {
             return;
         }
 
+        // Coalesce redundant infrastructure-initiated registrations (cl. 16.4.3):
+        // if a registration is already in progress (T351 active) — typically the
+        // SwMI is re-sending the command because our in-flight
+        // U-LOCATION-UPDATE-DEMAND has not yet been acknowledged — do not queue
+        // another demand. The outstanding demand (and its T351-driven
+        // retransmission, cl. 16.4.5) already satisfies the command; a second
+        // demand would only pile up behind the first on the acknowledged basic
+        // link (stop-and-wait, cl. 22.3.2.3) and never make progress. The
+        // command's basic-link frame is still acknowledged independently by the
+        // LLC (BL-ACK).
+        if self.reg_state == RegState::Registering && self.t351_countdown > 0 {
+            tracing::debug!(
+                "MM: <- D-LOCATION-UPDATE-COMMAND while a registration is already in progress \
+                 (T351 active, {} slots left); coalescing — not sending a duplicate demand",
+                self.t351_countdown
+            );
+            return;
+        }
+
         // cl. 16.4.3: if the "cell type control" element is present the MS would
         // update its cell-type preference (cl. 16.4.12) and, if the serving cell
         // is no longer permitted, issue an MLE-LINK request to reselect a cell
@@ -1684,6 +1703,30 @@ attach_groups = []
         deliver_dl(&mut mm, &mut q, build_command(false, Some(MS_MNI ^ 0x1)));
         assert_eq!(mm.reg_state, RegState::Idle, "command for a different MNI ignored");
         assert!(q.pop_front().is_none(), "no demand emitted for a foreign MNI");
+    }
+
+    /// A second D-LOCATION-UPDATE-COMMAND arriving while a registration is
+    /// already in progress (T351 active) is coalesced: MM does not emit a
+    /// duplicate U-LOCATION-UPDATE-DEMAND (cl. 16.4.3 / 22.3.2.3 stop-and-wait).
+    #[test]
+    fn test_command_coalesced_while_registering() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        // First command → registration starts, one demand emitted.
+        deliver_dl(&mut mm, &mut q, build_command(false, Some(MS_MNI)));
+        assert_eq!(mm.reg_state, RegState::Registering);
+        assert!(q.pop_front().is_some(), "first command emits a demand");
+        assert!(q.pop_front().is_none(), "exactly one demand for the first command");
+
+        // Second command while still Registering with T351 active → coalesced.
+        assert!(mm.t351_countdown > 0, "T351 running after the first command");
+        deliver_dl(&mut mm, &mut q, build_command(false, Some(MS_MNI)));
+        assert_eq!(mm.reg_state, RegState::Registering, "still registering");
+        assert!(
+            q.pop_front().is_none(),
+            "duplicate command coalesced — no second demand queued"
+        );
     }
 
     /// If the serving cell does not require registration, MM stays idle.

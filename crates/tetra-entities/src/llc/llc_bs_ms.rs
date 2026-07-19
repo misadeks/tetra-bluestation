@@ -458,8 +458,18 @@ impl Llc {
             }),
         };
 
-        // Register that we expect an ACK for this message
-        tracing::warn!("setting expected ack for ts1, but that's not neccessarily correct");
+        // Register that we expect an ACK for this message. NOTE: the expected-ack
+        // slot is recorded as ts1 here; this is a placeholder ("first signalling
+        // timeslot") rather than the actual granted uplink slot, but the ack is
+        // matched by SSI/N(R) not by ts, so it does not affect correctness.
+        // Downgraded from a WARN in MS mode (this dev note fired on every
+        // acknowledged uplink and drowned the MS log); the BS keeps the WARN so
+        // its behaviour/log is unchanged.
+        if self.is_ms_mode() {
+            tracing::trace!("setting expected ack for ts1 (placeholder; matched by SSI/N(R), not ts)");
+        } else {
+            tracing::warn!("setting expected ack for ts1, but that's not neccessarily correct");
+        }
         self.outbound_messages.push_back(ExpectedInAck {
             ns,
             addr: prim.main_address,
@@ -785,7 +795,11 @@ impl Llc {
                     ack.addr.ssi,
                     ack.ns
                 );
-                ack.tx_reporter.mark_lost();
+                // Panic-safe: in MS mode the last uplink attempt for this entry
+                // may have been dropped (Discarded) or is still in flight
+                // (Pending), where mark_lost() would panic. For the BS the
+                // reporter is always Transmitted here, so this is a no-op change.
+                ack.tx_reporter.try_mark_lost();
             }
             // The ack expires here
         }
