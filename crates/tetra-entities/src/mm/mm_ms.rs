@@ -10,6 +10,7 @@ use tetra_pdus::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
+use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 
 /// Number of downlink timeslots to wait for a location update response before
 /// retransmitting the U-LOCATION-UPDATE-DEMAND. One TDMA multiframe is 18 frames
@@ -24,6 +25,17 @@ const REGISTRATION_RETRY_SLOTS: u32 = 288;
 /// selection). Guards against transmitting forever on a cell that never answers.
 const MAX_REGISTRATION_ATTEMPTS: u8 = 5;
 
+/// Number of downlink timeslots to keep the stack running after a U-ITSI DETACH
+/// has been queued at shutdown, so the MAC random-access procedure (cl. 23.5.1.4)
+/// and the PHY have time to actually transmit the burst before the SDR streams
+/// close. One TDMA multiframe (18 frames × 4 slots ≈ 1.02 s) is ~72 slots; this
+/// is ~2 multiframes ≈ 2 s, enough for at least one random-access opportunity and
+/// a retransmission. De-registration is best-effort (cl. 16.6.1: MM proceeds
+/// whether the DLL reports the PDU "successfully or unsuccessfully transmitted"),
+/// so this is a bounded drain, not a wait for acknowledgement. It is an
+/// implementation guard, not a value transmitted on air.
+const DETACH_DRAIN_SLOTS: u32 = 144;
+
 /// MS registration state (ETSI TS 100 392-2 cl. 16.4 location updating /
 /// ITSI attach).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +48,10 @@ enum RegState {
     Registering,
     /// Registration accepted by the SwMI.
     Registered,
+    /// De-registration in progress: a U-ITSI DETACH has been sent at shutdown
+    /// and the stack is being drained so the burst can be transmitted
+    /// (cl. 16.6.1). Terminal — the MS is stopping.
+    Detaching,
 }
 
 pub struct MmMs {
@@ -47,6 +63,9 @@ pub struct MmMs {
     retry_countdown: u32,
     /// Number of demands sent for the current registration attempt.
     attempts: u8,
+    /// Downlink slots remaining to drain after sending a U-ITSI DETACH at
+    /// shutdown, giving the MAC/PHY time to transmit it (cl. 16.6.1).
+    detach_countdown: u32,
 }
 
 impl MmMs {
@@ -56,6 +75,7 @@ impl MmMs {
             reg_state: RegState::Idle,
             retry_countdown: 0,
             attempts: 0,
+            detach_countdown: 0,
         }
     }
 
@@ -84,6 +104,11 @@ impl MmMs {
             // Already registered on a cell; a repeated confirmation for the same
             // cell needs no action. (Cell change resets MLE's confirmation.)
             tracing::debug!("MM: activate-conf received while already registered; ignoring");
+            return;
+        }
+        if self.reg_state == RegState::Detaching {
+            // Shutting down; do not start a new registration.
+            tracing::debug!("MM: activate-conf received while detaching; ignoring");
             return;
         }
         tracing::info!("MM: serving cell selected (LA={}), initiating ITSI attach registration", conf.la);
@@ -148,6 +173,50 @@ impl MmMs {
         self.reg_state = RegState::Registering;
         self.retry_countdown = REGISTRATION_RETRY_SLOTS;
         self.attempts += 1;
+    }
+
+    /// Build and send a U-ITSI DETACH (cl. 16.9.3.3) down to MLE as part of the
+    /// de-registration procedure (cl. 16.6.1). Sent with an MLE-UNITDATA request
+    /// over acknowledged basic link (TL-DATA, per Figure 16.7); the MS identity
+    /// is carried by the MAC-layer source address, so the optional MNI address
+    /// extension is omitted (cl. 16.6.1 note: it cannot fully safeguard the
+    /// identity anyway as there is no ISSI element in the PDU). De-registration
+    /// is best-effort — MM does not wait for a D-MM STATUS response.
+    fn send_itsi_detach(&mut self, queue: &mut MessageQueue) {
+        let issi = self.own_issi();
+
+        // Minimal detach: no MNI address extension, no proprietary element.
+        let pdu = UItsiDetach {
+            address_extension: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(4);
+        pdu.to_bitbuf(&mut sdu).expect("U-ITSI DETACH serialization");
+        sdu.seek(0);
+        tracing::info!(
+            "MM: -> U-ITSI DETACH (de-registration) for ISSI {} sdu {}",
+            issi,
+            sdu.dump_bin()
+        );
+
+        let m = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: 0,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(m);
     }
 
     fn rx_lmm_mle_unitdata_ind(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
@@ -240,6 +309,13 @@ impl TetraEntityTrait for MmMs {
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
+        // While detaching at shutdown, count down the bounded drain that gives
+        // the MAC/PHY time to transmit the U-ITSI DETACH (cl. 16.6.1).
+        if self.reg_state == RegState::Detaching {
+            self.detach_countdown = self.detach_countdown.saturating_sub(1);
+            return;
+        }
+
         // Drive the registration retransmission timer (cl. 16.4). Only active
         // while awaiting a response to a sent demand.
         if self.reg_state != RegState::Registering {
@@ -283,6 +359,25 @@ impl TetraEntityTrait for MmMs {
             }
         }
     }
+
+    /// Shutdown hook (cl. 16.6.1): if the MS is registered, emit a U-ITSI DETACH
+    /// and ask the router to keep running so it can be transmitted. Returns
+    /// `true` only when a detach was actually initiated.
+    fn begin_deregistration(&mut self, queue: &mut MessageQueue) -> bool {
+        if self.reg_state != RegState::Registered {
+            tracing::info!("MM: shutdown while not registered; no de-registration needed");
+            return false;
+        }
+        tracing::info!("MM: shutdown while registered; sending U-ITSI DETACH (de-registration)");
+        self.send_itsi_detach(queue);
+        self.reg_state = RegState::Detaching;
+        self.detach_countdown = DETACH_DRAIN_SLOTS;
+        true
+    }
+
+    fn deregistration_pending(&self) -> bool {
+        self.reg_state == RegState::Detaching && self.detach_countdown > 0
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +386,7 @@ mod tests {
     use tetra_config::bluestation::from_toml_str;
     use tetra_saps::lmm::LmmMleUnitdataInd;
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
+    use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 
     const MS_ISSI: u32 = 1000001;
 
@@ -463,5 +559,76 @@ attach_groups = []
         let msg = q.pop_front().expect("demand retransmitted after timeout");
         assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
         assert_eq!(mm.attempts, 2);
+    }
+
+    /// On shutdown while registered, MM emits a valid, BS-parseable U-ITSI DETACH
+    /// (cl. 16.6.1 / 16.9.3.3) and enters the bounded detach drain.
+    #[test]
+    fn test_detach_on_shutdown_when_registered() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        // Get to the Registered state.
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+
+        // Shutdown: a detach must be initiated.
+        assert!(mm.begin_deregistration(&mut q), "detach must be initiated when registered");
+        assert_eq!(mm.reg_state, RegState::Detaching);
+        assert!(mm.deregistration_pending());
+
+        let msg = q.pop_front().expect("a U-ITSI DETACH must be emitted");
+        assert!(q.pop_front().is_none(), "exactly one message emitted");
+        assert_eq!(msg.sap, Sap::LmmSap);
+        assert_eq!(msg.dest, TetraEntity::Mle);
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        assert_eq!(req.address.ssi, MS_ISSI);
+        assert_eq!(req.layer2service, Layer2Service::Acknowledged);
+
+        // The BS parses exactly this on the uplink; it must decode cleanly as a
+        // minimal detach (no MNI, no proprietary).
+        req.sdu.seek(0);
+        let pdu = UItsiDetach::from_bitbuf(&mut req.sdu).expect("BS must parse the detach");
+        assert!(pdu.address_extension.is_none());
+        assert!(pdu.proprietary.is_none());
+        assert_eq!(req.sdu.get_len_remaining(), 0, "detach fully consumed");
+    }
+
+    /// The detach drain counts down over `DETACH_DRAIN_SLOTS` ticks, then reports
+    /// no longer pending so the router can stop.
+    #[test]
+    fn test_detach_drain_bounded() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert!(mm.begin_deregistration(&mut q));
+        let _ = q.pop_front();
+
+        // Pending for the full drain window, then clears.
+        for _ in 0..DETACH_DRAIN_SLOTS {
+            assert!(mm.deregistration_pending(), "still draining");
+            mm.tick_start(&mut q, TdmaTime::default());
+        }
+        assert!(!mm.deregistration_pending(), "drain complete");
+
+        // No accidental uplinks emitted during the drain.
+        assert!(q.pop_front().is_none(), "detach drain emits nothing further");
+    }
+
+    /// On shutdown while not registered, MM does not attempt a detach.
+    #[test]
+    fn test_no_detach_when_not_registered() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        assert!(!mm.begin_deregistration(&mut q), "no detach when idle");
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(!mm.deregistration_pending());
+        assert!(q.pop_front().is_none(), "no PDU emitted when not registered");
     }
 }

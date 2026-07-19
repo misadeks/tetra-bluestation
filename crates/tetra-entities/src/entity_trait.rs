@@ -35,4 +35,23 @@ pub trait TetraEntityTrait: Send + AsAny {
     fn tick_end(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         false
     }
+
+    /// Begin the MS de-registration (ITSI detach) procedure at shutdown
+    /// (ETSI TS 100 392-2 clause 16.6.1). Called by the [`crate::MessageRouter`]
+    /// when the stack is asked to stop. An MS MM entity that is currently
+    /// registered overrides this to emit a U-ITSI DETACH PDU and returns `true`
+    /// to indicate the stack should keep running (bounded) so the burst can be
+    /// transmitted over the air before the SDR streams close. The default is a
+    /// no-op returning `false` (nothing to detach / not applicable).
+    fn begin_deregistration(&mut self, _queue: &mut MessageQueue) -> bool {
+        false
+    }
+
+    /// While shutting down, returns `true` if a de-registration initiated by
+    /// [`Self::begin_deregistration`] is still in progress (the U-ITSI DETACH
+    /// has not yet had time to be transmitted). The router keeps driving the
+    /// stack until this returns `false` (or a bound is reached).
+    fn deregistration_pending(&self) -> bool {
+        false
+    }
 }

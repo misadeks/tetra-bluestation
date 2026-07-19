@@ -193,6 +193,32 @@ impl MessageRouter {
         self.run_tick_end(true);
     }
 
+    /// Ask the MM entity to begin the MS de-registration procedure (ITSI detach,
+    /// ETSI TS 100 392-2 cl. 16.6.1) at shutdown. Returns `true` if a detach was
+    /// initiated and the stack should keep running (bounded) so the burst can be
+    /// transmitted before the SDR closes. The queued PDU is delivered down the
+    /// stack immediately so it is pending in the MAC for the next uplink
+    /// opportunity.
+    fn begin_deregistration(&mut self) -> bool {
+        let started = match self.entities.get_mut(&TetraEntity::Mm) {
+            Some(mm) => mm.begin_deregistration(&mut self.msg_queue),
+            None => false,
+        };
+        if started {
+            self.deliver_all_messages();
+        }
+        started
+    }
+
+    /// Returns `true` while a shutdown de-registration is still draining (the
+    /// U-ITSI DETACH has not yet had time to be transmitted).
+    fn deregistration_pending(&self) -> bool {
+        self.entities
+            .get(&TetraEntity::Mm)
+            .map(|mm| mm.deregistration_pending())
+            .unwrap_or(false)
+    }
+
     /// Runs the full stack either forever or for a specified number of ticks.
     /// If `running` is provided, the loop will exit when the flag is set to false
     /// (e.g. by a Ctrl+C signal handler), allowing entities to be dropped cleanly.
@@ -248,13 +274,44 @@ impl MessageRouter {
     /// increment because RX advances time.
     fn run_stack_ms(&mut self, num_ticks: Option<usize>, running: Option<Arc<AtomicBool>>) {
         let mut ticks: usize = 0;
+        // Set once the stop signal is seen and the de-registration (ITSI detach)
+        // has been initiated; while true the loop keeps running (bounded) so the
+        // detach burst can be transmitted before the SDR streams close.
+        let mut detaching = false;
+        // Hard safety cap on drain iterations: if the downlink is lost mid-drain
+        // the MM countdown (driven from tick_start) stops advancing, so bound the
+        // drain by loop iterations too and never hang on shutdown.
+        let mut detach_iters: usize = 0;
+        const MAX_DETACH_ITERS: usize = 2000;
 
         loop {
             // Check if we've been asked to stop (e.g. Ctrl+C)
             if let Some(ref flag) = running {
                 if !flag.load(Ordering::Relaxed) {
-                    eprintln!("\n[INFO] Shutting down gracefully...");
-                    break;
+                    if !detaching {
+                        // First time we see the stop signal: try to de-register.
+                        // If the MS is registered this sends a U-ITSI DETACH
+                        // (cl. 16.6.1) and we keep running to transmit it;
+                        // otherwise stop immediately.
+                        if self.begin_deregistration() {
+                            eprintln!(
+                                "\n[INFO] De-registering (ITSI detach) before shutdown..."
+                            );
+                            detaching = true;
+                        } else {
+                            eprintln!("\n[INFO] Shutting down gracefully...");
+                            break;
+                        }
+                    } else if !self.deregistration_pending()
+                        || detach_iters >= MAX_DETACH_ITERS
+                    {
+                        // Detach has had time to be transmitted (or the drain hit
+                        // its hard cap); stop now.
+                        eprintln!("\n[INFO] De-registration sent; shutting down gracefully...");
+                        break;
+                    }
+                    // else: still draining — fall through and keep running.
+                    detach_iters += 1;
                 }
             }
 
