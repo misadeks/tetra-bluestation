@@ -226,4 +226,83 @@ mod tests {
         assert!(restart_required);
         assert_eq!(message, "staged");
     }
+
+    /// T4 JSON-schema freeze (Plane A + Plane B wire format).
+    ///
+    /// Round-trip tests alone do NOT freeze the schema: a symmetric serde rename
+    /// (variant or field) changes encode and decode together and still passes.
+    /// These golden-string assertions pin the exact on-the-wire JSON so any
+    /// accidental rename of a wrapper, variant, or field breaks the build with a
+    /// clear diff. The strings here are the contract the reference UI is built
+    /// against (schema `bluestation-ms-interface-1`).
+    #[test]
+    fn test_json_schema_freeze_golden_wire_format() {
+        use crate::management::{ManagementCommand, ManagementResponse, MS_INTERFACE_SCHEMA_VERSION};
+        let codec = ControlCodecJson;
+        let enc_cmd = |c: &ControlCommand| String::from_utf8(codec.encode_command(c)).unwrap();
+        let enc_resp = |r: &ControlResponse| String::from_utf8(codec.encode_response(r)).unwrap();
+
+        // --- Plane B (management) commands ---
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::GetState { handle: 5 })),
+            r#"{"Management":{"GetState":{"handle":5}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::GetInterfaceVersion { handle: 7 })),
+            r#"{"Management":{"GetInterfaceVersion":{"handle":7}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::GetConfig { handle: 3 })),
+            r#"{"Management":{"GetConfig":{"handle":3}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::SetConfig {
+                handle: 9,
+                toml: "x=1".to_string(),
+            })),
+            r#"{"Management":{"SetConfig":{"handle":9,"toml":"x=1"}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::ApplyConfig { handle: 4 })),
+            r#"{"Management":{"ApplyConfig":{"handle":4}}}"#
+        );
+
+        // --- Plane B (management) responses ---
+        assert_eq!(
+            enc_resp(&ControlResponse::Management(ManagementResponse::InterfaceVersion {
+                handle: 7,
+                version: MS_INTERFACE_SCHEMA_VERSION.to_string(),
+            })),
+            r#"{"Management":{"InterfaceVersion":{"handle":7,"version":"bluestation-ms-interface-1"}}}"#
+        );
+        // Guard the frozen constant itself so a bump is a deliberate, visible edit.
+        assert_eq!(MS_INTERFACE_SCHEMA_VERSION, "bluestation-ms-interface-1");
+        assert_eq!(
+            enc_resp(&ControlResponse::Management(ManagementResponse::Config {
+                handle: 3,
+                toml: "x=1".to_string(),
+            })),
+            r#"{"Management":{"Config":{"handle":3,"toml":"x=1"}}}"#
+        );
+        assert_eq!(
+            enc_resp(&ControlResponse::Management(ManagementResponse::Ack {
+                handle: 9,
+                accepted: true,
+                restart_required: true,
+                message: "staged".to_string(),
+            })),
+            r#"{"Management":{"Ack":{"handle":9,"accepted":true,"restart_required":true,"message":"staged"}}}"#
+        );
+
+        // --- Plane A (TNMM-SAP, standardized) request ack ---
+        // Freezes the standardized primitive-ack variant + field names on the wire.
+        assert_eq!(
+            enc_resp(&ControlResponse::TnmmAck {
+                handle: 6,
+                accepted: true,
+                detail: None,
+            }),
+            r#"{"TnmmAck":{"handle":6,"accepted":true,"detail":null}}"#
+        );
+    }
 }
