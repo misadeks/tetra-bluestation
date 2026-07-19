@@ -7,7 +7,9 @@ use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use tetra_entities::umac::umac_ms::UmacMs;
+use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
+use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
 
 use crate::common::ComponentTest;
 
@@ -334,9 +336,10 @@ fn test_build_mac_access_block_fillbits() {
     assert_eq!(recovered, expected, "recovered TM-SDU matches source");
 }
 
-/// Slice 3C: an SDU too large for a single SCH/HU access burst must be rejected
-/// (uplink fragmentation, cl. 23.4.2.1, is not yet implemented). 63 bits of SDU
-/// plus the 30-bit header exceeds the 92-bit type-1 block.
+/// Slice 3C: an SDU too large for a single self-contained SCH/HU access burst
+/// must be rejected by `build_mac_access_block` (63 bits of SDU plus the 30-bit
+/// header exceeds the 92-bit type-1 block). Such SDUs are instead fragmented via
+/// `build_mac_access_frag_start` + `build_mac_end_hu_block` (cl. 23.4.2.1.2).
 #[test]
 fn test_build_mac_access_block_oversized() {
     let issi: u32 = 0x0000_0001;
@@ -344,6 +347,109 @@ fn test_build_mac_access_block_oversized() {
     let mut sdu = BitBuffer::from_bitstr(&sdu_bits);
     assert!(
         UmacMs::build_mac_access_block(issi, &mut sdu).is_none(),
-        "oversized SDU must be rejected (needs fragmentation)"
+        "oversized SDU must be rejected by the self-contained path (needs fragmentation)"
+    );
+}
+
+/// A pseudo-random bit string of the given length (deterministic).
+fn bitstr(len: usize) -> String {
+    let mut s = String::with_capacity(len);
+    let mut x: u32 = 0x9E37_79B9;
+    for _ in 0..len {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        s.push(if (x >> 31) & 1 == 1 { '1' } else { '0' });
+    }
+    s
+}
+
+/// Uplink MAC fragmentation (ETSI TS 100 392-2 cl. 23.4.2.1.2, form i): an
+/// oversized TM-SDU is split into a MAC-ACCESS "start of fragmentation"
+/// (carrying a capacity request) transmitted by random access, and a MAC-END-HU
+/// remainder transmitted on a granted subslot. Build both blocks, decode them
+/// back through the base station's own PDU parsers, and confirm the two
+/// fragments reassemble to exactly the original TM-SDU.
+#[test]
+fn test_uplink_fragmentation_roundtrip() {
+    debug::setup_logging_verbose();
+
+    let issi: u32 = 0x0012_D687; // 1234567
+    // 96-bit SDU (e.g. an ITSI-attach demand with a group attachment). The
+    // first fragment carries 56 bits (fills the 92-bit block after the 36-bit
+    // frag-start header); the 40-bit remainder goes in the MAC-END-HU.
+    let sdu_bits = bitstr(96);
+    let expected: Vec<u8> = sdu_bits.chars().map(|c| (c == '1') as u8).collect();
+    let mut sdu = BitBuffer::from_bitstr(&sdu_bits);
+
+    let (mut frag_block, mut remainder) =
+        UmacMs::build_mac_access_frag_start(issi, &mut sdu).expect("oversized SDU fragments");
+    assert_eq!(frag_block.get_len(), 92, "frag-start is a 92-bit type-1 block");
+    assert_eq!(remainder.get_len(), 40, "remainder = 96 - 56 first-fragment bits");
+
+    // Decode the frag-start MAC-ACCESS with the BS's own parser.
+    let frag_pdu = MacAccess::from_bitbuf(&mut frag_block).expect("frag-start decodes");
+    assert_eq!(frag_pdu.addr.expect("addressed").ssi, issi, "frag-start ISSI matches");
+    assert_eq!(frag_pdu.frag_flag, Some(true), "start-of-fragmentation flag set");
+    assert_eq!(
+        frag_pdu.reservation_req,
+        Some(ReservationRequirement::Req1Subslot),
+        "capacity request asks for one subslot"
+    );
+    assert_eq!(frag_pdu.length_ind, None, "frag-start carries no length indication");
+    assert_eq!(frag_pdu.fill_bits, false, "first fragment fills the block, no fill bits");
+    // Header is 36 bits (ISSI + optional field flag + capacity request); the
+    // first 56 TM-SDU bits follow.
+    assert_eq!(frag_block.get_pos(), 36, "frag-start header is 36 bits");
+    let mut first = vec![0u8; 56];
+    frag_block.to_bitarr(&mut first);
+    assert_eq!(first, expected[..56], "first fragment carries the first 56 SDU bits");
+
+    // Build and decode the MAC-END-HU remainder.
+    let mut end_block = UmacMs::build_mac_end_hu_block(&mut remainder).expect("remainder fits one MAC-END-HU");
+    assert_eq!(end_block.get_len(), 92, "MAC-END-HU is a 92-bit type-1 block");
+    let end_pdu = MacEndHu::from_bitbuf(&mut end_block).expect("MAC-END-HU decodes");
+    // 7-bit header + 40-bit SDU = 47 content bits; padded to 48 (6 octets) with
+    // a single fill bit (cl. 23.4.2.2).
+    assert_eq!(end_pdu.length_ind, Some(6), "length indication = 6 octets");
+    assert_eq!(end_pdu.fill_bits, true, "one fill bit pads to the octet boundary");
+    assert_eq!(end_pdu.reservation_req, None, "final fragment carries no reservation requirement");
+    assert_eq!(end_block.get_pos(), 7, "MAC-END-HU header is 7 bits");
+    let mut rest = vec![0u8; 40];
+    end_block.to_bitarr(&mut rest);
+    assert_eq!(rest, expected[56..], "MAC-END-HU carries the remaining 40 SDU bits");
+
+    // The two fragments reassemble to exactly the original TM-SDU.
+    let mut reassembled = first;
+    reassembled.extend_from_slice(&rest);
+    assert_eq!(reassembled, expected, "reassembled SDU equals the original");
+}
+
+/// A byte-aligned MAC-END-HU remainder needs no fill bits: 7-bit header + a
+/// 49-bit remainder = 56 bits (7 octets), so `length_ind` = 7 and
+/// `fill_bits` is false (cl. 21.4.2.2 / 23.4.2.2).
+#[test]
+fn test_mac_end_hu_byte_aligned_no_fill() {
+    let rem_bits = bitstr(49);
+    let expected: Vec<u8> = rem_bits.chars().map(|c| (c == '1') as u8).collect();
+    let mut remainder = BitBuffer::from_bitstr(&rem_bits);
+
+    let mut block = UmacMs::build_mac_end_hu_block(&mut remainder).expect("fits one MAC-END-HU");
+    let pdu = MacEndHu::from_bitbuf(&mut block).expect("decodes");
+    assert_eq!(pdu.length_ind, Some(7), "56 content bits = 7 octets");
+    assert_eq!(pdu.fill_bits, false, "byte-aligned, no fill bits");
+    let mut rest = vec![0u8; 49];
+    block.to_bitarr(&mut rest);
+    assert_eq!(rest, expected, "recovered remainder matches");
+}
+
+/// `build_mac_access_frag_start` only fragments genuinely oversized SDUs: a
+/// short SDU that fits a single fragment returns `None` (the caller uses the
+/// self-contained `build_mac_access_block` path instead).
+#[test]
+fn test_frag_start_rejects_small_sdu() {
+    let issi: u32 = 0x0000_0001;
+    let mut sdu = BitBuffer::from_bitstr(&"1".repeat(40)); // <= 56-bit first fragment
+    assert!(
+        UmacMs::build_mac_access_frag_start(issi, &mut sdu).is_none(),
+        "an SDU that fits one fragment must not be fragmented"
     );
 }

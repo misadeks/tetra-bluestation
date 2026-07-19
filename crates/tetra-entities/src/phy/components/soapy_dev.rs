@@ -21,8 +21,10 @@ use super::soapyio;
 
 /// Fixed sample offset added to the downlink-derived timing reference when
 /// aligning the MS uplink modulator. It absorbs the residual delay between the
-/// RX and TX signal chains (analog front end + DSP pipeline) and the MS timing
-/// advance (ETSI TS 100 392-2 cl. 9.5). Zero is the nominal starting point;
+/// RX and TX signal chains (analog front end + DSP pipeline) so the burst lands
+/// within the uplink burst timing / guard period (ETSI TS 100 392-2 cl. 9.4.3.4;
+/// note TETRA has no active timing-advance procedure -- MS-BS propagation is
+/// absorbed by the uplink guard period). Zero is the nominal starting point;
 /// this is the single knob to tune against a real base station if the burst
 /// lands slightly early/late in the uplink slot. Positive = transmit later.
 const MS_TX_SAMPLE_DELAY: SampleCount = 0;
@@ -208,7 +210,7 @@ impl RxTxDev for RxTxDevSoapySdr {
         // to the PA for RfPath::Tx and to the LNA for RfPath::Rx. The SoapySDR
         // GPIO API (`self.sdr` -> `Device::write_gpio`) or a board-specific
         // control line is the intended extension point. Keep the switch settling
-        // time within the uplink guard period (ETSI TS 100 392-2 cl. 9.5).
+        // time within the uplink guard period (ETSI TS 100 392-2 cl. 9.4.3.4).
         tracing::trace!(?path, "set_rf_path (full-duplex: no antenna switching)");
     }
 
@@ -451,7 +453,7 @@ impl TxDsp {
     ) -> Result<bool, RxTxDevError> {
         // MS uplink: align the uplink modulator(s) to the downlink timing
         // recovered by the RX demodulator, offset by the fixed RX->TX chain
-        // delay / timing advance. Without this the uplink modulator's timing
+        // delay (see MS_TX_SAMPLE_DELAY). Without this the uplink modulator's timing
         // reference stays at 0 while the burst time carries the base station's
         // absolute (large) TDMA clock, so the burst is scheduled at an
         // impossible far-future sample position and only silence is ever

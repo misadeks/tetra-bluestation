@@ -171,9 +171,10 @@ impl<D: RxTxDev> PhyMs<D> {
 
     /// Number of timeslots the uplink leads... i.e. the granted uplink slot is
     /// this many timeslots after the downlink slot that carried the grant. This
-    /// is the fixed TETRA duplex spacing (ETSI TS 100 392-2 cl. 9.5, "the uplink
-    /// ... is delayed by two timeslots relative to the downlink"), and is the
-    /// same offset UMAC's random access uses (`dltime.add_timeslots(2)`).
+    /// is the fixed TETRA frame alignment (ETSI TS 100 392-2 cl. 9.3.9: "the
+    /// ... uplink shall be delayed by the fixed period of 2 timeslots from the
+    /// ... downlink"), and is the same offset UMAC's random access uses
+    /// (`dltime.add_timeslots(2)`).
     const UPLINK_TIMESLOT_OFFSET: i32 = 2;
 
     /// Translate the granted uplink slot into the demodulator-local TDMA basis.
@@ -212,8 +213,9 @@ impl<D: RxTxDev> PhyMs<D> {
 
     /// Choose the absolute uplink slot to transmit a granted burst in.
     ///
-    /// `granted` is the nominal uplink opportunity (`dltime + 2`, the fixed
-    /// duplex spacing of ETSI TS 100 392-2 cl. 9.5) in the demodulator-local
+    /// `granted` is the nominal uplink opportunity (`dltime + 2`: the uplink
+    /// frame is delayed by a fixed 2 timeslots from the downlink, ETSI TS 100
+    /// 392-2 cl. 9.3.9 Frame alignment) in the demodulator-local
     /// basis: it carries the correct timeslot-within-frame phase for the
     /// random-access opportunity, but its absolute frame number follows the
     /// *demodulated* downlink time, which the SDR RX pipeline delays by several

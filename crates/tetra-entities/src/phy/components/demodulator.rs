@@ -377,7 +377,8 @@ impl Demodulator {
     /// 0, as tracked by downlink synchronization. Returns `None` until the
     /// demodulator has achieved downlink lock (`Mode::Dl`). Used to align an
     /// uplink transmit modulator to the recovered air-interface timing so the
-    /// MS transmits its burst in the correct slot (ETSI TS 100 392-2 cl. 9.5).
+    /// MS transmits its burst in the correct slot (ETSI TS 100 392-2 cl. 9.3.9
+    /// Frame alignment).
     pub fn synchronized_reference_time(&self) -> Option<SampleCount> {
         if self.mode == Mode::Dl {
             Some(self.reference_time)
