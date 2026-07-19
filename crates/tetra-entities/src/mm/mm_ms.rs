@@ -1308,6 +1308,13 @@ impl MmMs {
                     state: Box::new(state),
                 }));
             }
+            // Frozen interface schema version discovery; always serviceable.
+            ManagementCommand::GetInterfaceVersion { handle } => {
+                self.respond(ControlResponse::Management(ManagementResponse::InterfaceVersion {
+                    handle,
+                    version: crate::management::MS_INTERFACE_SCHEMA_VERSION.to_string(),
+                }));
+            }
             // Read the active configuration as canonical TOML (always serviceable).
             ManagementCommand::GetConfig { handle } => {
                 let cfg = self.config.config();
@@ -2673,6 +2680,32 @@ attach_groups = []
             .expect("a Management Ack response")
     }
 
+    /// GetInterfaceVersion returns the frozen schema-version string (live).
+    #[test]
+    fn test_management_get_interface_version() {
+        use crate::management::{ManagementCommand, ManagementResponse, MS_INTERFACE_SCHEMA_VERSION};
+        use crate::net_control::ControlResponse;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetInterfaceVersion { handle: 90 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, version) = dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::InterfaceVersion { handle, version }) => {
+                    Some((handle, version))
+                }
+                _ => None,
+            })
+            .expect("an InterfaceVersion response");
+        assert_eq!(handle, 90);
+        assert_eq!(version, MS_INTERFACE_SCHEMA_VERSION);
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
     /// GetConfig returns canonical TOML that re-parses through the validator.
     #[test]
     fn test_management_get_config_roundtrips() {
@@ -2826,5 +2859,39 @@ attach_groups = []
         assert_eq!(handle, 85);
         assert!(!accepted, "no context => refused");
         assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// T4 (mock-transport CI): a management command survives a full JSON
+    /// encode -> decode -> MmMs handle -> response encode -> decode loop, proving
+    /// the wire path is portable end to end over the mock control transport.
+    #[test]
+    fn test_management_end_to_end_over_json_codec() {
+        use crate::management::{ManagementCommand, ManagementResponse};
+        use crate::net_control::ControlResponse;
+        use crate::net_control::codec::ControlCodecJson;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        let codec = ControlCodecJson;
+
+        // UI side: build a command, serialize it, and (mock transport) deserialize.
+        let wire = codec.encode_command(&ControlCommand::Management(ManagementCommand::GetInterfaceVersion { handle: 7 }));
+        let cmd = codec.decode_command(&wire).expect("decode command");
+        dispatcher.send(cmd);
+
+        // Stack side: MM handles it and emits a response.
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        // Response travels back over the mock transport: serialize + deserialize.
+        let resp = dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .next()
+            .expect("a response");
+        let round = codec.decode_response(&codec.encode_response(&resp)).expect("decode response");
+        let ControlResponse::Management(ManagementResponse::InterfaceVersion { handle, version }) = round else {
+            panic!("expected InterfaceVersion response");
+        };
+        assert_eq!(handle, 7);
+        assert_eq!(version, crate::management::MS_INTERFACE_SCHEMA_VERSION);
     }
 }

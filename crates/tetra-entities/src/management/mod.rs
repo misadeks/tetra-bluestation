@@ -23,6 +23,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::tnmm::ServiceStatus;
 
+/// Frozen schema version of the MS external interface (**NON-STANDARD**,
+/// Plane A TNMM-SAP indications/requests + Plane B management), independent of
+/// the transport-level WebSocket subprotocol handshake string
+/// (`CONTROL_PROTOCOL_VERSION` / `TELEMETRY_PROTOCOL_VERSION`), which is shared
+/// with the BS and therefore intentionally NOT bumped here.
+///
+/// A UI discovers this at runtime via [`ManagementCommand::GetInterfaceVersion`]
+/// so it can gate on the message catalog it was built against. Bump this (and
+/// the documented message catalog) whenever the Plane A/B message shapes change
+/// in a non-backwards-compatible way. `1` is the first frozen revision covering
+/// T1 TNMM indications, T2 TNMM requests and T3 management read/write.
+pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-1";
+
 /// MS registration state, mirrored for the management snapshot (non-standard).
 ///
 /// A serializable view of the internal MM registration state machine (ETSI
@@ -85,6 +98,10 @@ pub struct MsRuntimeState {
 pub enum ManagementCommand {
     /// Read the current MS runtime state (live/anytime).
     GetState { handle: u32 },
+    /// Discover the frozen MS interface schema version (live/anytime) so the UI
+    /// can gate on the message catalog it was built against. Independent of the
+    /// transport handshake subprotocol string.
+    GetInterfaceVersion { handle: u32 },
     /// Read the active stack configuration, serialized as canonical TOML
     /// (the same on-disk schema the stack loads at startup).
     GetConfig { handle: u32 },
@@ -108,6 +125,9 @@ pub enum ManagementCommand {
 pub enum ManagementResponse {
     /// Response to [`ManagementCommand::GetState`].
     State { handle: u32, state: Box<MsRuntimeState> },
+    /// Response to [`ManagementCommand::GetInterfaceVersion`]: the frozen
+    /// [`MS_INTERFACE_SCHEMA_VERSION`].
+    InterfaceVersion { handle: u32, version: String },
     /// Response to [`ManagementCommand::GetConfig`]: the active configuration
     /// serialized as canonical TOML.
     Config { handle: u32, toml: String },
