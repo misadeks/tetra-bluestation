@@ -150,21 +150,15 @@ struct TomlConfigRoot {
     extra: HashMap<String, Value>,
 }
 
-/// Serialize a runtime [`StackConfig`] back to a canonical TOML string
-/// (**NON-STANDARD**, Plane B config write-back).
-///
-/// This is the inverse of [`from_toml_str`]: it projects the runtime config
-/// through the DTO layer (`cfg_to_*_dto`) — the single on-disk schema source of
-/// truth — and renders it with `toml`. The result re-parses through
-/// [`from_toml_str`] to an equivalent `StackConfig` (round-trip closed), so a
-/// GetConfig -> edit -> SetConfig -> reload cycle is stable. `config_version` is
-/// emitted verbatim so the file stays loadable.
-///
-/// Secrets are written as plaintext: the DTO fields are plain `String`s and the
-/// TOML file is their canonical store (`SecretField` redaction applies to logs
-/// only and is not routed through here).
-pub fn to_toml_string(cfg: &StackConfig) -> Result<String, String> {
-    let root = TomlConfigRoot {
+/// Redaction sentinel written in place of secret values by
+/// [`to_toml_string_redacted`] and recognised by [`restore_redacted_secrets`]
+/// (**NON-STANDARD**, Plane B). A secret arriving from the wire equal to this
+/// token means "unchanged" — the current on-disk value is preserved rather than
+/// overwritten with the token. Matches `SecretField`'s log redaction string.
+pub const REDACTED_SECRET: &str = "********";
+
+fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
+    TomlConfigRoot {
         config_version: "0.6".to_string(),
         stack_mode: cfg.stack_mode,
         debug_log: cfg.debug_log.clone(),
@@ -176,8 +170,103 @@ pub fn to_toml_string(cfg: &StackConfig) -> Result<String, String> {
         command: cfg.control.as_ref().map(cfg_control_to_dto),
         ms: cfg.ms.as_ref().map(cfg_to_ms_dto),
         extra: HashMap::new(),
-    };
+    }
+}
+
+/// Serialize a runtime [`StackConfig`] back to a canonical TOML string
+/// (**NON-STANDARD**, Plane B config write-back).
+///
+/// This is the inverse of [`from_toml_str`]: it projects the runtime config
+/// through the DTO layer (`cfg_to_*_dto`) — the single on-disk schema source of
+/// truth — and renders it with `toml`. The result re-parses through
+/// [`from_toml_str`] to an equivalent `StackConfig` (round-trip closed), so a
+/// GetConfig -> edit -> SetConfig -> reload cycle is stable. `config_version` is
+/// emitted verbatim so the file stays loadable.
+///
+/// **This is the on-disk path and writes real secret values as plaintext** (the
+/// DTO secret fields are plain `String`s and the TOML file is their canonical
+/// store; `SecretField` redaction applies to logs only and is not routed through
+/// here). For the over-the-wire read path use [`to_toml_string_redacted`].
+pub fn to_toml_string(cfg: &StackConfig) -> Result<String, String> {
+    let root = cfg_to_root(cfg);
     toml::to_string_pretty(&root).map_err(|e| format!("TOML serialization failed: {e}"))
+}
+
+/// Like [`to_toml_string`] but with every secret value replaced by
+/// [`REDACTED_SECRET`] (**NON-STANDARD**, Plane B GetConfig wire path).
+///
+/// Used when serving the config to a (possibly remote) UI: plaintext
+/// credentials must never leave the process. The UI edits the redacted document
+/// and sends it back; [`restore_redacted_secrets`] then preserves the real
+/// secrets on write-back so the round-trip does not clobber them with the token.
+/// Redacted fields: control/telemetry HTTP Basic passwords and the brew password.
+pub fn to_toml_string_redacted(cfg: &StackConfig) -> Result<String, String> {
+    let mut root = cfg_to_root(cfg);
+    if let Some(c) = root.command.as_mut() {
+        if c.password.is_some() {
+            c.password = Some(REDACTED_SECRET.to_string());
+        }
+    }
+    if let Some(t) = root.telemetry.as_mut() {
+        if t.password.is_some() {
+            t.password = Some(REDACTED_SECRET.to_string());
+        }
+    }
+    if let Some(b) = root.brew.as_mut() {
+        if !b.password.is_empty() {
+            b.password = REDACTED_SECRET.to_string();
+        }
+    }
+    toml::to_string_pretty(&root).map_err(|e| format!("TOML serialization failed: {e}"))
+}
+
+/// Restore secrets that a UI sent back unchanged (equal to [`REDACTED_SECRET`])
+/// from the currently-active `current` config into `incoming`
+/// (**NON-STANDARD**, Plane B SetConfig write path).
+///
+/// A UI reads a redacted config ([`to_toml_string_redacted`]), edits unrelated
+/// fields and posts it back; the secret fields still carry the sentinel. This
+/// substitutes the real current value for each sentinel so a benign round-trip
+/// never overwrites a live secret with the token. A genuinely new secret value
+/// (not the sentinel) is kept as supplied. Removing a section entirely is an
+/// honest edit and is left as-is (the secret is dropped with its section).
+pub fn restore_redacted_secrets(mut incoming: StackConfig, current: &StackConfig) -> StackConfig {
+    if let Some(ctrl) = incoming.control.as_mut() {
+        if let Some((user, pass)) = ctrl.credentials.clone() {
+            if pass == REDACTED_SECRET {
+                let restored = current
+                    .control
+                    .as_ref()
+                    .and_then(|c| c.credentials.as_ref())
+                    .map(|(_, cp)| cp.clone())
+                    .unwrap_or(pass);
+                ctrl.credentials = Some((user, restored));
+            }
+        }
+    }
+    if let Some(tel) = incoming.telemetry.as_mut() {
+        if let Some((user, pass)) = tel.credentials.clone() {
+            if pass == REDACTED_SECRET {
+                let restored = current
+                    .telemetry
+                    .as_ref()
+                    .and_then(|t| t.credentials.as_ref())
+                    .map(|(_, cp)| cp.clone())
+                    .unwrap_or(pass);
+                tel.credentials = Some((user, restored));
+            }
+        }
+    }
+    if let Some(brew) = incoming.brew.as_mut() {
+        if let Some(pass) = brew.password.clone() {
+            if pass.as_ref() == REDACTED_SECRET {
+                if let Some(cur) = current.brew.as_ref().and_then(|b| b.password.clone()) {
+                    brew.password = Some(cur);
+                }
+            }
+        }
+    }
+    incoming
 }
 
 #[cfg(test)]
@@ -258,5 +347,96 @@ attach_groups = []
         let cfg = from_toml_str(MS_TOML).expect("initial parse");
         let rendered = to_toml_string(&cfg).expect("serialize");
         assert!(rendered.contains("config_version = \"0.6\""));
+    }
+
+    // An MS config that additionally configures a control endpoint with HTTP
+    // Basic credentials, so the secret redaction/restore paths have a secret.
+    const MS_TOML_WITH_SECRET: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+tx_gain_dac = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+
+[command]
+host = "127.0.0.1"
+port = 9000
+username = "ui-operator"
+password = "supersecret"
+"#;
+
+    #[test]
+    fn to_toml_string_redacted_hides_secrets_but_keeps_username() {
+        let cfg = from_toml_str(MS_TOML_WITH_SECRET).expect("parse");
+        let disk = to_toml_string(&cfg).expect("disk serialize");
+        let wire = to_toml_string_redacted(&cfg).expect("wire serialize");
+
+        // On-disk keeps the real secret; the wire form must not leak it.
+        assert!(disk.contains("supersecret"));
+        assert!(!wire.contains("supersecret"), "wire form must not leak the password");
+        assert!(wire.contains(REDACTED_SECRET), "wire form carries the sentinel");
+        // Non-secret fields still travel so the UI can display/edit them.
+        assert!(wire.contains("ui-operator"));
+        assert!(wire.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn restore_redacted_secrets_preserves_unchanged_secret() {
+        let current = from_toml_str(MS_TOML_WITH_SECRET).expect("current");
+        // Simulate a UI that read the redacted config and posted it back verbatim.
+        let wire = to_toml_string_redacted(&current).expect("wire");
+        let incoming = from_toml_str(&wire).expect("reparse wire");
+        assert_eq!(
+            incoming.control.as_ref().unwrap().credentials.as_ref().unwrap().1,
+            REDACTED_SECRET,
+            "sanity: incoming carries the sentinel"
+        );
+
+        let merged = restore_redacted_secrets(incoming, &current);
+        // The real secret is restored, never persisted as the sentinel.
+        assert_eq!(merged.control.as_ref().unwrap().credentials.as_ref().unwrap().1, "supersecret");
+        let disk = to_toml_string(&merged).expect("disk");
+        assert!(disk.contains("supersecret"));
+        assert!(!disk.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn restore_redacted_secrets_keeps_a_genuinely_new_secret() {
+        let current = from_toml_str(MS_TOML_WITH_SECRET).expect("current");
+        // UI supplies a brand-new password (not the sentinel).
+        let updated = MS_TOML_WITH_SECRET.replace("supersecret", "rotated-pass");
+        let incoming = from_toml_str(&updated).expect("parse updated");
+
+        let merged = restore_redacted_secrets(incoming, &current);
+        assert_eq!(merged.control.as_ref().unwrap().credentials.as_ref().unwrap().1, "rotated-pass");
     }
 }

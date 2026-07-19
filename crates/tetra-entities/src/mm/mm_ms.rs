@@ -1316,9 +1316,11 @@ impl MmMs {
                 }));
             }
             // Read the active configuration as canonical TOML (always serviceable).
+            // Secrets are redacted on the wire; the real values never leave the
+            // process (restored on SetConfig write-back from the current config).
             ManagementCommand::GetConfig { handle } => {
                 let cfg = self.config.config();
-                match tetra_config::bluestation::to_toml_string(&cfg) {
+                match tetra_config::bluestation::to_toml_string_redacted(&cfg) {
                     Ok(toml) => {
                         self.respond(ControlResponse::Management(ManagementResponse::Config { handle, toml }));
                     }
@@ -1387,7 +1389,15 @@ impl MmMs {
             }
         };
 
-        // 2) Normalize: re-serialize so the on-disk file is canonical and
+        // 2) Merge redacted secrets: a UI that read the config via GetConfig sees
+        //    secrets as the REDACTED_SECRET sentinel. Preserve the live on-disk
+        //    value for any secret returned unchanged (sentinel), so a benign
+        //    round-trip edit never clobbers a credential; genuinely-new secrets
+        //    (not the sentinel) are kept as supplied.
+        let current = self.config.config();
+        let parsed = tetra_config::bluestation::restore_redacted_secrets(parsed, &current);
+
+        // 3) Normalize: re-serialize so the on-disk file is canonical and
         //    provably re-parses to the validated config.
         let normalized = match tetra_config::bluestation::to_toml_string(&parsed) {
             Ok(s) => s,
@@ -1403,7 +1413,7 @@ impl MmMs {
             }
         };
 
-        // 3) Persist to the config file path.
+        // 4) Persist to the config file path.
         let path = ctx.config_path.clone();
         if let Err(e) = std::fs::write(&path, normalized) {
             tracing::error!("MM(MS): SetConfig failed to write {}: {e}", path.display());
@@ -2811,6 +2821,120 @@ attach_groups = []
         assert!(!restart_required);
         assert!(!path.exists(), "no file written for rejected config");
         assert!(!mm.runtime_snapshot().restart_required);
+    }
+
+    // An MS config that additionally configures a control endpoint with HTTP
+    // Basic credentials, so the secret redaction/restore paths carry a secret.
+    const MS_TOML_WITH_SECRET: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+
+[command]
+host = "127.0.0.1"
+port = 9000
+username = "ui-operator"
+password = "supersecret"
+"#;
+
+    fn ms_mm_wired_with_secret(
+    ) -> (MmMs, crate::net_telemetry::TelemetrySource, crate::net_control::CommandDispatcher) {
+        use crate::net_control::channel::make_control_link;
+        use crate::net_telemetry::telemetry_channel;
+        let cfg = from_toml_str(MS_TOML_WITH_SECRET).expect("valid MS test config with secret");
+        let (sink, source) = telemetry_channel();
+        let (dispatcher, endpoint) = make_control_link();
+        let mm = MmMs::new(SharedConfig::from_parts(cfg, None), Some(sink), Some(endpoint));
+        (mm, source, dispatcher)
+    }
+
+    /// End-to-end secret handling (Plane B, non-standard):
+    /// - GetConfig redacts the control password on the wire (never leaks it).
+    /// - SetConfig with the redacted document back preserves the real on-disk
+    ///   secret (a benign round-trip must not clobber the credential).
+    /// - SetConfig with a genuinely new password overwrites it.
+    #[test]
+    fn test_management_config_redacts_and_preserves_secret() {
+        use crate::management::ManagementCommand;
+        use tetra_config::bluestation::REDACTED_SECRET;
+
+        let (mut mm, _source, dispatcher) = ms_mm_wired_with_secret();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-secret-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested, is_running);
+
+        // 1) GetConfig must redact the secret on the wire.
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 84 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, wire_toml) = last_config(&dispatcher);
+        assert!(!wire_toml.contains("supersecret"), "GetConfig must not leak the password");
+        assert!(wire_toml.contains(REDACTED_SECRET), "GetConfig carries the redaction sentinel");
+        assert!(wire_toml.contains("ui-operator"), "non-secret username still travels");
+
+        // 2) UI posts the redacted document back unchanged => on-disk secret preserved.
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 85,
+            toml: wire_toml.clone(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, accepted, _rr) = last_mgmt_ack(&dispatcher);
+        assert!(accepted, "redacted round-trip config accepted");
+        let written = std::fs::read_to_string(&path).expect("config written");
+        assert!(written.contains("supersecret"), "real secret preserved on disk");
+        assert!(!written.contains(REDACTED_SECRET), "sentinel never persisted to disk");
+
+        // 3) A genuinely new password is written through.
+        let rotated = wire_toml.replace(REDACTED_SECRET, "rotated-pass");
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 86,
+            toml: rotated,
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, accepted, _rr) = last_mgmt_ack(&dispatcher);
+        assert!(accepted, "rotated config accepted");
+        let written = std::fs::read_to_string(&path).expect("config written");
+        assert!(written.contains("rotated-pass"), "new secret written to disk");
+        assert!(!written.contains("supersecret"), "old secret replaced");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// ApplyConfig requests the controlled restart: sets the shared
