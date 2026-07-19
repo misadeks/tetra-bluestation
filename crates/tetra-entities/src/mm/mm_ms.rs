@@ -111,10 +111,16 @@ pub struct MmMs {
     /// Downlink slots remaining to drain after sending a U-ITSI DETACH at
     /// shutdown, giving the MAC/PHY time to transmit it (cl. 16.6.1).
     detach_countdown: u32,
+    /// Location area of the serving cell as reported by the most recent
+    /// LMM-ACTIVATE confirmation (cl. 17.3.2). Cached so the TNMM-REGISTRATION
+    /// indication/confirm can report "LA (where registered)" (Table 15.5).
+    /// Defaults to the configured cell LA until a serving cell is selected.
+    serving_la: u16,
 }
 
 impl MmMs {
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
+        let serving_la = config.config().cell.location_area;
         Self {
             config,
             telemetry,
@@ -125,6 +131,7 @@ impl MmMs {
             system_rejection_count: 0,
             left_system: false,
             detach_countdown: 0,
+            serving_la,
         }
     }
 
@@ -157,6 +164,194 @@ impl MmMs {
     fn own_mni(&self) -> u32 {
         let net = &self.config.config().net;
         ((net.mcc as u32) << 14) | (net.mnc as u32 & 0x3FFF)
+    }
+
+    // ----------------------------------------------------------------------
+    // TNMM-SAP indications (Plane A, OUTBOUND) — ETSI TS 100 392-2 cl. 15.3.
+    //
+    // These push standardized TNMM primitives (cl. 15.3.3 / 15.3.4) toward the
+    // MS user application over the telemetry side-channel. They never touch the
+    // on-air SapMsg queue and never change registration state — they only
+    // report state that MM has already reached, so no air/TNMM behaviour is
+    // invented.
+    // ----------------------------------------------------------------------
+
+    /// Push a TNMM indication/confirm to the user application, if a telemetry
+    /// sink is wired. Fire-and-forget (lock-free).
+    fn emit(&self, event: crate::net_telemetry::TelemetryEvent) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(event);
+        }
+    }
+
+    /// MCC where registered (Table 15.5). This single-network clear-mode MS only
+    /// ever camps on / registers with cells of its configured network — a
+    /// D-LOCATION-UPDATE-COMMAND carrying a different MNI is ignored (own_mni
+    /// check) — so the registered MCC is the configured home MCC.
+    fn where_registered_mcc(&self) -> u16 {
+        self.config.config().net.mcc
+    }
+
+    /// MNC where registered (Table 15.5). See [`Self::where_registered_mcc`].
+    fn where_registered_mnc(&self) -> u16 {
+        self.config.config().net.mnc
+    }
+
+    /// Cell type where registered (Table 15.5). TNMM registration / location
+    /// updating is a trunked-mode (V+D) procedure carried out on a CA cell; this
+    /// stack implements no direct-mode (DA) registration path, so the cell where
+    /// this MS registers is always a CA cell (`cl. 15.3.4` value "CA cell").
+    fn where_registered_cell_type(&self) -> crate::tnmm::CellType {
+        crate::tnmm::CellType::CaCell
+    }
+
+    /// Build the "group identities" parameter (Table 15.8) for a set of GSSIs
+    /// that have just been attached at ITSI attach, as reported to the user
+    /// application. GITI = Attachment, so the conditional lifetime + class of
+    /// usage members are present; the detachment reason is absent (cl. 15.3.4).
+    /// GTSI = MNI << 24 | GSSI (cl. 15.3.4 "GTSI").
+    fn attached_group_identities(&self, gssis: &[u32]) -> Vec<crate::tnmm::GroupIdentity> {
+        use crate::tnmm::{ClassOfUsage, GroupIdentity, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityLifetime};
+        let mni = self.own_mni() as u64;
+        gssis
+            .iter()
+            .map(|gssi| GroupIdentity {
+                gtsi: (mni << 24) | (*gssi as u64),
+                group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                // Attached at ITSI attach with the class of usage MM sends in the
+                // demand (cl. 16.10.6, GROUP_CLASS_OF_USAGE = 4 -> "Class of Usage 4").
+                group_identity_lifetime: Some(GroupIdentityLifetime::AttachmentNeededForNextItsiAttach),
+                class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                group_identity_detachment_reason: None,
+            })
+            .collect()
+    }
+
+    /// Emit a TNMM-SERVICE indication (Table 15.6, cl. 15.3.3.8) reflecting the
+    /// MS service state. Disable status is always "enabled": the disabling
+    /// procedure is defined in ETSI EN 300 392-7 (Part 7, security), which is out
+    /// of scope, so this MS is never in a temporary/permanently-disabled state.
+    fn emit_service(&self, service_status: crate::tnmm::ServiceStatus) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::{DisableStatus, TnmmServiceIndication};
+        self.emit(TelemetryEvent::TnmmServiceIndication(TnmmServiceIndication {
+            service_status,
+            disable_status: DisableStatus::Enabled,
+        }));
+    }
+
+    /// Map an on-air `Reject cause` (cl. 16.10.42) to the TNMM-SAP
+    /// `Registration reject cause` enumeration (cl. 15.3.4). Returns `None` for
+    /// the on-air causes that have no TNMM-SAP enumerant ("use CA/DA cell not
+    /// permitted"), which therefore cannot be reported through this parameter.
+    fn map_registration_reject_cause(cause: RejectCause) -> Option<crate::tnmm::RegistrationRejectCause> {
+        use crate::tnmm::RegistrationRejectCause as T;
+        Some(match cause {
+            RejectCause::ItsiAtsiUnknown => T::ItsiUnknown,
+            RejectCause::IllegalMs => T::IllegalMs,
+            RejectCause::LaNotAllowed => T::LaNotAllowed,
+            RejectCause::LaUnknown => T::LaUnknown,
+            RejectCause::NetworkFailure => T::NetworkFailure,
+            RejectCause::Congestion => T::Congestion,
+            RejectCause::ForwardRegistrationFailure => T::ForwardRegistrationFailure,
+            RejectCause::ServiceNotSubscribed => T::ServiceNotSubscribed,
+            RejectCause::MandatoryElementError => T::MandatoryElementError,
+            RejectCause::MessageConsistencyError => T::MessageConsistencyError,
+            RejectCause::RoamingNotSupported => T::RoamingNotSupported,
+            RejectCause::MigrationNotSupported => T::MigrationNotSupported,
+            RejectCause::NoCipherKsg => T::NoCipherKsg,
+            RejectCause::IdentifiedCipherKsgNotSupported => T::IdentifiedCipherKsgNotSupported,
+            RejectCause::RequestedCipherKeyTypeNotAvailable => T::RequestedCipherKeyTypeNotAvailable,
+            RejectCause::IdentifiedCipherKeyNotAvailable => T::IdentifiedCipherKeyNotAvailable,
+            RejectCause::CipheringRequired => T::CipheringRequired,
+            RejectCause::AuthenticationFailure => T::AuthenticationFailure,
+            RejectCause::UseCaCellNotPermitted | RejectCause::UseDaCellNotPermitted => return None,
+        })
+    }
+
+    /// Emit a TNMM-REGISTRATION indication reporting that MM has failed a
+    /// registration procedure (Table 15.5; status = "failure" + reject cause,
+    /// cl. 15.3.3.7 / NOTE 1). LA/MCC/MNC reflect the cell the attempt was made
+    /// against. Followed by a TNMM-SERVICE "out of service" indication.
+    fn emit_registration_failure(&self, cause: Option<RejectCause>) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::{RegistrationStatus, ServiceStatus, TnmmRegistrationIndication};
+        let reject = cause.and_then(Self::map_registration_reject_cause);
+        self.emit(TelemetryEvent::TnmmRegistrationIndication(Box::new(TnmmRegistrationIndication {
+            registration_status: RegistrationStatus::Failure,
+            registration_reject_cause: reject,
+            cell_type_where_registered: self.where_registered_cell_type(),
+            la_where_registered: self.serving_la,
+            mcc_where_registered: self.where_registered_mcc(),
+            mnc_where_registered: self.where_registered_mnc(),
+            swmis_required_cell_types: None,
+            energy_economy_mode: None,
+            energy_economy_mode_status: None,
+            group_identities: None,
+            group_identity_attach_detach_mode: None,
+        })));
+        self.emit_service(ServiceStatus::OutOfService);
+    }
+
+    /// Emit the TNMM-SAP outbound primitives for a successfully carried-out
+    /// registration (Tables 15.5 / 15.1 / 15.6):
+    /// - TNMM-REGISTRATION indication and confirm (status = "success"), the
+    ///   confirm informing the user application the MS is ready for use
+    ///   (cl. 15.3.3.7);
+    /// - TNMM-SERVICE indication "in service" (cl. 15.3.3.8);
+    /// - TNMM-ATTACH DETACH GROUP IDENTITY indication reporting the groups the
+    ///   SwMI attached, when any (cl. 15.3.3.1).
+    ///
+    /// `attached_gssis` are the GSSIs the SwMI confirmed attached in the
+    /// D-LOCATION-UPDATE-ACCEPT (empty when none / group attachment failed).
+    fn emit_registration_success(&self, attached_gssis: &[u32]) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::{
+            RegistrationStatus, ServiceStatus, TnmmAttachDetachGroupIdentityIndication,
+            TnmmRegistrationConfirm, TnmmRegistrationIndication,
+        };
+
+        let group_identities = self.attached_group_identities(attached_gssis);
+        let groups_opt = if group_identities.is_empty() {
+            None
+        } else {
+            Some(group_identities.clone())
+        };
+
+        self.emit(TelemetryEvent::TnmmRegistrationIndication(Box::new(TnmmRegistrationIndication {
+            registration_status: RegistrationStatus::Success,
+            registration_reject_cause: None,
+            cell_type_where_registered: self.where_registered_cell_type(),
+            la_where_registered: self.serving_la,
+            mcc_where_registered: self.where_registered_mcc(),
+            mnc_where_registered: self.where_registered_mnc(),
+            swmis_required_cell_types: None,
+            energy_economy_mode: None,
+            energy_economy_mode_status: None,
+            group_identities: groups_opt.clone(),
+            group_identity_attach_detach_mode: None,
+        })));
+
+        self.emit(TelemetryEvent::TnmmRegistrationConfirm(Box::new(TnmmRegistrationConfirm {
+            registration_status: RegistrationStatus::Success,
+            registration_reject_cause: None,
+            cell_type_where_registered: self.where_registered_cell_type(),
+            la_where_registered: self.serving_la,
+            mcc_where_registered: self.where_registered_mcc(),
+            mnc_where_registered: self.where_registered_mnc(),
+            energy_economy_mode: None,
+            energy_economy_mode_status: None,
+            group_identities: groups_opt,
+            group_identity_attach_detach_mode: None,
+        })));
+
+        self.emit_service(ServiceStatus::InService);
+
+        if !group_identities.is_empty() {
+            self.emit(TelemetryEvent::TnmmAttachDetachGroupIdentityIndication(
+                TnmmAttachDetachGroupIdentityIndication { group_identities },
+            ));
+        }
     }
 
     /// Build the "class of MS" element (ETSI TS 100 392-2 cl. 16.10.5, Table
@@ -275,6 +470,9 @@ impl MmMs {
             return;
         }
         tracing::info!("MM: serving cell selected (LA={}), initiating ITSI attach registration", conf.la);
+        // Cache the serving cell's LA so TNMM-REGISTRATION indications/confirms
+        // can report "LA (where registered)" (Table 15.5).
+        self.serving_la = conf.la;
         self.attempts = 0;
         self.send_location_update_demand(queue);
     }
@@ -342,6 +540,11 @@ impl MmMs {
         self.reg_state = RegState::Registering;
         self.t351_countdown = T351_TIMEOUT_SLOTS;
         self.attempts += 1;
+
+        // TNMM-SERVICE indication (Table 15.6): the MS is now in service but
+        // awaiting the registration response (cl. 15.3.4 "in service waiting for
+        // registration").
+        self.emit_service(crate::tnmm::ServiceStatus::InServiceWaitingForRegistration);
     }
 
     /// Handle a D-LOCATION-UPDATE-COMMAND (ETSI TS 100 392-2 cl. 16.4.3): the
@@ -506,6 +709,10 @@ impl MmMs {
         self.reg_state = RegState::Registering;
         self.t351_countdown = T351_TIMEOUT_SLOTS;
         self.attempts += 1;
+
+        // TNMM-SERVICE indication (Table 15.6): in service, awaiting the
+        // registration response (cl. 15.3.4 "in service waiting for registration").
+        self.emit_service(crate::tnmm::ServiceStatus::InServiceWaitingForRegistration);
     }
 
     /// Build and send a U-ITSI DETACH (cl. 16.9.3.3) down to MLE as part of the
@@ -616,8 +823,9 @@ impl MmMs {
         // log the result for observability; RX group filtering continues to use
         // the configured attach_groups (dynamic granted-set tracking is a future
         // refinement).
+        let mut attached_gssis: Vec<u32> = Vec::new();
         if let Some(accept) = &pdu.group_identity_location_accept {
-            let attached: Vec<u32> = accept
+            attached_gssis = accept
                 .group_identity_downlink
                 .as_ref()
                 .map(|v| {
@@ -630,7 +838,7 @@ impl MmMs {
             tracing::info!(
                 "MM: group attachment result (accept_reject={}): attached GSSIs {:?}",
                 accept.group_identity_accept_reject,
-                attached
+                attached_gssis
             );
         } else if !self.attach_groups().is_empty() {
             // cl. 16.4.1.1: "In case the group identity location accept
@@ -654,6 +862,10 @@ impl MmMs {
         self.reg_state = RegState::Registered;
         self.t351_countdown = 0;
         self.system_rejection_count = 0;
+
+        // TNMM-SAP (cl. 15.3) outbound indications to the user application. MM has
+        // just carried out the registration procedure successfully.
+        self.emit_registration_success(&attached_gssis);
     }
 
     /// Handle D-LOCATION-UPDATE-REJECT (cl. 16.9.2.9 / 16.4.1.1): the SwMI
@@ -700,8 +912,10 @@ impl MmMs {
         }
 
         // TNMM-REGISTRATION indication ("failure" + reject cause, cl. 16.4.1.1)
-        // would be issued to the user application here; there is no user-app
-        // consumer of the TNMM-SAP in this stack, so it is logged above.
+        // to the user application is emitted from the terminal branches below —
+        // only where MM actually abandons the registration (not while a re-try is
+        // still outstanding, which keeps the procedure in progress).
+        let cause_opt = cause.ok();
 
         let action = cause.map(Self::analyse_reject_cause).unwrap_or(RejectAction::Abandon);
         match action {
@@ -720,6 +934,8 @@ impl MmMs {
                         MAX_REGISTRATION_ATTEMPTS
                     );
                     self.reg_state = RegState::Idle;
+                    // Terminal: registration procedure carried out unsuccessfully.
+                    self.emit_registration_failure(cause_opt);
                 }
             }
             RejectAction::Abandon => {
@@ -729,6 +945,8 @@ impl MmMs {
                 // the next LMM-ACTIVATE confirmation.
                 tracing::info!("MM: reject cause requires cell reselection / abandon; returning to idle");
                 self.reg_state = RegState::Idle;
+                // Terminal: registration procedure carried out unsuccessfully.
+                self.emit_registration_failure(cause_opt);
             }
             RejectAction::SystemRejection => {
                 self.system_rejection_count = self.system_rejection_count.saturating_add(1);
@@ -747,6 +965,8 @@ impl MmMs {
                     );
                 }
                 self.reg_state = RegState::Idle;
+                // Terminal: registration procedure carried out unsuccessfully.
+                self.emit_registration_failure(cause_opt);
             }
         }
     }
@@ -913,6 +1133,10 @@ impl TetraEntityTrait for MmMs {
         self.send_itsi_detach(queue);
         self.reg_state = RegState::Detaching;
         self.detach_countdown = DETACH_DRAIN_SLOTS;
+
+        // TNMM-SERVICE indication (Table 15.6): the MS is de-registering and
+        // therefore going out of service (cl. 15.3.4 "out of service").
+        self.emit_service(crate::tnmm::ServiceStatus::OutOfService);
         true
     }
 
@@ -925,6 +1149,7 @@ impl TetraEntityTrait for MmMs {
 mod tests {
     use super::*;
     use crate::net_control::ControlCommand;
+    use crate::net_telemetry::TelemetryEvent;
     use tetra_config::bluestation::from_toml_str;
     use tetra_saps::lmm::LmmMleUnitdataInd;
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
@@ -1466,5 +1691,196 @@ attach_groups = []
         // unchanged, and no uplink PDU produced as a side effect.
         assert_eq!(mm.reg_state, RegState::Idle, "control command must not change reg state");
         assert!(q.pop_front().is_none(), "no PDU emitted for an unhandled control command");
+    }
+
+    // -----------------------------------------------------------------------
+    // T1: TNMM-SAP outbound indications (cl. 15.3.3 / 15.3.4). Drive MM state
+    // transitions through a wired telemetry sink and assert the exact primitives
+    // reach the (simulated) user application.
+    // -----------------------------------------------------------------------
+
+    /// Collect all telemetry events currently queued on the source.
+    fn drain(source: &crate::net_telemetry::TelemetrySource) -> Vec<TelemetryEvent> {
+        let mut out = Vec::new();
+        while let Some(e) = source.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    /// Successful registration emits, in order: a TNMM-SERVICE "in service
+    /// waiting for registration" indication when the demand is sent, then on
+    /// D-LOCATION-UPDATE-ACCEPT a TNMM-REGISTRATION indication + confirm
+    /// (status = success) and a TNMM-SERVICE "in service" indication
+    /// (cl. 15.3.3.7 / 15.3.3.8).
+    #[test]
+    fn test_accept_emits_registration_success_and_service() {
+        use crate::tnmm::{RegistrationStatus, ServiceStatus};
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let waiting = drain(&source);
+        assert!(
+            waiting.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s)
+                    if s.service_status == ServiceStatus::InServiceWaitingForRegistration
+            )),
+            "demand must emit 'in service waiting for registration'"
+        );
+
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        let events = drain(&source);
+
+        let reg_ind = events.iter().find_map(|e| match e {
+            TelemetryEvent::TnmmRegistrationIndication(i) => Some(i),
+            _ => None,
+        });
+        let reg_ind = reg_ind.expect("TNMM-REGISTRATION indication emitted on accept");
+        assert_eq!(reg_ind.registration_status, RegistrationStatus::Success);
+        assert_eq!(reg_ind.registration_reject_cause, None);
+        assert_eq!(reg_ind.cell_type_where_registered, crate::tnmm::CellType::CaCell);
+        assert_eq!(reg_ind.la_where_registered, 1);
+        assert_eq!(reg_ind.mcc_where_registered, 901);
+        assert_eq!(reg_ind.mnc_where_registered, 9999);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmRegistrationConfirm(c) if c.registration_status == RegistrationStatus::Success
+            )),
+            "TNMM-REGISTRATION confirm emitted on accept"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::InService
+            )),
+            "TNMM-SERVICE 'in service' emitted on accept"
+        );
+    }
+
+    /// `emit_registration_success` builds one `GroupIdentity` per attached GSSI
+    /// with GITI = Attachment and GTSI = (own MNI << 24) | GSSI (cl. 15.3.4), and
+    /// emits a TNMM-ATTACH DETACH GROUP IDENTITY indication (cl. 15.3.3.1).
+    #[test]
+    fn test_registration_success_emits_group_identities() {
+        use crate::tnmm::GroupIdentityAttachDetachTypeIdentifier as Giti;
+        let (mm, source, _dispatcher) = ms_mm_wired();
+        let gssi = 100u32;
+        mm.emit_registration_success(&[gssi]);
+        let events = drain(&source);
+
+        let group_ind = events.iter().find_map(|e| match e {
+            TelemetryEvent::TnmmAttachDetachGroupIdentityIndication(i) => Some(i),
+            _ => None,
+        });
+        let group_ind = group_ind.expect("group identity indication emitted for attached GSSIs");
+        assert_eq!(group_ind.group_identities.len(), 1);
+        let g = &group_ind.group_identities[0];
+        assert_eq!(g.group_identity_attach_detach_type_identifier, Giti::Attachment);
+        let expected_gtsi = ((mm.own_mni() as u64) << 24) | (gssi as u64);
+        assert_eq!(g.gtsi, expected_gtsi);
+        assert!(g.group_identity_lifetime.is_some(), "GITI=Attachment carries lifetime");
+        assert!(g.class_of_usage.is_some(), "GITI=Attachment carries class of usage");
+        assert!(g.group_identity_detachment_reason.is_none());
+    }
+
+    /// A terminal reject (Illegal MS → abandon) emits a TNMM-REGISTRATION
+    /// indication with status = failure + the mapped reject cause, then a
+    /// TNMM-SERVICE "out of service" indication (cl. 15.3.3.7 / 15.3.4).
+    #[test]
+    fn test_reject_emits_registration_failure_and_out_of_service() {
+        use crate::tnmm::{RegistrationRejectCause, RegistrationStatus, ServiceStatus};
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = drain(&source); // discard the "waiting" service indication
+
+        // Illegal MS (cause 2) is an abandon cause (cl. 16.4.1.1): terminal.
+        deliver_dl(&mut mm, &mut q, build_reject(2));
+        assert_eq!(mm.reg_state, RegState::Idle);
+        let events = drain(&source);
+
+        let reg_ind = events.iter().find_map(|e| match e {
+            TelemetryEvent::TnmmRegistrationIndication(i) => Some(i),
+            _ => None,
+        });
+        let reg_ind = reg_ind.expect("TNMM-REGISTRATION failure indication emitted on terminal reject");
+        assert_eq!(reg_ind.registration_status, RegistrationStatus::Failure);
+        assert_eq!(reg_ind.registration_reject_cause, Some(RegistrationRejectCause::IllegalMs));
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
+            )),
+            "TNMM-SERVICE 'out of service' emitted on terminal reject"
+        );
+    }
+
+    /// A recoverable reject (Congestion → re-try) keeps the registration in
+    /// progress, so no failure indication is emitted (cl. 16.4.1.1).
+    #[test]
+    fn test_recoverable_reject_emits_no_failure() {
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = drain(&source);
+
+        // Congestion (cause 6) permits a re-try: still Registering, not terminal.
+        deliver_dl(&mut mm, &mut q, build_reject(6));
+        let events = drain(&source);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TelemetryEvent::TnmmRegistrationIndication(_))),
+            "no failure indication while a re-try is still outstanding"
+        );
+    }
+
+    /// The on-air reject causes "use CA/DA cell not permitted" (cl. 16.10.42)
+    /// have no TNMM-SAP enumerant (cl. 15.3.4): the mapping returns `None`.
+    #[test]
+    fn test_reject_cause_without_tnmm_enumerant_maps_to_none() {
+        assert_eq!(
+            MmMs::map_registration_reject_cause(RejectCause::UseCaCellNotPermitted),
+            None
+        );
+        assert_eq!(
+            MmMs::map_registration_reject_cause(RejectCause::UseDaCellNotPermitted),
+            None
+        );
+        assert_eq!(
+            MmMs::map_registration_reject_cause(RejectCause::IllegalMs),
+            Some(crate::tnmm::RegistrationRejectCause::IllegalMs)
+        );
+    }
+
+    /// De-registration at shutdown emits a TNMM-SERVICE "out of service"
+    /// indication (cl. 15.3.3.8).
+    #[test]
+    fn test_deregistration_emits_out_of_service() {
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        let _ = drain(&source); // discard registration/service events
+
+        assert!(mm.begin_deregistration(&mut q));
+        let events = drain(&source);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
+            )),
+            "de-registration emits 'out of service'"
+        );
     }
 }
