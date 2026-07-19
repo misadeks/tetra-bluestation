@@ -1,6 +1,6 @@
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, frames, unimplemented_log};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, unimplemented_log};
 use tetra_pdus::phy::traits::rxtx_dev::{RfPath, RxBurstBits, RxTxDev, TxSlotBits};
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -16,10 +16,10 @@ use crate::{MessageQueue, TetraEntityTrait};
 /// modulator places them within the slot per the burst delay (cl. 9.4.3.4).
 struct PendingTx {
     /// Absolute TDMA time (demodulator-local basis) of the uplink slot the
-    /// burst is scheduled in. This is chosen *ahead of the true hardware TX
-    /// frontier* rather than at the nominal `dltime + 2` opportunity (see
-    /// [`PhyMs::schedule_uplink_time`]), so retirement must compare against the
-    /// same true frontier the scheduling used.
+    /// burst is scheduled in: the exact granted opportunity `dltime + 2`
+    /// (cl. 9.3.9). Retirement compares against the TX generation frontier
+    /// ([`RxTxDev::tx_air_time`]), which advances past this slot once the
+    /// modulator has produced the burst.
     time: TdmaTime,
     /// Uplink burst modulation bits (NUB or CUB).
     burst: Vec<u8>,
@@ -189,80 +189,17 @@ impl<D: RxTxDev> PhyMs<D> {
     /// slots), so feeding the network time straight into the modulator places
     /// the burst hundreds of slots into the future and only silence is emitted.
     ///
-    /// Because every uplink is currently a random-access transmission at the
+    /// Because every uplink is a random-access or reserved transmission at the
     /// fixed DL+2 opportunity, the granted slot is unambiguously
     /// `self.dltime + UPLINK_TIMESLOT_OFFSET` in the local basis, where
     /// `self.dltime` is the just-demodulated downlink slot (kept in the local
-    /// basis by `drive_rx`). This gives the correct **timeslot-within-frame
-    /// phase** of the uplink random-access opportunity. Its absolute frame
-    /// number, however, is tied to the *demodulated* downlink time, which the RX
-    /// pipeline delays; [`Self::schedule_uplink_time`] advances it to a
-    /// reachable future occurrence of the same opportunity.
+    /// basis by `drive_rx`). This gives the correct timeslot-within-frame phase
+    /// *and* frame number of the uplink opportunity. With discontinuous TX (the
+    /// transmitter is silent between bursts, so the generation frontier is not
+    /// pinned ahead of the DAC — see `soapy_dev::TxDsp`), this exact slot is
+    /// reachable, so it is transmitted as-is with no frame-advance.
     fn local_uplink_time(&self) -> TdmaTime {
         self.dltime.add_timeslots(Self::UPLINK_TIMESLOT_OFFSET)
-    }
-
-    /// Minimum lead, in timeslots, that a scheduled uplink burst must keep
-    /// ahead of the TX generation frontier.
-    ///
-    /// A burst is transmitted cleanly only if the frontier still sits *behind*
-    /// its slot start when the modulator produces it, so the modulator sweeps
-    /// from before SN0 (the π/4-DQPSK phase reference, `slot_begin + 68`
-    /// samples). With too little lead the frontier overruns the slot start
-    /// between scheduling and production and SN0 is clipped — the burst carries
-    /// no valid phase reference and the BS cannot decode it (hardware-observed:
-    /// a `2`-slot lead gives `ahead_samples ≈ +2779` and SN0 fires / the BS
-    /// acknowledges; `0` gives `ahead_samples ≈ −250`, SN0 clipped, silent).
-    /// `2` timeslots is the working margin.
-    ///
-    /// KNOWN LIMITATION: this margin makes reserved-access slots (the MAC-END-HU
-    /// at the exact BS-granted `dltime + 2`, ETSI TS 100 392-2 cl. 23.5.2.2.2 /
-    /// 9.3.9) unreachable — the frontier plus this lead is already past that
-    /// fixed slot, so [`Self::schedule_uplink_time`] frame-advances it and it
-    /// misses the reserved slot. Contention random access is unaffected (its
-    /// opportunities recur). Closing this needs a reduction of the MS RX→TX
-    /// pipeline latency (an SDR-timing change), not any air-interface procedure
-    /// — TETRA has no timing-advance (propagation is absorbed by the uplink
-    /// guard period, cl. 9.4.3.4).
-    const UPLINK_MIN_LEAD_SLOTS: i32 = 2;
-
-    /// Choose the absolute uplink slot to transmit a granted burst in.
-    ///
-    /// `granted` is the nominal uplink opportunity (`dltime + 2`: the uplink
-    /// frame is delayed by a fixed 2 timeslots from the downlink, ETSI TS 100
-    /// 392-2 cl. 9.3.9 Frame alignment) in the demodulator-local
-    /// basis: it carries the correct timeslot-within-frame phase for the
-    /// random-access opportunity, but its absolute frame number follows the
-    /// *demodulated* downlink time, which the SDR RX pipeline delays by several
-    /// slots. `now` is the TX generation frontier ([`RxTxDev::tx_air_time`]) —
-    /// the slot the modulator is currently producing signal for, which leads
-    /// real time by the transmit look-ahead window.
-    ///
-    /// Because the RX pipeline delay plus that look-ahead put the frontier well
-    /// past the nominally-paired uplink slot, `granted` is already behind the
-    /// point the transmitter can still reach. So we transmit in a *later*
-    /// occurrence of the same access opportunity: advance `granted` by whole
-    /// TETRA frames (4 slots), which preserves the uplink timeslot phase, until
-    /// it lands at least [`Self::UPLINK_MIN_LEAD_SLOTS`] ahead of the frontier.
-    /// This mirrors how the BS schedules transmission — always from the true
-    /// master clock, ahead of real time — instead of reacting to the delayed
-    /// receive stream.
-    ///
-    /// Note: advancing by whole frames keeps the timeslot but changes the frame
-    /// number; landing on frame 18 (whose uplink carries special usage) could in
-    /// principle miss a random-access opportunity. Access rights are signalled
-    /// dynamically per frame via ACCESS-ASSIGN, so this is left to revisit if a
-    /// base station is observed to reject specific frames.
-    fn schedule_uplink_time(granted: TdmaTime, now: TdmaTime) -> TdmaTime {
-        let target = now.add_timeslots(Self::UPLINK_MIN_LEAD_SLOTS);
-        // Slots `granted` sits behind `target` (positive when it must advance).
-        let deficit = target.diff(granted);
-        if deficit <= 0 {
-            return granted;
-        }
-        // Round the advance up to whole frames so the timeslot phase is kept.
-        let frames_needed = (deficit + frames!(1) - 1).div_euclid(frames!(1));
-        granted.add_timeslots(frames!(frames_needed))
     }
 
     /// Build the modulation bits of an uplink burst from an LMAC transmit
@@ -324,89 +261,36 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 let SapMsgInner::TpUnitdataReq(prim) = message.msg else {
                     panic!("PhyMs TpSap expected TpUnitdataReq, got {:?}", message.msg);
                 };
-                // The grant time UMAC supplies is in the network-absolute basis.
-                // `local_uplink_time` recovers the granted opportunity's phase
-                // in the demodulator-local basis; `schedule_uplink_time` then
-                // moves it ahead of the true hardware TX frontier so the burst
-                // is actually reachable despite RX pipeline latency. If the true
-                // frontier is not yet known (pre-lock) we fall back to the
-                // nominal grant.
+                // Schedule at the exact granted uplink opportunity in the
+                // demodulator-local basis (`dltime + 2`, ETSI TS 100 392-2
+                // cl. 9.3.9 Frame alignment). `local_uplink_time` recovers that
+                // slot's phase in the basis the modulator's `reference_time` is
+                // anchored to (see `local_uplink_time`).
+                //
+                // With discontinuous uplink TX (the transmitter emits nothing
+                // between bursts — see `soapy_dev::TxDsp` idle-skip) the TX
+                // generation frontier is no longer pinned `dmax` blocks ahead of
+                // the DAC: on the next burst the `dmin` fast-forward re-anchors
+                // the frontier just ahead of the DAC, so the sweep starts before
+                // `dltime + 2` and produces the burst in it. The granted slot is
+                // therefore reachable and is honoured *exactly* for both
+                // contention random access and reserved bursts (the MAC-END-HU
+                // at the BS-granted slot, cl. 23.5.2.2.2) — no frame-advance, no
+                // reserved-drop. TETRA has no timing-advance procedure;
+                // propagation is absorbed by the uplink guard period
+                // (cl. 9.4.3.4).
                 let net_time = prim.time;
                 let reserved = prim.reserved_access;
                 let granted = self.local_uplink_time();
-                let frontier = self.rxtxdev.tx_air_time();
-                let sched = match frontier {
-                    Some(now) => Self::schedule_uplink_time(granted, now),
-                    None => granted,
-                };
-                // Reachability diagnostic (INFO — uplinks are infrequent).
-                // `frontier_deficit` = slots the granted slot sits behind the
-                // frontier (>0 means it was NOT reachable and had to advance).
-                // `advanced` slots is how far schedule_uplink_time moved it.
-                let frontier_deficit = frontier.map(|now| now.diff(granted));
-                let advanced = sched.diff(granted);
 
-                // Split the frontier deficit into its two contributors so the
-                // dominant one can be tuned before changing any timing. T (the
-                // TX generation look-ahead) is measured directly from the
-                // device; L (the RX demodulation latency) is derived from the
-                // total, since `frontier_deficit = (T + L) - UPLINK_TIMESLOT_OFFSET`
-                // (frontier - granted, with granted = dltime + OFFSET). The
-                // reserved slot is reachable only when `T + L <= OFFSET` (2
-                // timeslots, ETSI TS 100 392-2 cl. 9.3.9). Both are only
-                // meaningful once the frontier is known.
-                let tx_lookahead = self.rxtxdev.ms_tx_lookahead();
-                let rx_latency_slots = match (frontier_deficit, tx_lookahead.as_ref()) {
-                    (Some(deficit), Some(la)) => {
-                        Some((deficit + Self::UPLINK_TIMESLOT_OFFSET) as f64 - la.slots)
-                    }
-                    _ => None,
-                };
-
-                // Reserved-access bursts (the MAC-END-HU that completes an uplink
-                // fragmentation) are granted one specific slot by the BS
-                // (ETSI TS 100 392-2 cl. 23.5.2.2.2, granting delay "capacity
-                // allocation at next opportunity"). Unlike contention random
-                // access, a later occurrence of the same timeslot is NOT
-                // equivalent: the BS's per-slot ownership check rejects a burst
-                // that lands outside the reserved slot (it logs "MAC-END-HU for
-                // unassigned block"). So a reserved burst must be transmitted at
-                // exactly the granted slot or not at all. If schedule_uplink_time
-                // had to frame-advance it (`advanced != 0`), the exact slot is
-                // already behind the TX generation frontier and unreachable on
-                // this pipeline; drop the burst and let MM retransmit the whole
-                // demand rather than transmit into an unreserved slot. (Reducing
-                // the reserved-slot deficit is an SDR RX->TX timing concern, not
-                // an air-interface procedure -- TETRA has no timing advance.)
-                if reserved && advanced != 0 {
-                    tracing::warn!(
-                        granted = %granted,
-                        frontier = ?frontier,
-                        frontier_deficit = ?frontier_deficit,
-                        would_advance = advanced,
-                        tx_lookahead = ?tx_lookahead,
-                        rx_latency_slots = ?rx_latency_slots,
-                        network = ?net_time,
-                        "PhyMs: reserved uplink slot unreachable (behind TX frontier); \
-                         dropping reserved burst (MM will retransmit)"
-                    );
-                    return;
-                }
-
-                let pending = Self::build_pending_tx(prim, sched);
+                let pending = Self::build_pending_tx(prim, granted);
                 tracing::info!(
                     scheduled = %pending.time,
-                    granted = %granted,
-                    frontier = ?frontier,
-                    frontier_deficit = ?frontier_deficit,
-                    advanced,
                     reserved,
-                    tx_lookahead = ?tx_lookahead,
-                    rx_latency_slots = ?rx_latency_slots,
                     network = ?net_time,
                     dl = %self.dltime,
                     bits = pending.burst.len(),
-                    "PhyMs: queued uplink burst (honouring exact grant when reachable)"
+                    "PhyMs: queued uplink burst at exact grant (dltime+2)"
                 );
                 if self.pending_tx.is_some() {
                     tracing::warn!("PhyMs: overwriting an uplink burst that was not yet transmitted");
@@ -639,31 +523,28 @@ attach_groups = []
         assert!(phy.rxtxdev.rf_path.is_empty(), "no antenna switch without a burst");
     }
 
-    /// A queued uplink burst is scheduled ahead of the true TX frontier,
-    /// presented to the device, the antenna switched to TX, and once the true
-    /// frontier passes the scheduled slot the burst is retired and the antenna
-    /// handed back to RX.
+    /// A queued uplink burst is scheduled at the exact granted slot
+    /// (`dltime + 2`), presented to the device, the antenna switched to TX, and
+    /// once the TX generation frontier passes the scheduled slot the burst is
+    /// retired and the antenna handed back to RX.
     #[test]
     fn test_pending_burst_scheduled_then_retired() {
         let base = TdmaTime::default();
-        // At rx_prim the PHY's dltime is the default `base`, so the granted
-        // opportunity is base+2. With the true frontier at `base`, target =
-        // frontier + UPLINK_MIN_LEAD_SLOTS(2) = base+2 == the granted slot, so
-        // deficit is 0 and it is honoured at exactly that slot (no frame-advance).
+        // At rx_prim the PHY's dltime is the default `base`, so the burst is
+        // scheduled at the exact granted opportunity base+2 (cl. 9.3.9),
+        // independent of the frontier.
         let ul_time = base.add_timeslots(2);
 
         let mut phy = phy_ms(MockRxTx::default());
         let mut queue = MessageQueue::new();
 
-        // Upper layers request an uplink transmission; frontier just behind the
-        // opportunity.
-        phy.rxtxdev.next_air_time = Some(base);
+        // Upper layers request an uplink transmission.
         phy.rx_prim(&mut queue, cub_uplink_req(ul_time, false));
         assert!(phy.pending_tx.is_some(), "burst queued by rx_prim");
         assert_eq!(
             phy.pending_tx.as_ref().unwrap().time.to_int(),
             ul_time.to_int(),
-            "scheduled at the granted slot when already ahead of the frontier"
+            "scheduled at the exact granted slot dltime+2"
         );
 
         // True frontier still before the scheduled slot: burst is presented,
@@ -694,83 +575,33 @@ attach_groups = []
         assert_eq!(phy.rxtxdev.rf_path, vec![RfPath::Tx, RfPath::Rx], "no extra switches");
     }
 
-    /// When the true TX frontier has already run past the nominal `dltime + 2`
-    /// opportunity (the RX-pipeline-latency case that motivates the true-clock
-    /// scheduler), the burst is advanced by whole frames to a reachable future
-    /// occurrence: the uplink timeslot phase is preserved and the slot lands at
-    /// least `UPLINK_MIN_LEAD_SLOTS` ahead of the frontier.
+    /// Scheduling is now independent of the TX generation frontier: with
+    /// discontinuous TX the granted slot `dltime + 2` (cl. 9.3.9) is always
+    /// reachable, so both contention and reserved bursts are queued at exactly
+    /// that slot even when the frontier happens to be far ahead — no
+    /// frame-advance, no drop.
     #[test]
-    fn test_burst_advanced_by_whole_frames_when_frontier_ahead() {
+    fn test_burst_scheduled_at_exact_grant_regardless_of_frontier() {
         let base = TdmaTime::default();
         let granted = base.add_timeslots(2); // dltime(base) + 2
-        // Frontier 10 slots ahead of `base` (pipeline latency far exceeds the
-        // 2-slot duplex gap), so the nominal opportunity is already in the past.
-        let frontier = base.add_timeslots(10);
 
-        let mut phy = phy_ms(MockRxTx::default());
-        let mut queue = MessageQueue::new();
+        for reserved in [false, true] {
+            let mut phy = phy_ms(MockRxTx::default());
+            let mut queue = MessageQueue::new();
 
-        phy.rxtxdev.next_air_time = Some(frontier);
-        phy.rx_prim(&mut queue, cub_uplink_req(granted, false));
+            // Frontier reported far ahead of the opportunity — must not matter.
+            phy.rxtxdev.next_air_time = Some(base.add_timeslots(10));
+            phy.rx_prim(&mut queue, cub_uplink_req(granted, reserved));
 
-        let sched = phy.pending_tx.as_ref().expect("burst queued").time;
-        // Must be at least frontier + lead ahead...
-        assert!(
-            sched.diff(frontier) >= PhyMs::<MockRxTx>::UPLINK_MIN_LEAD_SLOTS,
-            "scheduled {sched:?} not far enough ahead of frontier {frontier:?}"
-        );
-        // ...advanced by a whole number of frames from the grant...
-        assert_eq!((sched.diff(granted)).rem_euclid(4), 0, "advance is a whole number of frames");
-        // ...which preserves the uplink timeslot phase.
-        assert_eq!(sched.t, granted.t, "uplink timeslot phase preserved");
-    }
-
-    /// A reserved-access burst (the MAC-END-HU completing an uplink
-    /// fragmentation) must land in exactly the granted slot (ETSI TS 100 392-2
-    /// cl. 23.5.2.2.2). When that slot is already behind the TX frontier — so it
-    /// would otherwise be frame-advanced — PhyMs drops it instead of transmitting
-    /// into an unreserved slot (the BS would reject it as "unassigned block").
-    #[test]
-    fn test_reserved_burst_dropped_when_frontier_ahead() {
-        let base = TdmaTime::default();
-        let granted = base.add_timeslots(2); // dltime(base) + 2
-        // Frontier 10 slots ahead: the reserved slot is in the past and could
-        // only be reached by frame-advancing, which is forbidden for reserved.
-        let frontier = base.add_timeslots(10);
-
-        let mut phy = phy_ms(MockRxTx::default());
-        let mut queue = MessageQueue::new();
-
-        phy.rxtxdev.next_air_time = Some(frontier);
-        phy.rx_prim(&mut queue, cub_uplink_req(granted, true));
-
-        assert!(
-            phy.pending_tx.is_none(),
-            "reserved burst behind the frontier must be dropped, not frame-advanced"
-        );
-    }
-
-    /// A reserved-access burst whose granted slot is still reachable ahead of the
-    /// frontier is transmitted at exactly that slot, with no frame-advance.
-    #[test]
-    fn test_reserved_burst_transmitted_at_exact_slot_when_reachable() {
-        let base = TdmaTime::default();
-        // At rx_prim the PHY's dltime is `base`, so granted = base + 2. With the
-        // frontier at `base`, granted == frontier + UPLINK_MIN_LEAD_SLOTS(2), so
-        // it is reachable at exactly that slot (deficit 0, no advance).
-        let granted = base.add_timeslots(2);
-
-        let mut phy = phy_ms(MockRxTx::default());
-        let mut queue = MessageQueue::new();
-
-        phy.rxtxdev.next_air_time = Some(base);
-        phy.rx_prim(&mut queue, cub_uplink_req(granted, true));
-
-        let pending = phy.pending_tx.as_ref().expect("reachable reserved burst queued");
-        assert_eq!(
-            pending.time.to_int(),
-            granted.to_int(),
-            "reserved burst transmitted at exactly the granted slot (no frame-advance)"
-        );
+            let pending = phy
+                .pending_tx
+                .as_ref()
+                .expect("burst queued at exact grant regardless of frontier");
+            assert_eq!(
+                pending.time.to_int(),
+                granted.to_int(),
+                "burst (reserved={reserved}) scheduled at exactly dltime+2"
+            );
+        }
     }
 }

@@ -419,6 +419,16 @@ struct TxDsp {
     block_count: fcfb::BlockCount,
     initial_time: i64,
     modulators: Vec<ModulatorChannel>,
+    /// True when every modulator is an *uplink* (MS) modulator, i.e. the
+    /// transmission is discontinuous by spec (ETSI TS 100 392-2 cl. 9.4.3.4 —
+    /// the MS keys the carrier only for its granted burst and is otherwise
+    /// silent). For such a transmitter we do not generate or stream idle
+    /// silence: whatever samples we do not write, the SoapySX driver plays as
+    /// silence automatically (ALSA silence-fill, `stop_threshold`/`silence_size`
+    /// set to the ring boundary) and the per-sample RX/TX switch keys the PA off
+    /// for zero-amplitude samples. A downlink (BS) modulator is a *continuous*
+    /// carrier (cl. 9.5) and is never gated this way.
+    discontinuous: bool,
 }
 
 impl TxDsp {
@@ -441,11 +451,17 @@ impl TxDsp {
             modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *ul_freq, modulator::Mode::Ul));
         }
 
+        // Pure-MS uplink: every modulator is discontinuous. (BS builds downlink
+        // modulators from `bs_dl_frequencies`; a monitor/BS mix would have at
+        // least one, disabling the idle-skip.)
+        let discontinuous = !phy_config.ms_ul_frequencies.is_empty() && phy_config.bs_dl_frequencies.is_empty();
+
         Self {
             fcfb,
             block_count: 0,
             initial_time: 0, // TODO: get it from RX
             modulators,
+            discontinuous,
         }
     }
 
@@ -470,6 +486,24 @@ impl TxDsp {
             for modulator in self.modulators.iter_mut() {
                 modulator.set_reference_time(aligned);
             }
+        }
+
+        // Discontinuous MS uplink: emit nothing when there is no burst to send
+        // this cycle. Streaming idle silence would force the generation frontier
+        // (`block_count`) to run the full `dmax` look-ahead ahead of the DAC on
+        // every cycle, which is exactly what pushes a BS-granted uplink slot
+        // (`dltime + 2`, cl. 9.3.9) behind the frontier and makes it
+        // unreachable. By not writing idle blocks the frontier collapses back
+        // toward the DAC (re-anchored via the `dmin` skip below on the next
+        // burst), so the granted slot stays ahead of the frontier and the burst
+        // is produced in it. The SoapySX driver fills every un-written sample
+        // with silence and keys the PA off for it, so skipping generation is
+        // exactly equivalent to transmitting silence — minus the frontier lead.
+        // A continuous downlink (BS) carrier always supplies a burst and is
+        // never skipped.
+        let have_burst = tx_slot.iter().any(|slot| slot.slot.is_some());
+        if self.discontinuous && !have_burst {
+            return Ok(false);
         }
 
         let current_sample = sdr.tx_current_count()?;
