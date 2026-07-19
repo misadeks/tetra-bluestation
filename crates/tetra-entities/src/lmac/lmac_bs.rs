@@ -359,6 +359,9 @@ impl LmacBs {
             blk2: None,
             // BS downlink derives its TX time from the stack clock in PhyBs.
             time: None,
+            // Reserved-access applies only to the MS uplink; BS downlink is
+            // clock-driven, so this is always false here.
+            reserved_access: false,
         };
 
         // Encode blk1 and optionally blk2

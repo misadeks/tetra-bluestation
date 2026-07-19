@@ -1011,6 +1011,7 @@ impl BsChannelScheduler {
                     }),
                     bbk: None,
                     ul_phy_chan: ul_phy,
+                    reserved_access: false,
                 }
             } else {
                 // Normal traffic: full-slot TCH
@@ -1024,6 +1025,7 @@ impl BsChannelScheduler {
                     blk2: None,
                     bbk: None,
                     ul_phy_chan: ul_phy,
+                    reserved_access: false,
                 }
             }
         } else {
@@ -1044,6 +1046,7 @@ impl BsChannelScheduler {
                     blk2: None,
                     bbk: None,
                     ul_phy_chan: ul_phy,
+                    reserved_access: false,
                 }
             } else {
                 // If this is an allocated traffic slot in hangtime, keep it alive with an idle SCH/F (Null PDU).
@@ -1059,6 +1062,7 @@ impl BsChannelScheduler {
                         blk2: None,
                         bbk: None,
                         ul_phy_chan: ul_phy,
+                        reserved_access: false,
                     }
                 } else {
                     // Put default SYNC/SYSINFO frame
@@ -1068,6 +1072,7 @@ impl BsChannelScheduler {
                         blk2: None,
                         bbk: None,
                         ul_phy_chan: ul_phy,
+                        reserved_access: false,
                     }
                 }
             }

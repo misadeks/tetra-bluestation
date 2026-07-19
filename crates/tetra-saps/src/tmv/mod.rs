@@ -30,6 +30,15 @@ pub struct TmvUnitdataReqSlot {
 
     /// The BBK block. We might consider letting the LMAC generate this automatically.
     pub bbk: Option<TmvUnitdataReq>,
+
+    /// `true` when this uplink burst is a **reserved-access** transmission (the
+    /// BS reserved this exact slot in response to a capacity request, e.g. the
+    /// MAC-END-HU completing an uplink fragmentation, ETSI TS 100 392-2
+    /// cl. 23.5.2.2.2). A reserved burst must be transmitted in exactly the
+    /// granted slot; unlike contention random access it may not be moved to a
+    /// later occurrence. `false` for random-access / contention bursts and for
+    /// all BS downlink transmissions.
+    pub reserved_access: bool,
 }
 
 /// The TMV-UNITDATA indication primitive shall be used by the lower MAC to deliver a received MAC block;

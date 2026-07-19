@@ -282,6 +282,9 @@ impl LmacMs {
             blk1: Some(type5),
             blk2: None,
             time: Some(ul_time),
+            // Carry the reserved/contention distinction down to PhyMs so it can
+            // enforce exact-slot transmission for reserved access (cl. 23.5.2.2.2).
+            reserved_access: prim.reserved_access,
         };
 
         let m = SapMsg {

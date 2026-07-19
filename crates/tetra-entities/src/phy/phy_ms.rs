@@ -332,6 +332,7 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 // frontier is not yet known (pre-lock) we fall back to the
                 // nominal grant.
                 let net_time = prim.time;
+                let reserved = prim.reserved_access;
                 let granted = self.local_uplink_time();
                 let frontier = self.rxtxdev.tx_air_time();
                 let sched = match frontier {
@@ -342,10 +343,37 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 // `frontier_deficit` = slots the granted slot sits behind the
                 // frontier (>0 means it was NOT reachable and had to advance).
                 // `advanced` slots is how far schedule_uplink_time moved it.
-                // For a reserved MAC-END-HU we need advanced == 0 (exact slot);
-                // if it is non-zero, MS_TX_LOOKAHEAD_BLOCKS is too high.
                 let frontier_deficit = frontier.map(|now| now.diff(granted));
                 let advanced = sched.diff(granted);
+
+                // Reserved-access bursts (the MAC-END-HU that completes an uplink
+                // fragmentation) are granted one specific slot by the BS
+                // (ETSI TS 100 392-2 cl. 23.5.2.2.2, granting delay "capacity
+                // allocation at next opportunity"). Unlike contention random
+                // access, a later occurrence of the same timeslot is NOT
+                // equivalent: the BS's per-slot ownership check rejects a burst
+                // that lands outside the reserved slot (it logs "MAC-END-HU for
+                // unassigned block"). So a reserved burst must be transmitted at
+                // exactly the granted slot or not at all. If schedule_uplink_time
+                // had to frame-advance it (`advanced != 0`), the exact slot is
+                // already behind the TX generation frontier and unreachable on
+                // this pipeline; drop the burst and let MM retransmit the whole
+                // demand rather than transmit into an unreserved slot. (Reducing
+                // the reserved-slot deficit is an SDR RX->TX timing concern, not
+                // an air-interface procedure -- TETRA has no timing advance.)
+                if reserved && advanced != 0 {
+                    tracing::warn!(
+                        granted = %granted,
+                        frontier = ?frontier,
+                        frontier_deficit = ?frontier_deficit,
+                        would_advance = advanced,
+                        network = ?net_time,
+                        "PhyMs: reserved uplink slot unreachable (behind TX frontier); \
+                         dropping reserved burst (MM will retransmit)"
+                    );
+                    return;
+                }
+
                 let pending = Self::build_pending_tx(prim, sched);
                 tracing::info!(
                     scheduled = %pending.time,
@@ -353,6 +381,7 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                     frontier = ?frontier,
                     frontier_deficit = ?frontier_deficit,
                     advanced,
+                    reserved,
                     network = ?net_time,
                     dl = %self.dltime,
                     bits = pending.burst.len(),
@@ -557,7 +586,8 @@ attach_groups = []
     }
 
     /// A TP-UNITDATA request carrying a SCH/HU control block for `time`.
-    fn cub_uplink_req(time: TdmaTime) -> SapMsg {
+    /// `reserved` marks it as reserved-access (exact-slot-or-drop) vs contention.
+    fn cub_uplink_req(time: TdmaTime, reserved: bool) -> SapMsg {
         let type5 = BitBuffer::from_bitarr(&[0u8; CUB_BLK_BITS * 2]);
         SapMsg {
             sap: Sap::TpSap,
@@ -570,6 +600,7 @@ attach_groups = []
                 blk1: Some(type5),
                 blk2: None,
                 time: Some(time),
+                reserved_access: reserved,
             }),
         }
     }
@@ -606,7 +637,7 @@ attach_groups = []
         // Upper layers request an uplink transmission; frontier just behind the
         // opportunity.
         phy.rxtxdev.next_air_time = Some(base);
-        phy.rx_prim(&mut queue, cub_uplink_req(ul_time));
+        phy.rx_prim(&mut queue, cub_uplink_req(ul_time, false));
         assert!(phy.pending_tx.is_some(), "burst queued by rx_prim");
         assert_eq!(
             phy.pending_tx.as_ref().unwrap().time.to_int(),
@@ -659,7 +690,7 @@ attach_groups = []
         let mut queue = MessageQueue::new();
 
         phy.rxtxdev.next_air_time = Some(frontier);
-        phy.rx_prim(&mut queue, cub_uplink_req(granted));
+        phy.rx_prim(&mut queue, cub_uplink_req(granted, false));
 
         let sched = phy.pending_tx.as_ref().expect("burst queued").time;
         // Must be at least frontier + lead ahead...
@@ -671,5 +702,54 @@ attach_groups = []
         assert_eq!((sched.diff(granted)).rem_euclid(4), 0, "advance is a whole number of frames");
         // ...which preserves the uplink timeslot phase.
         assert_eq!(sched.t, granted.t, "uplink timeslot phase preserved");
+    }
+
+    /// A reserved-access burst (the MAC-END-HU completing an uplink
+    /// fragmentation) must land in exactly the granted slot (ETSI TS 100 392-2
+    /// cl. 23.5.2.2.2). When that slot is already behind the TX frontier — so it
+    /// would otherwise be frame-advanced — PhyMs drops it instead of transmitting
+    /// into an unreserved slot (the BS would reject it as "unassigned block").
+    #[test]
+    fn test_reserved_burst_dropped_when_frontier_ahead() {
+        let base = TdmaTime::default();
+        let granted = base.add_timeslots(2); // dltime(base) + 2
+        // Frontier 10 slots ahead: the reserved slot is in the past and could
+        // only be reached by frame-advancing, which is forbidden for reserved.
+        let frontier = base.add_timeslots(10);
+
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        phy.rxtxdev.next_air_time = Some(frontier);
+        phy.rx_prim(&mut queue, cub_uplink_req(granted, true));
+
+        assert!(
+            phy.pending_tx.is_none(),
+            "reserved burst behind the frontier must be dropped, not frame-advanced"
+        );
+    }
+
+    /// A reserved-access burst whose granted slot is still reachable ahead of the
+    /// frontier is transmitted at exactly that slot, with no frame-advance.
+    #[test]
+    fn test_reserved_burst_transmitted_at_exact_slot_when_reachable() {
+        let base = TdmaTime::default();
+        // At rx_prim the PHY's dltime is `base`, so granted = base + 2. With the
+        // frontier at `base`, granted == frontier + UPLINK_MIN_LEAD_SLOTS(2), so
+        // it is reachable at exactly that slot (deficit 0, no advance).
+        let granted = base.add_timeslots(2);
+
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        phy.rxtxdev.next_air_time = Some(base);
+        phy.rx_prim(&mut queue, cub_uplink_req(granted, true));
+
+        let pending = phy.pending_tx.as_ref().expect("reachable reserved burst queued");
+        assert_eq!(
+            pending.time.to_int(),
+            granted.to_int(),
+            "reserved burst transmitted at exactly the granted slot (no frame-advance)"
+        );
     }
 }

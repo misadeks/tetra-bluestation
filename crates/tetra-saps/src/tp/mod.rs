@@ -25,4 +25,13 @@ pub struct TpUnitdataReqSlot {
     /// that hardware time. The BS downlink derives its own TX time from the
     /// stack clock, so it leaves this `None`.
     pub time: Option<TdmaTime>,
+
+    /// `true` when this uplink burst is a **reserved-access** transmission that
+    /// must land in exactly the granted slot (see
+    /// [`crate::tmv::TmvUnitdataReqSlot::reserved_access`]). The MS PHY
+    /// transmits a reserved burst only if the granted slot is still reachable
+    /// ahead of the TX generation frontier; if it would have to be moved to a
+    /// later slot it is dropped instead (a later slot is not reserved and the
+    /// BS would reject it). `false` for contention bursts and BS downlink.
+    pub reserved_access: bool,
 }

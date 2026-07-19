@@ -45,6 +45,7 @@ fn encode_uplink(lchan: LogicalChannel, mac_block: BitBuffer, scrambling_code: u
             }),
             blk2: None,
             bbk: None,
+            reserved_access: false,
         }),
     };
 
