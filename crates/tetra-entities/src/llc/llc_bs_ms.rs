@@ -137,6 +137,11 @@ impl Llc {
         }
     }
 
+    /// True when this LLC instance is configured as a mobile station (MS).
+    fn is_ms_mode(&self) -> bool {
+        self.config.config().stack_mode == StackMode::Ms
+    }
+
     /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number.
     /// ETSI 22.3.2.3 case d: when a waiting ACK and outgoing TL-DATA exist for the same link, the
     /// LLC shall emit a combined BL-ADATA PDU. Matching by SSI alone is correct today because all
@@ -185,8 +190,25 @@ impl Llc {
             return;
         };
 
-        // Check it was indeed already transmitted by the Umac
-        if expected_ack.t_umac_done.is_none() {
+        // Check it was indeed already transmitted by the Umac.
+        //
+        // BS mode keeps the strict guard (unchanged): a BL-ACK arriving before
+        // the local tx bookkeeping (t_umac_done) is set is treated as a stale
+        // retransmission of an ack for the before-last message and deferred by
+        // pushing the entry back to the head of the queue.
+        //
+        // MS mode: this guard strands the entry forever. The MS transmits its
+        // uplink via random access (MAC-ACCESS); by the time we get here,
+        // take_expected_ack_for_ssi has already confirmed the entry was
+        // submitted to the Umac (t_submitted_to_umac.is_some(), i.e. the burst
+        // was handed to the PHY). The BS piggybacks the ack for that uplink onto
+        // a *single* downlink PDU (e.g. the D-LOCATION-UPDATE-ACCEPT BL-ADATA
+        // N(R)) and never repeats it, so ignoring it here means the pending
+        // entry is never cleared and permanently blocks the next acknowledged
+        // uplink for this link (notably the shutdown U-ITSI DETACH). A valid ack
+        // from the BS proves the uplink was received, so accept it even if the
+        // local t_umac_done flag has not caught up yet.
+        if expected_ack.t_umac_done.is_none() && !self.is_ms_mode() {
             // This may be an old retransmission of an ack for the before-last basic link message
             // Let's push the ack back into the head of the queue (not tail)..
             tracing::warn!(
@@ -202,7 +224,15 @@ impl Llc {
         if expected_ack.ns == nr {
             // Successful ACK: N(R) matches N(S)
             tracing::debug!("received ACK for SSI {} N(R) {}", addr.ssi, expected_ack.ns);
-            expected_ack.tx_reporter.mark_acknowledged();
+            // The tx_reporter state machine only allows Transmitted -> Acknowledged.
+            // In MS mode we may accept an ack before the local reporter observed the
+            // transmission (see above), leaving it in Pending; only signal the upper
+            // layer when the transition is valid. Either way the entry is dropped
+            // here (already removed by take_expected_ack_for_ssi), which unblocks
+            // the link.
+            if expected_ack.tx_reporter.is_transmitted() {
+                expected_ack.tx_reporter.mark_acknowledged();
+            }
             return;
         } else {
             // N(R) mismatch — per ETSI 22.3.2.3(k), not a successful ACK. Maybe a retransmission?
@@ -1038,6 +1068,133 @@ attach_groups = []
         let llc = llc("Bs");
         assert!(llc.should_acknowledge(&TetraAddress::new(OWN_ISSI, SsiType::Ssi)));
         assert!(llc.should_acknowledge(&TetraAddress::new(OTHER_ISSI, SsiType::Ssi)));
+    }
+
+    /// Enqueues one acknowledged BL-DATA uplink for `ssi` (as MM's registration
+    /// demand / U-ITSI DETACH would) and marks it submitted-to-Umac but NOT yet
+    /// umac-done — i.e. the race window where the BS's piggybacked ack can arrive
+    /// before the local tx bookkeeping (t_umac_done) has caught up. Returns the
+    /// Llc and the N(S) that was assigned to the pending uplink.
+    fn llc_with_pending_uplink(mode: &str, ssi: u32) -> (Llc, u8) {
+        let mut llc = llc(mode);
+        let mut queue = MessageQueue::new();
+
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        sdu.write_bits(0b00010, 5); // minimal U-ITSI DETACH SDU
+        sdu.seek(0);
+
+        let req = SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                main_address: TetraAddress::new(ssi, SsiType::Issi),
+                link_id: 0,
+                endpoint_id: 0,
+                tl_sdu: sdu,
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: false,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        );
+        llc.rx_tla_tldata_req_bl(&mut queue, req);
+
+        // Mimic submit_free_messages_to_umac having handed the burst to the Umac,
+        // without the tx bookkeeping (t_umac_done) having caught up yet.
+        let ns = {
+            let entry = llc.outbound_messages.front_mut().expect("one pending uplink");
+            entry.t_submitted_to_umac = Some(entry.t_first);
+            assert!(entry.t_umac_done.is_none());
+            entry.ns
+        };
+        (llc, ns)
+    }
+
+    /// MS mode: a piggybacked ack that arrives before the local tx bookkeeping
+    /// (t_umac_done) is set must still clear the pending uplink. Otherwise the
+    /// entry becomes a permanent zombie that blocks the next acknowledged uplink
+    /// (e.g. the shutdown U-ITSI DETACH). The BS sends this ack only once, so it
+    /// cannot be recovered later.
+    #[test]
+    fn test_ms_accepts_ack_before_umac_done() {
+        let (mut llc, ns) = llc_with_pending_uplink("Ms", OWN_ISSI);
+        assert_eq!(llc.outbound_messages.len(), 1);
+
+        llc.process_incoming_ack(TetraAddress::new(OWN_ISSI, SsiType::Issi), ns);
+
+        assert!(
+            llc.outbound_messages.is_empty(),
+            "MS must consume the early piggybacked ack and unblock the link"
+        );
+    }
+
+    /// After the early ack has cleared the (never-retransmitted) registration
+    /// demand, a subsequent acknowledged uplink for the same SSI (the detach)
+    /// must be submittable rather than blocked behind a zombie entry.
+    #[test]
+    fn test_ms_detach_not_blocked_after_early_ack() {
+        let (mut llc, ns) = llc_with_pending_uplink("Ms", OWN_ISSI);
+        llc.process_incoming_ack(TetraAddress::new(OWN_ISSI, SsiType::Issi), ns);
+        assert!(llc.outbound_messages.is_empty());
+
+        // Now the detach (second acknowledged uplink for the same SSI) is queued.
+        let mut queue = MessageQueue::new();
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        sdu.write_bits(0b00010, 5);
+        sdu.seek(0);
+        let detach = SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                main_address: TetraAddress::new(OWN_ISSI, SsiType::Issi),
+                link_id: 0,
+                endpoint_id: 0,
+                tl_sdu: sdu,
+                stealing_permission: false,
+                subscriber_class: 0,
+                fcs_flag: false,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        );
+        llc.rx_tla_tldata_req_bl(&mut queue, detach);
+
+        let mut umac_queue = MessageQueue::new();
+        let had_activity = llc.submit_free_messages_to_umac(&mut umac_queue);
+        assert!(
+            had_activity,
+            "detach must be submitted to the Umac, not blocked by a previous message"
+        );
+    }
+
+    /// BS mode: behaviour is unchanged — an ack arriving before t_umac_done is
+    /// deferred (pushed back), because the BS legitimately sees repeated acks and
+    /// relies on the strict guard.
+    #[test]
+    fn test_bs_defers_ack_before_umac_done() {
+        let (mut llc, ns) = llc_with_pending_uplink("Bs", OWN_ISSI);
+        assert_eq!(llc.outbound_messages.len(), 1);
+
+        llc.process_incoming_ack(TetraAddress::new(OWN_ISSI, SsiType::Issi), ns);
+
+        assert_eq!(
+            llc.outbound_messages.len(),
+            1,
+            "BS must keep the entry (deferred) when the ack precedes t_umac_done"
+        );
     }
 }
 
