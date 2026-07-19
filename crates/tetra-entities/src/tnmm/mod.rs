@@ -376,6 +376,16 @@ pub struct TnmmAttachDetachGroupIdentityConfirm {
 /// TNMM-REPORT **indication** parameters (Table 15.4). Informs the user
 /// application of a successful or unsuccessful transmission of U-ITSI DETACH
 /// (cl. 15.3.3.6).
+///
+/// **Result source not yet wired (deliberate).** Emitting this indication with
+/// a real value requires knowing the *transmission result* of the shutdown
+/// U-ITSI DETACH burst. That depends on (a) the deferred MLE-REPORT tx-result
+/// hook and (b) a known MS-side defect where the acknowledged basic-link
+/// outbound queue head-of-line-blocks when the SwMI replies with BL-DATA (the
+/// random-access-transmitted DETACH entry never clears `t_umac_done`, so the
+/// detach may not actually transmit). Until those are fixed MS-side, MM must
+/// **not** synthesise a `TransferResult` — the type is defined per spec but no
+/// emit point asserts a real transfer result yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
 pub struct TnmmReportIndication {
     /// `Transfer result` — M.
