@@ -953,22 +953,22 @@ impl UmacMs {
 
         // NOTE: this MAC-END-HU is a reserved-access burst that must land in the
         // exact granted uplink slot for the BS's per-frame slot-ownership check
+        // NOTE: this MAC-END-HU is a reserved-access burst that must land in the
+        // exact granted uplink slot for the BS's per-frame slot-ownership check
         // (cl. 23.5.2) to accept it. TETRA has no timing-advance procedure; the
         // uplink/downlink timing is fixed (cl. 9.3.9) and the grant here is
         // "next opportunity" (cl. 23.5.2.2.2), so the target slot is exactly
-        // dltime + 2, computed above. The gap is purely an implementation
-        // artifact of this SDR stack: PhyMs::schedule_uplink_time frame-advances
-        // every uplink because the RX->TX software pipeline latency exceeds the
-        // 2-slot duplex gap, so the burst cannot physically leave at dltime + 2
-        // and is retimed to a later occurrence of the same timeslot phase. That
-        // is fine for contention-based random access (opportunities recur) but a
-        // reserved delay-0 grant must hit the exact granted slot, so the
-        // frame-advanced MAC-END-HU will not satisfy the BS slot-ownership
-        // check. Closing this needs the reserved burst to leave at dltime + 2
-        // (an SDR TX-timing/pipeline-latency fix in PhyMs) -- NOT a spec feature.
-        // The PDU construction and grant handling here are spec-correct and
-        // unit-tested regardless; emitting via the normal uplink path keeps the
-        // whole chain exercised and observable on hardware.
+        // dltime + 2, computed above. Reaching it is an SDR TX-timing concern,
+        // not a spec feature: PhyMs honours the exact granted slot only while it
+        // still lies ahead of the TX generation frontier, so the MS uplink
+        // generation look-ahead is kept small (MS_TX_LOOKAHEAD_BLOCKS in
+        // soapy_dev) to keep dltime + 2 reachable; when it is, PhyMs transmits at
+        // exactly that slot with no frame-advance. If the frontier ever overruns
+        // the slot the burst is frame-advanced to a later occurrence of the same
+        // timeslot phase, which a reserved delay-0 grant would fail -- hence the
+        // small look-ahead. The PDU construction and grant handling here are
+        // spec-correct and unit-tested regardless; emitting via the normal uplink
+        // path keeps the whole chain exercised and observable on hardware.
         let blk = TmvUnitdataReq {
             mac_block: block,
             logical_channel: LogicalChannel::SchHu,
