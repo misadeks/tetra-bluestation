@@ -1,6 +1,6 @@
 use std::panic;
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, PhyBlockNum, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
 use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
@@ -33,6 +33,10 @@ use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 /// SCH/HU (Control Uplink Burst) type-1 MAC block length in bits (ETSI TS 100
 /// 392-2, SCH/HU coding parameters).
 const SCH_HU_TYPE1_BITS: usize = 92;
+
+/// TETRA broadcast identity: the 24-bit SSI with all bits set (ETSI TS 100
+/// 392-2 addressing). MAC PDUs addressed to it are processed by every MS.
+const BROADCAST_SSI: u32 = 0xFF_FFFF;
 
 /// A MAC block built and queued for uplink transmission, awaiting a valid
 /// access opportunity. ETSI TS 100 392-2 cl. 23.5 (MAC access). The random
@@ -448,7 +452,17 @@ impl UmacMs {
         }
 
         tracing::debug!("rx_mac_resource: {}", prim.pdu.dump_bin_full(true));
-        if pdu.length_ind == 0b111111 {
+
+        // MS receive filter (ETSI TS 100 392-2 clause 23 addressing): ignore
+        // MAC-RESOURCE PDUs addressed to other subscribers/groups. Applied in
+        // MS mode only; monitor mode observes all traffic. `pdu.addr` is
+        // guaranteed `Some` here (null PDU returned above).
+        if !self.accept_downlink_address(&pdu.addr.unwrap()) {
+            tracing::debug!(
+                "rx_mac_resource: dropping PDU addressed to {} (not this MS)",
+                pdu.addr.unwrap()
+            );
+        } else if pdu.length_ind == 0b111111 {
             // Fragmentation start, add to defragmenter
             self.defrag.insert_first(&mut prim.pdu, self.dltime, pdu.addr.unwrap(), None);
         } else if pdu.length_ind == 0b111110 {
@@ -600,6 +614,22 @@ impl UmacMs {
 
         // Pass block directly to LLC
         tracing::debug!("rx_mac_end: sdu: {:?}", defragbuf.buffer.dump_bin());
+
+        // MS receive filter (ETSI TS 100 392-2 clause 23 addressing): drop a
+        // reassembled message addressed to another subscriber/group. The first
+        // fragment is normally already filtered in rx_mac_resource, so this is
+        // a defensive backstop. Advance the parse position so any following
+        // MAC PDU in the block is still parsed.
+        if !self.accept_downlink_address(&defragbuf.addr) {
+            tracing::debug!(
+                "rx_mac_end: dropping reassembled PDU addressed to {} (not this MS)",
+                defragbuf.addr
+            );
+            prim.pdu.set_raw_end(orig_end);
+            prim.pdu.set_raw_pos(prim.pdu.get_raw_start() + pdu_len_bits + num_fill_bits);
+            prim.pdu.set_raw_start(prim.pdu.get_raw_pos());
+            return;
+        }
 
         let m = SapMsg {
             sap: Sap::TmaSap,
@@ -1000,6 +1030,39 @@ impl UmacMs {
             .issi
     }
 
+    /// MS receive filter (ETSI TS 100 392-2 clause 23 addressing): decide
+    /// whether a downlink MAC PDU carrying `addr` is destined for this mobile
+    /// station.
+    ///
+    /// At the MAC layer an individual (ISSI) and a group (GSSI) identity are
+    /// both carried as a bare 24-bit SSI — `MacResourceAddrType` has no
+    /// distinct group code — so ownership is decided purely by SSI value: the
+    /// MS accepts its own ISSI, any group it has attached to, and the
+    /// broadcast address, and ignores traffic addressed to other
+    /// subscribers/groups.
+    ///
+    /// Filtering applies ONLY in MS mode. In monitor mode (and any non-MS
+    /// mode) the receiver is passive and must observe all traffic, so nothing
+    /// is filtered.
+    fn accept_downlink_address(&self, addr: &TetraAddress) -> bool {
+        let cfg = self.config.config();
+        if cfg.stack_mode != StackMode::Ms {
+            // Monitor / non-MS mode: observe everything.
+            return true;
+        }
+        // Broadcast address is always processed.
+        if addr.ssi == BROADCAST_SSI {
+            return true;
+        }
+        let Some(ms) = cfg.ms.as_ref() else {
+            // No MS section (should not happen in MS mode): preserve prior
+            // unfiltered behaviour rather than silently dropping traffic.
+            return true;
+        };
+        // Own individual identity or any attached group.
+        addr.ssi == ms.issi || ms.attach_groups.contains(&addr.ssi)
+    }
+
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
         tracing::trace!("rx_tlmb_prim");
         unimplemented!();
@@ -1271,5 +1334,103 @@ attach_groups = []
         umac.drive_random_access(&mut q, &ongoing_a_assign());
 
         assert!(q.pop_front().is_none(), "idle state machine emits nothing");
+    }
+
+    // --- MS MAC receive filtering (ETSI TS 100 392-2 clause 23 addressing) ---
+
+    /// Build a UMAC for `mode` ("Ms" / "Mon" / "Bs") with the given own ISSI and
+    /// attached groups. The `[ms]` section is only emitted for MS mode (it is
+    /// required there and rejected otherwise).
+    fn umac_cfg(mode: &str, issi: u32, groups: &[u32]) -> UmacMs {
+        let groups_str = groups.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+        let ms_section = if mode == "Ms" {
+            format!("\n[ms]\nissi = {issi}\nsubscriber_class = 1\nattach_groups = [{groups_str}]\n")
+        } else {
+            String::new()
+        };
+        let toml = format!(
+            r#"
+config_version = "0.6"
+stack_mode = "{mode}"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+{ms_section}"#
+        );
+        let cfg = from_toml_str(&toml).expect("valid test config");
+        UmacMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// A generic (untyped) MAC-layer SSI address, as produced by the
+    /// MAC-RESOURCE parser for both individual and group identities.
+    fn ssi_addr(ssi: u32) -> TetraAddress {
+        TetraAddress {
+            ssi,
+            ssi_type: SsiType::Ssi,
+        }
+    }
+
+    #[test]
+    fn test_ms_accepts_own_issi() {
+        let umac = umac_cfg("Ms", 1000001, &[]);
+        assert!(umac.accept_downlink_address(&ssi_addr(1000001)));
+    }
+
+    #[test]
+    fn test_ms_drops_foreign_issi() {
+        let umac = umac_cfg("Ms", 1000001, &[]);
+        // Traffic addressed to another subscriber must be ignored.
+        assert!(!umac.accept_downlink_address(&ssi_addr(2200699)));
+    }
+
+    #[test]
+    fn test_ms_accepts_attached_group_only() {
+        let umac = umac_cfg("Ms", 1000001, &[91, 100]);
+        assert!(umac.accept_downlink_address(&ssi_addr(91)));
+        assert!(umac.accept_downlink_address(&ssi_addr(100)));
+        // A group we have not attached to is not for us.
+        assert!(!umac.accept_downlink_address(&ssi_addr(92)));
+    }
+
+    #[test]
+    fn test_ms_accepts_broadcast() {
+        let umac = umac_cfg("Ms", 1000001, &[]);
+        assert!(umac.accept_downlink_address(&ssi_addr(BROADCAST_SSI)));
+    }
+
+    #[test]
+    fn test_monitor_accepts_everything() {
+        // Monitor mode is passive: it must observe all traffic, unfiltered.
+        let umac = umac_cfg("Mon", 0, &[]);
+        assert!(umac.accept_downlink_address(&ssi_addr(2200699)));
+        assert!(umac.accept_downlink_address(&ssi_addr(1)));
+        assert!(umac.accept_downlink_address(&ssi_addr(BROADCAST_SSI)));
     }
 }
