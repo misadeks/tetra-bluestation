@@ -346,6 +346,23 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 let frontier_deficit = frontier.map(|now| now.diff(granted));
                 let advanced = sched.diff(granted);
 
+                // Split the frontier deficit into its two contributors so the
+                // dominant one can be tuned before changing any timing. T (the
+                // TX generation look-ahead) is measured directly from the
+                // device; L (the RX demodulation latency) is derived from the
+                // total, since `frontier_deficit = (T + L) - UPLINK_TIMESLOT_OFFSET`
+                // (frontier - granted, with granted = dltime + OFFSET). The
+                // reserved slot is reachable only when `T + L <= OFFSET` (2
+                // timeslots, ETSI TS 100 392-2 cl. 9.3.9). Both are only
+                // meaningful once the frontier is known.
+                let tx_lookahead = self.rxtxdev.ms_tx_lookahead();
+                let rx_latency_slots = match (frontier_deficit, tx_lookahead.as_ref()) {
+                    (Some(deficit), Some(la)) => {
+                        Some((deficit + Self::UPLINK_TIMESLOT_OFFSET) as f64 - la.slots)
+                    }
+                    _ => None,
+                };
+
                 // Reserved-access bursts (the MAC-END-HU that completes an uplink
                 // fragmentation) are granted one specific slot by the BS
                 // (ETSI TS 100 392-2 cl. 23.5.2.2.2, granting delay "capacity
@@ -367,6 +384,8 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                         frontier = ?frontier,
                         frontier_deficit = ?frontier_deficit,
                         would_advance = advanced,
+                        tx_lookahead = ?tx_lookahead,
+                        rx_latency_slots = ?rx_latency_slots,
                         network = ?net_time,
                         "PhyMs: reserved uplink slot unreachable (behind TX frontier); \
                          dropping reserved burst (MM will retransmit)"
@@ -382,6 +401,8 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                     frontier_deficit = ?frontier_deficit,
                     advanced,
                     reserved,
+                    tx_lookahead = ?tx_lookahead,
+                    rx_latency_slots = ?rx_latency_slots,
                     network = ?net_time,
                     dl = %self.dltime,
                     bits = pending.burst.len(),

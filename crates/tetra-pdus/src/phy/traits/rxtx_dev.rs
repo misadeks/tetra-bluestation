@@ -37,6 +37,31 @@ pub struct TxSlotBits<'a> {
     // pub subslot2: Option<&'a [u8]>,
 }
 
+/// Diagnostic snapshot of the MS transmit look-ahead: how far the TX
+/// *generation frontier* currently leads the hardware DAC pointer ("now").
+///
+/// This is the **T** term of the reserved-slot reachability budget. To transmit
+/// in the exact BS-granted uplink slot (`dltime + 2`, ETSI TS 100 392-2
+/// cl. 9.3.9), the frontier must not already be past it, i.e.
+/// `T (this look-ahead) + L (RX demod latency) <= 2 timeslots` (the fixed
+/// DL->UL turnaround). This report measures T so it can be logged and split out
+/// from the total (L is derived as `total - T`); it does not change any timing.
+///
+/// It is expressed in modem TX blocks (the exact quantity the generator gates
+/// against its maximum look-ahead window) as well as the equivalent timeslots.
+#[derive(Debug, Clone, Copy)]
+pub struct MsTxLookahead {
+    /// Look-ahead in modem TX blocks: `block_count - DAC_block`, the same
+    /// quantity the generator caps at [`Self::max_blocks`].
+    pub blocks: i64,
+    /// The generator's maximum look-ahead window, in blocks. `blocks` is kept
+    /// below this; the head-room `max_blocks - blocks` shows how much the cap
+    /// could be reduced before it starts clipping generation.
+    pub max_blocks: i64,
+    /// `blocks` converted to TDMA timeslots (1 timeslot = 1020 modem samples).
+    pub slots: f64,
+}
+
 /// RF signal path for the radio front end.
 ///
 /// On full-duplex hardware (independent RX and TX chains) both paths are always
@@ -84,6 +109,18 @@ pub trait RxTxDev {
     /// has been generated. The default is `None`, which is appropriate for
     /// devices/tests that never transmit.
     fn tx_air_time(&self) -> Option<TdmaTime> {
+        None
+    }
+
+    /// Diagnostic: current MS transmit look-ahead (the **T** term of the
+    /// reserved-slot reachability budget; see [`MsTxLookahead`]).
+    ///
+    /// Returns how far the TX generation frontier leads the hardware DAC pointer
+    /// right now, so it can be logged alongside the total frontier deficit to
+    /// separate the TX look-ahead from the RX demodulation latency. Purely a
+    /// measurement — it has no effect on scheduling. `None` on devices/tests
+    /// that never transmit or before transmission is possible (the default).
+    fn ms_tx_lookahead(&self) -> Option<MsTxLookahead> {
         None
     }
 }

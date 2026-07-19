@@ -10,6 +10,7 @@ use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 use tetra_pdus::phy::traits::rxtx_dev::TxSlotBits;
 use tetra_pdus::phy::traits::rxtx_dev::RfPath;
+use tetra_pdus::phy::traits::rxtx_dev::MsTxLookahead;
 
 use crate::phy::components::soapy_dev;
 
@@ -239,6 +240,10 @@ impl RxTxDev for RxTxDevSoapySdr {
         let frontier = self.tx_dsp.as_ref()?.generation_frontier()?;
         let slot = (frontier - reference_time).div_euclid(modulator::SAMPLES_SLOT) as i32;
         Some(TdmaTime::from_int(slot))
+    }
+
+    fn ms_tx_lookahead(&self) -> Option<MsTxLookahead> {
+        self.tx_dsp.as_ref()?.lookahead(&self.sdr)
     }
 }
 
@@ -484,7 +489,7 @@ impl TxDsp {
             self.block_count = new_block_count;
         }
         // Limit how far into future TX blocks are generated.
-        let dmax = 60;
+        let dmax = Self::TX_GEN_MAX_BLOCKS;
         if d > dmax {
             return Ok(false);
         }
@@ -541,6 +546,43 @@ impl TxDsp {
     fn generation_frontier(&self) -> Option<SampleCount> {
         let modem_block_len = self.modulators.first()?.modem_block_len() as SampleCount;
         Some(self.block_count * modem_block_len)
+    }
+
+    /// Maximum number of modem TX blocks the generator produces ahead of the
+    /// hardware DAC pointer (the look-ahead cap enforced in
+    /// [`Self::process_block`]). A larger window guards against DAC underruns
+    /// but pushes the generation frontier further ahead of real time, which is
+    /// what makes a BS-granted reserved uplink slot unreachable (see
+    /// [`MsTxLookahead`] / `PhyMs::schedule_uplink_time`).
+    const TX_GEN_MAX_BLOCKS: fcfb::BlockCount = 60;
+
+    /// Measure the current TX look-ahead: how far the generation frontier leads
+    /// the hardware DAC pointer, in modem blocks and in timeslots. This is the
+    /// **T** term of the reserved-slot reachability budget (see
+    /// [`MsTxLookahead`]); it is a pure diagnostic and changes nothing.
+    ///
+    /// `blocks = block_count - DAC_block` is computed exactly as the look-ahead
+    /// gate in [`Self::process_block`] (`d`), so it is directly comparable to
+    /// [`Self::TX_GEN_MAX_BLOCKS`]. Each block spans `modem_block_len` modem
+    /// samples, and a timeslot is `SAMPLES_SLOT` modem samples, so the block
+    /// count converts to timeslots independently of the SDR sample rate.
+    fn lookahead(&self, sdr: &soapyio::SoapyIo) -> Option<MsTxLookahead> {
+        if !sdr.tx_possible() {
+            return None;
+        }
+        let current_sample = sdr.tx_current_count().ok()?;
+        let output_block_size = self.fcfb.output_block_size() as SampleCount;
+        if output_block_size == 0 {
+            return None;
+        }
+        let current_block = current_sample.div_euclid(output_block_size);
+        let blocks = self.block_count - current_block;
+        let modem_block_len = self.modulators.first()?.modem_block_len() as f64;
+        Some(MsTxLookahead {
+            blocks,
+            max_blocks: Self::TX_GEN_MAX_BLOCKS,
+            slots: blocks as f64 * modem_block_len / modulator::SAMPLES_SLOT as f64,
+        })
     }
 }
 
