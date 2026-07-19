@@ -213,27 +213,29 @@ impl RxTxDev for RxTxDevSoapySdr {
     }
 
     fn tx_air_time(&self) -> Option<TdmaTime> {
-        // Local-basis TDMA slot at the *true* hardware TX frontier ("now").
+        // Local-basis TDMA slot at the TX *generation frontier* — the point the
+        // modulator is currently producing signal for. This is the line the MS
+        // uplink scheduler must stay ahead of.
         //
-        // `reference_time` is the modem-sample-rate position of local slot 0,
-        // maintained by the downlink demodulator (the same reference the uplink
-        // modulator is aligned to). The demodulated downlink time lags real
-        // time by the RX pipeline delay, but the SDR's TX sample counter
-        // (`tx_current_count`, driven by the hardware clock via
-        // get_hardware_time) does not — so mapping that true counter through
-        // `reference_time` yields the actual current air-interface slot the
-        // transmitter is generating against.
+        // It is deliberately the generation frontier (`block_count`), not the
+        // true hardware "now": block generation runs a look-ahead window
+        // (`dmin`..`dmax`) ahead of real time, and the modulator only emits a
+        // burst while it sweeps forward through the slot. A burst scheduled at
+        // true-now + a couple slots can therefore still land *behind* the
+        // already-advanced generation pointer and be produced as silence. Using
+        // the frontier makes the lead self-calibrating against that look-ahead.
         //
-        // The TX counter is in the SDR sample rate; scale it to the modem
-        // sample rate the reference/slot arithmetic uses. `None` until the
-        // downlink is locked (no reference) or TX is not yet possible.
+        // `reference_time` is the modem-sample position of local slot 0 (from
+        // the downlink demodulator); the frontier is in the same modem-sample
+        // domain, so their difference divided by the slot length is the slot
+        // index. `None` until downlink lock, before TX is possible, or before
+        // any block has been generated.
         let reference_time = self.rx_dsp.as_ref()?.dl_reference_time()?;
         if !self.sdr.tx_possible() {
             return None;
         }
-        let tx_now = self.sdr.tx_current_count().ok()?;
-        let now_modem = (tx_now as f64 * modulator::SAMPLE_RATE / self.sdr.tx_sample_rate()).round() as SampleCount;
-        let slot = (now_modem - reference_time).div_euclid(modulator::SAMPLES_SLOT) as i32;
+        let frontier = self.tx_dsp.as_ref()?.generation_frontier()?;
+        let slot = (frontier - reference_time).div_euclid(modulator::SAMPLES_SLOT) as i32;
         Some(TdmaTime::from_int(slot))
     }
 }
@@ -523,6 +525,21 @@ impl TxDsp {
 
         Ok(true)
     }
+
+    /// Modem-sample position of the current TX generation frontier — the next
+    /// block the modulators will produce (`block_first = block_count *
+    /// modem_block_len`, the same quantity the modulator times bursts against).
+    ///
+    /// This leads the true hardware "now" by the TX look-ahead window (the
+    /// `dmin`..`dmax` block gating in [`Self::process_block`]). Uplink bursts
+    /// must be scheduled *ahead of this frontier*, not merely ahead of true
+    /// time: block generation only advances, so a slot whose start already sits
+    /// behind the frontier is produced as silence and never revisited. `None`
+    /// before any modulator exists.
+    fn generation_frontier(&self) -> Option<SampleCount> {
+        let modem_block_len = self.modulators.first()?.modem_block_len() as SampleCount;
+        Some(self.block_count * modem_block_len)
+    }
 }
 
 struct DemodulatorChannel {
@@ -601,6 +618,14 @@ impl ModulatorChannel {
 
     fn set_reference_time(&mut self, reference_time: SampleCount) {
         self.modulator.set_reference_time(reference_time);
+    }
+
+    /// Number of new modem-rate samples the modulator produces per TX block.
+    /// This is the multiplier between the TX block count and the modem sample
+    /// counter (`block_first = block_count * modem_block_len`), so it converts
+    /// the generation frontier into the sample domain the burst timing uses.
+    fn modem_block_len(&self) -> usize {
+        self.upconverter.input_block_size().new
     }
 
     fn process(&mut self, fcfb: &mut fcfb::SynthesisOutputProcessor, block_count: fcfb::BlockCount, tx_slot: &TxSlotBits) -> bool {

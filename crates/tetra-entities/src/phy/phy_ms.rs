@@ -201,14 +201,13 @@ impl<D: RxTxDev> PhyMs<D> {
         self.dltime.add_timeslots(Self::UPLINK_TIMESLOT_OFFSET)
     }
 
-    /// Minimum lead, in timeslots, between the true hardware TX frontier and the
+    /// Minimum lead, in timeslots, between the TX generation frontier and the
     /// slot an uplink burst is scheduled in.
     ///
-    /// The burst must land far enough ahead of hardware "now" that the
-    /// modulator's look-ahead TX generation window (see `soapy_dev`'s
-    /// `dmin`..`dmax` block gating) sweeps through the slot before real time
-    /// passes it. Two slots (~28 ms) sits comfortably inside that window while
-    /// adding minimal uplink latency.
+    /// The burst must land a little ahead of the frontier (the slot the
+    /// transmitter is currently producing) so the modulator sweeps forward
+    /// through the whole slot rather than finding it already behind the
+    /// generation pointer. Two slots (~28 ms) is a small, safe margin.
     const UPLINK_MIN_LEAD_SLOTS: i32 = 2;
 
     /// Choose the absolute uplink slot to transmit a granted burst in.
@@ -218,18 +217,19 @@ impl<D: RxTxDev> PhyMs<D> {
     /// basis: it carries the correct timeslot-within-frame phase for the
     /// random-access opportunity, but its absolute frame number follows the
     /// *demodulated* downlink time, which the SDR RX pipeline delays by several
-    /// slots. `now` is the true hardware TX frontier ([`RxTxDev::tx_air_time`]),
-    /// which is **not** pipeline-delayed.
+    /// slots. `now` is the TX generation frontier ([`RxTxDev::tx_air_time`]) —
+    /// the slot the modulator is currently producing signal for, which leads
+    /// real time by the transmit look-ahead window.
     ///
-    /// Because that pipeline delay (≈7 slots on the current hardware) exceeds
-    /// the 2-slot duplex gap, the nominally-paired uplink slot is already in the
-    /// past by the time the MS could physically transmit it. So we transmit in a
-    /// *later* occurrence of the same access opportunity: advance `granted` by
-    /// whole TETRA frames (4 slots), which preserves the uplink timeslot phase,
-    /// until it lands at least [`Self::UPLINK_MIN_LEAD_SLOTS`] ahead of the true
-    /// frontier. This mirrors how the BS schedules transmission — always from
-    /// the true master clock, ahead of real time — instead of reacting to the
-    /// delayed receive stream.
+    /// Because the RX pipeline delay plus that look-ahead put the frontier well
+    /// past the nominally-paired uplink slot, `granted` is already behind the
+    /// point the transmitter can still reach. So we transmit in a *later*
+    /// occurrence of the same access opportunity: advance `granted` by whole
+    /// TETRA frames (4 slots), which preserves the uplink timeslot phase, until
+    /// it lands at least [`Self::UPLINK_MIN_LEAD_SLOTS`] ahead of the frontier.
+    /// This mirrors how the BS schedules transmission — always from the true
+    /// master clock, ahead of real time — instead of reacting to the delayed
+    /// receive stream.
     ///
     /// Note: advancing by whole frames keeps the timeslot but changes the frame
     /// number; landing on frame 18 (whose uplink carries special usage) could in
@@ -401,14 +401,13 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 tracing::info!(ts = %self.dltime, "PhyMs: downlink synchronized");
             }
 
-            // Retire the pending burst once the true hardware TX frontier has
-            // passed its scheduled slot: by then the device has already
-            // generated the burst signal (its look-ahead window runs ahead of
-            // real time), so it is safe to drop it and hand the antenna back to
-            // RX. Using the true frontier (`tx_air_time`) — not the
-            // pipeline-delayed downlink time — keeps retirement consistent with
-            // the true-clock scheduling in `rx_prim`; comparing against the
-            // delayed downlink time would retire the burst before it is sent.
+            // Retire the pending burst once the TX generation frontier has
+            // passed its scheduled slot: by then the modulator has already
+            // swept through and produced the burst, so it is safe to drop it and
+            // hand the antenna back to RX. Using the frontier (`tx_air_time`) —
+            // the same clock the scheduling in `rx_prim` used — keeps the two
+            // consistent; comparing against the pipeline-delayed downlink time
+            // would retire the burst before it is produced.
             if self.tx_path_active {
                 let now = self.rxtxdev.tx_air_time();
                 let sent = match (&self.pending_tx, now) {
