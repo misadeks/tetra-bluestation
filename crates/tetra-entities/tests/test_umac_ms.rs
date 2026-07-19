@@ -260,15 +260,18 @@ fn test_resource_null_pdu_does_not_panic() {
     // Must not panic; the null PDU is dropped and produces no LLC delivery.
     test.deliver_all_messages();
 }
-/// (ETSI TS 100 392-2 cl. 21.4.2.1). Build a byte-aligned block (no fill bits),
-/// decode it back with `MacAccess::from_bitbuf`, and confirm the ISSI, length
-/// indication and recovered TM-SDU round-trip.
+/// (ETSI TS 100 392-2 cl. 21.4.2.1). Build a block, decode it back with
+/// `MacAccess::from_bitbuf`, and confirm the ISSI, the absence of a length
+/// indication, and the recovered TM-SDU round-trip. A self-contained
+/// random-access MAC-ACCESS carries no length indication (cl. 21.4.2.1); the
+/// PDU implicitly fills the MAC block and the remaining capacity is completed
+/// with fill bits (cl. 23.4.2.2).
 #[test]
 fn test_build_mac_access_block_roundtrip() {
     debug::setup_logging_verbose();
 
     let issi: u32 = 0x0012_3456;
-    // 28-bit SDU: 36-bit header + 28 = 64 bits = 8 octets, exactly byte-aligned.
+    // 28-bit SDU: 30-bit header + 28 = 58 bits of content, filled to 92 bits.
     let sdu_bits = "0110100100011110001011010010";
     let mut sdu = BitBuffer::from_bitstr(sdu_bits);
 
@@ -278,20 +281,24 @@ fn test_build_mac_access_block_roundtrip() {
     let decoded = MacAccess::from_bitbuf(&mut block).expect("decodes");
     let addr = decoded.addr.expect("addressed");
     assert_eq!(addr.ssi, issi, "recovered ISSI matches source");
-    assert_eq!(decoded.length_ind, Some(8), "length indication = 8 octets");
-    assert_eq!(decoded.fill_bits, false, "no fill bits for byte-aligned content");
+    assert_eq!(decoded.length_ind, None, "no length indication (cl. 21.4.2.1)");
+    assert_eq!(decoded.frag_flag, None, "no capacity request / fragmentation flag");
+    assert_eq!(decoded.reservation_req, None, "no reservation requirement");
+    assert_eq!(decoded.fill_bits, true, "fill bits complete the MAC block");
 
     // The buffer cursor now sits at the start of the TM-SDU (after the header).
-    assert_eq!(block.get_pos(), 36, "MAC-ACCESS header is 36 bits");
+    assert_eq!(block.get_pos(), 30, "MAC-ACCESS header is 30 bits (no optional field)");
     let mut recovered = vec![0u8; sdu_bits.len()];
     block.to_bitarr(&mut recovered);
     let expected: Vec<u8> = sdu_bits.chars().map(|c| (c == '1') as u8).collect();
     assert_eq!(recovered, expected, "recovered TM-SDU matches source");
 }
 
-/// Slice 3C: verify fill-bit insertion when the content is not byte-aligned
-/// (ETSI TS 100 392-2 cl. 21.4.2.1 length indication). A 17-bit SDU gives
-/// 36 + 17 = 53 bits of content, padded with 3 fill bits to 56 bits (7 octets).
+/// Slice 3C: verify the fill-bit completion rule (ETSI TS 100 392-2
+/// cl. 23.4.2.2). With no length indication the MAC-ACCESS implicitly spans the
+/// whole MAC block; the fill bits are a single "1" immediately after the TM-SDU
+/// followed by "0"s to the end of the block. A 17-bit SDU gives 30 + 17 = 47
+/// bits of content, so the fill marker sits at bit 47 and bits 48..92 are zero.
 #[test]
 fn test_build_mac_access_block_fillbits() {
     debug::setup_logging_verbose();
@@ -303,13 +310,24 @@ fn test_build_mac_access_block_fillbits() {
     let mut block = UmacMs::build_mac_access_block(issi, &mut sdu).expect("SDU fits a single burst");
     assert_eq!(block.get_len(), 92);
 
+    // Fill-bit structure (cl. 23.4.2.2): "1" right after the TM-SDU, then zeros.
+    let marker_pos = 30 + sdu_bits.len(); // header + TM-SDU
+    assert_eq!(
+        block.peek_bits_startoffset(marker_pos, 1).unwrap(),
+        1,
+        "fill marker '1' immediately follows the TM-SDU"
+    );
+    for i in (marker_pos + 1)..92 {
+        assert_eq!(block.peek_bits_startoffset(i, 1).unwrap(), 0, "fill bits are zero to the block end");
+    }
+
     let decoded = MacAccess::from_bitbuf(&mut block).expect("decodes");
     assert_eq!(decoded.addr.expect("addressed").ssi, issi);
-    assert_eq!(decoded.length_ind, Some(7), "36 + 17 + 3 fill = 56 bits = 7 octets");
+    assert_eq!(decoded.length_ind, None, "no length indication (cl. 21.4.2.1)");
     assert_eq!(decoded.fill_bits, true, "fill bits present");
 
-    // SDU sits immediately after the 36-bit header, before the fill bits.
-    assert_eq!(block.get_pos(), 36);
+    // SDU sits immediately after the 30-bit header, before the fill bits.
+    assert_eq!(block.get_pos(), 30);
     let mut recovered = vec![0u8; sdu_bits.len()];
     block.to_bitarr(&mut recovered);
     let expected: Vec<u8> = sdu_bits.chars().map(|c| (c == '1') as u8).collect();
@@ -317,12 +335,12 @@ fn test_build_mac_access_block_fillbits() {
 }
 
 /// Slice 3C: an SDU too large for a single SCH/HU access burst must be rejected
-/// (uplink fragmentation, cl. 21.4.3, is not yet implemented). 60 bits of SDU
-/// plus the 36-bit header exceeds the 92-bit type-1 block.
+/// (uplink fragmentation, cl. 23.4.2.1, is not yet implemented). 63 bits of SDU
+/// plus the 30-bit header exceeds the 92-bit type-1 block.
 #[test]
 fn test_build_mac_access_block_oversized() {
     let issi: u32 = 0x0000_0001;
-    let sdu_bits = "0".repeat(60); // 36 + 60 = 96 > 92
+    let sdu_bits = "0".repeat(63); // 30 + 63 = 93 > 92
     let mut sdu = BitBuffer::from_bitstr(&sdu_bits);
     assert!(
         UmacMs::build_mac_access_block(issi, &mut sdu).is_none(),

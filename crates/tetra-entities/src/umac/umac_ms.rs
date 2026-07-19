@@ -920,8 +920,19 @@ impl UmacMs {
     /// block is addressed with the MS's own ISSI (the uplink MAC-ACCESS address
     /// is always an ISSI, cl. 21.4.2.1). Returns the full 92-bit type-1 block
     /// (MAC-ACCESS header + TM-SDU + fill bits), or `None` if the SDU does not
-    /// fit a single access burst (uplink fragmentation, cl. 21.4.3, not yet
+    /// fit a single access burst (uplink fragmentation, cl. 23.4.2.1, not yet
     /// implemented).
+    ///
+    /// The PDU carries **no length indication**: per cl. 21.4.2.1 the length
+    /// indication field "should be used only if association within the uplink
+    /// subslot is required or for transmission of the null PDU", neither of
+    /// which applies to a self-contained random-access signalling burst. With
+    /// the optional field flag left at 0, the MAC-ACCESS implicitly spans the
+    /// whole MAC block and the remaining capacity is completed with fill bits
+    /// (cl. 23.4.2.2: a bit "1" immediately after the TM-SDU followed by bits
+    /// "0" to the end of the MAC block). The receiver (cl. 23.4.3.2) treats the
+    /// PDU as filling the block and strips the trailing fill bits, so the
+    /// padding is never mis-decoded as a spurious second concatenated MAC PDU.
     pub fn build_mac_access_block(issi: u32, sdu: &mut BitBuffer) -> Option<BitBuffer> {
         let mut pdu = MacAccess {
             fill_bits: false,
@@ -931,13 +942,15 @@ impl UmacMs {
                 ssi: issi,
             }),
             event_label: None,
-            length_ind: Some(0),
+            // No length indication and no capacity request: optional field
+            // flag = 0 (cl. 21.4.2.1). The PDU implicitly fills the MAC block.
+            length_ind: None,
             frag_flag: None,
             reservation_req: None,
         };
 
-        // Measure the header length. The fill_bits flag and the length_ind
-        // value do not change the number of header bits.
+        // Measure the header length. The fill_bits flag does not change the
+        // number of header bits (30 bits with an ISSI and no optional field).
         let hdr_len = {
             let mut scratch = BitBuffer::new(64);
             pdu.to_bitbuf(&mut scratch);
@@ -946,25 +959,26 @@ impl UmacMs {
 
         let sdu_len = sdu.get_len();
         let content_len = hdr_len + sdu_len;
-        // The length indication counts octets, so pad the content to the next
-        // byte boundary with fill bits (cl. 21.4.2.1 / 23.4.3 length indication).
-        let num_fill_bits = (8 - content_len % 8) % 8;
-        let total_len = content_len + num_fill_bits;
-        if total_len > SCH_HU_TYPE1_BITS {
-            return None; // Would require uplink fragmentation (deferred)
+        if content_len > SCH_HU_TYPE1_BITS {
+            // Does not fit a single access burst; would require uplink
+            // fragmentation (MAC-ACCESS frag start + MAC-END-HU, cl. 23.4.2.1),
+            // which is not yet implemented.
+            return None;
         }
 
-        pdu.length_ind = Some((total_len / 8) as u8);
+        // Fill bits complete the block whenever the content is shorter than the
+        // available MAC-block capacity (cl. 23.4.2.2). The "fill bit indication"
+        // is set to 1 iff any fill bits are present.
+        let num_fill_bits = SCH_HU_TYPE1_BITS - content_len;
         pdu.fill_bits = num_fill_bits != 0;
 
         // Assemble the full 92-bit type-1 block: MAC-ACCESS header + TM-SDU +
-        // fill bits. Bits beyond the length indication are don't-care (left
-        // zeroed); the receiver ignores everything past length_ind octets.
+        // fill bits ("1" then "0"s to the end of the MAC block, cl. 23.4.2.2).
         let mut block = BitBuffer::new(SCH_HU_TYPE1_BITS);
         pdu.to_bitbuf(&mut block);
         sdu.seek(0);
         block.copy_bits(sdu, sdu_len);
-        fillbits::addition::write(&mut block, Some(num_fill_bits));
+        fillbits::addition::write(&mut block, None);
         block.seek(0);
         Some(block)
     }
