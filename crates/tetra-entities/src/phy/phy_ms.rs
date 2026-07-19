@@ -202,14 +202,25 @@ impl<D: RxTxDev> PhyMs<D> {
         self.dltime.add_timeslots(Self::UPLINK_TIMESLOT_OFFSET)
     }
 
-    /// Minimum lead, in timeslots, between the TX generation frontier and the
-    /// slot an uplink burst is scheduled in.
+    /// Minimum lead, in timeslots, that a scheduled uplink burst must keep
+    /// ahead of the TX generation frontier.
     ///
-    /// The burst must land a little ahead of the frontier (the slot the
-    /// transmitter is currently producing) so the modulator sweeps forward
-    /// through the whole slot rather than finding it already behind the
-    /// generation pointer. Two slots (~28 ms) is a small, safe margin.
-    const UPLINK_MIN_LEAD_SLOTS: i32 = 2;
+    /// This is a *floor*, not the actual lead. It is `0` so that a granted slot
+    /// which already lies ahead of the frontier is transmitted **at exactly
+    /// that slot**, with no frame-advance. Honouring the exact slot is required
+    /// for reserved access: the MAC-END-HU that completes an uplink
+    /// fragmentation must land in the precise BS-granted slot (`dltime + 2`,
+    /// ETSI TS 100 392-2 cl. 23.5.2 / 9.3.9), and the BS per-frame slot-owner
+    /// check rejects it otherwise. A burst is frame-advanced (see
+    /// [`Self::schedule_uplink_time`]) only when the frontier has genuinely
+    /// overrun the granted slot, which — for recurring random access — simply
+    /// moves it to the next occurrence of the same opportunity.
+    ///
+    /// The real safety margin against the frontier is provided upstream, by
+    /// keeping the MS uplink generation look-ahead small
+    /// (`MS_TX_LOOKAHEAD_BLOCKS`) so `dltime + 2` sits a fraction of a slot
+    /// ahead of the frontier in the first place.
+    const UPLINK_MIN_LEAD_SLOTS: i32 = 0;
 
     /// Choose the absolute uplink slot to transmit a granted burst in.
     ///
@@ -318,18 +329,30 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 // nominal grant.
                 let net_time = prim.time;
                 let granted = self.local_uplink_time();
-                let sched = match self.rxtxdev.tx_air_time() {
+                let frontier = self.rxtxdev.tx_air_time();
+                let sched = match frontier {
                     Some(now) => Self::schedule_uplink_time(granted, now),
                     None => granted,
                 };
+                // Reachability diagnostic (INFO — uplinks are infrequent).
+                // `frontier_deficit` = slots the granted slot sits behind the
+                // frontier (>0 means it was NOT reachable and had to advance).
+                // `advanced` slots is how far schedule_uplink_time moved it.
+                // For a reserved MAC-END-HU we need advanced == 0 (exact slot);
+                // if it is non-zero, MS_TX_LOOKAHEAD_BLOCKS is too high.
+                let frontier_deficit = frontier.map(|now| now.diff(granted));
+                let advanced = sched.diff(granted);
                 let pending = Self::build_pending_tx(prim, sched);
-                tracing::debug!(
+                tracing::info!(
                     scheduled = %pending.time,
                     granted = %granted,
+                    frontier = ?frontier,
+                    frontier_deficit = ?frontier_deficit,
+                    advanced,
                     network = ?net_time,
                     dl = %self.dltime,
                     bits = pending.burst.len(),
-                    "PhyMs: queued uplink burst (scheduled ahead of true TX frontier)"
+                    "PhyMs: queued uplink burst (honouring exact grant when reachable)"
                 );
                 if self.pending_tx.is_some() {
                     tracing::warn!("PhyMs: overwriting an uplink burst that was not yet transmitted");
@@ -569,7 +592,9 @@ attach_groups = []
         let base = TdmaTime::default();
         // At rx_prim the PHY's dltime is the default `base`, so the granted
         // opportunity is base+2. With the true frontier at `base`, base+2 is
-        // already >= frontier + UPLINK_MIN_LEAD_SLOTS(2), so it schedules there.
+        // already ahead of the frontier (frontier_deficit < 0), so with
+        // UPLINK_MIN_LEAD_SLOTS(0) it is honoured at exactly that slot (no
+        // frame-advance).
         let ul_time = base.add_timeslots(2);
 
         let mut phy = phy_ms(MockRxTx::default());

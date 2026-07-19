@@ -29,6 +29,37 @@ use super::soapyio;
 /// lands slightly early/late in the uplink slot. Positive = transmit later.
 const MS_TX_SAMPLE_DELAY: SampleCount = 0;
 
+/// TX generation look-ahead ceiling, in modem blocks, for an MS **uplink**
+/// `TxDsp` (see [`TxDsp::process_block`], the `d > dmax` gate). It bounds how
+/// far ahead of the true hardware clock the transmit modulator generates
+/// signal — i.e. the position of the generation frontier that uplink bursts
+/// are scheduled against ([`TxDsp::generation_frontier`]).
+///
+/// Why the MS needs a *smaller* ceiling than the base station:
+/// A reserved-access burst (the MAC-END-HU that completes an uplink
+/// fragmentation, ETSI TS 100 392-2 cl. 23.5.2) must be transmitted in the
+/// *exact* slot the BS granted — `dltime + 2` (cl. 9.3.9 frame alignment,
+/// delay-0 grant cl. 23.5.2.2.2). `PhyMs` can only honour that exact slot if
+/// it still lies ahead of the generation frontier; block generation only moves
+/// forward, so a slot already behind the frontier can never be produced and
+/// `PhyMs::schedule_uplink_time` would have to frame-advance it (fine for
+/// recurring random access, but a reserved grant would then miss its slot).
+/// One TETRA timeslot is `SAMPLES_SLOT / modem_block_len ≈ 1020 / 108 ≈ 9.4`
+/// modem blocks, and the granted slot leads the frontier only while the
+/// frontier lead stays under the 2-timeslot duplex gap. So the ceiling must be
+/// kept **below ~18 blocks** for `dltime + 2` to remain reachable.
+///
+/// TUNING (hardware): this trades reachability against TX underruns.
+/// - Too high (≳18 blocks): the reserved MAC-END-HU frame-advances and misses
+///   its granted slot (BS never reassembles the fragmented uplink).
+/// - Too low: the frontier sits too close to real time and the transmitter
+///   underruns — watch for "Too late to produce TX block" warnings and raise
+///   this value until they stop.
+/// Read the `PhyMs: queued uplink burst` INFO line (`frontier_deficit`,
+/// `advanced`) to see whether `dltime + 2` was reachable, and adjust.
+/// The base-station downlink `TxDsp` is unaffected (it keeps the original 60).
+const MS_TX_LOOKAHEAD_BLOCKS: fcfb::BlockCount = 12;
+
 pub struct SdrConfig<'a> {
     /// SoapySDR device arguments
     pub dev_args: &'a [(&'a str, &'a str)],
@@ -414,6 +445,11 @@ struct TxDsp {
     block_count: fcfb::BlockCount,
     initial_time: i64,
     modulators: Vec<ModulatorChannel>,
+    /// Look-ahead ceiling for block generation (`d > tx_lookahead_max` stops
+    /// generating further ahead of the hardware clock). Smaller for an MS
+    /// uplink `TxDsp` so reserved uplink slots stay reachable; see
+    /// [`MS_TX_LOOKAHEAD_BLOCKS`].
+    tx_lookahead_max: fcfb::BlockCount,
 }
 
 impl TxDsp {
@@ -436,11 +472,22 @@ impl TxDsp {
             modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *ul_freq, modulator::Mode::Ul));
         }
 
+        // An MS uplink TxDsp (built from `ms_ul_frequencies`) must keep its
+        // generation frontier close to real time so reserved uplink slots
+        // remain reachable; the BS downlink TxDsp keeps the original wider
+        // window. See MS_TX_LOOKAHEAD_BLOCKS.
+        let tx_lookahead_max = if !phy_config.ms_ul_frequencies.is_empty() {
+            MS_TX_LOOKAHEAD_BLOCKS
+        } else {
+            60
+        };
+
         Self {
             fcfb,
             block_count: 0,
             initial_time: 0, // TODO: get it from RX
             modulators,
+            tx_lookahead_max,
         }
     }
 
@@ -483,8 +530,11 @@ impl TxDsp {
             );
             self.block_count = new_block_count;
         }
-        // Limit how far into future TX blocks are generated
-        let dmax = 60;
+        // Limit how far into future TX blocks are generated. For an MS uplink
+        // TxDsp this ceiling is small (MS_TX_LOOKAHEAD_BLOCKS) so the generation
+        // frontier stays close enough to real time that reserved uplink slots
+        // (`dltime + 2`) remain reachable; the BS downlink keeps the wide window.
+        let dmax = self.tx_lookahead_max;
         if d > dmax {
             return Ok(false);
         }
