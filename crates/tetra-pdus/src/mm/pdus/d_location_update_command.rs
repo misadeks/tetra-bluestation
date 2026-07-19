@@ -5,6 +5,7 @@ use tetra_core::typed_pdu_fields::*;
 use tetra_core::{BitBuffer, pdu_parse_error::PduParseErr};
 
 use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
+use crate::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 
 /// Representation of the D-LOCATION UPDATE COMMAND PDU (Clause 16.9.2.8).
 /// The infrastructure sends this message to the MS to initiate a location update demand in the MS.
@@ -22,14 +23,12 @@ pub struct DLocationUpdateCommand {
     pub ciphering_parameters: Option<u64>,
     /// Type2, 24 bits, MNI of the MS,
     pub address_extension: Option<u64>,
-    /// Conditional 3 bits, Cell type control
-    pub cell_type_control: Option<u64>,
-    /// Conditional 3 bits, Proprietary
-    pub proprietary: Option<u64>,
+    /// Type3, Cell type control
+    pub cell_type_control: Option<Type3FieldGeneric>,
+    /// Type3, Proprietary
+    pub proprietary: Option<Type3FieldGeneric>,
 }
 
-#[allow(unreachable_code)] // TODO FIXME review, finalize and remove this
-#[allow(unused_variables)]
 impl DLocationUpdateCommand {
     /// Parse from BitBuffer
     pub fn from_bitbuf(buffer: &mut BitBuffer) -> Result<Self, PduParseErr> {
@@ -40,23 +39,28 @@ impl DLocationUpdateCommand {
         let group_identity_report = buffer.read_field(1, "group_identity_report")? != 0;
         // Type1
         let cipher_control = buffer.read_field(1, "cipher_control")? != 0;
-        // Conditional
-        unimplemented!();
-        let ciphering_parameters = if true { Some(0) } else { None };
+        // Conditional: "Ciphering parameters" (10 bits) present only when
+        // "Cipher control" = 1 (cl. 16.9.2.8 note); absent otherwise. Mirrors
+        // the encoder in to_bitbuf.
+        let ciphering_parameters = if cipher_control {
+            Some(buffer.read_field(10, "ciphering_parameters")?)
+        } else {
+            None
+        };
 
         // obit designates presence of any further type2, type3 or type4 fields
         let mut obit = delimiters::read_obit(buffer)?;
 
         // Type2
         let address_extension = typed::parse_type2_generic(obit, buffer, 24, "address_extension")?;
-        // Conditional
-        unimplemented!();
-        let cell_type_control = if obit { Some(0) } else { None };
-        // Conditional
-        unimplemented!();
-        let proprietary = if obit { Some(0) } else { None };
 
-        // Read trailing obit (if not previously encountered)
+        // Type3
+        let cell_type_control = typed::parse_type3_generic(obit, buffer, MmType34ElemIdDl::CellTypeControl)?;
+
+        // Type3
+        let proprietary = typed::parse_type3_generic(obit, buffer, MmType34ElemIdDl::Proprietary)?;
+
+        // Read trailing mbit (if not previously encountered)
         obit = if obit { buffer.read_field(1, "trailing_obit")? == 1 } else { obit };
         if obit {
             return Err(PduParseErr::InvalidTrailingMbitValue);
@@ -86,7 +90,9 @@ impl DLocationUpdateCommand {
         }
 
         // Check if any optional field present and place o-bit
-        let obit = self.address_extension.is_some();
+        let obit = self.address_extension.is_some()
+            || self.cell_type_control.is_some()
+            || self.proprietary.is_some();
         delimiters::write_obit(buffer, obit as u8);
         if !obit {
             return Ok(());
@@ -95,14 +101,12 @@ impl DLocationUpdateCommand {
         // Type2
         typed::write_type2_generic(obit, buffer, self.address_extension, 24);
 
-        // Conditional
-        if let Some(ref value) = self.cell_type_control {
-            buffer.write_bits(*value, 3);
-        }
-        // Conditional
-        if let Some(ref value) = self.proprietary {
-            buffer.write_bits(*value, 3);
-        }
+        // Type3
+        typed::write_type3_generic(obit, buffer, &self.cell_type_control, MmType34ElemIdDl::CellTypeControl)?;
+
+        // Type3
+        typed::write_type3_generic(obit, buffer, &self.proprietary, MmType34ElemIdDl::Proprietary)?;
+
         // Write terminating m-bit
         delimiters::write_mbit(buffer, 0);
         Ok(())

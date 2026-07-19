@@ -1,6 +1,7 @@
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
+use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, unimplemented_log};
 use tetra_saps::lmm::{LmmMleActivateConf, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -8,10 +9,13 @@ use tetra_saps::{SapMsg, SapMsgInner};
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use tetra_pdus::mm::enums::reject_cause::RejectCause;
+use tetra_pdus::mm::enums::type34_elem_id_ul::MmType34ElemIdUl;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
+use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
+use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
 use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 
@@ -132,6 +136,69 @@ impl MmMs {
             .as_ref()
             .map(|ms| ms.attach_groups.clone())
             .unwrap_or_default()
+    }
+
+    /// Own Mobile Network Identity (MNI) as the 24-bit value carried in the
+    /// address extension information element (ETSI EN 300 392-1 clause 7): the
+    /// 10-bit MCC in the high bits followed by the 14-bit MNC. Taken from the
+    /// configured home network (`[net_info]`), which is the MNI of the MS ITSI.
+    fn own_mni(&self) -> u32 {
+        let net = &self.config.config().net;
+        ((net.mcc as u32) << 14) | (net.mnc as u32 & 0x3FFF)
+    }
+
+    /// Build the "class of MS" element (ETSI TS 100 392-2 cl. 16.10.5, Table
+    /// 16.31) describing this MS's radio capabilities. Clause 16.4.3 requires
+    /// the U-LOCATION-UPDATE-DEMAND sent in response to a D-LOCATION-UPDATE-
+    /// COMMAND to contain this element.
+    ///
+    /// The bits reflect the *actual* capabilities of this clear-mode voice SDR
+    /// implementation — they are not invented capabilities: only `voice` is
+    /// asserted, and `e2e_encryption_not_supported` is set (reversed polarity:
+    /// true = E2E encryption **not** supported, which is correct — Part 7
+    /// security is out of scope). All data / advanced-link / encryption /
+    /// authentication / alternative-modulation capabilities are `false` because
+    /// the stack does not implement them. `air_interface_version` = 3 is the AI
+    /// protocol version in use on this network (directly observed from the
+    /// reference radio registering against this same BS); it is an interworking
+    /// version field, not a fabricated capability.
+    fn build_class_of_ms(&self) -> ClassOfMs {
+        ClassOfMs {
+            freq_simplex_duplex: false,
+            multislot_phase_mod: false,
+            concurrent_multicarrier: false,
+            voice: true,
+            e2e_encryption_not_supported: true,
+            circuit_mode_data: false,
+            tetra_packet_data: false,
+            fast_switching: false,
+            dck_encryption: false,
+            clch_needed: false,
+            concurrent_circuit_mode: false,
+            original_advanced_link: false,
+            minimum_mode: false,
+            carrier_specific_signalling: false,
+            authentication: false,
+            sck_encryption: false,
+            air_interface_version: 3,
+            common_scch: false,
+            reserved_21: false,
+            mac_d_blck: false,
+            extended_advanced_link: false,
+            d8psk: false,
+        }
+    }
+
+    /// Build a "group report response" element (ETSI TS 100 392-2 cl. 16.10.27a,
+    /// Table 16.59) indicating "group report complete" (length 1 bit, value 0).
+    /// Sent in the command-response demand when all reported groups are carried
+    /// in that single PDU (cl. 16.4.3).
+    fn group_report_complete() -> Type3FieldGeneric {
+        Type3FieldGeneric {
+            field_id: MmType34ElemIdUl::GroupReportResponse as u64,
+            len: 1,
+            data: vec![0],
+        }
     }
 
     /// Build the group identity location demand element carried inside the
@@ -265,6 +332,170 @@ impl MmMs {
         self.attempts += 1;
     }
 
+    /// Handle a D-LOCATION-UPDATE-COMMAND (ETSI TS 100 392-2 cl. 16.4.3): the
+    /// SwMI has demanded that the MS (re)registers ("infrastructure initiated
+    /// registration"). On receipt, if the MNI in the address extension matches
+    /// the MS's own MNI (or is absent), the MS responds with a
+    /// U-LOCATION-UPDATE-DEMAND of type "demand location updating" and starts
+    /// T351.
+    fn rx_d_location_update_command(&mut self, queue: &mut MessageQueue, mut sdu: BitBuffer) {
+        let pdu = match DLocationUpdateCommand::from_bitbuf(&mut sdu) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                tracing::warn!("Failed parsing DLocationUpdateCommand: {:?} {}", e, sdu.dump_bin());
+                return;
+            }
+        };
+
+        // cl. 16.4.3: "extract the MNI from the address extension information
+        // element. If the MNI is the same as the MNI of the MS ITSI (or the MNI
+        // is not present), then [proceed]". A command carrying a different MNI is
+        // not for us.
+        if let Some(mni) = pdu.address_extension {
+            if mni != self.own_mni() as u64 {
+                tracing::debug!(
+                    "MM: <- D-LOCATION-UPDATE-COMMAND for MNI {} != own MNI {}; ignoring",
+                    mni,
+                    self.own_mni()
+                );
+                return;
+            }
+        }
+
+        if self.left_system {
+            tracing::debug!("MM: D-LOCATION-UPDATE-COMMAND received but MS left the system (N351); ignoring");
+            return;
+        }
+        if self.reg_state == RegState::Detaching {
+            tracing::debug!("MM: D-LOCATION-UPDATE-COMMAND received while detaching; ignoring");
+            return;
+        }
+
+        // cl. 16.4.3: if the "cell type control" element is present the MS would
+        // update its cell-type preference (cl. 16.4.12) and, if the serving cell
+        // is no longer permitted, issue an MLE-LINK request to reselect a cell
+        // (possibly MLE-CLOSE / out of service). That MLE cell-type plumbing is
+        // not implemented; this BS sends no cell-type control, so we log and
+        // proceed to register on the current serving cell.
+        if pdu.cell_type_control.is_some() {
+            tracing::warn!(
+                "MM: D-LOCATION-UPDATE-COMMAND carries a cell type control element; \
+                 cell-type-preference update / MLE-LINK reselection (cl. 16.4.12) is not \
+                 implemented — proceeding with the current serving cell"
+            );
+        }
+
+        tracing::info!(
+            "MM: <- D-LOCATION-UPDATE-COMMAND (infrastructure-initiated registration), \
+             group_report_request={}",
+            pdu.group_identity_report
+        );
+
+        self.attempts = 0;
+        self.send_demand_location_update(queue, pdu.group_identity_report);
+    }
+
+    /// Build and send the U-LOCATION-UPDATE-DEMAND that answers a
+    /// D-LOCATION-UPDATE-COMMAND (ETSI TS 100 392-2 cl. 16.4.3). Distinct from
+    /// the plain ITSI-attach demand (`send_location_update_demand`): per
+    /// cl. 16.4.3 this demand carries the MNI in the address extension and the
+    /// ISSI in the SSI element (the true ITSI), the class of MS element, a
+    /// location-update type of "demand location updating", and group handling
+    /// that depends on whether the command requested a group report.
+    fn send_demand_location_update(&mut self, queue: &mut MessageQueue, group_report_requested: bool) {
+        let issi = self.own_issi();
+        let groups = self.attach_groups();
+
+        // Group handling (cl. 16.4.3):
+        //  - With a group report request: the MS shall regard all group
+        //    identities as no longer attached. If it wishes to keep receiving
+        //    group signalling it may include the attachments here; the first
+        //    attachment uses attach/detach mode "detach all + attach defined"
+        //    (which `build_group_identity_location_demand` already sets, value 1)
+        //    and report "not report request". As all reported groups fit in this
+        //    single PDU, a "group report response = group report complete"
+        //    element is included. If there are no groups, only the "group report
+        //    complete" element is sent. (Timer T353 would start here; the group
+        //    identity response timer is a later MM slice — R3.)
+        //  - Without a group report request: the MS may still include an
+        //    attachment request for its configured groups (optional), and no
+        //    group report response element is sent.
+        let (group_identity_location_demand, group_report_response) = if group_report_requested {
+            (
+                self.build_group_identity_location_demand(),
+                Some(Self::group_report_complete()),
+            )
+        } else {
+            (self.build_group_identity_location_demand(), None)
+        };
+
+        // cl. 16.4.3: location update type = "demand location updating" (the MS
+        // is enabled; "disabled MS updating" would be used if the MS were
+        // disabled — enable/disable is EN 300 392-7, out of scope). The demand
+        // shall contain the MNI (address extension) and ISSI (SSI element) — the
+        // true ITSI — the class of MS element, shall not request to append the
+        // LA, and shall not carry LA information (this is not a forward
+        // registration). Extended capabilities are omitted (the MS supports none
+        // of the listed items beyond CA); no energy saving mode (not activated).
+        let pdu = ULocationUpdateDemand {
+            location_update_type: LocationUpdateType::DemandLocationUpdating,
+            request_to_append_la: false,
+            cipher_control: false,
+            ciphering_parameters: None,
+            class_of_ms: Some(self.build_class_of_ms()),
+            energy_saving_mode: None,
+            la_information: None,
+            ssi: Some(issi as u64),
+            address_extension: Some(self.own_mni() as u64),
+            group_identity_location_demand,
+            group_report_response,
+            authentication_uplink: None,
+            extended_capabilities: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(4);
+        pdu.to_bitbuf(&mut sdu)
+            .expect("U-LOCATION-UPDATE-DEMAND (demand location updating) serialization");
+        sdu.seek(0);
+        tracing::info!(
+            "MM: -> U-LOCATION-UPDATE-DEMAND (demand location updating) ISSI {} MNI {} \
+             group_report_requested {} attach_groups {:?} sdu {}",
+            issi,
+            self.own_mni(),
+            group_report_requested,
+            groups,
+            sdu.dump_bin()
+        );
+
+        // NOTE: cl. 16.4.3 assigns this PDU priority 6 (or 3 when a group report
+        // response is included). The LMM-UNITDATA request primitive carries no
+        // PDU-priority parameter in this stack, so the priority cannot be
+        // signalled to lower layers — a documented limitation, not an on-air
+        // deviation of the PDU contents.
+        let m = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: 0,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(m);
+
+        self.reg_state = RegState::Registering;
+        self.t351_countdown = T351_TIMEOUT_SLOTS;
+        self.attempts += 1;
+    }
+
     /// Build and send a U-ITSI DETACH (cl. 16.9.3.3) down to MLE as part of the
     /// de-registration procedure (cl. 16.6.1). Sent with an MLE-UNITDATA request
     /// over acknowledged basic link (TL-DATA, per Figure 16.7); the MS identity
@@ -309,7 +540,7 @@ impl MmMs {
         queue.push_back(m);
     }
 
-    fn rx_lmm_mle_unitdata_ind(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    fn rx_lmm_mle_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
             panic!()
         };
@@ -331,7 +562,9 @@ impl MmMs {
             MmPduTypeDl::DDisable => unimplemented_log!("DDisable"),
             MmPduTypeDl::DEnable => unimplemented_log!("DEnable"),
             MmPduTypeDl::DLocationUpdateAccept => self.rx_d_location_update_accept(prim.sdu.clone()),
-            MmPduTypeDl::DLocationUpdateCommand => unimplemented_log!("DLocationUpdateCommand"),
+            MmPduTypeDl::DLocationUpdateCommand => {
+                self.rx_d_location_update_command(queue, prim.sdu.clone())
+            }
             MmPduTypeDl::DLocationUpdateReject => self.rx_d_location_update_reject(prim.sdu.clone()),
             MmPduTypeDl::DLocationUpdateProceeding => unimplemented_log!("DLocationUpdateProceeding"),
             MmPduTypeDl::DAttachDetachGroupIdentity => unimplemented_log!("DAttachDetachGroupIdentity"),
@@ -825,6 +1058,131 @@ attach_groups = []
         assert!(ul.iter().all(|g| g.class_of_usage == Some(GROUP_CLASS_OF_USAGE)));
         assert!(ul.iter().all(|g| g.group_identity_detachment_uplink.is_none()));
         assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
+    }
+
+    /// Own MNI for the test config (mcc=901, mnc=9999): (901<<14)|9999.
+    const MS_MNI: u64 = (901 << 14) | 9999;
+
+    /// Build a D-LOCATION-UPDATE-COMMAND (cl. 16.9.2.8) with the given group
+    /// report request flag and optional MNI address extension. Minimal: no
+    /// ciphering, no cell type control, no proprietary element (as this BS
+    /// sends).
+    fn build_command(group_report: bool, address_extension: Option<u64>) -> BitBuffer {
+        let pdu = DLocationUpdateCommand {
+            group_identity_report: group_report,
+            cipher_control: false,
+            ciphering_parameters: None,
+            address_extension,
+            cell_type_control: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu
+    }
+
+    /// A D-LOCATION-UPDATE-COMMAND (infrastructure-initiated registration,
+    /// cl. 16.4.3) makes MM send a U-LOCATION-UPDATE-DEMAND of type "demand
+    /// location updating" that contains the MNI (address extension), the ISSI
+    /// (SSI element) and the class of MS element, and it must round-trip through
+    /// the exact parser the BS uses.
+    #[test]
+    fn test_command_triggers_demand_location_updating() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        deliver_dl(&mut mm, &mut q, build_command(false, None));
+        assert_eq!(mm.reg_state, RegState::Registering);
+        assert_eq!(mm.attempts, 1);
+
+        let msg = q.pop_front().expect("a demand must be emitted");
+        assert!(q.pop_front().is_none(), "exactly one message emitted");
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        assert_eq!(req.address.ssi, MS_ISSI);
+
+        req.sdu.seek(0);
+        let pdu = ULocationUpdateDemand::from_bitbuf(&mut req.sdu).expect("BS must parse the demand");
+        assert_eq!(pdu.location_update_type, LocationUpdateType::DemandLocationUpdating);
+        assert!(!pdu.request_to_append_la, "cl. 16.4.3: shall not request append LA");
+        assert!(pdu.la_information.is_none(), "cl. 16.4.3: LA information shall be absent");
+        assert_eq!(pdu.ssi, Some(MS_ISSI as u64), "cl. 16.4.3: ISSI in SSI element");
+        assert_eq!(pdu.address_extension, Some(MS_MNI), "cl. 16.4.3: MNI in address extension");
+        let class = pdu.class_of_ms.expect("cl. 16.4.3: class of MS shall be present");
+        assert!(class.voice, "voice-capable radio");
+        assert!(class.e2e_encryption_not_supported, "no E2E encryption");
+        assert!(pdu.group_report_response.is_none(), "no group report requested");
+        assert!(pdu.group_identity_location_demand.is_none(), "no groups configured");
+        assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
+    }
+
+    /// A command WITH a group report request makes MM regard groups as
+    /// un-attached and, since all reported groups fit in this one PDU, include a
+    /// "group report response = group report complete" element (cl. 16.4.3 /
+    /// 16.10.27a). Configured groups are (re)attached in the same demand.
+    #[test]
+    fn test_command_with_group_report_request() {
+        let mut mm = ms_mm_with_groups(&[91]);
+        let mut q = MessageQueue::new();
+
+        deliver_dl(&mut mm, &mut q, build_command(true, Some(MS_MNI)));
+        let msg = q.pop_front().expect("a demand must be emitted");
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        req.sdu.seek(0);
+        let pdu = ULocationUpdateDemand::from_bitbuf(&mut req.sdu).expect("BS must parse the demand");
+
+        let grr = pdu.group_report_response.expect("group report response present");
+        assert_eq!(grr.len, 1, "group report response is 1 bit");
+        assert_eq!(grr.data, vec![0], "value 0 = group report complete (Table 16.59)");
+
+        let gild = pdu
+            .group_identity_location_demand
+            .expect("configured group re-attached in the demand");
+        assert_eq!(gild.group_identity_attach_detach_mode, 1);
+        let gssis: Vec<u32> = gild
+            .group_identity_uplink
+            .expect("group entries present")
+            .iter()
+            .filter_map(|g| g.gssi)
+            .collect();
+        assert_eq!(gssis, vec![91]);
+        assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
+    }
+
+    /// With a group report request but no configured groups, MM sends only the
+    /// "group report complete" element and no group identity location demand
+    /// (cl. 16.4.3: "If the MS has no groups to attach, it shall send
+    /// U-LOCATION UPDATE DEMAND PDU containing a group report response
+    /// information element indicating 'group report complete'").
+    #[test]
+    fn test_command_group_report_no_groups() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        deliver_dl(&mut mm, &mut q, build_command(true, None));
+        let msg = q.pop_front().expect("a demand must be emitted");
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        req.sdu.seek(0);
+        let pdu = ULocationUpdateDemand::from_bitbuf(&mut req.sdu).expect("BS must parse the demand");
+        assert!(pdu.group_report_response.is_some(), "group report complete sent");
+        assert!(pdu.group_identity_location_demand.is_none(), "no groups to attach");
+    }
+
+    /// A command whose MNI address extension does not match the MS's own MNI is
+    /// not for this MS and shall be ignored (cl. 16.4.3), leaving MM idle.
+    #[test]
+    fn test_command_wrong_mni_ignored() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        deliver_dl(&mut mm, &mut q, build_command(false, Some(MS_MNI ^ 0x1)));
+        assert_eq!(mm.reg_state, RegState::Idle, "command for a different MNI ignored");
+        assert!(q.pop_front().is_none(), "no demand emitted for a foreign MNI");
     }
 
     /// If the serving cell does not require registration, MM stays idle.
