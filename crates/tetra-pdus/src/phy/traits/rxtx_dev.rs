@@ -67,4 +67,24 @@ pub trait RxTxDev {
     /// separate RX and TX chains (the current hardware): both paths are always
     /// connected and no switching is required.
     fn set_rf_path(&mut self, _path: RfPath) {}
+
+    /// The TDMA slot currently at the device's *true* transmit frontier, i.e.
+    /// "now" on the hardware TX clock, expressed in the same local TDMA basis as
+    /// the demodulated downlink time.
+    ///
+    /// This is the clock the MS uplink scheduler must stay ahead of. It differs
+    /// from the demodulated downlink time returned by [`Self::rxtx_timeslot`]:
+    /// that downlink time is delayed by the RX processing pipeline (samples are
+    /// delivered over the SDR transport and demodulated some slots after they
+    /// were captured), whereas this reflects the true hardware clock the
+    /// modulator transmits against. The MS PHY schedules uplink bursts relative
+    /// to this frontier so they land in a slot the transmitter can actually
+    /// still reach (see `PhyMs::schedule_uplink_time`).
+    ///
+    /// Returns `None` when the frontier is unknown — before downlink lock (no
+    /// timing reference) or before transmission is possible. The default is
+    /// `None`, which is appropriate for devices/tests that never transmit.
+    fn tx_air_time(&self) -> Option<TdmaTime> {
+        None
+    }
 }

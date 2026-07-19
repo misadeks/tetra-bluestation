@@ -10,7 +10,7 @@ use crate::phy::components::modem_common::*;
 const SPS: SampleCount = 4;
 
 /// Samples per slot
-const SAMPLES_SLOT: SampleCount = SPS * 255;
+pub const SAMPLES_SLOT: SampleCount = SPS * 255;
 
 /// Output sample rate
 pub const SAMPLE_RATE: f64 = 18000.0 * SPS as f64;

@@ -1,6 +1,6 @@
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, unimplemented_log};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, frames, unimplemented_log};
 use tetra_pdus::phy::traits::rxtx_dev::{RfPath, RxBurstBits, RxTxDev, TxSlotBits};
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -15,7 +15,11 @@ use crate::{MessageQueue, TetraEntityTrait};
 /// type-5 modulation bits of a Normal or Control Uplink Burst (SN1..SNmax); the
 /// modulator places them within the slot per the burst delay (cl. 9.4.3.4).
 struct PendingTx {
-    /// Absolute TDMA time of the granted uplink slot.
+    /// Absolute TDMA time (demodulator-local basis) of the uplink slot the
+    /// burst is scheduled in. This is chosen *ahead of the true hardware TX
+    /// frontier* rather than at the nominal `dltime + 2` opportunity (see
+    /// [`PhyMs::schedule_uplink_time`]), so retirement must compare against the
+    /// same true frontier the scheduling used.
     time: TdmaTime,
     /// Uplink burst modulation bits (NUB or CUB).
     burst: Vec<u8>,
@@ -188,10 +192,60 @@ impl<D: RxTxDev> PhyMs<D> {
     /// fixed DL+2 opportunity, the granted slot is unambiguously
     /// `self.dltime + UPLINK_TIMESLOT_OFFSET` in the local basis, where
     /// `self.dltime` is the just-demodulated downlink slot (kept in the local
-    /// basis by `drive_rx`). This is the same physical slot UMAC addressed, only
-    /// numbered in the basis the modulator understands.
+    /// basis by `drive_rx`). This gives the correct **timeslot-within-frame
+    /// phase** of the uplink random-access opportunity. Its absolute frame
+    /// number, however, is tied to the *demodulated* downlink time, which the RX
+    /// pipeline delays; [`Self::schedule_uplink_time`] advances it to a
+    /// reachable future occurrence of the same opportunity.
     fn local_uplink_time(&self) -> TdmaTime {
         self.dltime.add_timeslots(Self::UPLINK_TIMESLOT_OFFSET)
+    }
+
+    /// Minimum lead, in timeslots, between the true hardware TX frontier and the
+    /// slot an uplink burst is scheduled in.
+    ///
+    /// The burst must land far enough ahead of hardware "now" that the
+    /// modulator's look-ahead TX generation window (see `soapy_dev`'s
+    /// `dmin`..`dmax` block gating) sweeps through the slot before real time
+    /// passes it. Two slots (~28 ms) sits comfortably inside that window while
+    /// adding minimal uplink latency.
+    const UPLINK_MIN_LEAD_SLOTS: i32 = 2;
+
+    /// Choose the absolute uplink slot to transmit a granted burst in.
+    ///
+    /// `granted` is the nominal uplink opportunity (`dltime + 2`, the fixed
+    /// duplex spacing of ETSI TS 100 392-2 cl. 9.5) in the demodulator-local
+    /// basis: it carries the correct timeslot-within-frame phase for the
+    /// random-access opportunity, but its absolute frame number follows the
+    /// *demodulated* downlink time, which the SDR RX pipeline delays by several
+    /// slots. `now` is the true hardware TX frontier ([`RxTxDev::tx_air_time`]),
+    /// which is **not** pipeline-delayed.
+    ///
+    /// Because that pipeline delay (≈7 slots on the current hardware) exceeds
+    /// the 2-slot duplex gap, the nominally-paired uplink slot is already in the
+    /// past by the time the MS could physically transmit it. So we transmit in a
+    /// *later* occurrence of the same access opportunity: advance `granted` by
+    /// whole TETRA frames (4 slots), which preserves the uplink timeslot phase,
+    /// until it lands at least [`Self::UPLINK_MIN_LEAD_SLOTS`] ahead of the true
+    /// frontier. This mirrors how the BS schedules transmission — always from
+    /// the true master clock, ahead of real time — instead of reacting to the
+    /// delayed receive stream.
+    ///
+    /// Note: advancing by whole frames keeps the timeslot but changes the frame
+    /// number; landing on frame 18 (whose uplink carries special usage) could in
+    /// principle miss a random-access opportunity. Access rights are signalled
+    /// dynamically per frame via ACCESS-ASSIGN, so this is left to revisit if a
+    /// base station is observed to reject specific frames.
+    fn schedule_uplink_time(granted: TdmaTime, now: TdmaTime) -> TdmaTime {
+        let target = now.add_timeslots(Self::UPLINK_MIN_LEAD_SLOTS);
+        // Slots `granted` sits behind `target` (positive when it must advance).
+        let deficit = target.diff(granted);
+        if deficit <= 0 {
+            return granted;
+        }
+        // Round the advance up to whole frames so the timeslot phase is kept.
+        let frames_needed = (deficit + frames!(1) - 1).div_euclid(frames!(1));
+        granted.add_timeslots(frames!(frames_needed))
     }
 
     /// Build the modulation bits of an uplink burst from an LMAC transmit
@@ -253,18 +307,27 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 let SapMsgInner::TpUnitdataReq(prim) = message.msg else {
                     panic!("PhyMs TpSap expected TpUnitdataReq, got {:?}", message.msg);
                 };
-                // The grant time UMAC supplies is in the network-absolute basis;
-                // reschedule it in the demodulator-local basis the modulator
-                // uses (see `local_uplink_time`).
+                // The grant time UMAC supplies is in the network-absolute basis.
+                // `local_uplink_time` recovers the granted opportunity's phase
+                // in the demodulator-local basis; `schedule_uplink_time` then
+                // moves it ahead of the true hardware TX frontier so the burst
+                // is actually reachable despite RX pipeline latency. If the true
+                // frontier is not yet known (pre-lock) we fall back to the
+                // nominal grant.
                 let net_time = prim.time;
-                let local_time = self.local_uplink_time();
-                let pending = Self::build_pending_tx(prim, local_time);
+                let granted = self.local_uplink_time();
+                let sched = match self.rxtxdev.tx_air_time() {
+                    Some(now) => Self::schedule_uplink_time(granted, now),
+                    None => granted,
+                };
+                let pending = Self::build_pending_tx(prim, sched);
                 tracing::debug!(
-                    local = %pending.time,
+                    scheduled = %pending.time,
+                    granted = %granted,
                     network = ?net_time,
                     dl = %self.dltime,
                     bits = pending.burst.len(),
-                    "PhyMs: queued uplink burst (rescheduled network->local)"
+                    "PhyMs: queued uplink burst (scheduled ahead of true TX frontier)"
                 );
                 if self.pending_tx.is_some() {
                     tracing::warn!("PhyMs: overwriting an uplink burst that was not yet transmitted");
@@ -338,14 +401,21 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 tracing::info!(ts = %self.dltime, "PhyMs: downlink synchronized");
             }
 
-            // Retire the pending burst once its slot has passed (the device has
-            // already produced the TX signal ahead of the current time) and hand
-            // the antenna back to RX.
+            // Retire the pending burst once the true hardware TX frontier has
+            // passed its scheduled slot: by then the device has already
+            // generated the burst signal (its look-ahead window runs ahead of
+            // real time), so it is safe to drop it and hand the antenna back to
+            // RX. Using the true frontier (`tx_air_time`) — not the
+            // pipeline-delayed downlink time — keeps retirement consistent with
+            // the true-clock scheduling in `rx_prim`; comparing against the
+            // delayed downlink time would retire the burst before it is sent.
             if self.tx_path_active {
-                let sent = self
-                    .pending_tx
-                    .as_ref()
-                    .map_or(true, |pending| time.to_int() > pending.time.to_int());
+                let now = self.rxtxdev.tx_air_time();
+                let sent = match (&self.pending_tx, now) {
+                    (Some(pending), Some(now)) => now.diff(pending.time) > 0,
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                };
                 if sent {
                     self.pending_tx = None;
                     self.rxtxdev.set_rf_path(RfPath::Rx);
@@ -419,6 +489,9 @@ attach_groups = []
         rf_path: Vec<RfPath>,
         /// Downlink TDMA time the next `rxtx_timeslot` call reports.
         next_time: TdmaTime,
+        /// True hardware TX frontier the PHY sees via `tx_air_time`. `None`
+        /// models "not locked / TX not possible yet".
+        next_air_time: Option<TdmaTime>,
     }
 
     impl RxTxDev for MockRxTx {
@@ -443,6 +516,10 @@ attach_groups = []
 
         fn set_rf_path(&mut self, path: RfPath) {
             self.rf_path.push(path);
+        }
+
+        fn tx_air_time(&self) -> Option<TdmaTime> {
+            self.next_air_time
         }
     }
 
@@ -482,43 +559,88 @@ attach_groups = []
         assert!(phy.rxtxdev.rf_path.is_empty(), "no antenna switch without a burst");
     }
 
-    /// A queued uplink burst is presented to the device in its granted slot, the
-    /// antenna is switched to TX, and once the downlink time passes the slot the
-    /// burst is retired and the antenna handed back to RX.
+    /// A queued uplink burst is scheduled ahead of the true TX frontier,
+    /// presented to the device, the antenna switched to TX, and once the true
+    /// frontier passes the scheduled slot the burst is retired and the antenna
+    /// handed back to RX.
     #[test]
     fn test_pending_burst_scheduled_then_retired() {
         let base = TdmaTime::default();
+        // At rx_prim the PHY's dltime is the default `base`, so the granted
+        // opportunity is base+2. With the true frontier at `base`, base+2 is
+        // already >= frontier + UPLINK_MIN_LEAD_SLOTS(2), so it schedules there.
         let ul_time = base.add_timeslots(2);
 
         let mut phy = phy_ms(MockRxTx::default());
         let mut queue = MessageQueue::new();
 
-        // Upper layers request an uplink transmission.
+        // Upper layers request an uplink transmission; frontier just behind the
+        // opportunity.
+        phy.rxtxdev.next_air_time = Some(base);
         phy.rx_prim(&mut queue, cub_uplink_req(ul_time));
         assert!(phy.pending_tx.is_some(), "burst queued by rx_prim");
+        assert_eq!(
+            phy.pending_tx.as_ref().unwrap().time.to_int(),
+            ul_time.to_int(),
+            "scheduled at the granted slot when already ahead of the frontier"
+        );
 
-        // Downlink still before the granted slot: burst is presented, antenna
-        // switched to TX, burst kept pending.
+        // True frontier still before the scheduled slot: burst is presented,
+        // antenna switched to TX, burst kept pending.
         phy.rxtxdev.next_time = base.add_timeslots(1);
+        phy.rxtxdev.next_air_time = Some(base.add_timeslots(1));
         phy.drive_rx(&mut queue);
         let call0 = phy.rxtxdev.tx_calls[0].as_ref().expect("burst presented on first drive");
         assert_eq!(call0.0.to_int(), ul_time.to_int(), "scheduled at the granted slot time");
         assert_eq!(call0.1.len(), CUB_BURST_BITS, "control uplink burst bits");
         assert_eq!(phy.rxtxdev.rf_path, vec![RfPath::Tx]);
-        assert!(phy.pending_tx.is_some(), "kept pending until slot passes");
+        assert!(phy.pending_tx.is_some(), "kept pending until frontier passes");
 
-        // Downlink now past the granted slot: burst still presented this cycle,
-        // then retired and antenna returned to RX.
+        // True frontier now past the scheduled slot: burst still presented this
+        // cycle, then retired and antenna returned to RX.
         phy.rxtxdev.next_time = ul_time.add_timeslots(1);
+        phy.rxtxdev.next_air_time = Some(ul_time.add_timeslots(1));
         phy.drive_rx(&mut queue);
         assert!(phy.rxtxdev.tx_calls[1].is_some(), "burst presented while still pending");
-        assert!(phy.pending_tx.is_none(), "burst retired after slot passed");
+        assert!(phy.pending_tx.is_none(), "burst retired after frontier passed");
         assert_eq!(phy.rxtxdev.rf_path, vec![RfPath::Tx, RfPath::Rx]);
 
         // Nothing pending anymore: empty TX slot, no further antenna switching.
         phy.rxtxdev.next_time = ul_time.add_timeslots(2);
+        phy.rxtxdev.next_air_time = Some(ul_time.add_timeslots(2));
         phy.drive_rx(&mut queue);
         assert!(phy.rxtxdev.tx_calls[2].is_none(), "TX idle once burst is gone");
         assert_eq!(phy.rxtxdev.rf_path, vec![RfPath::Tx, RfPath::Rx], "no extra switches");
+    }
+
+    /// When the true TX frontier has already run past the nominal `dltime + 2`
+    /// opportunity (the RX-pipeline-latency case that motivates the true-clock
+    /// scheduler), the burst is advanced by whole frames to a reachable future
+    /// occurrence: the uplink timeslot phase is preserved and the slot lands at
+    /// least `UPLINK_MIN_LEAD_SLOTS` ahead of the frontier.
+    #[test]
+    fn test_burst_advanced_by_whole_frames_when_frontier_ahead() {
+        let base = TdmaTime::default();
+        let granted = base.add_timeslots(2); // dltime(base) + 2
+        // Frontier 10 slots ahead of `base` (pipeline latency far exceeds the
+        // 2-slot duplex gap), so the nominal opportunity is already in the past.
+        let frontier = base.add_timeslots(10);
+
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        phy.rxtxdev.next_air_time = Some(frontier);
+        phy.rx_prim(&mut queue, cub_uplink_req(granted));
+
+        let sched = phy.pending_tx.as_ref().expect("burst queued").time;
+        // Must be at least frontier + lead ahead...
+        assert!(
+            sched.diff(frontier) >= PhyMs::<MockRxTx>::UPLINK_MIN_LEAD_SLOTS,
+            "scheduled {sched:?} not far enough ahead of frontier {frontier:?}"
+        );
+        // ...advanced by a whole number of frames from the grant...
+        assert_eq!((sched.diff(granted)).rem_euclid(4), 0, "advance is a whole number of frames");
+        // ...which preserves the uplink timeslot phase.
+        assert_eq!(sched.t, granted.t, "uplink timeslot phase preserved");
     }
 }

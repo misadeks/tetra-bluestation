@@ -211,6 +211,31 @@ impl RxTxDev for RxTxDevSoapySdr {
         // time within the uplink guard period (ETSI TS 100 392-2 cl. 9.5).
         tracing::trace!(?path, "set_rf_path (full-duplex: no antenna switching)");
     }
+
+    fn tx_air_time(&self) -> Option<TdmaTime> {
+        // Local-basis TDMA slot at the *true* hardware TX frontier ("now").
+        //
+        // `reference_time` is the modem-sample-rate position of local slot 0,
+        // maintained by the downlink demodulator (the same reference the uplink
+        // modulator is aligned to). The demodulated downlink time lags real
+        // time by the RX pipeline delay, but the SDR's TX sample counter
+        // (`tx_current_count`, driven by the hardware clock via
+        // get_hardware_time) does not — so mapping that true counter through
+        // `reference_time` yields the actual current air-interface slot the
+        // transmitter is generating against.
+        //
+        // The TX counter is in the SDR sample rate; scale it to the modem
+        // sample rate the reference/slot arithmetic uses. `None` until the
+        // downlink is locked (no reference) or TX is not yet possible.
+        let reference_time = self.rx_dsp.as_ref()?.dl_reference_time()?;
+        if !self.sdr.tx_possible() {
+            return None;
+        }
+        let tx_now = self.sdr.tx_current_count().ok()?;
+        let now_modem = (tx_now as f64 * modulator::SAMPLE_RATE / self.sdr.tx_sample_rate()).round() as SampleCount;
+        let slot = (now_modem - reference_time).div_euclid(modulator::SAMPLES_SLOT) as i32;
+        Some(TdmaTime::from_int(slot))
+    }
 }
 
 struct RxDsp {
