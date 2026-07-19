@@ -515,11 +515,24 @@ impl TxDsp {
         let dmin = 2; // how many blocks in future minimum
         if d < dmin {
             let new_block_count = current_block + dmin;
-            tracing::warn!(
-                "Too late to produce TX block {}, skipping {} TX blocks",
-                self.block_count,
-                new_block_count - self.block_count
-            );
+            let skipped = new_block_count - self.block_count;
+            // For a discontinuous (MS) uplink this fast-forward is the *expected*
+            // re-anchor, not an underrun: between bursts the transmitter is
+            // silent (see the idle-skip above), so the frontier collapses back
+            // toward the DAC and the next burst pulls block_count forward to
+            // just ahead of it. That is exactly what keeps the granted uplink
+            // slot (dltime+2, cl. 9.3.9) reachable. Only a continuous (BS)
+            // carrier, which is meant to produce every block, treats a skip as a
+            // real "too late" underrun worth warning about.
+            if self.discontinuous {
+                tracing::debug!(
+                    "Discontinuous TX re-anchor: skipping {} TX blocks to block {}",
+                    skipped,
+                    new_block_count
+                );
+            } else {
+                tracing::warn!("Too late to produce TX block {}, skipping {} TX blocks", self.block_count, skipped);
+            }
             self.block_count = new_block_count;
         }
         // Limit how far into future TX blocks are generated.
