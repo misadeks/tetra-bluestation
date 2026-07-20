@@ -19,9 +19,15 @@ pub struct LmmMleActivateInd {
 
 /// This shall be used as a confirmation to the MM entity that a cell has been selected with the
 /// required characteristics.
+///
+/// Per ETSI TS 100 392-2 cl. 16.4.1.0 the MLE-LINK/ACTIVATE indication "supplies the MNC, MCC,
+/// LA and cell type of the new cell" so MM can apply the registration conditions of cl. 18.3.4.7.1a
+/// (different network -> migrating; LA outside the registered area -> roaming location updating).
 #[derive(Debug, Clone)]
 pub struct LmmMleActivateConf {
     pub registration_required: bool,
+    pub mcc: u16,
+    pub mnc: u16,
     pub la: u16,
     pub cell_type: Todo,
 }

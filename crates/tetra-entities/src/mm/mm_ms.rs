@@ -80,6 +80,16 @@ enum RegState {
     Detaching,
 }
 
+/// Identity of a cell as seen by MM: network (MCC/MNC) plus location area.
+/// Used to apply the registration conditions of ETSI TS 100 392-2 cl. 18.3.4.7.1a
+/// (network change -> migrating; LA outside the registered area -> roaming).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellId {
+    mcc: u16,
+    mnc: u16,
+    la: u16,
+}
+
 pub struct MmMs {
     config: SharedConfig,
     /// Registration procedure state (cl. 16.4).
@@ -101,6 +111,21 @@ pub struct MmMs {
     /// Downlink slots remaining to drain after sending a U-ITSI DETACH at
     /// shutdown, giving the MAC/PHY time to transmit it (cl. 16.6.1).
     detach_countdown: u32,
+    /// The cell MM currently believes it is camped on, from the most recent
+    /// LMM-ACTIVATE confirm (cl. 17.3.2). Used to distinguish a genuine cell/LA
+    /// change from a repeated confirmation for the same cell.
+    current_cell: Option<CellId>,
+    /// The cell in which the MS last completed a successful registration
+    /// (cl. 16.4). Its LA is the (single-LA) "registered area" against which an
+    /// LA change is evaluated (cl. 18.3.4.7.1a cond. 2). `None` until the first
+    /// successful registration.
+    registered_cell: Option<CellId>,
+    /// The cell targeted by the in-flight registration attempt, promoted to
+    /// `registered_cell` on a D-LOCATION-UPDATE-ACCEPT.
+    pending_cell: Option<CellId>,
+    /// Location-updating type of the in-flight attempt, so a T351 resend
+    /// (cl. 16.4.5) repeats the same request type.
+    pending_lu_type: LocationUpdateType,
 }
 
 impl MmMs {
@@ -113,6 +138,10 @@ impl MmMs {
             system_rejection_count: 0,
             left_system: false,
             detach_countdown: 0,
+            current_cell: None,
+            registered_cell: None,
+            pending_cell: None,
+            pending_lu_type: LocationUpdateType::ItsiAttach,
         }
     }
 
@@ -238,23 +267,18 @@ impl MmMs {
     /// LMM-ACTIVATE confirmation from MLE (cl. 17.3.2): a serving cell has been
     /// selected. Start the registration procedure if the cell requires it.
     fn rx_activate_conf(&mut self, queue: &mut MessageQueue, conf: &LmmMleActivateConf) {
+        let cell = CellId {
+            mcc: conf.mcc,
+            mnc: conf.mnc,
+            la: conf.la,
+        };
+        // Track the cell MM believes it is camped on, from the latest confirm.
+        self.current_cell = Some(cell);
+
         if self.left_system {
             // Left the system after N351 system rejections (cl. 16.11.2.1); no
             // further registration until a power cycle (process restart).
             tracing::debug!("MM: activate-conf received but MS left the system (N351); ignoring");
-            return;
-        }
-        if !conf.registration_required {
-            tracing::info!(
-                "MM: serving cell (LA={}) does not require registration; not registering",
-                conf.la
-            );
-            return;
-        }
-        if self.reg_state == RegState::Registered {
-            // Already registered on a cell; a repeated confirmation for the same
-            // cell needs no action. (Cell change resets MLE's confirmation.)
-            tracing::debug!("MM: activate-conf received while already registered; ignoring");
             return;
         }
         if self.reg_state == RegState::Detaching {
@@ -262,28 +286,99 @@ impl MmMs {
             tracing::debug!("MM: activate-conf received while detaching; ignoring");
             return;
         }
-        tracing::info!("MM: serving cell selected (LA={}), initiating ITSI attach registration", conf.la);
+        if self.reg_state == RegState::Registering {
+            // A registration attempt is already in flight; the current attempt
+            // will complete or time out. Do not start a second one.
+            tracing::debug!("MM: activate-conf received while a registration is in flight; ignoring");
+            return;
+        }
+
+        // Apply the registration conditions of ETSI TS 100 392-2 cl. 18.3.4.7.1a
+        // (see also cl. 16.4.1.0). Decide both *whether* to register and *which*
+        // location-updating type applies.
+        let lu_type = if self.reg_state == RegState::Registered {
+            match self.registered_cell {
+                // Same cell/LA as where we are registered: no location update is
+                // required (cl. 18.3.4.7.1a NOTE 2 — returning to / staying on a
+                // cell requires registration only if a normal condition applies).
+                Some(reg) if reg == cell => {
+                    tracing::debug!(
+                        "MM: activate-conf for the registered cell (MCC={} MNC={} LA={}); no re-registration",
+                        cell.mcc, cell.mnc, cell.la
+                    );
+                    return;
+                }
+                // Different network (MNI): migrating location updating is required
+                // regardless of the new cell's registration flag
+                // (cl. 18.3.4.7.1a cond. 1).
+                Some(reg) if reg.mcc != cell.mcc || reg.mnc != cell.mnc => {
+                    tracing::info!(
+                        "MM: network changed {}/{} -> {}/{}; migrating location updating (cl. 18.3.4.7.1a)",
+                        reg.mcc, reg.mnc, cell.mcc, cell.mnc
+                    );
+                    LocationUpdateType::MigratingLocationUpdating
+                }
+                // Same network, LA outside the registered area: roaming location
+                // updating is required only if the new cell requires registration
+                // (cl. 18.3.4.7.1a cond. 2).
+                _ => {
+                    if !conf.registration_required {
+                        tracing::info!(
+                            "MM: LA changed to {} but new cell does not require registration; \
+                             not registering (cl. 18.3.4.7.1a cond. 2)",
+                            cell.la
+                        );
+                        return;
+                    }
+                    tracing::info!(
+                        "MM: LA outside registered area (registered LA={:?}, now LA={}); \
+                         roaming location updating (cl. 18.3.4.7.1a)",
+                        self.registered_cell.map(|c| c.la), cell.la
+                    );
+                    LocationUpdateType::RoamingLocationUpdating
+                }
+            }
+        } else {
+            // Not registered: initial registration / ITSI attach (cl. 16.9.3.4),
+            // performed only when the selected cell requires registration.
+            if !conf.registration_required {
+                tracing::info!(
+                    "MM: serving cell (LA={}) does not require registration; not registering",
+                    conf.la
+                );
+                return;
+            }
+            tracing::info!("MM: serving cell selected (LA={}), initiating ITSI attach registration", conf.la);
+            LocationUpdateType::ItsiAttach
+        };
+
+        self.pending_cell = Some(cell);
         self.attempts = 0;
-        self.send_location_update_demand(queue);
+        self.send_location_update_demand(queue, lu_type);
     }
 
     /// Build and send a U-LOCATION-UPDATE-DEMAND (ITSI attach, cl. 16.9.3.4) down
     /// to MLE. MLE prepends its protocol discriminator and forwards it to LLC,
     /// from where it reaches the MAC and is transmitted on the uplink via random
     /// access (cl. 23.5.1.4).
-    fn send_location_update_demand(&mut self, queue: &mut MessageQueue) {
+    fn send_location_update_demand(&mut self, queue: &mut MessageQueue, lu_type: LocationUpdateType) {
         let issi = self.own_issi();
+        // Remember the type in flight so a T351 resend repeats the same request
+        // (cl. 16.4.5).
+        self.pending_lu_type = lu_type;
 
         // Attach the configured group identities as part of the ITSI attach
         // (cl. 16.8.2): the SwMI affiliates the MS to these groups and will then
         // forward group-addressed traffic to it. Omitted when none configured.
         let group_identity_location_demand = self.build_group_identity_location_demand();
 
-        // Minimal ITSI-attach demand: no ciphering, no optional elements. The
-        // MS identity is carried by the MAC-layer source address, so the ssi
-        // element is left absent (cl. 16.9.3.4 note 2 / BS accepts this).
+        // Minimal demand: no ciphering, no optional elements. The MS identity is
+        // carried by the MAC-layer source address, so the ssi element is left
+        // absent (cl. 16.9.3.4 note 2 / BS accepts this). `lu_type` reflects the
+        // reason for the update: ITSI attach (initial), roaming (LA change) or
+        // migrating (network change) per cl. 16.10.35 / 18.3.4.7.1a.
         let pdu = ULocationUpdateDemand {
-            location_update_type: LocationUpdateType::ItsiAttach,
+            location_update_type: lu_type,
             request_to_append_la: false,
             cipher_control: false,
             ciphering_parameters: None,
@@ -303,7 +398,8 @@ impl MmMs {
         pdu.to_bitbuf(&mut sdu).expect("U-LOCATION-UPDATE-DEMAND serialization");
         sdu.seek(0);
         tracing::info!(
-            "MM: -> U-LOCATION-UPDATE-DEMAND (ITSI attach) for ISSI {}, attach_groups {:?} sdu {}",
+            "MM: -> U-LOCATION-UPDATE-DEMAND ({:?}) for ISSI {}, attach_groups {:?} sdu {}",
+            lu_type,
             issi,
             self.attach_groups(),
             sdu.dump_bin()
@@ -510,6 +606,9 @@ impl MmMs {
         };
         queue.push_back(m);
 
+        // Track the target cell so a subsequent ACCEPT promotes it to the
+        // registered cell (the demand re-registers on the current serving cell).
+        self.pending_cell = self.current_cell;
         self.reg_state = RegState::Registering;
         self.t351_countdown = T351_TIMEOUT_SLOTS;
         self.attempts += 1;
@@ -657,8 +756,13 @@ impl MmMs {
 
         // Successful registration: stop timer T351 (cl. 16.4.1.1) and clear the
         // N351 system-rejection counter (cl. 16.11.2.1 counts rejections "without
-        // a successful registration").
+        // a successful registration"). Promote the pending cell to the registered
+        // cell so its LA becomes the registered area against which a later LA
+        // change is evaluated (cl. 18.3.4.7.1a).
         self.reg_state = RegState::Registered;
+        if self.pending_cell.is_some() {
+            self.registered_cell = self.pending_cell;
+        }
         self.t351_countdown = 0;
         self.system_rejection_count = 0;
     }
@@ -863,7 +967,7 @@ impl TetraEntityTrait for MmMs {
             "MM: T351 expired with no registration response; resending U-LOCATION-UPDATE-DEMAND (attempt {})",
             self.attempts + 1
         );
-        self.send_location_update_demand(queue);
+        self.send_location_update_demand(queue, self.pending_lu_type);
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -969,9 +1073,15 @@ attach_groups = []
     }
 
     fn activate_conf(registration_required: bool) -> LmmMleActivateConf {
+        activate_conf_cell(registration_required, 901, 9999, 1)
+    }
+
+    fn activate_conf_cell(registration_required: bool, mcc: u16, mnc: u16, la: u16) -> LmmMleActivateConf {
         LmmMleActivateConf {
             registration_required,
-            la: 1,
+            mcc,
+            mnc,
+            la,
             cell_type: 0,
         }
     }
@@ -1433,5 +1543,108 @@ attach_groups = []
         assert_eq!(mm.reg_state, RegState::Idle);
         assert!(!mm.deregistration_pending());
         assert!(q.pop_front().is_none(), "no PDU emitted when not registered");
+    }
+
+    /// Helper: drive MM to Registered on the default config cell (901/9999, LA 1)
+    /// via an ITSI-attach activate-conf + a D-LOCATION-UPDATE-ACCEPT, draining the
+    /// emitted demand. Leaves the queue empty.
+    fn register_on_default_cell(mm: &mut MmMs, q: &mut MessageQueue) {
+        mm.rx_activate_conf(q, &activate_conf(true));
+        let _ = q.pop_front().expect("registration demand");
+        assert!(q.pop_front().is_none());
+        deliver_dl(mm, q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+    }
+
+    /// Helper: pop exactly one U-LOCATION-UPDATE-DEMAND off the queue and return its
+    /// location-update type (parsed through the BS's own decoder).
+    fn pop_demand_lu_type(q: &mut MessageQueue) -> LocationUpdateType {
+        let msg = q.pop_front().expect("a demand must be emitted");
+        assert!(q.pop_front().is_none(), "exactly one message emitted");
+        assert_eq!(msg.dest, TetraEntity::Mle);
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        req.sdu.seek(0);
+        ULocationUpdateDemand::from_bitbuf(&mut req.sdu)
+            .expect("BS must parse the demand")
+            .location_update_type
+    }
+
+    /// R1 (cl. 18.3.4.7.1a NOTE 2): re-selecting the SAME cell (same MCC/MNC/LA)
+    /// while already registered must NOT trigger a new location update.
+    #[test]
+    fn test_same_cell_no_reregistration() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        register_on_default_cell(&mut mm, &mut q);
+
+        // A repeated activate-conf for the identical cell: no LU, stays Registered.
+        mm.rx_activate_conf(&mut q, &activate_conf_cell(true, 901, 9999, 1));
+        assert_eq!(mm.reg_state, RegState::Registered);
+        assert!(q.pop_front().is_none(), "same-cell return emits no demand");
+    }
+
+    /// R1 (cl. 18.3.4.7.1a cond 2): an LA change within the same network, when the
+    /// new cell requires registration, triggers a roaming location update.
+    #[test]
+    fn test_la_change_triggers_roaming_lu() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        register_on_default_cell(&mut mm, &mut q);
+
+        mm.rx_activate_conf(&mut q, &activate_conf_cell(true, 901, 9999, 2));
+        assert_eq!(mm.reg_state, RegState::Registering);
+        assert_eq!(
+            pop_demand_lu_type(&mut q),
+            LocationUpdateType::RoamingLocationUpdating
+        );
+    }
+
+    /// R1 (cl. 18.3.4.7.1a cond 1): a network (MCC/MNC) change triggers a migrating
+    /// location update regardless of the new cell's registration-required flag.
+    #[test]
+    fn test_network_change_triggers_migrating_lu() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        register_on_default_cell(&mut mm, &mut q);
+
+        mm.rx_activate_conf(&mut q, &activate_conf_cell(false, 902, 1, 5));
+        assert_eq!(mm.reg_state, RegState::Registering);
+        assert_eq!(
+            pop_demand_lu_type(&mut q),
+            LocationUpdateType::MigratingLocationUpdating
+        );
+    }
+
+    /// R1 (cl. 18.3.4.7.1a cond 2): an LA change where the new cell does NOT require
+    /// registration must not trigger a location update.
+    #[test]
+    fn test_la_change_without_registration_required_skips() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        register_on_default_cell(&mut mm, &mut q);
+
+        mm.rx_activate_conf(&mut q, &activate_conf_cell(false, 901, 9999, 2));
+        assert_eq!(mm.reg_state, RegState::Registered);
+        assert!(q.pop_front().is_none(), "no LU when new cell needs no registration");
+    }
+
+    /// R1 (cl. 16.4.1.0 / 18.3.4.7.1a): the registered area (LA where registration
+    /// completed) is captured on the accept, so a later same-LA return is a no-op.
+    #[test]
+    fn test_registered_cell_captured_on_accept() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        register_on_default_cell(&mut mm, &mut q);
+
+        assert_eq!(
+            mm.registered_cell,
+            Some(CellId {
+                mcc: 901,
+                mnc: 9999,
+                la: 1
+            })
+        );
     }
 }

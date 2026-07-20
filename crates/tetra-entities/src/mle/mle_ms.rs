@@ -333,6 +333,7 @@ impl MleMs {
                 cell.location_area = Some(pdu.location_area);
                 cell.subscriber_class = Some(pdu.subscriber_class);
                 cell.registration_required = Some(registration_required);
+                let (mcc, mnc) = (cell.mcc, cell.mnc);
                 if changed {
                     tracing::info!(
                         "MLE: serving cell SYSINFO adopted: LA={} subscriber_class={:#x} registration_required={}",
@@ -345,10 +346,16 @@ impl MleMs {
                 // now that both the SYNC identity and the SYSINFO parameters are
                 // known (cl. 18.3.4.6 completes selection; the confirmation is the
                 // LMM-ACTIVATE confirm primitive, cl. 17.3.2).
-                if self.activate_confirmed {
-                    None
+                //
+                // Additionally re-confirm whenever the location area of the
+                // already-selected cell changes (cl. 16.4.1.0 / 18.3.4.7.1a
+                // cond. 2): an LA change may require a roaming location update, so
+                // MM must be re-notified to re-evaluate against its registered
+                // area. Repeated identical SYSINFO (no LA change) is suppressed.
+                if !self.activate_confirmed || changed {
+                    Some((mcc, mnc, pdu.location_area, registration_required))
                 } else {
-                    Some((pdu.location_area, registration_required))
+                    None
                 }
             }
             None => {
@@ -359,19 +366,30 @@ impl MleMs {
             }
         };
 
-        if let Some((la, registration_required)) = confirm {
+        if let Some((mcc, mnc, la, registration_required)) = confirm {
             self.activate_confirmed = true;
-            self.send_mle_activate_conf(queue, la, registration_required);
+            self.send_mle_activate_conf(queue, mcc, mnc, la, registration_required);
         }
     }
 
     /// Send the LMM-ACTIVATE confirmation to MM (ETSI TS 100 392-2 cl. 17.3.2):
     /// a cell has been selected with the required characteristics. `registration_required`
     /// comes from the cell's D-MLE-SYSINFO BS service details and lets MM decide
-    /// whether to perform a location update (cl. 16.4).
-    fn send_mle_activate_conf(&mut self, queue: &mut MessageQueue, la: u16, registration_required: bool) {
+    /// whether to perform a location update (cl. 16.4). MCC/MNC/LA identify the
+    /// cell so MM can distinguish migrating (network change) from roaming (LA
+    /// change) location updating (cl. 16.4.1.0 / 18.3.4.7.1a).
+    fn send_mle_activate_conf(
+        &mut self,
+        queue: &mut MessageQueue,
+        mcc: u16,
+        mnc: u16,
+        la: u16,
+        registration_required: bool,
+    ) {
         tracing::info!(
-            "MLE: cell selection complete, confirming to MM (LA={}, registration_required={})",
+            "MLE: cell selection complete, confirming to MM (MCC={}, MNC={}, LA={}, registration_required={})",
+            mcc,
+            mnc,
             la,
             registration_required
         );
@@ -381,6 +399,8 @@ impl MleMs {
             dest: TetraEntity::Mm,
             msg: SapMsgInner::LmmMleActivateConf(LmmMleActivateConf {
                 registration_required,
+                mcc,
+                mnc,
                 la,
                 cell_type: 0, // Todo (cl. 18): cell type not modelled yet
             }),
