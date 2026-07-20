@@ -9,10 +9,12 @@ pub mod mle;
 pub mod mm;
 pub mod phy;
 pub mod sndcp;
+pub mod tnmm;
 pub mod umac;
 
 pub mod network;
 
+pub mod management;
 pub mod net_brew;
 pub mod net_control;
 pub mod net_telemetry;

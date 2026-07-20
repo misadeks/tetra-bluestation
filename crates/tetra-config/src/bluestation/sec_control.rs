@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml::Value;
 
 /// Control endpoint configuration
@@ -18,7 +18,7 @@ pub struct CfgControl {
     pub credentials: Option<(String, String)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct CfgControlDto {
     /// Control server hostname or IP
     pub host: String,
@@ -34,7 +34,7 @@ pub struct CfgControlDto {
     /// Optional password for HTTP Basic auth
     pub password: Option<String>,
 
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
 }
 
@@ -57,4 +57,24 @@ pub fn apply_control_patch(src: CfgControlDto) -> Result<CfgControl, String> {
         },
         ca_cert: src.ca_cert,
     })
+}
+
+/// Inverse of [`apply_control_patch`] for TOML write-back (Plane B, non-standard).
+/// The `credentials` tuple is split back into `username`/`password`. Secrets are
+/// written as plaintext: the TOML file is their canonical store (redaction is for
+/// logs only, via `SecretField`, which this DTO does not use).
+pub fn cfg_control_to_dto(c: &CfgControl) -> CfgControlDto {
+    let (username, password) = match &c.credentials {
+        Some((u, p)) => (Some(u.clone()), Some(p.clone())),
+        None => (None, None),
+    };
+    CfgControlDto {
+        host: c.host.clone(),
+        port: c.port,
+        use_tls: c.use_tls,
+        ca_cert: c.ca_cert.clone(),
+        username,
+        password,
+        extra: HashMap::new(),
+    }
 }

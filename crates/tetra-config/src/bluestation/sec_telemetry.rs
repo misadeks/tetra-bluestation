@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml::Value;
 
 /// Telemetry endpoint configuration
@@ -18,7 +18,7 @@ pub struct CfgTelemetry {
     pub credentials: Option<(String, String)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct CfgTelemetryDto {
     /// Telemetry server hostname or IP
     pub host: String,
@@ -34,7 +34,7 @@ pub struct CfgTelemetryDto {
     /// Optional password for HTTP Basic auth
     pub password: Option<String>,
 
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
 }
 
@@ -57,4 +57,22 @@ pub fn apply_telemetry_patch(src: CfgTelemetryDto) -> Result<CfgTelemetry, Strin
         },
         ca_cert: src.ca_cert,
     })
+}
+
+/// Inverse of [`apply_telemetry_patch`] for TOML write-back (Plane B, non-standard).
+/// See [`crate::bluestation::cfg_control_to_dto`] for the secret-handling rationale.
+pub fn cfg_telemetry_to_dto(c: &CfgTelemetry) -> CfgTelemetryDto {
+    let (username, password) = match &c.credentials {
+        Some((u, p)) => (Some(u.clone()), Some(p.clone())),
+        None => (None, None),
+    };
+    CfgTelemetryDto {
+        host: c.host.clone(),
+        port: c.port,
+        use_tls: c.use_tls,
+        ca_cert: c.ca_cert.clone(),
+        username,
+        password,
+        extra: HashMap::new(),
+    }
 }

@@ -1,4 +1,9 @@
+use crate::net_control::ControlEndpoint;
+use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
@@ -93,6 +98,14 @@ struct CellId {
 
 pub struct MmMs {
     config: SharedConfig,
+    /// OUTBOUND external-interface handle (stack -> UI): TNMM indications
+    /// (ETSI TS 100 392-2 cl. 15.3) are pushed here in later phases. Wired in
+    /// Phase T0; `None` when no telemetry endpoint is configured.
+    telemetry: Option<TelemetrySink>,
+    /// INBOUND external-interface handle (UI -> stack): TNMM requests
+    /// (cl. 15.3) are received here in later phases. Wired in Phase T0; `None`
+    /// when no control endpoint is configured.
+    control: Option<ControlEndpoint>,
     /// Registration procedure state (cl. 16.4).
     reg_state: RegState,
     /// Timer T351 (registration response time, cl. 16.11.1.1) countdown in
@@ -132,12 +145,45 @@ pub struct MmMs {
     /// reselection requires re-registration even inside the registered area, and
     /// a cell returning to "normal mode" triggers a periodic location update.
     temporary_registration: bool,
+    /// Location area of the serving cell as reported by the most recent
+    /// LMM-ACTIVATE confirmation (cl. 17.3.2). Cached so the TNMM-REGISTRATION
+    /// indication/confirm can report "LA (where registered)" (Table 15.5).
+    /// Defaults to the configured cell LA until a serving cell is selected.
+    serving_la: u16,
+    /// Runtime plumbing needed by the Plane B management write/apply handlers
+    /// (config file path + process restart signalling). `None` in unit tests
+    /// and read-only deployments, in which case `SetConfig`/`ApplyConfig` are
+    /// refused gracefully rather than acted upon. **NON-STANDARD** (Plane B).
+    mgmt_ctx: Option<ManagementContext>,
+    /// UI hint (**NON-STANDARD**, Plane B): a configuration change has been
+    /// staged to disk via `SetConfig` that only takes effect after a controlled
+    /// restart (`ApplyConfig`). Surfaced in the runtime-state snapshot.
+    restart_required: bool,
+}
+
+/// Runtime plumbing for the Plane B management write/apply handlers
+/// (**NON-STANDARD**). Carries the on-disk config path to persist to and the
+/// process-level restart signalling shared with `main`.
+struct ManagementContext {
+    /// Path of the TOML config file that `SetConfig` writes and that the
+    /// supervisor-respawned process reloads at startup.
+    config_path: PathBuf,
+    /// Set by `ApplyConfig` to request the supervisor-driven restart; polled by
+    /// `main` after the stack run loop exits so it can exit with the documented
+    /// restart exit code.
+    restart_requested: Arc<AtomicBool>,
+    /// Cleared by `ApplyConfig` to break the stack run loop and begin the
+    /// graceful shutdown drain (the same `is_running` flag `main` owns).
+    is_running: Arc<AtomicBool>,
 }
 
 impl MmMs {
-    pub fn new(config: SharedConfig) -> Self {
+    pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
+        let serving_la = config.config().cell.location_area;
         Self {
             config,
+            telemetry,
+            control,
             reg_state: RegState::Idle,
             t351_countdown: 0,
             attempts: 0,
@@ -149,7 +195,26 @@ impl MmMs {
             pending_cell: None,
             pending_lu_type: LocationUpdateType::ItsiAttach,
             temporary_registration: false,
+            serving_la,
+            mgmt_ctx: None,
+            restart_required: false,
         }
+    }
+
+    /// Install the Plane B management context (**NON-STANDARD**): the config
+    /// file path to persist `SetConfig` writes to, plus the shared restart /
+    /// running flags `main` uses to drive a controlled restart on `ApplyConfig`.
+    ///
+    /// Provided via a setter (not a `new()` parameter) so the many existing
+    /// test constructors are unaffected; when it is not installed the write /
+    /// apply management commands are refused gracefully.
+    pub fn set_management_context(
+        &mut self,
+        config_path: PathBuf,
+        restart_requested: Arc<AtomicBool>,
+        is_running: Arc<AtomicBool>,
+    ) {
+        self.mgmt_ctx = Some(ManagementContext { config_path, restart_requested, is_running });
     }
 
     /// Own Individual Short Subscriber Identity (ISSI) from the MS config
@@ -181,6 +246,194 @@ impl MmMs {
     fn own_mni(&self) -> u32 {
         let net = &self.config.config().net;
         ((net.mcc as u32) << 14) | (net.mnc as u32 & 0x3FFF)
+    }
+
+    // ----------------------------------------------------------------------
+    // TNMM-SAP indications (Plane A, OUTBOUND) — ETSI TS 100 392-2 cl. 15.3.
+    //
+    // These push standardized TNMM primitives (cl. 15.3.3 / 15.3.4) toward the
+    // MS user application over the telemetry side-channel. They never touch the
+    // on-air SapMsg queue and never change registration state — they only
+    // report state that MM has already reached, so no air/TNMM behaviour is
+    // invented.
+    // ----------------------------------------------------------------------
+
+    /// Push a TNMM indication/confirm to the user application, if a telemetry
+    /// sink is wired. Fire-and-forget (lock-free).
+    fn emit(&self, event: crate::net_telemetry::TelemetryEvent) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(event);
+        }
+    }
+
+    /// MCC where registered (Table 15.5). This single-network clear-mode MS only
+    /// ever camps on / registers with cells of its configured network — a
+    /// D-LOCATION-UPDATE-COMMAND carrying a different MNI is ignored (own_mni
+    /// check) — so the registered MCC is the configured home MCC.
+    fn where_registered_mcc(&self) -> u16 {
+        self.config.config().net.mcc
+    }
+
+    /// MNC where registered (Table 15.5). See [`Self::where_registered_mcc`].
+    fn where_registered_mnc(&self) -> u16 {
+        self.config.config().net.mnc
+    }
+
+    /// Cell type where registered (Table 15.5). TNMM registration / location
+    /// updating is a trunked-mode (V+D) procedure carried out on a CA cell; this
+    /// stack implements no direct-mode (DA) registration path, so the cell where
+    /// this MS registers is always a CA cell (`cl. 15.3.4` value "CA cell").
+    fn where_registered_cell_type(&self) -> crate::tnmm::CellType {
+        crate::tnmm::CellType::CaCell
+    }
+
+    /// Build the "group identities" parameter (Table 15.8) for a set of GSSIs
+    /// that have just been attached at ITSI attach, as reported to the user
+    /// application. GITI = Attachment, so the conditional lifetime + class of
+    /// usage members are present; the detachment reason is absent (cl. 15.3.4).
+    /// GTSI = MNI << 24 | GSSI (cl. 15.3.4 "GTSI").
+    fn attached_group_identities(&self, gssis: &[u32]) -> Vec<crate::tnmm::GroupIdentity> {
+        use crate::tnmm::{ClassOfUsage, GroupIdentity, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityLifetime};
+        let mni = self.own_mni() as u64;
+        gssis
+            .iter()
+            .map(|gssi| GroupIdentity {
+                gtsi: (mni << 24) | (*gssi as u64),
+                group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                // Attached at ITSI attach with the class of usage MM sends in the
+                // demand (cl. 16.10.6, GROUP_CLASS_OF_USAGE = 4 -> "Class of Usage 4").
+                group_identity_lifetime: Some(GroupIdentityLifetime::AttachmentNeededForNextItsiAttach),
+                class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                group_identity_detachment_reason: None,
+            })
+            .collect()
+    }
+
+    /// Emit a TNMM-SERVICE indication (Table 15.6, cl. 15.3.3.8) reflecting the
+    /// MS service state. Disable status is always "enabled": the disabling
+    /// procedure is defined in ETSI EN 300 392-7 (Part 7, security), which is out
+    /// of scope, so this MS is never in a temporary/permanently-disabled state.
+    fn emit_service(&self, service_status: crate::tnmm::ServiceStatus) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::{DisableStatus, TnmmServiceIndication};
+        self.emit(TelemetryEvent::TnmmServiceIndication(TnmmServiceIndication {
+            service_status,
+            disable_status: DisableStatus::Enabled,
+        }));
+    }
+
+    /// Map an on-air `Reject cause` (cl. 16.10.42) to the TNMM-SAP
+    /// `Registration reject cause` enumeration (cl. 15.3.4). Returns `None` for
+    /// the on-air causes that have no TNMM-SAP enumerant ("use CA/DA cell not
+    /// permitted"), which therefore cannot be reported through this parameter.
+    fn map_registration_reject_cause(cause: RejectCause) -> Option<crate::tnmm::RegistrationRejectCause> {
+        use crate::tnmm::RegistrationRejectCause as T;
+        Some(match cause {
+            RejectCause::ItsiAtsiUnknown => T::ItsiUnknown,
+            RejectCause::IllegalMs => T::IllegalMs,
+            RejectCause::LaNotAllowed => T::LaNotAllowed,
+            RejectCause::LaUnknown => T::LaUnknown,
+            RejectCause::NetworkFailure => T::NetworkFailure,
+            RejectCause::Congestion => T::Congestion,
+            RejectCause::ForwardRegistrationFailure => T::ForwardRegistrationFailure,
+            RejectCause::ServiceNotSubscribed => T::ServiceNotSubscribed,
+            RejectCause::MandatoryElementError => T::MandatoryElementError,
+            RejectCause::MessageConsistencyError => T::MessageConsistencyError,
+            RejectCause::RoamingNotSupported => T::RoamingNotSupported,
+            RejectCause::MigrationNotSupported => T::MigrationNotSupported,
+            RejectCause::NoCipherKsg => T::NoCipherKsg,
+            RejectCause::IdentifiedCipherKsgNotSupported => T::IdentifiedCipherKsgNotSupported,
+            RejectCause::RequestedCipherKeyTypeNotAvailable => T::RequestedCipherKeyTypeNotAvailable,
+            RejectCause::IdentifiedCipherKeyNotAvailable => T::IdentifiedCipherKeyNotAvailable,
+            RejectCause::CipheringRequired => T::CipheringRequired,
+            RejectCause::AuthenticationFailure => T::AuthenticationFailure,
+            RejectCause::UseCaCellNotPermitted | RejectCause::UseDaCellNotPermitted => return None,
+        })
+    }
+
+    /// Emit a TNMM-REGISTRATION indication reporting that MM has failed a
+    /// registration procedure (Table 15.5; status = "failure" + reject cause,
+    /// cl. 15.3.3.7 / NOTE 1). LA/MCC/MNC reflect the cell the attempt was made
+    /// against. Followed by a TNMM-SERVICE "out of service" indication.
+    fn emit_registration_failure(&self, cause: Option<RejectCause>) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::{RegistrationStatus, ServiceStatus, TnmmRegistrationIndication};
+        let reject = cause.and_then(Self::map_registration_reject_cause);
+        self.emit(TelemetryEvent::TnmmRegistrationIndication(Box::new(TnmmRegistrationIndication {
+            registration_status: RegistrationStatus::Failure,
+            registration_reject_cause: reject,
+            cell_type_where_registered: self.where_registered_cell_type(),
+            la_where_registered: self.serving_la,
+            mcc_where_registered: self.where_registered_mcc(),
+            mnc_where_registered: self.where_registered_mnc(),
+            swmis_required_cell_types: None,
+            energy_economy_mode: None,
+            energy_economy_mode_status: None,
+            group_identities: None,
+            group_identity_attach_detach_mode: None,
+        })));
+        self.emit_service(ServiceStatus::OutOfService);
+    }
+
+    /// Emit the TNMM-SAP outbound primitives for a successfully carried-out
+    /// registration (Tables 15.5 / 15.1 / 15.6):
+    /// - TNMM-REGISTRATION indication and confirm (status = "success"), the
+    ///   confirm informing the user application the MS is ready for use
+    ///   (cl. 15.3.3.7);
+    /// - TNMM-SERVICE indication "in service" (cl. 15.3.3.8);
+    /// - TNMM-ATTACH DETACH GROUP IDENTITY indication reporting the groups the
+    ///   SwMI attached, when any (cl. 15.3.3.1).
+    ///
+    /// `attached_gssis` are the GSSIs the SwMI confirmed attached in the
+    /// D-LOCATION-UPDATE-ACCEPT (empty when none / group attachment failed).
+    fn emit_registration_success(&self, attached_gssis: &[u32]) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::{
+            RegistrationStatus, ServiceStatus, TnmmAttachDetachGroupIdentityIndication,
+            TnmmRegistrationConfirm, TnmmRegistrationIndication,
+        };
+
+        let group_identities = self.attached_group_identities(attached_gssis);
+        let groups_opt = if group_identities.is_empty() {
+            None
+        } else {
+            Some(group_identities.clone())
+        };
+
+        self.emit(TelemetryEvent::TnmmRegistrationIndication(Box::new(TnmmRegistrationIndication {
+            registration_status: RegistrationStatus::Success,
+            registration_reject_cause: None,
+            cell_type_where_registered: self.where_registered_cell_type(),
+            la_where_registered: self.serving_la,
+            mcc_where_registered: self.where_registered_mcc(),
+            mnc_where_registered: self.where_registered_mnc(),
+            swmis_required_cell_types: None,
+            energy_economy_mode: None,
+            energy_economy_mode_status: None,
+            group_identities: groups_opt.clone(),
+            group_identity_attach_detach_mode: None,
+        })));
+
+        self.emit(TelemetryEvent::TnmmRegistrationConfirm(Box::new(TnmmRegistrationConfirm {
+            registration_status: RegistrationStatus::Success,
+            registration_reject_cause: None,
+            cell_type_where_registered: self.where_registered_cell_type(),
+            la_where_registered: self.serving_la,
+            mcc_where_registered: self.where_registered_mcc(),
+            mnc_where_registered: self.where_registered_mnc(),
+            energy_economy_mode: None,
+            energy_economy_mode_status: None,
+            group_identities: groups_opt,
+            group_identity_attach_detach_mode: None,
+        })));
+
+        self.emit_service(ServiceStatus::InService);
+
+        if !group_identities.is_empty() {
+            self.emit(TelemetryEvent::TnmmAttachDetachGroupIdentityIndication(
+                TnmmAttachDetachGroupIdentityIndication { group_identities },
+            ));
+        }
     }
 
     /// Build the "class of MS" element (ETSI TS 100 392-2 cl. 16.10.5, Table
@@ -281,6 +534,11 @@ impl MmMs {
         };
         // Track the cell MM believes it is camped on, from the latest confirm.
         self.current_cell = Some(cell);
+        // Cache the serving cell's LA (from the latest confirm) so the
+        // TNMM-REGISTRATION indication/confirm can report "LA (where
+        // registered)" (Table 15.5). Runs on every confirm regardless of the
+        // registration-condition early returns below.
+        self.serving_la = conf.la;
 
         if self.left_system {
             // Left the system after N351 system rejections (cl. 16.11.2.1); no
@@ -466,6 +724,11 @@ impl MmMs {
         self.reg_state = RegState::Registering;
         self.t351_countdown = T351_TIMEOUT_SLOTS;
         self.attempts += 1;
+
+        // TNMM-SERVICE indication (Table 15.6): the MS is now in service but
+        // awaiting the registration response (cl. 15.3.4 "in service waiting for
+        // registration").
+        self.emit_service(crate::tnmm::ServiceStatus::InServiceWaitingForRegistration);
     }
 
     /// Handle a D-LOCATION-UPDATE-COMMAND (ETSI TS 100 392-2 cl. 16.4.3): the
@@ -652,6 +915,10 @@ impl MmMs {
         self.reg_state = RegState::Registering;
         self.t351_countdown = T351_TIMEOUT_SLOTS;
         self.attempts += 1;
+
+        // TNMM-SERVICE indication (Table 15.6): in service, awaiting the
+        // registration response (cl. 15.3.4 "in service waiting for registration").
+        self.emit_service(crate::tnmm::ServiceStatus::InServiceWaitingForRegistration);
     }
 
     /// Build and send a U-ITSI DETACH (cl. 16.9.3.3) down to MLE as part of the
@@ -781,8 +1048,9 @@ impl MmMs {
         // log the result for observability; RX group filtering continues to use
         // the configured attach_groups (dynamic granted-set tracking is a future
         // refinement).
+        let mut attached_gssis: Vec<u32> = Vec::new();
         if let Some(accept) = &pdu.group_identity_location_accept {
-            let attached: Vec<u32> = accept
+            attached_gssis = accept
                 .group_identity_downlink
                 .as_ref()
                 .map(|v| {
@@ -795,7 +1063,7 @@ impl MmMs {
             tracing::info!(
                 "MM: group attachment result (accept_reject={}): attached GSSIs {:?}",
                 accept.group_identity_accept_reject,
-                attached
+                attached_gssis
             );
         } else if !self.attach_groups().is_empty() {
             // cl. 16.4.1.1: "In case the group identity location accept
@@ -824,6 +1092,10 @@ impl MmMs {
         }
         self.t351_countdown = 0;
         self.system_rejection_count = 0;
+
+        // TNMM-SAP (cl. 15.3) outbound indications to the user application. MM has
+        // just carried out the registration procedure successfully.
+        self.emit_registration_success(&attached_gssis);
     }
 
     /// Handle D-LOCATION-UPDATE-REJECT (cl. 16.9.2.9 / 16.4.1.1): the SwMI
@@ -870,8 +1142,10 @@ impl MmMs {
         }
 
         // TNMM-REGISTRATION indication ("failure" + reject cause, cl. 16.4.1.1)
-        // would be issued to the user application here; there is no user-app
-        // consumer of the TNMM-SAP in this stack, so it is logged above.
+        // to the user application is emitted from the terminal branches below —
+        // only where MM actually abandons the registration (not while a re-try is
+        // still outstanding, which keeps the procedure in progress).
+        let cause_opt = cause.ok();
 
         let action = cause.map(Self::analyse_reject_cause).unwrap_or(RejectAction::Abandon);
         match action {
@@ -890,6 +1164,8 @@ impl MmMs {
                         MAX_REGISTRATION_ATTEMPTS
                     );
                     self.reg_state = RegState::Idle;
+                    // Terminal: registration procedure carried out unsuccessfully.
+                    self.emit_registration_failure(cause_opt);
                 }
             }
             RejectAction::Abandon => {
@@ -899,6 +1175,8 @@ impl MmMs {
                 // the next LMM-ACTIVATE confirmation.
                 tracing::info!("MM: reject cause requires cell reselection / abandon; returning to idle");
                 self.reg_state = RegState::Idle;
+                // Terminal: registration procedure carried out unsuccessfully.
+                self.emit_registration_failure(cause_opt);
             }
             RejectAction::SystemRejection => {
                 self.system_rejection_count = self.system_rejection_count.saturating_add(1);
@@ -917,6 +1195,8 @@ impl MmMs {
                     );
                 }
                 self.reg_state = RegState::Idle;
+                // Terminal: registration procedure carried out unsuccessfully.
+                self.emit_registration_failure(cause_opt);
             }
         }
     }
@@ -969,8 +1249,441 @@ impl MmMs {
             _ => RejectAction::Abandon,
         }
     }
-}
 
+    /// Drain and handle inbound external-interface commands (UI -> stack).
+    ///
+    /// The control endpoint is polled once per downlink tick (mirroring
+    /// `MmBs::tick_start`). Commands are drained first so the immutable borrow of
+    /// `self.control` is released before any handler mutates MM state.
+    ///
+    /// Unlike the BS placeholder handler this never panics: commands originate
+    /// from an external UI process and an unexpected/unsupported variant must not
+    /// be able to crash the MS stack.
+    fn poll_control(&mut self, queue: &mut MessageQueue) {
+        let mut commands = Vec::new();
+        if let Some(cep) = &self.control {
+            while let Some(cmd) = cep.try_recv() {
+                commands.push(cmd);
+            }
+        }
+        for cmd in commands {
+            self.handle_control_command(queue, cmd);
+        }
+    }
+
+    /// Send a control response back to the UI, if a control endpoint is wired.
+    fn respond(&self, response: crate::net_control::ControlResponse) {
+        if let Some(cep) = &self.control {
+            cep.respond(response);
+        }
+    }
+
+    /// Handle one inbound control command. TNMM-SAP requests (Plane A, cl. 15.3)
+    /// are acted upon here; the TNMM *result* is reported asynchronously through
+    /// the outbound TNMM-SAP indications/confirms on the telemetry channel
+    /// (cl. 15.3.2), so the control response only acknowledges whether MM acted.
+    fn handle_control_command(&mut self, queue: &mut MessageQueue, cmd: crate::net_control::ControlCommand) {
+        use crate::net_control::{ControlCommand, ControlResponse};
+        match cmd {
+            // TNMM-REGISTRATION request (Table 15.5, cl. 15.3.3.7): initiate
+            // attachment and registration of the terminal.
+            ControlCommand::TnmmRegistration { handle, request } => {
+                self.handle_tnmm_registration_request(queue, handle, &request);
+            }
+            // TNMM-DEREGISTRATION request (Table 15.2, cl. 15.3.3.2): cancel the
+            // registration. Reuses the shutdown de-registration path (cl. 16.6.1),
+            // which sends U-ITSI DETACH and emits TNMM-SERVICE "out of service".
+            ControlCommand::TnmmDeregistration { handle, request } => {
+                // Table 15.2 NOTE: with all attached ITSIs detached the ISSI/MCC/
+                // MNC need not be present. When present, they must select this
+                // MS's own ITSI (single-ITSI stack).
+                if let Some(issi) = request.issi {
+                    if issi != self.own_issi() {
+                        tracing::warn!(
+                            "MM(MS): TNMM-DEREGISTRATION for ISSI {} != own ISSI {}; ignoring",
+                            issi,
+                            self.own_issi()
+                        );
+                        self.respond(ControlResponse::TnmmAck {
+                            handle,
+                            accepted: false,
+                            detail: Some("ISSI does not match the configured ITSI".to_string()),
+                        });
+                        return;
+                    }
+                }
+                let acted = self.begin_deregistration(queue);
+                let detail = if acted { None } else { Some("not registered; nothing to detach".to_string()) };
+                self.respond(ControlResponse::TnmmAck { handle, accepted: true, detail });
+            }
+            // TNMM-ATTACH DETACH GROUP IDENTITY request (Table 15.1, cl. 15.3.3.1):
+            // the standalone U-ATTACH/DETACH GROUP IDENTITY procedure (cl. 16.9.3)
+            // is not implemented in this stack — group attachment is only carried
+            // bundled in the ITSI-attach registration (cl. 16.8.2). Documented
+            // deferral: accepted = false so the UI knows no action was taken.
+            ControlCommand::TnmmAttachDetachGroupIdentity { handle, request } => {
+                tracing::warn!(
+                    "MM(MS): TNMM-ATTACH DETACH GROUP IDENTITY request received but the standalone \
+                     group identity procedure (cl. 16.9.3) is not implemented; {} entrie(s) ignored",
+                    request.group_identity_request.len()
+                );
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some(
+                        "standalone group attach/detach (cl. 16.9.3) not implemented; \
+                         groups are attached at registration"
+                            .to_string(),
+                    ),
+                });
+            }
+            // TNMM-STATUS request (Table 15.7, cl. 15.3.3.9): selects direct mode
+            // / dual watch / energy economy — none implemented in this stack.
+            ControlCommand::TnmmStatus { handle, .. } => {
+                tracing::warn!(
+                    "MM(MS): TNMM-STATUS request received but direct mode / dual watch / energy \
+                     economy are not implemented; ignoring"
+                );
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("direct mode / dual watch / energy economy not implemented".to_string()),
+                });
+            }
+            // TNMM-ENERGY SAVING request (Table 15.3, cl. 15.3.3.5): dormant —
+            // the energy-economy procedure (cl. 16.7) is not implemented.
+            ControlCommand::TnmmEnergySaving { handle, .. } => {
+                tracing::warn!("MM(MS): TNMM-ENERGY SAVING request received but energy economy (cl. 16.7) is not implemented; ignoring");
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("energy economy (cl. 16.7) not implemented".to_string()),
+                });
+            }
+            // Management / provisioning (Plane B, **NON-STANDARD**). Served here
+            // because MM is the single writer of MS runtime state. See
+            // `crate::management` for the standards disclaimer.
+            ControlCommand::Management(mgmt) => {
+                self.handle_management_command(mgmt, queue);
+            }
+            // Non-TNMM commands are not addressed to MM(MS); log and drop.
+            other => {
+                tracing::warn!("MM(MS): received non-TNMM control command with no MS handler, dropping: {:?}", other);
+            }
+        }
+    }
+
+    /// Act on a TNMM-REGISTRATION request (Table 15.5). Validates the requested
+    /// ITSI against the configured one (single-ITSI stack) and, when the MS is
+    /// idle, initiates the ITSI-attach registration by sending a
+    /// U-LOCATION-UPDATE-DEMAND — the same path taken on serving-cell selection
+    /// (rx_activate_conf). The registration *result* is reported later through
+    /// the TNMM-REGISTRATION indication/confirm.
+    fn handle_tnmm_registration_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        handle: u32,
+        request: &crate::tnmm::TnmmRegistrationRequest,
+    ) {
+        use crate::net_control::ControlResponse;
+
+        // The request identifies the ITSI to register (ISSI + MNI). This stack
+        // manages a single configured ITSI, so a mismatch cannot be honoured.
+        let own_mcc = self.config.config().net.mcc;
+        let own_mnc = self.config.config().net.mnc;
+        if request.issi != self.own_issi() || request.mcc_of_issi != own_mcc || request.mnc_of_issi != own_mnc {
+            tracing::warn!(
+                "MM(MS): TNMM-REGISTRATION request for ITSI {}/{}/{} != configured {}/{}/{}; ignoring",
+                request.mcc_of_issi,
+                request.mnc_of_issi,
+                request.issi,
+                own_mcc,
+                own_mnc,
+                self.own_issi()
+            );
+            self.respond(ControlResponse::TnmmAck {
+                handle,
+                accepted: false,
+                detail: Some("ISSI/MNI does not match the configured ITSI".to_string()),
+            });
+            return;
+        }
+
+        if self.left_system {
+            self.respond(ControlResponse::TnmmAck {
+                handle,
+                accepted: false,
+                detail: Some("MS left the system (N351); registration requires a restart".to_string()),
+            });
+            return;
+        }
+
+        match self.reg_state {
+            RegState::Idle => {
+                // Initiate the ITSI-attach registration. Note: MLE must have a
+                // serving cell for the demand to actually be transmitted; the
+                // demand reuses the exact air path of rx_activate_conf.
+                tracing::info!("MM(MS): TNMM-REGISTRATION request; initiating ITSI attach registration");
+                self.attempts = 0;
+                self.send_location_update_demand(queue, LocationUpdateType::ItsiAttach);
+                self.respond(ControlResponse::TnmmAck { handle, accepted: true, detail: None });
+            }
+            RegState::Registering => {
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("registration already in progress".to_string()),
+                });
+            }
+            RegState::Registered => {
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("already registered".to_string()),
+                });
+            }
+            RegState::Detaching => {
+                self.respond(ControlResponse::TnmmAck {
+                    handle,
+                    accepted: false,
+                    detail: Some("de-registration in progress".to_string()),
+                });
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Management / provisioning handlers (Plane B, **NON-STANDARD**).
+    //
+    // Implementation-defined stack provisioning + runtime-state reads. NOT part
+    // of any ETSI standard (see `crate::management`). Carried over the reused
+    // control transport in the dedicated `Management` variant.
+    // ----------------------------------------------------------------------
+
+    /// Handle one inbound management command (Plane B, non-standard).
+    fn handle_management_command(&mut self, cmd: crate::management::ManagementCommand, queue: &mut MessageQueue) {
+        use crate::management::{ManagementCommand, ManagementResponse};
+        use crate::net_control::ControlResponse;
+        match cmd {
+            // Read-only runtime state snapshot; always serviceable.
+            ManagementCommand::GetState { handle } => {
+                let state = self.runtime_snapshot();
+                self.respond(ControlResponse::Management(ManagementResponse::State {
+                    handle,
+                    state: Box::new(state),
+                }));
+            }
+            // Frozen interface schema version discovery; always serviceable.
+            ManagementCommand::GetInterfaceVersion { handle } => {
+                self.respond(ControlResponse::Management(ManagementResponse::InterfaceVersion {
+                    handle,
+                    version: crate::management::MS_INTERFACE_SCHEMA_VERSION.to_string(),
+                }));
+            }
+            // Read the active configuration as canonical TOML (always serviceable).
+            // Secrets are redacted on the wire; the real values never leave the
+            // process (restored on SetConfig write-back from the current config).
+            ManagementCommand::GetConfig { handle } => {
+                let cfg = self.config.config();
+                match tetra_config::bluestation::to_toml_string_redacted(&cfg) {
+                    Ok(toml) => {
+                        self.respond(ControlResponse::Management(ManagementResponse::Config { handle, toml }));
+                    }
+                    Err(e) => {
+                        tracing::error!("MM(MS): failed to serialize active config: {e}");
+                        self.respond(ControlResponse::Management(ManagementResponse::Error {
+                            handle,
+                            message: format!("failed to serialize active config: {e}"),
+                        }));
+                    }
+                }
+            }
+            // Stage a new configuration: validate through the exact startup
+            // validator, then persist to disk. Structural changes take effect on
+            // the next `ApplyConfig`; the process is NOT bounced here.
+            ManagementCommand::SetConfig { handle, toml } => {
+                self.handle_set_config(handle, toml);
+            }
+            // Apply staged configuration: drain-and-restart under the external
+            // supervisor. Reuses the graceful de-registration drain (cl. 16.6.1).
+            ManagementCommand::ApplyConfig { handle } => {
+                self.handle_apply_config(handle, queue);
+            }
+        }
+    }
+
+    /// Validate + persist a staged configuration (Plane B, non-standard).
+    ///
+    /// The payload is parsed through [`tetra_config::bluestation::from_toml_str`]
+    /// — the exact validator the stack runs at startup — so a config that would
+    /// fail to load is rejected here rather than bricking the radio on restart.
+    /// On success it is re-serialized to canonical form and written to the
+    /// config file, and `restart_required` is set so the UI shows a pending
+    /// restart. The running process keeps its current (old) config until an
+    /// explicit `ApplyConfig`.
+    fn handle_set_config(&mut self, handle: u32, toml: String) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+
+        let ctx = match &self.mgmt_ctx {
+            Some(ctx) => ctx,
+            None => {
+                tracing::warn!("MM(MS): SetConfig received but no management context installed; refusing");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: "configuration write-back is not available in this deployment".to_string(),
+                }));
+                return;
+            }
+        };
+
+        // 1) Validate: parse through the startup validator.
+        let parsed = match tetra_config::bluestation::from_toml_str(&toml) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!("MM(MS): SetConfig rejected invalid configuration: {e}");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: format!("configuration rejected: {e}"),
+                }));
+                return;
+            }
+        };
+
+        // 2) Merge redacted secrets: a UI that read the config via GetConfig sees
+        //    secrets as the REDACTED_SECRET sentinel. Preserve the live on-disk
+        //    value for any secret returned unchanged (sentinel), so a benign
+        //    round-trip edit never clobbers a credential; genuinely-new secrets
+        //    (not the sentinel) are kept as supplied.
+        let current = self.config.config();
+        let parsed = tetra_config::bluestation::restore_redacted_secrets(parsed, &current);
+
+        // 3) Normalize: re-serialize so the on-disk file is canonical and
+        //    provably re-parses to the validated config.
+        let normalized = match tetra_config::bluestation::to_toml_string(&parsed) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("MM(MS): SetConfig failed to normalize configuration: {e}");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: format!("configuration could not be serialized: {e}"),
+                }));
+                return;
+            }
+        };
+
+        // 4) Persist to the config file path.
+        let path = ctx.config_path.clone();
+        if let Err(e) = std::fs::write(&path, normalized) {
+            tracing::error!("MM(MS): SetConfig failed to write {}: {e}", path.display());
+            self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                handle,
+                accepted: false,
+                restart_required: self.restart_required,
+                message: format!("failed to write configuration file: {e}"),
+            }));
+            return;
+        }
+
+        self.restart_required = true;
+        tracing::info!("MM(MS): staged new configuration to {} (restart required to apply)", path.display());
+        self.respond(ControlResponse::Management(ManagementResponse::Ack {
+            handle,
+            accepted: true,
+            restart_required: true,
+            message: "configuration staged; apply (restart) required to take effect".to_string(),
+        }));
+    }
+
+    /// Apply staged configuration by draining and requesting a controlled
+    /// restart (Plane B, non-standard).
+    ///
+    /// This reuses the existing graceful shutdown path: if the MS is registered
+    /// it begins de-registration (U-ITSI DETACH, cl. 16.6.1) so the drain sends
+    /// it, then clears the shared `is_running` flag to break the stack run loop
+    /// and sets `restart_requested` so `main` exits with the restart exit code.
+    /// The external supervisor respawns the process with the new config. It does
+    /// **not** relaunch in-process (the SDR handle and thread graph are owned by
+    /// `main`).
+    fn handle_apply_config(&mut self, handle: u32, queue: &mut MessageQueue) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+
+        let ctx = match &self.mgmt_ctx {
+            Some(ctx) => ctx,
+            None => {
+                tracing::warn!("MM(MS): ApplyConfig received but no management context installed; refusing");
+                self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                    handle,
+                    accepted: false,
+                    restart_required: self.restart_required,
+                    message: "restart/apply is not available in this deployment".to_string(),
+                }));
+                return;
+            }
+        };
+
+        // Signal main to exit with the restart code once the loop unwinds, and
+        // clear the running flag to break the loop and start the drain.
+        ctx.restart_requested.store(true, Ordering::SeqCst);
+        ctx.is_running.store(false, Ordering::SeqCst);
+
+        // Reuse the graceful de-registration drain so a registered MS cleanly
+        // detaches before the restart (best-effort, cl. 16.6.1).
+        let detaching = self.begin_deregistration(queue);
+
+        tracing::info!(
+            "MM(MS): ApplyConfig -> restart requested (detach initiated: {}); supervisor will respawn with new config",
+            detaching
+        );
+        self.respond(ControlResponse::Management(ManagementResponse::Ack {
+            handle,
+            accepted: true,
+            restart_required: self.restart_required,
+            message: "restart initiated; the stack will de-register and respawn with the staged configuration".to_string(),
+        }));
+    }
+
+    /// Build an [`crate::management::MsRuntimeState`] snapshot from MM's own
+    /// state and the active configuration (Plane B, non-standard). MM is the
+    /// single writer of MS runtime state, so no locking is required.
+    fn runtime_snapshot(&self) -> crate::management::MsRuntimeState {
+        use crate::management::{MsRuntimeState, RegistrationState};
+        use crate::tnmm::ServiceStatus;
+
+        let registration_state = match self.reg_state {
+            RegState::Idle => RegistrationState::Idle,
+            RegState::Registering => RegistrationState::Registering,
+            RegState::Registered => RegistrationState::Registered,
+            RegState::Detaching => RegistrationState::Detaching,
+        };
+        // Derived service status: mirrors the vocabulary of the TNMM-SERVICE
+        // indication (Plane A) without asserting a standardized primitive.
+        let service_status = match self.reg_state {
+            RegState::Registered => ServiceStatus::InService,
+            RegState::Registering => ServiceStatus::InServiceWaitingForRegistration,
+            RegState::Idle | RegState::Detaching => ServiceStatus::OutOfService,
+        };
+        let cfg = self.config.config();
+        MsRuntimeState {
+            registration_state,
+            service_status,
+            own_issi: self.own_issi(),
+            home_mcc: cfg.net.mcc,
+            home_mnc: cfg.net.mnc,
+            serving_la: self.serving_la,
+            colour_code: cfg.cell.colour_code,
+            attached_groups: self.attach_groups(),
+            restart_required: self.restart_required,
+        }
+    }
+}
 /// Action MM takes after analysing a D-LOCATION-UPDATE-REJECT cause
 /// (ETSI TS 100 392-2 cl. 16.4.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -995,6 +1708,11 @@ impl TetraEntityTrait for MmMs {
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
+        // Drain any inbound external-interface (UI -> stack) commands first.
+        // Phase T0 wires the endpoint but defines no MS control commands yet;
+        // TNMM requests (ETSI TS 100 392-2 cl. 15.3) are handled here in T2.
+        self.poll_control(queue);
+
         // While detaching at shutdown, count down the bounded drain that gives
         // the MAC/PHY time to transmit the U-ITSI DETACH (cl. 16.6.1).
         if self.reg_state == RegState::Detaching {
@@ -1061,6 +1779,10 @@ impl TetraEntityTrait for MmMs {
         self.send_itsi_detach(queue);
         self.reg_state = RegState::Detaching;
         self.detach_countdown = DETACH_DRAIN_SLOTS;
+
+        // TNMM-SERVICE indication (Table 15.6): the MS is de-registering and
+        // therefore going out of service (cl. 15.3.4 "out of service").
+        self.emit_service(crate::tnmm::ServiceStatus::OutOfService);
         true
     }
 
@@ -1072,6 +1794,8 @@ impl TetraEntityTrait for MmMs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_control::ControlCommand;
+    use crate::net_telemetry::TelemetryEvent;
     use tetra_config::bluestation::from_toml_str;
     use tetra_saps::lmm::LmmMleUnitdataInd;
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
@@ -1121,14 +1845,14 @@ attach_groups = []
 
     fn ms_mm() -> MmMs {
         let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
-        MmMs::new(SharedConfig::from_parts(cfg, None))
+        MmMs::new(SharedConfig::from_parts(cfg, None), None, None)
     }
 
     fn ms_mm_with_groups(groups: &[u32]) -> MmMs {
         let list = groups.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
         let toml = MS_TOML.replace("attach_groups = []", &format!("attach_groups = [{list}]"));
         let cfg = from_toml_str(&toml).expect("valid MS test config");
-        MmMs::new(SharedConfig::from_parts(cfg, None))
+        MmMs::new(SharedConfig::from_parts(cfg, None), None, None)
     }
 
     fn activate_conf(registration_required: bool) -> LmmMleActivateConf {
@@ -1823,5 +2547,867 @@ attach_groups = []
         mm.rx_activate_conf(&mut q, &activate_conf_cell_sws(false, 901, 9999, 1, false));
         assert_eq!(mm.reg_state, RegState::Registering);
         assert_eq!(pop_demand_lu_type(&mut q), LocationUpdateType::ItsiAttach);
+    }
+
+    // --- Phase T0: MS external-interface wiring (enabler; no TNMM behaviour) ---
+
+    /// Build an MS MM wired to a telemetry sink and a control endpoint, and
+    /// return the far ends (telemetry source + command dispatcher) so a test can
+    /// act as the external UI process.
+    fn ms_mm_wired() -> (MmMs, crate::net_telemetry::TelemetrySource, crate::net_control::CommandDispatcher) {
+        use crate::net_control::channel::make_control_link;
+        use crate::net_telemetry::telemetry_channel;
+        let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
+        let (sink, source) = telemetry_channel();
+        let (dispatcher, endpoint) = make_control_link();
+        let mm = MmMs::new(SharedConfig::from_parts(cfg, None), Some(sink), Some(endpoint));
+        (mm, source, dispatcher)
+    }
+
+    /// T0: `MmMs::new` accepts and stores the telemetry sink + control endpoint
+    /// (mirroring `MmBs`), so `build_ms_stack` can wire the external interface.
+    #[test]
+    fn test_ms_mm_accepts_telemetry_and_control() {
+        let (mm, _source, _dispatcher) = ms_mm_wired();
+        assert!(mm.telemetry.is_some(), "telemetry sink wired");
+        assert!(mm.control.is_some(), "control endpoint wired");
+    }
+
+    /// T0: MM drains the control endpoint each tick. No MS control command is
+    /// defined yet, so an inbound command must be consumed and dropped without
+    /// panicking or altering registration state (cl. 15.3 requests land in T2).
+    #[test]
+    fn test_ms_mm_drains_control_without_panic() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::CommandA { handle: 7, parameter: 1 });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        // Command consumed (nothing left for the endpoint to receive), state
+        // unchanged, and no uplink PDU produced as a side effect.
+        assert_eq!(mm.reg_state, RegState::Idle, "control command must not change reg state");
+        assert!(q.pop_front().is_none(), "no PDU emitted for an unhandled control command");
+    }
+
+    // -----------------------------------------------------------------------
+    // T1: TNMM-SAP outbound indications (cl. 15.3.3 / 15.3.4). Drive MM state
+    // transitions through a wired telemetry sink and assert the exact primitives
+    // reach the (simulated) user application.
+    // -----------------------------------------------------------------------
+
+    /// Collect all telemetry events currently queued on the source.
+    fn drain(source: &crate::net_telemetry::TelemetrySource) -> Vec<TelemetryEvent> {
+        let mut out = Vec::new();
+        while let Some(e) = source.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    /// Successful registration emits, in order: a TNMM-SERVICE "in service
+    /// waiting for registration" indication when the demand is sent, then on
+    /// D-LOCATION-UPDATE-ACCEPT a TNMM-REGISTRATION indication + confirm
+    /// (status = success) and a TNMM-SERVICE "in service" indication
+    /// (cl. 15.3.3.7 / 15.3.3.8).
+    #[test]
+    fn test_accept_emits_registration_success_and_service() {
+        use crate::tnmm::{RegistrationStatus, ServiceStatus};
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let waiting = drain(&source);
+        assert!(
+            waiting.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s)
+                    if s.service_status == ServiceStatus::InServiceWaitingForRegistration
+            )),
+            "demand must emit 'in service waiting for registration'"
+        );
+
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        let events = drain(&source);
+
+        let reg_ind = events.iter().find_map(|e| match e {
+            TelemetryEvent::TnmmRegistrationIndication(i) => Some(i),
+            _ => None,
+        });
+        let reg_ind = reg_ind.expect("TNMM-REGISTRATION indication emitted on accept");
+        assert_eq!(reg_ind.registration_status, RegistrationStatus::Success);
+        assert_eq!(reg_ind.registration_reject_cause, None);
+        assert_eq!(reg_ind.cell_type_where_registered, crate::tnmm::CellType::CaCell);
+        assert_eq!(reg_ind.la_where_registered, 1);
+        assert_eq!(reg_ind.mcc_where_registered, 901);
+        assert_eq!(reg_ind.mnc_where_registered, 9999);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmRegistrationConfirm(c) if c.registration_status == RegistrationStatus::Success
+            )),
+            "TNMM-REGISTRATION confirm emitted on accept"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::InService
+            )),
+            "TNMM-SERVICE 'in service' emitted on accept"
+        );
+    }
+
+    /// `emit_registration_success` builds one `GroupIdentity` per attached GSSI
+    /// with GITI = Attachment and GTSI = (own MNI << 24) | GSSI (cl. 15.3.4), and
+    /// emits a TNMM-ATTACH DETACH GROUP IDENTITY indication (cl. 15.3.3.1).
+    #[test]
+    fn test_registration_success_emits_group_identities() {
+        use crate::tnmm::GroupIdentityAttachDetachTypeIdentifier as Giti;
+        let (mm, source, _dispatcher) = ms_mm_wired();
+        let gssi = 100u32;
+        mm.emit_registration_success(&[gssi]);
+        let events = drain(&source);
+
+        let group_ind = events.iter().find_map(|e| match e {
+            TelemetryEvent::TnmmAttachDetachGroupIdentityIndication(i) => Some(i),
+            _ => None,
+        });
+        let group_ind = group_ind.expect("group identity indication emitted for attached GSSIs");
+        assert_eq!(group_ind.group_identities.len(), 1);
+        let g = &group_ind.group_identities[0];
+        assert_eq!(g.group_identity_attach_detach_type_identifier, Giti::Attachment);
+        let expected_gtsi = ((mm.own_mni() as u64) << 24) | (gssi as u64);
+        assert_eq!(g.gtsi, expected_gtsi);
+        assert!(g.group_identity_lifetime.is_some(), "GITI=Attachment carries lifetime");
+        assert!(g.class_of_usage.is_some(), "GITI=Attachment carries class of usage");
+        assert!(g.group_identity_detachment_reason.is_none());
+    }
+
+    /// A terminal reject (Illegal MS → abandon) emits a TNMM-REGISTRATION
+    /// indication with status = failure + the mapped reject cause, then a
+    /// TNMM-SERVICE "out of service" indication (cl. 15.3.3.7 / 15.3.4).
+    #[test]
+    fn test_reject_emits_registration_failure_and_out_of_service() {
+        use crate::tnmm::{RegistrationRejectCause, RegistrationStatus, ServiceStatus};
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = drain(&source); // discard the "waiting" service indication
+
+        // Illegal MS (cause 2) is an abandon cause (cl. 16.4.1.1): terminal.
+        deliver_dl(&mut mm, &mut q, build_reject(2));
+        assert_eq!(mm.reg_state, RegState::Idle);
+        let events = drain(&source);
+
+        let reg_ind = events.iter().find_map(|e| match e {
+            TelemetryEvent::TnmmRegistrationIndication(i) => Some(i),
+            _ => None,
+        });
+        let reg_ind = reg_ind.expect("TNMM-REGISTRATION failure indication emitted on terminal reject");
+        assert_eq!(reg_ind.registration_status, RegistrationStatus::Failure);
+        assert_eq!(reg_ind.registration_reject_cause, Some(RegistrationRejectCause::IllegalMs));
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
+            )),
+            "TNMM-SERVICE 'out of service' emitted on terminal reject"
+        );
+    }
+
+    /// A recoverable reject (Congestion → re-try) keeps the registration in
+    /// progress, so no failure indication is emitted (cl. 16.4.1.1).
+    #[test]
+    fn test_recoverable_reject_emits_no_failure() {
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = drain(&source);
+
+        // Congestion (cause 6) permits a re-try: still Registering, not terminal.
+        deliver_dl(&mut mm, &mut q, build_reject(6));
+        let events = drain(&source);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TelemetryEvent::TnmmRegistrationIndication(_))),
+            "no failure indication while a re-try is still outstanding"
+        );
+    }
+
+    /// The on-air reject causes "use CA/DA cell not permitted" (cl. 16.10.42)
+    /// have no TNMM-SAP enumerant (cl. 15.3.4): the mapping returns `None`.
+    #[test]
+    fn test_reject_cause_without_tnmm_enumerant_maps_to_none() {
+        assert_eq!(
+            MmMs::map_registration_reject_cause(RejectCause::UseCaCellNotPermitted),
+            None
+        );
+        assert_eq!(
+            MmMs::map_registration_reject_cause(RejectCause::UseDaCellNotPermitted),
+            None
+        );
+        assert_eq!(
+            MmMs::map_registration_reject_cause(RejectCause::IllegalMs),
+            Some(crate::tnmm::RegistrationRejectCause::IllegalMs)
+        );
+    }
+
+    /// De-registration at shutdown emits a TNMM-SERVICE "out of service"
+    /// indication (cl. 15.3.3.8).
+    #[test]
+    fn test_deregistration_emits_out_of_service() {
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        let _ = drain(&source); // discard registration/service events
+
+        assert!(mm.begin_deregistration(&mut q));
+        let events = drain(&source);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
+            )),
+            "de-registration emits 'out of service'"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T2: TNMM-SAP requests (INBOUND, cl. 15.3.3). Drive requests through the
+    // wired control link (dispatcher = UI side) and assert MM's action + the
+    // TnmmAck transport response.
+    // -----------------------------------------------------------------------
+
+    /// Build the MS's own valid TNMM-REGISTRATION request (matching ITSI/MNI).
+    fn own_registration_request() -> crate::tnmm::TnmmRegistrationRequest {
+        use crate::tnmm::{RegistrationType, TnmmRegistrationRequest};
+        TnmmRegistrationRequest {
+            registration_type: RegistrationType::RegistrationToIndicatedCell,
+            required_cell_type_list: None,
+            preferred_cell_type_list: None,
+            preferred_la_list: None,
+            preferred_mcc_list: None,
+            preferred_mnc_list: None,
+            issi: MS_ISSI,
+            mcc_of_issi: 901,
+            mnc_of_issi: 9999,
+            energy_economy_mode: None,
+            group_identity_request: None,
+            group_identity_attach_detach_mode: None,
+        }
+    }
+
+    fn last_ack(dispatcher: &crate::net_control::CommandDispatcher) -> (bool, Option<String>) {
+        let resps = dispatcher.try_recv_responses();
+        let ack = resps
+            .into_iter()
+            .find_map(|r| match r {
+                crate::net_control::ControlResponse::TnmmAck { accepted, detail, .. } => Some((accepted, detail)),
+                _ => None,
+            })
+            .expect("a TnmmAck response");
+        ack
+    }
+
+    /// A TNMM-REGISTRATION request (Table 15.5) while idle initiates the ITSI
+    /// attach: MM sends a U-LOCATION-UPDATE-DEMAND and moves to Registering, and
+    /// acknowledges acceptance (cl. 15.3.3.7).
+    #[test]
+    fn test_tnmm_registration_request_triggers_demand() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmRegistration {
+            handle: 11,
+            request: Box::new(own_registration_request()),
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Registering);
+        let msg = q.pop_front().expect("registration demand queued");
+        assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
+        let (accepted, _detail) = last_ack(&dispatcher);
+        assert!(accepted, "registration request accepted");
+    }
+
+    /// A TNMM-REGISTRATION request for a different ITSI is rejected (single-ITSI
+    /// stack) with no state change.
+    #[test]
+    fn test_tnmm_registration_request_wrong_itsi_rejected() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let mut req = own_registration_request();
+        req.issi = MS_ISSI + 1;
+        dispatcher.send(ControlCommand::TnmmRegistration { handle: 12, request: Box::new(req) });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle, "no registration for a foreign ITSI");
+        assert!(q.pop_front().is_none(), "no demand for a foreign ITSI");
+        let (accepted, detail) = last_ack(&dispatcher);
+        assert!(!accepted);
+        assert!(detail.is_some());
+    }
+
+    /// A TNMM-DEREGISTRATION request (Table 15.2) while registered runs the
+    /// de-registration: MM sends U-ITSI DETACH, moves to Detaching, emits
+    /// TNMM-SERVICE "out of service", and acknowledges (cl. 15.3.3.2 / 16.6.1).
+    #[test]
+    fn test_tnmm_deregistration_request_detaches() {
+        use crate::tnmm::{ServiceStatus, TnmmDeregistrationRequest};
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        // Register first.
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        while q.pop_front().is_some() {}
+        let _ = drain(&source);
+
+        dispatcher.send(ControlCommand::TnmmDeregistration {
+            handle: 21,
+            request: TnmmDeregistrationRequest { issi: Some(MS_ISSI), mcc: None, mnc: None },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Detaching);
+        let msg = q.pop_front().expect("U-ITSI DETACH queued");
+        assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
+        let events = drain(&source);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
+            )),
+            "de-registration emits 'out of service'"
+        );
+        let (accepted, _detail) = last_ack(&dispatcher);
+        assert!(accepted);
+    }
+
+    /// A TNMM-DEREGISTRATION request while not registered is a no-op that is
+    /// acknowledged with a documented detail.
+    #[test]
+    fn test_tnmm_deregistration_request_when_not_registered() {
+        use crate::tnmm::TnmmDeregistrationRequest;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmDeregistration {
+            handle: 22,
+            request: TnmmDeregistrationRequest { issi: None, mcc: None, mnc: None },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none());
+        let (accepted, detail) = last_ack(&dispatcher);
+        assert!(accepted);
+        assert!(detail.is_some(), "documented 'nothing to detach' detail");
+    }
+
+    /// The standalone group attach/detach procedure (cl. 16.9.3) is not
+    /// implemented: a TNMM-ATTACH DETACH GROUP IDENTITY request is acknowledged
+    /// as not-accepted with a documented deferral, and changes no state.
+    #[test]
+    fn test_tnmm_group_identity_request_is_deferred() {
+        use crate::tnmm::{
+            ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
+            TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle: 31,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: 0x01,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                    class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                    group_identity_detachment_request: None,
+                }],
+                group_identity_report: None,
+            },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none());
+        let (accepted, detail) = last_ack(&dispatcher);
+        assert!(!accepted, "deferred procedure is not accepted");
+        assert!(detail.is_some());
+    }
+
+    /// Dormant primitives (STATUS / ENERGY SAVING requests) are acknowledged as
+    /// not-accepted with a documented reason and change no state.
+    #[test]
+    fn test_tnmm_status_and_energy_saving_requests_are_dormant() {
+        use crate::tnmm::{EnergyEconomyMode, TnmmEnergySavingRequest, TnmmStatusRequest};
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::TnmmStatus {
+            handle: 41,
+            request: TnmmStatusRequest { direct_mode: None, dual_watch: None, energy_economy_mode: None },
+        });
+        dispatcher.send(ControlCommand::TnmmEnergySaving {
+            handle: 42,
+            request: TnmmEnergySavingRequest { energy_economy_mode: EnergyEconomyMode::EnergyEconomyMode1 },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle);
+        let resps = dispatcher.try_recv_responses();
+        let acks: Vec<_> = resps
+            .into_iter()
+            .filter_map(|r| match r {
+                crate::net_control::ControlResponse::TnmmAck { handle, accepted, .. } => Some((handle, accepted)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(acks.len(), 2);
+        assert!(acks.iter().all(|(_, accepted)| !*accepted), "dormant requests not accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // T3: management / provisioning (Plane B, NON-STANDARD). Read-path slice:
+    // GetState returns an MS runtime-state snapshot built from MM state + config.
+    // -----------------------------------------------------------------------
+
+    /// Extract the last `Management(State{..})` response from a dispatcher.
+    fn last_state(dispatcher: &crate::net_control::CommandDispatcher) -> (u32, crate::management::MsRuntimeState) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::State { handle, state }) => Some((handle, *state)),
+                _ => None,
+            })
+            .expect("a Management State response")
+    }
+
+    /// GetState before any cell selection reports Idle / OutOfService and echoes
+    /// the configured identity/network/cell fields (non-standard Plane B).
+    #[test]
+    fn test_management_get_state_idle_snapshot() {
+        use crate::management::{ManagementCommand, RegistrationState};
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetState { handle: 71 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, state) = last_state(&dispatcher);
+        assert_eq!(handle, 71);
+        assert_eq!(state.registration_state, RegistrationState::Idle);
+        assert_eq!(state.service_status, ServiceStatus::OutOfService);
+        assert_eq!(state.own_issi, 1000001);
+        assert_eq!(state.home_mcc, 901);
+        assert_eq!(state.home_mnc, 9999);
+        assert_eq!(state.serving_la, 1);
+        assert_eq!(state.colour_code, 1);
+        assert!(state.attached_groups.is_empty());
+        // GetState is read-only: registration state must be untouched.
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none(), "GetState must not emit any PDU");
+    }
+
+    /// After successful registration, GetState reflects Registered / InService.
+    #[test]
+    fn test_management_get_state_registered_snapshot() {
+        use crate::management::{ManagementCommand, RegistrationState};
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        while q.pop_front().is_some() {}
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetState { handle: 72 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_handle, state) = last_state(&dispatcher);
+        assert_eq!(state.registration_state, RegistrationState::Registered);
+        assert_eq!(state.service_status, ServiceStatus::InService);
+    }
+
+    // -----------------------------------------------------------------------
+    // T3: management / provisioning (Plane B, NON-STANDARD). Write-path slice:
+    // GetConfig / SetConfig (validate+persist) / ApplyConfig (drain+restart).
+    // -----------------------------------------------------------------------
+
+    /// Extract the last `Management(Config{..})` response from a dispatcher.
+    fn last_config(dispatcher: &crate::net_control::CommandDispatcher) -> (u32, String) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::Config { handle, toml }) => Some((handle, toml)),
+                _ => None,
+            })
+            .expect("a Management Config response")
+    }
+
+    /// Extract the last `Management(Ack{..})` response from a dispatcher.
+    fn last_mgmt_ack(dispatcher: &crate::net_control::CommandDispatcher) -> (u32, bool, bool) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::Ack { handle, accepted, restart_required, .. }) => {
+                    Some((handle, accepted, restart_required))
+                }
+                _ => None,
+            })
+            .expect("a Management Ack response")
+    }
+
+    /// GetInterfaceVersion returns the frozen schema-version string (live).
+    #[test]
+    fn test_management_get_interface_version() {
+        use crate::management::{ManagementCommand, ManagementResponse, MS_INTERFACE_SCHEMA_VERSION};
+        use crate::net_control::ControlResponse;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetInterfaceVersion { handle: 90 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, version) = dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .find_map(|r| match r {
+                ControlResponse::Management(ManagementResponse::InterfaceVersion { handle, version }) => {
+                    Some((handle, version))
+                }
+                _ => None,
+            })
+            .expect("an InterfaceVersion response");
+        assert_eq!(handle, 90);
+        assert_eq!(version, MS_INTERFACE_SCHEMA_VERSION);
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// GetConfig returns canonical TOML that re-parses through the validator.
+    #[test]
+    fn test_management_get_config_roundtrips() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 80 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, toml) = last_config(&dispatcher);
+        assert_eq!(handle, 80);
+        let reparsed = from_toml_str(&toml).expect("GetConfig TOML must re-parse");
+        assert_eq!(reparsed.net.mcc, 901);
+        assert_eq!(reparsed.net.mnc, 9999);
+        assert_eq!(reparsed.ms.as_ref().unwrap().issi, 1000001);
+        // Read-only: no PDU emitted, state untouched.
+        assert!(q.pop_front().is_none());
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// SetConfig without an installed management context is refused gracefully
+    /// (accepted = false), never panics, and does not touch state.
+    #[test]
+    fn test_management_set_config_without_context_refused() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 81,
+            toml: MS_TOML.to_string(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 81);
+        assert!(!accepted, "no context => refused");
+        assert!(!restart_required);
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// SetConfig with a context validates + persists to disk and flags a pending
+    /// restart; the runtime snapshot then reports `restart_required = true`.
+    #[test]
+    fn test_management_set_config_persists_and_flags_restart() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-setcfg-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested.clone(), is_running.clone());
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 82,
+            toml: MS_TOML.to_string(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 82);
+        assert!(accepted, "valid config accepted");
+        assert!(restart_required, "restart flagged after staging");
+        // File written and re-parses.
+        let written = std::fs::read_to_string(&path).expect("config file written");
+        assert!(from_toml_str(&written).is_ok(), "persisted config must re-parse");
+        // SetConfig must NOT bounce the process.
+        assert!(is_running.load(std::sync::atomic::Ordering::SeqCst), "SetConfig must not stop the loop");
+        assert!(!restart_requested.load(std::sync::atomic::Ordering::SeqCst), "SetConfig must not request restart");
+        // Snapshot reflects the pending restart.
+        let snap = mm.runtime_snapshot();
+        assert!(snap.restart_required);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SetConfig rejects a config that fails the startup validator (accepted =
+    /// false) and does not write the file or flag a restart.
+    #[test]
+    fn test_management_set_config_rejects_invalid() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-badcfg-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested, is_running);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 83,
+            toml: "this = is not = valid toml {{{".to_string(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 83);
+        assert!(!accepted, "invalid config rejected");
+        assert!(!restart_required);
+        assert!(!path.exists(), "no file written for rejected config");
+        assert!(!mm.runtime_snapshot().restart_required);
+    }
+
+    // An MS config that additionally configures a control endpoint with HTTP
+    // Basic credentials, so the secret redaction/restore paths carry a secret.
+    const MS_TOML_WITH_SECRET: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+
+[command]
+host = "127.0.0.1"
+port = 9000
+username = "ui-operator"
+password = "supersecret"
+"#;
+
+    fn ms_mm_wired_with_secret(
+    ) -> (MmMs, crate::net_telemetry::TelemetrySource, crate::net_control::CommandDispatcher) {
+        use crate::net_control::channel::make_control_link;
+        use crate::net_telemetry::telemetry_channel;
+        let cfg = from_toml_str(MS_TOML_WITH_SECRET).expect("valid MS test config with secret");
+        let (sink, source) = telemetry_channel();
+        let (dispatcher, endpoint) = make_control_link();
+        let mm = MmMs::new(SharedConfig::from_parts(cfg, None), Some(sink), Some(endpoint));
+        (mm, source, dispatcher)
+    }
+
+    /// End-to-end secret handling (Plane B, non-standard):
+    /// - GetConfig redacts the control password on the wire (never leaks it).
+    /// - SetConfig with the redacted document back preserves the real on-disk
+    ///   secret (a benign round-trip must not clobber the credential).
+    /// - SetConfig with a genuinely new password overwrites it.
+    #[test]
+    fn test_management_config_redacts_and_preserves_secret() {
+        use crate::management::ManagementCommand;
+        use tetra_config::bluestation::REDACTED_SECRET;
+
+        let (mut mm, _source, dispatcher) = ms_mm_wired_with_secret();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-secret-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested, is_running);
+
+        // 1) GetConfig must redact the secret on the wire.
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 84 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, wire_toml) = last_config(&dispatcher);
+        assert!(!wire_toml.contains("supersecret"), "GetConfig must not leak the password");
+        assert!(wire_toml.contains(REDACTED_SECRET), "GetConfig carries the redaction sentinel");
+        assert!(wire_toml.contains("ui-operator"), "non-secret username still travels");
+
+        // 2) UI posts the redacted document back unchanged => on-disk secret preserved.
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 85,
+            toml: wire_toml.clone(),
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, accepted, _rr) = last_mgmt_ack(&dispatcher);
+        assert!(accepted, "redacted round-trip config accepted");
+        let written = std::fs::read_to_string(&path).expect("config written");
+        assert!(written.contains("supersecret"), "real secret preserved on disk");
+        assert!(!written.contains(REDACTED_SECRET), "sentinel never persisted to disk");
+
+        // 3) A genuinely new password is written through.
+        let rotated = wire_toml.replace(REDACTED_SECRET, "rotated-pass");
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 86,
+            toml: rotated,
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, accepted, _rr) = last_mgmt_ack(&dispatcher);
+        assert!(accepted, "rotated config accepted");
+        let written = std::fs::read_to_string(&path).expect("config written");
+        assert!(written.contains("rotated-pass"), "new secret written to disk");
+        assert!(!written.contains("supersecret"), "old secret replaced");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ApplyConfig requests the controlled restart: sets the shared
+    /// `restart_requested` flag and clears `is_running` so `main` exits with the
+    /// restart code, and (when registered) initiates the detach drain.
+    #[test]
+    fn test_management_apply_config_requests_restart() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        // Register first so ApplyConfig exercises the detach drain.
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        while q.pop_front().is_some() {}
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-apply-{}.toml", std::process::id()));
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path, restart_requested.clone(), is_running.clone());
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::ApplyConfig { handle: 84 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 84);
+        assert!(accepted, "apply accepted");
+        assert!(restart_requested.load(std::sync::atomic::Ordering::SeqCst), "restart requested");
+        assert!(!is_running.load(std::sync::atomic::Ordering::SeqCst), "run loop stopped");
+        // Registered MS begins de-registration (U-ITSI DETACH) on apply.
+        assert_eq!(mm.reg_state, RegState::Detaching);
+    }
+
+    /// ApplyConfig without a management context is refused gracefully.
+    #[test]
+    fn test_management_apply_config_without_context_refused() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::ApplyConfig { handle: 85 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 85);
+        assert!(!accepted, "no context => refused");
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// T4 (mock-transport CI): a management command survives a full JSON
+    /// encode -> decode -> MmMs handle -> response encode -> decode loop, proving
+    /// the wire path is portable end to end over the mock control transport.
+    #[test]
+    fn test_management_end_to_end_over_json_codec() {
+        use crate::management::{ManagementCommand, ManagementResponse};
+        use crate::net_control::ControlResponse;
+        use crate::net_control::codec::ControlCodecJson;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        let codec = ControlCodecJson;
+
+        // UI side: build a command, serialize it, and (mock transport) deserialize.
+        let wire = codec.encode_command(&ControlCommand::Management(ManagementCommand::GetInterfaceVersion { handle: 7 }));
+        let cmd = codec.decode_command(&wire).expect("decode command");
+        dispatcher.send(cmd);
+
+        // Stack side: MM handles it and emits a response.
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        // Response travels back over the mock transport: serialize + deserialize.
+        let resp = dispatcher
+            .try_recv_responses()
+            .into_iter()
+            .next()
+            .expect("a response");
+        let round = codec.decode_response(&codec.encode_response(&resp)).expect("decode response");
+        let ControlResponse::Management(ManagementResponse::InterfaceVersion { handle, version }) = round else {
+            panic!("expected InterfaceVersion response");
+        };
+        assert_eq!(handle, 7);
+        assert_eq!(version, crate::management::MS_INTERFACE_SCHEMA_VERSION);
     }
 }

@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use tetra_core::ranges::{SortedDisjointSsiRanges, SsiRange};
@@ -61,7 +61,7 @@ pub struct CfgCellInfo {
     pub timezone: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct CellInfoDto {
     pub main_carrier: u16,
     pub freq_band: u8,
@@ -100,7 +100,7 @@ pub struct CellInfoDto {
 
     pub timezone: Option<String>,
 
-    #[serde(flatten)]
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
 }
 
@@ -147,4 +147,47 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
 /// by users if needed.
 fn default_tetrapack_local_ranges() -> SortedDisjointSsiRanges {
     SortedDisjointSsiRanges::from_vec_ssirange(vec![SsiRange::new(0, 90)])
+}
+
+/// Inverse of [`cell_dto_to_cfg`] for TOML write-back (Plane B, non-standard).
+///
+/// The runtime `CfgCellInfo` holds concrete values (defaults already applied at
+/// load), so every optional DTO field is emitted as `Some(..)`; the resulting
+/// TOML re-parses to an identical `CfgCellInfo`. `freq_offset_hz`/
+/// `duplex_spacing_id` map back to the DTO's `freq_offset`/`duplex_spacing`
+/// (the exact inverse of [`cell_dto_to_cfg`]).
+pub fn cfg_to_cell_dto(ci: &CfgCellInfo) -> CellInfoDto {
+    CellInfoDto {
+        main_carrier: ci.main_carrier,
+        freq_band: ci.freq_band,
+        freq_offset: ci.freq_offset_hz,
+        duplex_spacing: ci.duplex_spacing_id,
+        reverse_operation: ci.reverse_operation,
+        custom_duplex_spacing: ci.custom_duplex_spacing,
+        location_area: ci.location_area,
+        neighbor_cell_broadcast: Some(ci.neighbor_cell_broadcast),
+        late_entry_supported: Some(ci.late_entry_supported),
+        subscriber_class: Some(ci.subscriber_class),
+        registration: Some(ci.registration),
+        deregistration: Some(ci.deregistration),
+        priority_cell: Some(ci.priority_cell),
+        no_minimum_mode: Some(ci.no_minimum_mode),
+        migration: Some(ci.migration),
+        system_wide_services: Some(ci.system_wide_services),
+        voice_service: Some(ci.voice_service),
+        circuit_mode_data_service: Some(ci.circuit_mode_data_service),
+        sndcp_service: Some(ci.sndcp_service),
+        aie_service: Some(ci.aie_service),
+        advanced_link: Some(ci.advanced_link),
+        system_code: Some(ci.system_code),
+        colour_code: Some(ci.colour_code),
+        sharing_mode: Some(ci.sharing_mode),
+        ts_reserved_frames: Some(ci.ts_reserved_frames),
+        u_plane_dtx: Some(ci.u_plane_dtx),
+        frame_18_ext: Some(ci.frame_18_ext),
+        ms_txpwr_max_cell: Some(ci.ms_txpwr_max_cell),
+        local_ssi_ranges: Some(ci.local_ssi_ranges.as_slice().iter().map(|r| (r.start, r.end)).collect()),
+        timezone: ci.timezone.clone(),
+        extra: HashMap::new(),
+    }
 }
