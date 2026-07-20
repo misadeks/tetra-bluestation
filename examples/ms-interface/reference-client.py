@@ -59,6 +59,30 @@ async def main(url: str) -> None:
         #    ack = await call({"Management": {"ApplyConfig": {"handle": 5}}})
         #    print("apply:", ack["Management"]["Ack"])  # stack de-registers + restarts
 
+        # 5) (Plane A, STANDARD) Switch talkgroup live (cl. 15.3.3.1 / cl. 16.8.2).
+        #    Requires the MS to already be registered. "DetachTheCurrentlyActive
+        #    GroupIdentities" detaches the current set and attaches GSSI 300 —
+        #    i.e. a talkgroup *change*. Use "Amendment" to add/remove without
+        #    disturbing the rest of the set. The Ack below only means "accepted
+        #    for processing"; the actual attach RESULT arrives asynchronously on
+        #    the telemetry channel as a TnmmAttachDetachGroupIdentityConfirm and
+        #    is reflected in GetState.attached_groups. Uncomment to use:
+        #    ack = await call({"TnmmAttachDetachGroupIdentity": {
+        #        "handle": 6,
+        #        "request": {
+        #            "group_identity_attach_detach_mode":
+        #                "DetachTheCurrentlyActiveGroupIdentities",
+        #            "group_identity_request": [{
+        #                "gtsi": 300,
+        #                "group_identity_attach_detach_type_identifier": "Attachment",
+        #                "class_of_usage": "ClassOfUsage4",
+        #                "group_identity_detachment_request": None,
+        #            }],
+        #            "group_identity_report": None,
+        #        },
+        #    }})
+        #    print("attach ack:", ack["TnmmAck"])
+
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

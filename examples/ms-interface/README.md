@@ -111,13 +111,47 @@ restart_required   : bool
 |---|---|---|
 | `TnmmRegistration {handle, request}` | 15.5 / 15.3.3.7 | initiate ITSI attach + registration |
 | `TnmmDeregistration {handle, request}` | 15.2 / 15.3.3.2 | U-ITSI DETACH (reuses shutdown drain) |
-| `TnmmAttachDetachGroupIdentity {handle, request}` | 15.1 / 15.3.3.1 | dormant: standalone cl. 16.9.3 not implemented (Ack accepted=false) |
+| `TnmmAttachDetachGroupIdentity {handle, request}` | 15.1 / 15.3.3.1 | live talkgroup attach/detach (standalone procedure cl. 16.8.2); requires the MS to be registered |
 | `TnmmStatus {handle, request}` | 15.7 / 15.3.3.9 | dormant: direct mode / dual watch / energy economy not implemented |
 | `TnmmEnergySaving {handle, request}` | 15.3 / 15.3.3.5 | dormant: energy economy cl. 16.7 not implemented |
 
 All requests are acknowledged with `ControlResponse::TnmmAck {handle, accepted:bool,
-detail:Option<String>}`. The TNMM *result* is reported asynchronously via the
-telemetry-channel indications (cl. 15.3.2).
+detail:Option<String>}`. The `TnmmAck` only reports whether the request was *accepted
+for processing* (e.g. rejected if the MS is not registered, or a group op is already
+outstanding). The TNMM *result* is reported asynchronously via the telemetry-channel
+indications/confirms (cl. 15.3.2).
+
+#### `TnmmAttachDetachGroupIdentity` request shape (Table 15.1 / 15.9)
+
+```
+{"TnmmAttachDetachGroupIdentity": {
+  "handle": 31,
+  "request": {
+    "group_identity_attach_detach_mode": "Amendment"
+        | "DetachTheCurrentlyActiveGroupIdentities",
+    "group_identity_request": [
+      { "gtsi": 300,
+        "group_identity_attach_detach_type_identifier": "Attachment",
+        "class_of_usage": "ClassOfUsage4",          // Attachment only
+        "group_identity_detachment_request": null } , // Detachment only
+      { "gtsi": 91,
+        "group_identity_attach_detach_type_identifier": "Detachment",
+        "class_of_usage": null,
+        "group_identity_detachment_request": "UserInitiatedDetachment" }
+    ],
+    "group_identity_report": null                   // Option<"ReportRequested"|"ReportNotRequested">
+  }
+}}
+```
+
+- `Amendment` (cl. 16.10.17 mode 0) adds/removes only the listed groups; the rest of
+  the attached set is untouched.
+- `DetachTheCurrentlyActiveGroupIdentities` (mode 1) detaches everything currently
+  attached, then attaches the listed groups — use this to *switch* talkgroup.
+- `gtsi` is the full 48-bit GTSI (`MNI << 24 | GSSI`); a bare GSSI also works (the low
+  24 bits are taken). `class_of_usage` maps to the on-air 3-bit value per cl. 16.10.6
+  (Table 16.32: "Class of usage N" = N-1). Detachment carries the reason per
+  cl. 16.10.21 (only `UserInitiatedDetachment` is defined at this SAP).
 
 ### Indications/confirms (telemetry channel), `TelemetryEvent` variants
 
@@ -125,8 +159,29 @@ telemetry-channel indications (cl. 15.3.2).
 |---|---|---|
 | TNMM-REGISTRATION indication | 15.5 | MM reg-state transitions (accept/reject/T351) |
 | TNMM-SERVICE indication | 15.6 | in/out of service transitions |
+| TNMM-ATTACH DETACH GROUP IDENTITY confirm | 15.1 | on the D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT, or on T353 expiry (failure) |
 | TNMM-REPORT indication | 15.4 | DORMANT — U-ITSI DETACH transfer-result source not yet wired (MM does not observe the TxReporter through LMM-UNITDATA) |
-| (STATUS / ENERGY-SAVING / group-detach) | 15.7 / 15.3 / — | DEFINED but DORMANT — stack cannot truthfully observe |
+| (STATUS / ENERGY-SAVING) | 15.7 / 15.3 | DEFINED but DORMANT — stack cannot truthfully observe |
+
+`TnmmAttachDetachGroupIdentityConfirm` telemetry event shape (Table 15.1):
+
+```
+{"TnmmAttachDetachGroupIdentityConfirm": {
+  "group_identity_attach_detach_mode": "Amendment" | "DetachTheCurrentlyActiveGroupIdentities",
+  "group_identity_report": null,
+  "group_identities": [                       // the SwMI-acknowledged groups (GTSIs only)
+    { "gtsi": 300,
+      "group_identity_attach_detach_type_identifier": "Attachment",
+      "group_identity_lifetime": "AttachmentNeededForNextItsiAttach",
+      "class_of_usage": "ClassOfUsage4",
+      "group_identity_detachment_reason": null }
+  ]
+}}
+```
+
+An empty `group_identities` list means no group was acknowledged (e.g. the operation
+failed / T353 expired). The confirmed set is also reflected in `MsRuntimeState.attached_groups`
+(readable via `GetState`).
 
 Reject-cause mapping: cl. 15.3.4 is a strict subset of the on-air 16.10.42 cause
 set; causes with no cl. 15.3.4 enumerant map to `None` (never fabricated).
@@ -159,4 +214,12 @@ wscat -s bluestation-control-v1 -c wss://<stack-host>:<port>/
 # Live TNMM registration:
 > {"TnmmRegistration":{"handle":6,"request":{...}}}
 < {"TnmmAck":{"handle":6,"accepted":true,"detail":null}}
+
+# Live talkgroup switch (detach all + attach GSSI 300) — must be registered first.
+# The Ack only means "accepted for processing"; the RESULT arrives on the
+# telemetry channel as a TnmmAttachDetachGroupIdentityConfirm.
+> {"TnmmAttachDetachGroupIdentity":{"handle":7,"request":{"group_identity_attach_detach_mode":"DetachTheCurrentlyActiveGroupIdentities","group_identity_request":[{"gtsi":300,"group_identity_attach_detach_type_identifier":"Attachment","class_of_usage":"ClassOfUsage4","group_identity_detachment_request":null}],"group_identity_report":null}}}
+< {"TnmmAck":{"handle":7,"accepted":true,"detail":null}}
+# ... then on the telemetry channel:
+< {"TnmmAttachDetachGroupIdentityConfirm":{"group_identity_attach_detach_mode":"DetachTheCurrentlyActiveGroupIdentities","group_identity_report":null,"group_identities":[{"gtsi":300,"group_identity_attach_detach_type_identifier":"Attachment","group_identity_lifetime":"AttachmentNeededForNextItsiAttach","class_of_usage":"ClassOfUsage4","group_identity_detachment_reason":null}]}}
 ```

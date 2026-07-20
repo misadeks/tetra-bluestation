@@ -22,6 +22,8 @@ use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
 use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
+use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
 use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
@@ -69,6 +71,14 @@ const DETACH_DRAIN_SLOTS: u32 = 144;
 /// the reference (Motorola) radio observed attaching against this same BS.
 const GROUP_CLASS_OF_USAGE: u8 = 4;
 
+/// Timer T353 — "Attach/Detach response time" (ETSI TS 100 392-2 cl. 16.11.1.3):
+/// the maximum time MM waits for a D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT
+/// after sending a U-ATTACH/DETACH GROUP IDENTITY (cl. 16.8.2). The spec value is
+/// **10 s**; at the per-downlink-slot MM tick rate (cl. 9.4.4, one slot ≈ 14.167
+/// ms) that is ≈ 706 slots — the same conversion basis as T351. On expiry the
+/// requested group attach/detach is treated as failed (cl. 16.8.5).
+const T353_TIMEOUT_SLOTS: u32 = 706;
+
 /// MS registration state (ETSI TS 100 392-2 cl. 16.4 location updating /
 /// ITSI attach).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +105,29 @@ struct CellId {
     mcc: u16,
     mnc: u16,
     la: u16,
+}
+
+/// State of an outstanding MS-initiated standalone group attach/detach
+/// (ETSI TS 100 392-2 cl. 16.8.2). Present between sending a
+/// U-ATTACH/DETACH GROUP IDENTITY PDU and receiving the matching
+/// D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT (or T353 expiry). Only one
+/// operation is outstanding at a time.
+#[derive(Debug, Clone)]
+struct PendingGroupOp {
+    /// Attach/detach mode used in the request (cl. 16.10.17): `true` =
+    /// "detach all currently attached and attach the specified" (the whole
+    /// attached set is replaced), `false` = "amendment" (add/remove the
+    /// specified groups). Needed to reconcile the attached-group set when the
+    /// acknowledgement arrives.
+    detach_all: bool,
+    /// Whether the user application requested a group report (Table 15.1);
+    /// echoed back in the TNMM confirm.
+    report_requested: bool,
+    /// Handle of the originating TNMM-ATTACH DETACH GROUP IDENTITY request,
+    /// for correlation in logs.
+    handle: u32,
+    /// Timer T353 (cl. 16.11.1.3) countdown in downlink slots.
+    t353_countdown: u32,
 }
 
 pub struct MmMs {
@@ -167,6 +200,10 @@ pub struct MmMs {
     /// 17.3.2) so the MAC downlink address filter (cl. 23.4.1.2.1) stays in
     /// sync, and the set re-requested on a re-registration.
     attached_gssis: BTreeSet<u32>,
+    /// Outstanding MS-initiated standalone group attach/detach operation
+    /// (cl. 16.8.2), if any. `None` when no U-ATTACH/DETACH GROUP IDENTITY is
+    /// awaiting its acknowledgement.
+    pending_group_op: Option<PendingGroupOp>,
 }
 
 /// Runtime plumbing for the Plane B management write/apply handlers
@@ -216,6 +253,7 @@ impl MmMs {
             mgmt_ctx: None,
             restart_required: false,
             attached_gssis,
+            pending_group_op: None,
         }
     }
 
@@ -1010,7 +1048,7 @@ impl MmMs {
             MmPduTypeDl::DLocationUpdateProceeding => unimplemented_log!("DLocationUpdateProceeding"),
             MmPduTypeDl::DAttachDetachGroupIdentity => unimplemented_log!("DAttachDetachGroupIdentity"),
             MmPduTypeDl::DAttachDetachGroupIdentityAcknowledgement => {
-                unimplemented_log!("DAttachDetachGroupIdentityAcknowledgement")
+                self.rx_d_attach_detach_group_identity_acknowledgement(queue, prim.sdu.clone())
             }
             MmPduTypeDl::DMmStatus => unimplemented_log!("DMmStatus"),
             MmPduTypeDl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
@@ -1373,25 +1411,12 @@ impl MmMs {
                 self.respond(ControlResponse::TnmmAck { handle, accepted: true, detail });
             }
             // TNMM-ATTACH DETACH GROUP IDENTITY request (Table 15.1, cl. 15.3.3.1):
-            // the standalone U-ATTACH/DETACH GROUP IDENTITY procedure (cl. 16.9.3)
-            // is not implemented in this stack — group attachment is only carried
-            // bundled in the ITSI-attach registration (cl. 16.8.2). Documented
-            // deferral: accepted = false so the UI knows no action was taken.
+            // the standalone MS-initiated group attach/detach procedure (cl. 16.8.2).
+            // Builds and sends a U-ATTACH/DETACH GROUP IDENTITY PDU, starts T353 and
+            // awaits the D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT (handled in
+            // `rx_d_attach_detach_group_identity_acknowledgement`).
             ControlCommand::TnmmAttachDetachGroupIdentity { handle, request } => {
-                tracing::warn!(
-                    "MM(MS): TNMM-ATTACH DETACH GROUP IDENTITY request received but the standalone \
-                     group identity procedure (cl. 16.9.3) is not implemented; {} entrie(s) ignored",
-                    request.group_identity_request.len()
-                );
-                self.respond(ControlResponse::TnmmAck {
-                    handle,
-                    accepted: false,
-                    detail: Some(
-                        "standalone group attach/detach (cl. 16.9.3) not implemented; \
-                         groups are attached at registration"
-                            .to_string(),
-                    ),
-                });
+                self.handle_tnmm_attach_detach_group_identity_request(queue, handle, &request);
             }
             // TNMM-STATUS request (Table 15.7, cl. 15.3.3.9): selects direct mode
             // / dual watch / energy economy — none implemented in this stack.
@@ -1506,6 +1531,341 @@ impl MmMs {
                 });
             }
         }
+    }
+
+    /// Act on a TNMM-ATTACH DETACH GROUP IDENTITY request (Table 15.1,
+    /// cl. 15.3.3.1): initiate the MS-initiated standalone group attach/detach
+    /// procedure (cl. 16.8.2). Validates preconditions, builds and sends a
+    /// U-ATTACH/DETACH GROUP IDENTITY PDU, starts T353 and stores the operation
+    /// as pending until the acknowledgement arrives.
+    fn handle_tnmm_attach_detach_group_identity_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        handle: u32,
+        request: &crate::tnmm::TnmmAttachDetachGroupIdentityRequest,
+    ) {
+        use crate::net_control::ControlResponse;
+        use crate::tnmm::GroupIdentityAttachDetachMode;
+
+        // cl. 16.8.2: the standalone group attach/detach procedure is an
+        // MS-initiated action carried in acknowledged signalling; it presupposes
+        // a registered MS (the SwMI must already know the ITSI). Refuse when not
+        // registered so the UI gets an immediate, honest failure.
+        if self.reg_state != RegState::Registered {
+            self.respond(ControlResponse::TnmmAck {
+                handle,
+                accepted: false,
+                detail: Some("not registered; cannot attach/detach groups".to_string()),
+            });
+            return;
+        }
+
+        // Only one standalone group operation may be outstanding at a time
+        // (single U-ATTACH/DETACH GROUP IDENTITY awaiting its acknowledgement).
+        if self.pending_group_op.is_some() {
+            self.respond(ControlResponse::TnmmAck {
+                handle,
+                accepted: false,
+                detail: Some("a group attach/detach is already in progress".to_string()),
+            });
+            return;
+        }
+
+        if request.group_identity_request.is_empty() {
+            self.respond(ControlResponse::TnmmAck {
+                handle,
+                accepted: false,
+                detail: Some("no group identities in the request".to_string()),
+            });
+            return;
+        }
+
+        // Build one Group identity uplink element (cl. 16.10.27) per requested
+        // group. GTSI = MNI << 24 | GSSI; this stack addresses groups by GSSI
+        // only (address type 0), so the MNI part is carried by the MS's own
+        // network context, not on air.
+        let uplink: Vec<GroupIdentityUplink> = request
+            .group_identity_request
+            .iter()
+            .map(|g| Self::group_identity_request_to_uplink(g))
+            .collect();
+
+        let detach_all = matches!(
+            request.group_identity_attach_detach_mode,
+            GroupIdentityAttachDetachMode::DetachTheCurrentlyActiveGroupIdentities
+        );
+
+        // cl. 16.8.2: MM shall set the group identity report to "not report
+        // request". A UI-requested report is not honoured (this BS does not
+        // support the group report procedure); note it and proceed.
+        let report_requested = matches!(request.group_identity_report, Some(crate::tnmm::GroupIdentityReport::ReportRequested));
+        if report_requested {
+            tracing::info!(
+                "MM(MS): TNMM-ATTACH DETACH GROUP IDENTITY requested a group report; not supported by this network, \
+                 sending with group identity report = 'not report request' (cl. 16.8.2)"
+            );
+        }
+
+        self.send_attach_detach_group_identity(queue, detach_all, uplink);
+
+        self.pending_group_op = Some(PendingGroupOp {
+            detach_all,
+            report_requested,
+            handle,
+            t353_countdown: T353_TIMEOUT_SLOTS,
+        });
+
+        self.respond(ControlResponse::TnmmAck { handle, accepted: true, detail: None });
+    }
+
+    /// Map a TNMM `Group identity request` (Table 15.9) to an on-air Group
+    /// identity uplink element (cl. 16.10.27). Attachment carries the class of
+    /// usage (cl. 16.10.6); detachment carries the detachment reason
+    /// (cl. 16.10.21). Addressed by GSSI only (address type 0).
+    fn group_identity_request_to_uplink(g: &crate::tnmm::GroupIdentityRequest) -> GroupIdentityUplink {
+        use crate::tnmm::GroupIdentityAttachDetachTypeIdentifier;
+        let gssi = (g.gtsi & 0xFF_FFFF) as u32;
+        match g.group_identity_attach_detach_type_identifier {
+            GroupIdentityAttachDetachTypeIdentifier::Attachment => GroupIdentityUplink {
+                class_of_usage: Some(
+                    g.class_of_usage
+                        .map(Self::class_of_usage_to_raw)
+                        .unwrap_or(GROUP_CLASS_OF_USAGE),
+                ),
+                group_identity_detachment_uplink: None,
+                gssi: Some(gssi),
+                address_extension: None,
+                vgssi: None,
+            },
+            GroupIdentityAttachDetachTypeIdentifier::Detachment => GroupIdentityUplink {
+                class_of_usage: None,
+                group_identity_detachment_uplink: Some(
+                    g.group_identity_detachment_request
+                        .map(Self::detachment_request_to_raw)
+                        // Default to "User initiated" (cl. 16.10.21) — this is a
+                        // user-application-driven detach.
+                        .unwrap_or(0b10),
+                ),
+                gssi: Some(gssi),
+                address_extension: None,
+                vgssi: None,
+            },
+        }
+    }
+
+    /// On-air `Class of usage` raw 3-bit encoding (cl. 16.10.6, Table 16.32):
+    /// "Class of usage N" is transmitted as raw value (N − 1).
+    fn class_of_usage_to_raw(cou: crate::tnmm::ClassOfUsage) -> u8 {
+        use crate::tnmm::ClassOfUsage::*;
+        match cou {
+            ClassOfUsage1 => 0,
+            ClassOfUsage2 => 1,
+            ClassOfUsage3 => 2,
+            ClassOfUsage4 => 3,
+            ClassOfUsage5 => 4,
+            ClassOfUsage6 => 5,
+            ClassOfUsage7 => 6,
+            ClassOfUsage8 => 7,
+        }
+    }
+
+    /// On-air `Class of usage` decode (cl. 16.10.6, Table 16.32): raw R → "Class
+    /// of usage (R + 1)". Inverse of [`Self::class_of_usage_to_raw`].
+    fn class_of_usage_from_raw(raw: u8) -> crate::tnmm::ClassOfUsage {
+        use crate::tnmm::ClassOfUsage::*;
+        match raw & 0b111 {
+            0 => ClassOfUsage1,
+            1 => ClassOfUsage2,
+            2 => ClassOfUsage3,
+            3 => ClassOfUsage4,
+            4 => ClassOfUsage5,
+            5 => ClassOfUsage6,
+            6 => ClassOfUsage7,
+            _ => ClassOfUsage8,
+        }
+    }
+
+    /// On-air `Group identity detachment uplink` raw 2-bit encoding
+    /// (cl. 16.10.21, Table 16.53). The TNMM SAP only defines the
+    /// user-initiated detachment reason (Table 15.9), which maps to 102.
+    fn detachment_request_to_raw(_req: crate::tnmm::GroupIdentityDetachmentRequest) -> u8 {
+        // GroupIdentityDetachmentRequest::UserInitiatedDetachment -> "User initiated".
+        0b10
+    }
+
+    /// Build and send a U-ATTACH/DETACH GROUP IDENTITY PDU (cl. 16.8.2 /
+    /// 16.9.3.1) over the LMM SAP (MLE-UNITDATA request, acknowledged basic
+    /// link, addressed by the MS's own ISSI). Per cl. 16.8.2 the group identity
+    /// report is set to "not report request" and the group report response
+    /// element is omitted. PDU priority 3 (cl. 16.8.2) is not plumbable through
+    /// the LMM-UNITDATA primitive here and is therefore documented, not carried.
+    fn send_attach_detach_group_identity(
+        &mut self,
+        queue: &mut MessageQueue,
+        detach_all: bool,
+        uplink: Vec<GroupIdentityUplink>,
+    ) {
+        let issi = self.own_issi();
+        let pdu = UAttachDetachGroupIdentity {
+            group_identity_report: false,
+            group_identity_attach_detach_mode: detach_all,
+            group_report_response: None,
+            group_identity_uplink: Some(uplink),
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        pdu.to_bitbuf(&mut sdu).expect("U-ATTACH/DETACH GROUP IDENTITY serialization");
+        sdu.seek(0);
+        tracing::info!(
+            "MM: -> U-ATTACH/DETACH GROUP IDENTITY (mode={}) for ISSI {} sdu {}",
+            if detach_all { "detach-all+attach" } else { "amendment" },
+            issi,
+            sdu.dump_bin()
+        );
+
+        let m = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: 0,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(m);
+    }
+
+    /// Handle D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT (cl. 16.8.2 /
+    /// 16.9.2.2): the SwMI's response to a standalone group attach/detach.
+    /// Stops T353, reconciles the attached-group set from the acknowledged
+    /// group identity downlink elements, pushes the new set to the MLE via
+    /// MLE-IDENTITIES (so the MAC downlink filter matches), and issues the
+    /// TNMM-ATTACH DETACH GROUP IDENTITY confirm to the user application.
+    fn rx_d_attach_detach_group_identity_acknowledgement(&mut self, queue: &mut MessageQueue, mut sdu: BitBuffer) {
+        let pdu = match DAttachDetachGroupIdentityAcknowledgement::from_bitbuf(&mut sdu) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed parsing DAttachDetachGroupIdentityAcknowledgement: {:?} {}",
+                    e,
+                    sdu.dump_bin()
+                );
+                return;
+            }
+        };
+
+        let Some(op) = self.pending_group_op.take() else {
+            tracing::debug!("MM: <- D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT with no outstanding request; ignoring");
+            return;
+        };
+
+        // Extract the accepted attachments / detachments from the downlink group
+        // identity elements (cl. 16.10.22): an element with a group identity
+        // attachment sub-element is (re)attached; one with a group identity
+        // detachment uplink sub-element is detached.
+        let mut accepted_attach: Vec<u32> = Vec::new();
+        let mut accepted_detach: Vec<u32> = Vec::new();
+        if let Some(downlink) = &pdu.group_identity_downlink {
+            for g in downlink {
+                let Some(gssi) = g.gssi else { continue };
+                if g.group_identity_attachment.is_some() {
+                    accepted_attach.push(gssi);
+                } else if g.group_identity_detachment_uplink.is_some() {
+                    accepted_detach.push(gssi);
+                }
+            }
+        }
+
+        tracing::info!(
+            "MM: <- D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT (accept_reject={} mode={}) attached={:?} detached={:?}",
+            pdu.group_identity_accept_reject,
+            if op.detach_all { "detach-all+attach" } else { "amendment" },
+            accepted_attach,
+            accepted_detach,
+        );
+
+        // Reconcile the authoritative attached-group set (cl. 16.8.2):
+        // - "detach all + attach": the new set is exactly the accepted attachments;
+        // - "amendment": add accepted attachments and remove accepted detachments.
+        if op.detach_all {
+            self.attached_gssis = accepted_attach.iter().copied().collect();
+        } else {
+            for gssi in &accepted_attach {
+                self.attached_gssis.insert(*gssi);
+            }
+            for gssi in &accepted_detach {
+                self.attached_gssis.remove(gssi);
+            }
+        }
+
+        // cl. 16.8.2: send the (post-reconcile) attached group identities to the
+        // MLE via MLE-IDENTITIES so the MAC downlink address filter matches the
+        // affiliation (cl. 23.4.1.2.1). `send_mle_identities` reads the runtime
+        // attached set; the detached list is informational.
+        self.send_mle_identities(queue, &accepted_detach);
+
+        // cl. 16.8.2: finally inform the user application with a TNMM-ATTACH
+        // DETACH GROUP IDENTITY confirm (Table 15.1).
+        self.emit_group_identity_confirm(&op, &accepted_attach, &accepted_detach);
+    }
+
+    /// Emit a TNMM-ATTACH DETACH GROUP IDENTITY confirm (Table 15.1,
+    /// cl. 15.3.3.1) reporting the outcome of a standalone group attach/detach.
+    /// The `group_identities` list reports each acknowledged group as a GTSI
+    /// (cl. 16.8.2: "using only the GTSIs since the (V)GSSIs is not known by the
+    /// user application").
+    fn emit_group_identity_confirm(&self, op: &PendingGroupOp, accepted_attach: &[u32], accepted_detach: &[u32]) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::{
+            GroupIdentity, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier,
+            GroupIdentityDetachment, GroupIdentityLifetime, GroupIdentityReport,
+            TnmmAttachDetachGroupIdentityConfirm,
+        };
+
+        let mni = self.own_mni() as u64;
+        let mut group_identities: Vec<GroupIdentity> = Vec::new();
+        for gssi in accepted_attach {
+            group_identities.push(GroupIdentity {
+                gtsi: (mni << 24) | (*gssi as u64),
+                group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                group_identity_lifetime: Some(GroupIdentityLifetime::AttachmentNeededForNextItsiAttach),
+                class_of_usage: Some(Self::class_of_usage_from_raw(GROUP_CLASS_OF_USAGE)),
+                group_identity_detachment_reason: None,
+            });
+        }
+        for gssi in accepted_detach {
+            group_identities.push(GroupIdentity {
+                gtsi: (mni << 24) | (*gssi as u64),
+                group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Detachment,
+                group_identity_lifetime: None,
+                class_of_usage: None,
+                group_identity_detachment_reason: Some(GroupIdentityDetachment::PermanentlyDetached),
+            });
+        }
+
+        let group_identity_attach_detach_mode = if op.detach_all {
+            GroupIdentityAttachDetachMode::DetachTheCurrentlyActiveGroupIdentities
+        } else {
+            GroupIdentityAttachDetachMode::Amendment
+        };
+
+        self.emit(TelemetryEvent::TnmmAttachDetachGroupIdentityConfirm(
+            TnmmAttachDetachGroupIdentityConfirm {
+                group_identity_attach_detach_mode,
+                group_identity_report: op
+                    .report_requested
+                    .then_some(GroupIdentityReport::ReportNotRequested),
+                group_identities,
+            },
+        ));
     }
 
     // ----------------------------------------------------------------------
@@ -1774,6 +2134,25 @@ impl TetraEntityTrait for MmMs {
         if self.reg_state == RegState::Detaching {
             self.detach_countdown = self.detach_countdown.saturating_sub(1);
             return;
+        }
+
+        // Drive timer T353 (attach/detach response time, cl. 16.11.1.3) for an
+        // outstanding standalone group attach/detach (cl. 16.8.2). On expiry the
+        // requested operation is treated as failed (cl. 16.8.5): the attached
+        // set is left unchanged and the user application is informed with a
+        // confirm reporting no acknowledged groups.
+        if let Some(op) = &mut self.pending_group_op {
+            if op.t353_countdown > 0 {
+                op.t353_countdown -= 1;
+            } else {
+                let op = self.pending_group_op.take().expect("checked Some");
+                tracing::warn!(
+                    "MM: T353 expired with no D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT (handle {}); \
+                     treating group attach/detach as failed (cl. 16.8.5)",
+                    op.handle
+                );
+                self.emit_group_identity_confirm(&op, &[], &[]);
+            }
         }
 
         // Drive timer T351 (registration response time, cl. 16.11.1.1). Only
@@ -2991,11 +3370,88 @@ attach_groups = []
         assert!(detail.is_some(), "documented 'nothing to detach' detail");
     }
 
-    /// The standalone group attach/detach procedure (cl. 16.9.3) is not
-    /// implemented: a TNMM-ATTACH DETACH GROUP IDENTITY request is acknowledged
-    /// as not-accepted with a documented deferral, and changes no state.
+    /// Build a D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT (cl. 16.9.2.2) that
+    /// accepts the given attached / detached GSSIs, exactly as this BS emits it.
+    fn build_group_ack(attached: &[u32], detached: &[u32]) -> BitBuffer {
+        use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
+        use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
+
+        let mut downlink = Vec::new();
+        for &g in attached {
+            downlink.push(GroupIdentityDownlink {
+                group_identity_attachment: Some(GroupIdentityAttachment {
+                    group_identity_attachment_lifetime: 3,
+                    class_of_usage: GROUP_CLASS_OF_USAGE,
+                }),
+                group_identity_detachment_uplink: None,
+                gssi: Some(g),
+                address_extension: None,
+                vgssi: None,
+            });
+        }
+        for &g in detached {
+            downlink.push(GroupIdentityDownlink {
+                group_identity_attachment: None,
+                group_identity_detachment_uplink: Some(0b10),
+                gssi: Some(g),
+                address_extension: None,
+                vgssi: None,
+            });
+        }
+        let pdu = DAttachDetachGroupIdentityAcknowledgement {
+            group_identity_accept_reject: 0,
+            reserved: false,
+            proprietary: None,
+            group_identity_downlink: if downlink.is_empty() { None } else { Some(downlink) },
+            group_identity_security_related_information: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu
+    }
+
+    /// Register a wired MS on the default cell and discard the registration
+    /// telemetry / MLE-IDENTITIES so a group-op test starts from a clean queue.
+    fn register_wired(mm: &mut MmMs, q: &mut MessageQueue, source: &crate::net_telemetry::TelemetrySource) {
+        mm.rx_activate_conf(q, &activate_conf(true));
+        let _ = q.pop_front().expect("registration demand");
+        deliver_dl(mm, q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        drain_mle_identities(q);
+        assert!(q.pop_front().is_none());
+        let _ = drain(source);
+    }
+
+    /// Pop the U-ATTACH/DETACH GROUP IDENTITY PDU MM queues and decode it through
+    /// the exact parser the BS uses (cl. 16.9.3.1), returning (issi, pdu).
+    fn pop_group_pdu(q: &mut MessageQueue) -> (u32, UAttachDetachGroupIdentity) {
+        let msg = q.pop_front().expect("group identity PDU queued");
+        assert_eq!(msg.dest, TetraEntity::Mle);
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        assert_eq!(req.layer2service, Layer2Service::Acknowledged);
+        let issi = req.address.ssi;
+        req.sdu.seek(0);
+        let pdu = UAttachDetachGroupIdentity::from_bitbuf(&mut req.sdu).expect("BS must parse the group PDU");
+        assert_eq!(req.sdu.get_len_remaining(), 0, "group PDU fully consumed");
+        (issi, pdu)
+    }
+
+    fn find_group_confirm(
+        events: &[TelemetryEvent],
+    ) -> Option<crate::tnmm::TnmmAttachDetachGroupIdentityConfirm> {
+        events.iter().find_map(|e| match e {
+            TelemetryEvent::TnmmAttachDetachGroupIdentityConfirm(c) => Some(c.clone()),
+            _ => None,
+        })
+    }
+
+    /// G2 (cl. 16.8.2): a standalone group attach/detach requested before the MS
+    /// is registered is refused (the SwMI must already know the ITSI) — no PDU,
+    /// no pending operation.
     #[test]
-    fn test_tnmm_group_identity_request_is_deferred() {
+    fn test_tnmm_group_attach_rejected_when_not_registered() {
         use crate::tnmm::{
             ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
             TnmmAttachDetachGroupIdentityRequest,
@@ -3008,7 +3464,7 @@ attach_groups = []
             request: TnmmAttachDetachGroupIdentityRequest {
                 group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
                 group_identity_request: vec![GroupIdentityRequest {
-                    gtsi: 0x01,
+                    gtsi: 300,
                     group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
                     class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
                     group_identity_detachment_request: None,
@@ -3018,11 +3474,273 @@ attach_groups = []
         });
         mm.tick_start(&mut q, TdmaTime::default());
 
-        assert_eq!(mm.reg_state, RegState::Idle);
-        assert!(q.pop_front().is_none());
+        assert!(q.pop_front().is_none(), "no PDU while unregistered");
+        assert!(mm.pending_group_op.is_none());
         let (accepted, detail) = last_ack(&dispatcher);
-        assert!(!accepted, "deferred procedure is not accepted");
+        assert!(!accepted);
         assert!(detail.is_some());
+    }
+
+    /// G2 (cl. 16.8.2): once registered, an amendment attach builds a
+    /// U-ATTACH/DETACH GROUP IDENTITY PDU (report = not-report-request, mode =
+    /// amendment, one Group identity uplink attachment with the class of usage),
+    /// which round-trips through the BS parser; T353 is started and the request
+    /// is acknowledged accepted.
+    #[test]
+    fn test_tnmm_group_attach_sends_pdu_and_starts_t353() {
+        use crate::tnmm::{
+            ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
+            TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        dispatcher.send(ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle: 32,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: 300,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                    class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                    group_identity_detachment_request: None,
+                }],
+                group_identity_report: None,
+            },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (issi, pdu) = pop_group_pdu(&mut q);
+        assert!(q.pop_front().is_none(), "exactly one PDU emitted");
+        assert_eq!(issi, MS_ISSI);
+        assert!(!pdu.group_identity_report, "cl. 16.8.2: report = not report request");
+        assert!(!pdu.group_identity_attach_detach_mode, "amendment mode");
+        assert!(pdu.group_report_response.is_none());
+        let ul = pdu.group_identity_uplink.expect("one uplink entry");
+        assert_eq!(ul.len(), 1);
+        assert_eq!(ul[0].gssi, Some(300));
+        // ClassOfUsage4 -> raw 3 (cl. 16.10.6 Table 16.32: "Class of usage N" = N-1).
+        assert_eq!(ul[0].class_of_usage, Some(3));
+        assert!(ul[0].group_identity_detachment_uplink.is_none());
+
+        let op = mm.pending_group_op.as_ref().expect("operation pending");
+        assert!(!op.detach_all);
+        // One tick decrement has already run in this tick_start.
+        assert_eq!(op.t353_countdown, T353_TIMEOUT_SLOTS - 1);
+
+        let (accepted, _d) = last_ack(&dispatcher);
+        assert!(accepted, "request accepted");
+    }
+
+    /// G3/G4 (cl. 16.8.2): the D-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT
+    /// stops T353, reconciles the attached-group set, pushes it to the MLE via
+    /// MLE-IDENTITIES, and emits a TNMM-ATTACH DETACH GROUP IDENTITY confirm.
+    #[test]
+    fn test_group_ack_reconciles_and_confirms() {
+        use crate::tnmm::{
+            ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
+            TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        dispatcher.send(ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle: 33,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: 300,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                    class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                    group_identity_detachment_request: None,
+                }],
+                group_identity_report: None,
+            },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+        let _ = pop_group_pdu(&mut q);
+        let _ = drain(&source);
+
+        // SwMI accepts the attachment of GSSI 300.
+        deliver_dl(&mut mm, &mut q, build_group_ack(&[300], &[]));
+
+        assert!(mm.attached_gssis.contains(&300), "attached set reconciled");
+        assert!(mm.pending_group_op.is_none(), "T353 stopped");
+        drain_mle_identities(&mut q);
+        assert!(q.pop_front().is_none());
+
+        let confirm = find_group_confirm(&drain(&source)).expect("a group identity confirm");
+        assert!(matches!(
+            confirm.group_identity_attach_detach_mode,
+            GroupIdentityAttachDetachMode::Amendment
+        ));
+        assert_eq!(confirm.group_identities.len(), 1);
+        let gid = &confirm.group_identities[0];
+        assert_eq!(gid.gtsi, (MS_MNI << 24) | 300);
+        assert!(matches!(
+            gid.group_identity_attach_detach_type_identifier,
+            GroupIdentityAttachDetachTypeIdentifier::Attachment
+        ));
+    }
+
+    /// G3 (cl. 16.8.2, amendment): an acknowledged detachment removes the group
+    /// from the attached set and the detachment reason is carried on air.
+    #[test]
+    fn test_group_amendment_detach_removes_group() {
+        use crate::tnmm::{
+            GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityDetachmentRequest,
+            GroupIdentityRequest, TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+        // Pretend GSSI 91 was previously attached.
+        mm.attached_gssis.insert(91);
+
+        dispatcher.send(ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle: 34,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: 91,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Detachment,
+                    class_of_usage: None,
+                    group_identity_detachment_request: Some(GroupIdentityDetachmentRequest::UserInitiatedDetachment),
+                }],
+                group_identity_report: None,
+            },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_issi, pdu) = pop_group_pdu(&mut q);
+        let ul = pdu.group_identity_uplink.expect("one uplink entry");
+        assert_eq!(ul[0].gssi, Some(91));
+        assert!(ul[0].class_of_usage.is_none());
+        // "User initiated" detachment reason (cl. 16.10.21 Table 16.53 = 102).
+        assert_eq!(ul[0].group_identity_detachment_uplink, Some(0b10));
+        let _ = drain(&source);
+
+        deliver_dl(&mut mm, &mut q, build_group_ack(&[], &[91]));
+        assert!(!mm.attached_gssis.contains(&91), "group detached from attached set");
+        assert!(mm.pending_group_op.is_none());
+    }
+
+    /// G3 (cl. 16.8.2, detach-all): the attached set is replaced by exactly the
+    /// acknowledged attachments.
+    #[test]
+    fn test_group_detach_all_replaces_set() {
+        use crate::tnmm::{
+            ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
+            TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+        mm.attached_gssis.insert(91);
+        mm.attached_gssis.insert(220);
+
+        dispatcher.send(ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle: 35,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::DetachTheCurrentlyActiveGroupIdentities,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: 500,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                    class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                    group_identity_detachment_request: None,
+                }],
+                group_identity_report: None,
+            },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_issi, pdu) = pop_group_pdu(&mut q);
+        assert!(pdu.group_identity_attach_detach_mode, "detach-all mode set");
+        let _ = drain(&source);
+
+        deliver_dl(&mut mm, &mut q, build_group_ack(&[500], &[]));
+        let attached: Vec<u32> = mm.attached_gssis.iter().copied().collect();
+        assert_eq!(attached, vec![500], "old groups replaced by the acknowledged set");
+    }
+
+    /// G2 (cl. 16.8.2): only one standalone group operation may be outstanding —
+    /// a second request while one is pending is refused.
+    #[test]
+    fn test_second_group_op_rejected_while_pending() {
+        use crate::tnmm::{
+            ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
+            TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        let mk = |gssi: u64, handle: u32| ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: gssi,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                    class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                    group_identity_detachment_request: None,
+                }],
+                group_identity_report: None,
+            },
+        };
+
+        dispatcher.send(mk(300, 36));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let _ = pop_group_pdu(&mut q);
+        let _ = dispatcher.try_recv_responses();
+
+        // Second request while the first is still awaiting its acknowledgement.
+        dispatcher.send(mk(301, 37));
+        mm.tick_start(&mut q, TdmaTime::default());
+        assert!(q.pop_front().is_none(), "no second PDU while one is pending");
+        let (accepted, detail) = last_ack(&dispatcher);
+        assert!(!accepted);
+        assert!(detail.is_some());
+    }
+
+    /// G3 (cl. 16.8.5): if T353 expires with no acknowledgement, the operation is
+    /// treated as failed — the pending op is cleared and a confirm is emitted.
+    #[test]
+    fn test_t353_expiry_fails_group_op() {
+        use crate::tnmm::{
+            ClassOfUsage, GroupIdentityAttachDetachMode, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityRequest,
+            TnmmAttachDetachGroupIdentityRequest,
+        };
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        dispatcher.send(ControlCommand::TnmmAttachDetachGroupIdentity {
+            handle: 38,
+            request: TnmmAttachDetachGroupIdentityRequest {
+                group_identity_attach_detach_mode: GroupIdentityAttachDetachMode::Amendment,
+                group_identity_request: vec![GroupIdentityRequest {
+                    gtsi: 300,
+                    group_identity_attach_detach_type_identifier: GroupIdentityAttachDetachTypeIdentifier::Attachment,
+                    class_of_usage: Some(ClassOfUsage::ClassOfUsage4),
+                    group_identity_detachment_request: None,
+                }],
+                group_identity_report: None,
+            },
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+        let _ = pop_group_pdu(&mut q);
+        let _ = drain(&source);
+
+        // Drive enough ticks for T353 to expire.
+        for _ in 0..(T353_TIMEOUT_SLOTS + 2) {
+            mm.tick_start(&mut q, TdmaTime::default());
+        }
+
+        assert!(mm.pending_group_op.is_none(), "operation cleared on T353 expiry");
+        let confirm = find_group_confirm(&drain(&source)).expect("a confirm on failure");
+        assert!(confirm.group_identities.is_empty(), "no groups acknowledged on failure");
     }
 
     /// Dormant primitives (STATUS / ENERGY SAVING requests) are acknowledged as
