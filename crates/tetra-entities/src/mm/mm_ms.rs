@@ -1,7 +1,7 @@
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -204,6 +204,15 @@ pub struct MmMs {
     /// (cl. 16.8.2), if any. `None` when no U-ATTACH/DETACH GROUP IDENTITY is
     /// awaiting its acknowledgement.
     pending_group_op: Option<PendingGroupOp>,
+    /// GSSIs queued to be affiliated via the standalone U-ATTACH/DETACH GROUP
+    /// IDENTITY procedure (cl. 16.8.2) after a successful registration, one
+    /// group per PDU. Drained sequentially: the next group is sent only once
+    /// the previous operation's acknowledgement (or T353 expiry) has cleared
+    /// `pending_group_op`. Keeping each attach to a single group holds the
+    /// uplink TM-SDU inside one MAC-ACCESS subslot (no fragmentation), matching
+    /// the reference radio which affiliates its extra groups standalone after
+    /// the ITSI attach.
+    groups_to_attach: VecDeque<u32>,
 }
 
 /// Runtime plumbing for the Plane B management write/apply handlers
@@ -254,6 +263,7 @@ impl MmMs {
             restart_required: false,
             attached_gssis,
             pending_group_op: None,
+            groups_to_attach: VecDeque::new(),
         }
     }
 
@@ -544,18 +554,19 @@ impl MmMs {
         }
     }
 
-    /// Build the group identity location demand element carried inside the
-    /// U-LOCATION-UPDATE-DEMAND at ITSI attach (cl. 16.10.24 / 16.8.2), from the
-    /// configured `attach_groups`. Returns `None` when no groups are configured
-    /// (the element is then omitted, as before).
+    /// Build the group identity location demand element (cl. 16.10.24 / 16.8.2)
+    /// from the configured `attach_groups`, returning `None` when none are
+    /// configured. Used ONLY by the D-LOCATION-UPDATE-COMMAND response path
+    /// (`send_demand_location_update`, cl. 16.4.3), where the spec requires the
+    /// MS to (re)attach its groups in the demand when a group report is
+    /// requested. The primary registration path (`send_location_update_demand`)
+    /// deliberately does NOT bundle groups (they are affiliated afterwards via
+    /// the standalone procedure) to keep the first uplink un-fragmented.
     ///
-    /// The attach/detach mode is set to "detach all currently attached group
-    /// identities and attach the group identities defined here" (cl. 16.10.17,
-    /// Table 16.49, value 1): at ITSI attach nothing is yet attached, so this
-    /// cleanly establishes exactly the configured set. Each group is an
-    /// attachment (`class_of_usage` present, `group_identity_detachment_uplink`
-    /// absent) carried as a plain GSSI (address type 0). This mirrors the
-    /// reference radio, which the BS accepts.
+    /// The attach/detach mode is "detach all currently attached and attach the
+    /// group identities defined here" (cl. 16.10.17, Table 16.49, value 1). Each
+    /// group is an attachment (`class_of_usage` present) carried as a plain GSSI
+    /// (address type 0).
     fn build_group_identity_location_demand(&self) -> Option<GroupIdentityLocationDemand> {
         let groups = self.attach_groups();
         if groups.is_empty() {
@@ -576,6 +587,76 @@ impl MmMs {
                     .collect(),
             ),
         })
+    }
+
+    /// Queue the configured group identities for post-registration affiliation
+    /// via the standalone U-ATTACH/DETACH GROUP IDENTITY procedure (cl. 16.8.2)
+    /// and kick off the first one. Called once a registration (ITSI attach /
+    /// roaming / migrating) has been accepted.
+    ///
+    /// Group attachment is deliberately **not** bundled into the
+    /// U-LOCATION-UPDATE-DEMAND (though cl. 16.8.2 permits it): bundling two or
+    /// more groups inflates the demand past a single MAC-ACCESS subslot, forcing
+    /// uplink fragmentation of the very first (registration) transaction. The
+    /// reference radio instead registers with a minimal demand and affiliates
+    /// its groups afterwards with standalone U-ATTACH/DETACH GROUP IDENTITY
+    /// PDUs. We follow that pattern and additionally send one group per PDU so
+    /// each attach fits one subslot (no fragmentation).
+    fn begin_post_registration_group_attach(&mut self, queue: &mut MessageQueue) {
+        let groups = self.attach_groups();
+        if groups.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "MM: registration complete; affiliating configured groups {:?} via standalone \
+             U-ATTACH/DETACH GROUP IDENTITY (cl. 16.8.2), one group per PDU",
+            groups
+        );
+        self.groups_to_attach = groups.into_iter().collect();
+        self.drive_group_attach_queue(queue);
+    }
+
+    /// Send the next queued standalone group attach (cl. 16.8.2) if no group
+    /// operation is currently in flight. Each PDU carries exactly one group
+    /// identity (attachment, amendment mode) so the uplink TM-SDU stays within a
+    /// single MAC-ACCESS subslot. Drains `groups_to_attach` one entry per
+    /// acknowledgement / T353 expiry.
+    fn drive_group_attach_queue(&mut self, queue: &mut MessageQueue) {
+        if self.pending_group_op.is_some() {
+            // A group operation is already outstanding; the next one is sent
+            // when its acknowledgement (or T353 expiry) clears pending_group_op.
+            return;
+        }
+        let Some(gssi) = self.groups_to_attach.pop_front() else {
+            return;
+        };
+
+        // One Group identity uplink element (cl. 16.10.27): attach this GSSI
+        // with the configured class of usage (cl. 16.10.6), address type 0
+        // (GSSI only). Amendment mode (cl. 16.10.17, Table 16.49 value 0) adds
+        // this group without disturbing groups affiliated by earlier PDUs in
+        // this sequence.
+        let uplink = vec![GroupIdentityUplink {
+            class_of_usage: Some(GROUP_CLASS_OF_USAGE),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        }];
+        tracing::info!(
+            "MM: affiliating group {} via standalone U-ATTACH/DETACH GROUP IDENTITY \
+             ({} remaining)",
+            gssi,
+            self.groups_to_attach.len()
+        );
+        self.send_attach_detach_group_identity(queue, false, uplink);
+        self.pending_group_op = Some(PendingGroupOp {
+            detach_all: false,
+            report_requested: false,
+            // Internal (config-driven) attach, not originated by a TNMM request.
+            handle: 0,
+            t353_countdown: T353_TIMEOUT_SLOTS,
+        });
     }
 
     /// LMM-ACTIVATE confirmation from MLE (cl. 17.3.2): a serving cell has been
@@ -719,10 +800,15 @@ impl MmMs {
         // (cl. 16.4.5).
         self.pending_lu_type = lu_type;
 
-        // Attach the configured group identities as part of the ITSI attach
-        // (cl. 16.8.2): the SwMI affiliates the MS to these groups and will then
-        // forward group-addressed traffic to it. Omitted when none configured.
-        let group_identity_location_demand = self.build_group_identity_location_demand();
+        // The ITSI-attach / roaming / migrating demand carries NO group identity
+        // attachment (cl. 16.9.3.4): although cl. 16.8.2 permits bundling group
+        // attachments here, doing so inflates the demand past a single
+        // MAC-ACCESS subslot and forces fragmentation of the first uplink
+        // transaction. Groups are instead affiliated after the registration is
+        // accepted, via the standalone U-ATTACH/DETACH GROUP IDENTITY procedure
+        // (see `begin_post_registration_group_attach`), matching the reference
+        // radio.
+        let group_identity_location_demand = None;
 
         // Minimal demand: no ciphering, no optional elements. The MS identity is
         // carried by the MAC-layer source address, so the ssi element is left
@@ -750,10 +836,11 @@ impl MmMs {
         pdu.to_bitbuf(&mut sdu).expect("U-LOCATION-UPDATE-DEMAND serialization");
         sdu.seek(0);
         tracing::info!(
-            "MM: -> U-LOCATION-UPDATE-DEMAND ({:?}) for ISSI {}, attach_groups {:?} sdu {}",
+            "MM: -> U-LOCATION-UPDATE-DEMAND ({:?}) for ISSI {} (no bundled groups; \
+             {} configured group(s) affiliated separately after accept) sdu {}",
             lu_type,
             issi,
-            self.attach_groups(),
+            self.attach_groups().len(),
             sdu.dump_bin()
         );
 
@@ -1096,9 +1183,10 @@ impl MmMs {
             if self.temporary_registration { " (TEMPORARY registration, cl. 16.4.8)" } else { "" },
         );
 
-        // Report the outcome of the group identity attachment requested in the
-        // demand (cl. 16.8.2 / 16.10.24). The SwMI returns the accepted groups
-        // (each carrying a group_identity_attachment) and/or rejected ones.
+        // A group identity location accept element is normally absent now: the
+        // demand no longer bundles group attachments (they are affiliated by the
+        // standalone procedure below). It is still handled defensively in case a
+        // SwMI echoes one (e.g. after a COMMAND-driven re-registration).
         let mut attached_gssis: Vec<u32> = Vec::new();
         let mut group_accept_present = false;
         if let Some(accept) = &pdu.group_identity_location_accept {
@@ -1114,23 +1202,9 @@ impl MmMs {
                 })
                 .unwrap_or_default();
             tracing::info!(
-                "MM: group attachment result (accept_reject={}): attached GSSIs {:?}",
+                "MM: group attachment result in accept (accept_reject={}): attached GSSIs {:?}",
                 accept.group_identity_accept_reject,
                 attached_gssis
-            );
-        } else if !self.attach_groups().is_empty() {
-            // cl. 16.4.1.1: "In case the group identity location accept
-            // information element is not present in the D-LOCATION UPDATE ACCEPT
-            // PDU, the MS shall assume the group attachment/detachment failed.
-            // The MS shall treat the failure as equivalent to T353 timer expiry."
-            // The ITSI registration itself is still accepted; only the group
-            // attachment failed. (T353 handling / re-attach is part of the group
-            // identity procedures, cl. 16.8 — a later MM slice.)
-            tracing::warn!(
-                "MM: registration accepted but no group identity location accept returned; \
-                 assuming group attachment failed (cl. 16.4.1.1, equivalent to T353 expiry) \
-                 for configured groups {:?}",
-                self.attach_groups()
             );
         }
 
@@ -1161,6 +1235,12 @@ impl MmMs {
         // TNMM-SAP (cl. 15.3) outbound indications to the user application. MM has
         // just carried out the registration procedure successfully.
         self.emit_registration_success(&attached_gssis);
+
+        // Affiliate the configured groups via the standalone U-ATTACH/DETACH
+        // GROUP IDENTITY procedure (cl. 16.8.2) now that the ITSI is registered.
+        // Deliberately not bundled into the demand above (see
+        // `begin_post_registration_group_attach`).
+        self.begin_post_registration_group_attach(queue);
     }
 
     /// Send an MLE-IDENTITIES request (cl. 17.3.2) carrying the MS's own ISSI and
@@ -1815,6 +1895,10 @@ impl MmMs {
         // cl. 16.8.2: finally inform the user application with a TNMM-ATTACH
         // DETACH GROUP IDENTITY confirm (Table 15.1).
         self.emit_group_identity_confirm(&op, &accepted_attach, &accepted_detach);
+
+        // Continue any pending post-registration affiliation sequence: send the
+        // next queued group now that this operation has completed.
+        self.drive_group_attach_queue(queue);
     }
 
     /// Emit a TNMM-ATTACH DETACH GROUP IDENTITY confirm (Table 15.1,
@@ -2152,6 +2236,9 @@ impl TetraEntityTrait for MmMs {
                     op.handle
                 );
                 self.emit_group_identity_confirm(&op, &[], &[]);
+                // One failed group must not stall the rest of a post-registration
+                // affiliation sequence: send the next queued group.
+                self.drive_group_attach_queue(queue);
             }
         }
 
@@ -2387,35 +2474,79 @@ attach_groups = []
         assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
     }
 
-    /// With groups configured, the ITSI-attach demand must carry a group identity
-    /// location demand element (cl. 16.8.2 / 16.10.24) attaching exactly those
-    /// GSSIs — mode 1 ("detach all + attach these"), each an attachment with a
-    /// class of usage — and it must round-trip through the BS parser.
+    /// Even with groups configured, the ITSI-attach demand must carry NO group
+    /// identity location demand element: bundling would force fragmentation of
+    /// the first uplink. Groups are affiliated afterwards via the standalone
+    /// procedure (see `test_post_registration_group_attach_sequential`).
     #[test]
-    fn test_registration_demand_carries_group_attachment() {
+    fn test_registration_demand_carries_no_group_attachment() {
         let mut mm = ms_mm_with_groups(&[91, 220]);
         let mut q = MessageQueue::new();
 
         mm.rx_activate_conf(&mut q, &activate_conf(true));
 
         let msg = q.pop_front().expect("a demand must be emitted");
+        assert!(q.pop_front().is_none(), "exactly one message emitted");
         let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
             panic!("expected LmmMleUnitdataReq");
         };
         req.sdu.seek(0);
         let pdu = ULocationUpdateDemand::from_bitbuf(&mut req.sdu).expect("BS must parse the demand");
 
-        let gild = pdu
-            .group_identity_location_demand
-            .expect("group identity location demand present");
-        assert_eq!(gild.group_identity_attach_detach_mode, 1);
-        let ul = gild.group_identity_uplink.expect("group entries present");
-        assert_eq!(ul.len(), 2);
-        let gssis: Vec<u32> = ul.iter().filter_map(|g| g.gssi).collect();
-        assert_eq!(gssis, vec![91, 220]);
-        assert!(ul.iter().all(|g| g.class_of_usage == Some(GROUP_CLASS_OF_USAGE)));
-        assert!(ul.iter().all(|g| g.group_identity_detachment_uplink.is_none()));
+        assert!(
+            pdu.group_identity_location_demand.is_none(),
+            "registration demand must not bundle group attachments"
+        );
         assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
+    }
+
+    /// After a registration is accepted, the configured groups are affiliated via
+    /// the standalone U-ATTACH/DETACH GROUP IDENTITY procedure (cl. 16.8.2), one
+    /// group per PDU (amendment mode), drained sequentially: the next group is
+    /// sent only after the previous one's acknowledgement.
+    #[test]
+    fn test_post_registration_group_attach_sequential() {
+        let mut mm = ms_mm_with_groups(&[91, 220]);
+        let mut q = MessageQueue::new();
+
+        // Register: demand out (no groups), then accept.
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front().expect("registration demand");
+        assert!(q.pop_front().is_none());
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        // The accept first emits MLE-IDENTITIES, then the first standalone attach.
+        drain_mle_identities(&mut q);
+
+        // First attach: group 91 only, amendment mode, one op in flight, 220 queued.
+        let (issi, pdu) = pop_group_pdu(&mut q);
+        assert_eq!(issi, MS_ISSI);
+        assert!(!pdu.group_identity_attach_detach_mode, "amendment mode");
+        let ul = pdu.group_identity_uplink.expect("one group element");
+        assert_eq!(ul.len(), 1, "exactly one group per PDU (no fragmentation)");
+        assert_eq!(ul[0].gssi, Some(91));
+        assert_eq!(ul[0].class_of_usage, Some(GROUP_CLASS_OF_USAGE));
+        assert!(mm.pending_group_op.is_some());
+        assert_eq!(mm.groups_to_attach.len(), 1, "group 220 still queued");
+        assert!(q.pop_front().is_none(), "only one attach PDU in flight");
+
+        // Acknowledge 91 -> the next queued group (220) is sent.
+        deliver_dl(&mut mm, &mut q, build_group_ack(&[91], &[]));
+        drain_mle_identities(&mut q);
+        let (_issi, pdu2) = pop_group_pdu(&mut q);
+        let ul2 = pdu2.group_identity_uplink.expect("one group element");
+        assert_eq!(ul2.len(), 1);
+        assert_eq!(ul2[0].gssi, Some(220));
+        assert!(mm.pending_group_op.is_some());
+        assert_eq!(mm.groups_to_attach.len(), 0, "queue drained");
+        assert!(q.pop_front().is_none());
+
+        // Acknowledge 220 -> sequence complete, nothing pending, nothing queued.
+        deliver_dl(&mut mm, &mut q, build_group_ack(&[220], &[]));
+        drain_mle_identities(&mut q);
+        assert!(mm.pending_group_op.is_none());
+        assert!(mm.groups_to_attach.is_empty());
+        assert!(q.pop_front().is_none());
     }
 
     /// Own MNI for the test config (mcc=901, mnc=9999): (901<<14)|9999.
