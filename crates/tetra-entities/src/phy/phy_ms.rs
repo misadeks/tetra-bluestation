@@ -2,11 +2,22 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, unimplemented_log};
 use tetra_pdus::phy::traits::rxtx_dev::{RfPath, RxBurstBits, RxTxDev, TxSlotBits};
+use tetra_saps::tlmb::TlmbMonitorInd;
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::phy::components::{burst_consts::*, slotter, train_consts::TIMESLOT_TYPE4_BITS};
 use crate::{MessageQueue, TetraEntityTrait};
+
+/// Consecutive demodulated downlink slots without a decodable burst
+/// (training-sequence/AACH decode failure) after which the MS PHY declares a
+/// serving-cell downlink failure to the MLE (ETSI TS 100 392-2 cl. 18.3.4.5.3).
+///
+/// Kept below the demodulator's own `slots_since_last_valid_burst >= 100`
+/// revert-to-`DlUnsynchronized` threshold so that the failure is surfaced while
+/// the demodulator is still producing (empty) slots — and the run loop is still
+/// ticking — rather than after it has stopped, when no ticks would run.
+const DOWNLINK_FAILURE_SLOTS: u32 = 50;
 
 /// A fully-built uplink burst waiting to be transmitted in a specific slot.
 ///
@@ -49,6 +60,11 @@ pub struct PhyMs<D: RxTxDev> {
     /// Whether downlink frame synchronization has been achieved.
     synced: bool,
 
+    /// Consecutive demodulated downlink slots with no decodable burst while
+    /// synchronized. Drives the radio-link-failure declaration once it reaches
+    /// [`DOWNLINK_FAILURE_SLOTS`] (cl. 18.3.4.5.3).
+    slots_without_burst: u32,
+
     /// Uplink burst awaiting transmission in a granted slot, if any. `None`
     /// means the TX stream stays idle (silence) this cycle — the MS only puts
     /// energy on air during a granted opportunity.
@@ -69,10 +85,26 @@ impl<D: RxTxDev> PhyMs<D> {
             config,
             dltime: TdmaTime::default(),
             synced: false,
+            slots_without_burst: 0,
             pending_tx: None,
             tx_path_active: false,
             rxtxdev,
         }
+    }
+
+    /// Notify the MLE of a serving-cell downlink monitoring transition.
+    ///
+    /// Emitted only on a change of the downlink-available state (failure or
+    /// recovery). Internal IPC only (not an air-interface PDU); the MLE maps it
+    /// onto the standardized MLE-BREAK / MLE-REOPEN primitives
+    /// (cl. 18.3.4.5.3 / 18.3.4.7).
+    fn emit_monitor_ind(queue: &mut MessageQueue, downlink_available: bool) {
+        queue.push_back(SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Phy,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbMonitorInd(TlmbMonitorInd { downlink_available }),
+        });
     }
 
     /// Forward a single decoded downlink block to the LMAC over the TP SAP.
@@ -359,9 +391,33 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
 
         if let Some(time) = recovered {
             self.dltime = time;
-            if has_burst && !self.synced {
-                self.synced = true;
-                tracing::info!(ts = %self.dltime, "PhyMs: downlink synchronized");
+            if has_burst {
+                // A decodable burst was received: reset the failure counter and,
+                // on the transition into sync (initial acquisition or recovery
+                // from a declared downlink failure), notify the MLE. On initial
+                // acquisition the MLE is not out-of-service, so the recovery
+                // indication is an idempotent no-op there.
+                self.slots_without_burst = 0;
+                if !self.synced {
+                    self.synced = true;
+                    tracing::info!(ts = %self.dltime, "PhyMs: downlink synchronized");
+                    Self::emit_monitor_ind(queue, true);
+                }
+            } else if self.synced {
+                // Synchronized but this demodulated slot carried no decodable
+                // burst (training-sequence/AACH decode failure, cl. 18.3.4.5.3).
+                // Declare a serving-cell downlink failure to the MLE once the
+                // failure persists past the threshold.
+                self.slots_without_burst = self.slots_without_burst.saturating_add(1);
+                if self.slots_without_burst >= DOWNLINK_FAILURE_SLOTS {
+                    self.synced = false;
+                    tracing::warn!(
+                        ts = %self.dltime,
+                        slots = self.slots_without_burst,
+                        "PhyMs: serving-cell downlink failure (cl. 18.3.4.5.3)"
+                    );
+                    Self::emit_monitor_ind(queue, false);
+                }
             }
 
             // Retire the pending burst once the TX generation frontier has
@@ -454,6 +510,13 @@ attach_groups = []
         /// True hardware TX frontier the PHY sees via `tx_air_time`. `None`
         /// models "not locked / TX not possible yet".
         next_air_time: Option<TdmaTime>,
+        /// When true, the next `rxtx_timeslot` returns a slot carrying a
+        /// decodable burst (a valid training sequence); when false it returns a
+        /// `NotFound` slot (demodulated but no decodable burst). Used to drive
+        /// the radio-link-failure detection tests. An `ExtendedTrainSeq` with no
+        /// bits is used so `split_dl_slot_and_send_to_lmac` takes its warn-and-
+        /// drop path (no full burst buffer needed).
+        rx_burst: bool,
     }
 
     impl RxTxDev for MockRxTx {
@@ -464,12 +527,18 @@ attach_groups = []
             self.tx_calls.push(record);
 
             let time = self.next_time;
+            let train_type = if self.rx_burst {
+                TrainingSequence::ExtendedTrainSeq
+            } else {
+                TrainingSequence::NotFound
+            };
             Ok(vec![Some(RxSlotBits {
                 time,
                 // NotFound => drive_rx recovers the time but does not try to
-                // split a (non-existent) full downlink burst.
+                // split a (non-existent) full downlink burst. ExtendedTrainSeq
+                // => a decodable burst is present (drive_rx counts it as sync).
                 slot: RxBurstBits {
-                    train_type: TrainingSequence::NotFound,
+                    train_type,
                     bits: &[],
                 },
                 ..Default::default()
@@ -603,5 +672,94 @@ attach_groups = []
                 "burst (reserved={reserved}) scheduled at exactly dltime+2"
             );
         }
+    }
+
+    /// Count the downlink-monitoring indications the PHY emitted to the MLE and
+    /// their availability flags, in order.
+    fn monitor_inds(queue: &MessageQueue) -> Vec<bool> {
+        queue
+            .iter()
+            .filter_map(|m| match &m.msg {
+                SapMsgInner::TlmbMonitorInd(inner) => {
+                    assert_eq!(m.dest, TetraEntity::Mle, "monitor indication addressed to MLE");
+                    Some(inner.downlink_available)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// On initial acquisition the PHY emits exactly one "downlink available"
+    /// monitoring indication and does not re-emit it on subsequent good slots.
+    #[test]
+    fn test_downlink_sync_emits_available_once() {
+        let mut phy = phy_ms(MockRxTx::default());
+        phy.rxtxdev.rx_burst = true;
+        let mut queue = MessageQueue::new();
+
+        for _ in 0..5 {
+            phy.drive_rx(&mut queue);
+        }
+
+        assert!(phy.synced, "synchronized after a decodable burst");
+        assert_eq!(monitor_inds(&queue), vec![true], "exactly one available indication");
+    }
+
+    /// After sync, a sustained run of demodulated-but-undecodable slots (past
+    /// the threshold) makes the PHY declare a downlink failure exactly once
+    /// (cl. 18.3.4.5.3); a shorter gap does not.
+    #[test]
+    fn test_downlink_failure_declared_after_threshold() {
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        // Acquire sync.
+        phy.rxtxdev.rx_burst = true;
+        phy.drive_rx(&mut queue);
+        assert!(phy.synced);
+
+        // A gap shorter than the threshold: no failure yet.
+        phy.rxtxdev.rx_burst = false;
+        for _ in 0..(DOWNLINK_FAILURE_SLOTS - 1) {
+            phy.drive_rx(&mut queue);
+        }
+        assert!(phy.synced, "still in service below the failure threshold");
+        assert_eq!(monitor_inds(&queue), vec![true], "no failure indication yet");
+
+        // Cross the threshold: exactly one failure indication.
+        phy.drive_rx(&mut queue);
+        assert!(!phy.synced, "downlink failure declared at the threshold");
+        assert_eq!(monitor_inds(&queue), vec![true, false]);
+
+        // Further missing slots do not re-declare failure.
+        for _ in 0..10 {
+            phy.drive_rx(&mut queue);
+        }
+        assert_eq!(monitor_inds(&queue), vec![true, false], "failure declared only once");
+    }
+
+    /// After a declared failure, the return of a decodable burst re-syncs and
+    /// emits a "downlink available" recovery indication.
+    #[test]
+    fn test_downlink_recovery_emits_available() {
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        phy.rxtxdev.rx_burst = true;
+        phy.drive_rx(&mut queue);
+
+        // Drive a full failure.
+        phy.rxtxdev.rx_burst = false;
+        for _ in 0..DOWNLINK_FAILURE_SLOTS {
+            phy.drive_rx(&mut queue);
+        }
+        assert!(!phy.synced);
+        assert_eq!(monitor_inds(&queue), vec![true, false]);
+
+        // Recover: a decodable burst returns.
+        phy.rxtxdev.rx_burst = true;
+        phy.drive_rx(&mut queue);
+        assert!(phy.synced, "re-synchronized on burst return");
+        assert_eq!(monitor_inds(&queue), vec![true, false, true], "recovery indication emitted");
     }
 }

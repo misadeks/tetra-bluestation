@@ -47,6 +47,10 @@ pub enum SapMsgInner {
     // TMB-SAP / TLB-SAP (merged to TLMB-SAP)
     TlmbSyncInd(TlmbSyncInd),
     TlmbSysinfoInd(TlmbSysinfoInd),
+    /// MS only — internal PHY -> MLE serving-cell downlink monitoring
+    /// indication (radio link failure / recovery, cl. 18.3.4.5.3 / 18.3.4.7).
+    /// Not an air-interface PDU.
+    TlmbMonitorInd(TlmbMonitorInd),
 
     // TMC-SAP
     TlmcConfigureReq(TlmcConfigureReq),
@@ -77,6 +81,12 @@ pub enum SapMsgInner {
     // LCMC-SAP (MLE-CMCE)
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),
     LcmcMleUnitdataReq(LcmcMleUnitdataReq),
+    /// MLE -> CMCE break indication (cl. 17.3.3): communication resources are
+    /// temporarily unavailable (serving-cell radio link failure).
+    LcmcMleBreakInd(LcmcMleBreakInd),
+    /// MLE -> CMCE reopen indication (cl. 17.3.3): communication resources are
+    /// available again (serving-cell downlink recovered).
+    LcmcMleReopenInd(LcmcMleReopenInd),
 
     // CMCE -> UMAC control
     CmceCallControl(CallControl),
@@ -114,6 +124,11 @@ impl Display for SapMsgInner {
             // TMB-SAP
             SapMsgInner::TlmbSyncInd(_) => write!(f, "TmbSyncInd"),
             SapMsgInner::TlmbSysinfoInd(_) => write!(f, "TmbSysinfoInd"),
+            SapMsgInner::TlmbMonitorInd(_) => write!(f, "TlmbMonitorInd"),
+
+            // LCMC-SAP
+            SapMsgInner::LcmcMleBreakInd(_) => write!(f, "LcmcMleBreakInd"),
+            SapMsgInner::LcmcMleReopenInd(_) => write!(f, "LcmcMleReopenInd"),
 
             // Control/Brew
             SapMsgInner::MmSubscriberUpdate(_) => write!(f, "MmSubscriberUpdate"),

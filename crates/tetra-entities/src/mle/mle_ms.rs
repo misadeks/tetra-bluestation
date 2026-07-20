@@ -2,7 +2,7 @@ use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, unimplemented_log};
-use tetra_saps::lcmc::LcmcMleUnitdataInd;
+use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
 use tetra_saps::lmm::{LmmMleActivateConf, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
@@ -56,6 +56,11 @@ pub struct MleMs {
     /// new cell is selected. Prevents re-triggering registration on every
     /// repeated SYSINFO for the same cell.
     activate_confirmed: bool,
+    /// Whether the MLE has declared the serving cell out of service following a
+    /// downlink radio-link failure (ETSI TS 100 392-2 cl. 18.3.4.5.3). While
+    /// out of service the MLE has issued MLE-BREAK to the upper layers and is
+    /// waiting for the downlink to recover (cl. 18.3.4.7).
+    out_of_service: bool,
 }
 
 impl MleMs {
@@ -64,6 +69,7 @@ impl MleMs {
             config,
             serving_cell: None,
             activate_confirmed: false,
+            out_of_service: false,
         }
     }
 
@@ -300,8 +306,74 @@ impl MleMs {
             SapMsgInner::TlmbSyncInd(_) => {
                 self.rx_tlmb_tl_sync_ind(queue, message);
             }
+            SapMsgInner::TlmbMonitorInd(ref inner) => {
+                let available = inner.downlink_available;
+                self.rx_tlmb_monitor_ind(queue, available);
+            }
             _ => {
                 panic!();
+            }
+        }
+    }
+
+    /// Handle the MS-internal serving-cell downlink monitoring indication from
+    /// the PHY (ETSI TS 100 392-2 cl. 18.3.4.5.3 / 18.3.4.7).
+    ///
+    /// On a declared downlink failure the MLE declares the cell out of service,
+    /// issues MLE-BREAK to the upper layers (CMCE), and re-arms cell selection
+    /// so that when the downlink recovers the cell is re-selected and the
+    /// LMM-ACTIVATE confirmation re-fired to MM — which then re-evaluates
+    /// registration against cl. 18.3.4.7.1a (same cell/LA => no re-registration,
+    /// NOTE 2; a changed LA/network => a location update). On recovery the MLE
+    /// issues MLE-REOPEN.
+    fn rx_tlmb_monitor_ind(&mut self, queue: &mut MessageQueue, downlink_available: bool) {
+        match (downlink_available, self.out_of_service) {
+            (false, false) => {
+                // Serving-cell radio link failure: declare out of service.
+                self.out_of_service = true;
+                tracing::warn!(
+                    "MLE: serving-cell downlink failure — declaring out of service, \
+                     MLE-BREAK to upper layers (cl. 18.3.4.5.3)"
+                );
+                // MLE-BREAK to CMCE (cl. 17.3.3): communication resources are
+                // temporarily unavailable. We do not model graceful service
+                // degradation, so no permitted-service list is carried.
+                queue.push_back(SapMsg {
+                    sap: Sap::LcmcSap,
+                    src: TetraEntity::Mle,
+                    dest: TetraEntity::Cmce,
+                    msg: SapMsgInner::LcmcMleBreakInd(LcmcMleBreakInd {
+                        permitted_services_in_ms_graceful_service_degradation_mode: 0,
+                    }),
+                });
+                // Drop the serving cell and re-arm the one-shot activate
+                // confirmation so that re-acquisition (a new SYNC) re-runs cell
+                // selection (cl. 18.3.4.6) and re-confirms to MM.
+                self.serving_cell = None;
+                self.activate_confirmed = false;
+            }
+            (true, true) => {
+                // Downlink recovered: reopen the link (cl. 18.3.4.7).
+                self.out_of_service = false;
+                tracing::info!("MLE: serving-cell downlink recovered — MLE-REOPEN (cl. 18.3.4.7)");
+                queue.push_back(SapMsg {
+                    sap: Sap::LcmcSap,
+                    src: TetraEntity::Mle,
+                    dest: TetraEntity::Cmce,
+                    msg: SapMsgInner::LcmcMleReopenInd(LcmcMleReopenInd {}),
+                });
+                // Cell selection re-runs on the next SYNC (serving_cell was
+                // cleared on break), re-firing the LMM-ACTIVATE confirmation so
+                // MM re-evaluates registration per cl. 18.3.4.7.1a.
+            }
+            _ => {
+                // No state change (idempotent): initial acquisition reports
+                // available while already in service, or repeated failure while
+                // already out of service.
+                tracing::trace!(
+                    "MLE: monitor indication (available={}) with no state change",
+                    downlink_available
+                );
             }
         }
     }
@@ -674,5 +746,150 @@ impl TetraEntityTrait for MleMs {
                 panic!();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tetra_config::bluestation::from_toml_str;
+
+    const MS_TOML: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+"#;
+
+    fn ms_mle() -> MleMs {
+        let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
+        MleMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// Put the MLE into the "camped and confirmed" state a real run reaches
+    /// after cell selection.
+    fn camp(mle: &mut MleMs) {
+        mle.serving_cell = Some(ServingCell {
+            mcc: 901,
+            mnc: 9999,
+            location_area: Some(1),
+            registration_required: Some(true),
+            system_wide_services: Some(true),
+            ..Default::default()
+        });
+        mle.activate_confirmed = true;
+    }
+
+    /// A downlink failure indication makes the MLE declare out-of-service, emit
+    /// MLE-BREAK to CMCE, clear the serving cell, and re-arm cell selection
+    /// (cl. 18.3.4.5.3).
+    #[test]
+    fn test_downlink_failure_declares_out_of_service_and_breaks() {
+        let mut mle = ms_mle();
+        camp(&mut mle);
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_monitor_ind(&mut queue, false);
+
+        assert!(mle.out_of_service, "declared out of service");
+        assert!(mle.serving_cell.is_none(), "serving cell cleared");
+        assert!(!mle.activate_confirmed, "activate confirmation re-armed");
+
+        let breaks: Vec<_> = queue
+            .iter()
+            .filter(|m| matches!(m.msg, SapMsgInner::LcmcMleBreakInd(_)))
+            .collect();
+        assert_eq!(breaks.len(), 1, "exactly one MLE-BREAK");
+        assert_eq!(breaks[0].dest, TetraEntity::Cmce, "MLE-BREAK addressed to CMCE");
+    }
+
+    /// A second failure indication while already out of service is idempotent:
+    /// no further MLE-BREAK.
+    #[test]
+    fn test_repeated_failure_is_idempotent() {
+        let mut mle = ms_mle();
+        camp(&mut mle);
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_monitor_ind(&mut queue, false);
+        mle.rx_tlmb_monitor_ind(&mut queue, false);
+
+        let breaks = queue
+            .iter()
+            .filter(|m| matches!(m.msg, SapMsgInner::LcmcMleBreakInd(_)))
+            .count();
+        assert_eq!(breaks, 1, "MLE-BREAK emitted only once");
+    }
+
+    /// Recovery after a failure emits MLE-REOPEN to CMCE and clears the
+    /// out-of-service state (cl. 18.3.4.7).
+    #[test]
+    fn test_recovery_emits_reopen() {
+        let mut mle = ms_mle();
+        camp(&mut mle);
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_monitor_ind(&mut queue, false);
+        mle.rx_tlmb_monitor_ind(&mut queue, true);
+
+        assert!(!mle.out_of_service, "back in service after recovery");
+        let reopens: Vec<_> = queue
+            .iter()
+            .filter(|m| matches!(m.msg, SapMsgInner::LcmcMleReopenInd(_)))
+            .collect();
+        assert_eq!(reopens.len(), 1, "exactly one MLE-REOPEN");
+        assert_eq!(reopens[0].dest, TetraEntity::Cmce, "MLE-REOPEN addressed to CMCE");
+    }
+
+    /// An "available" indication while in service (initial acquisition) is a
+    /// no-op: no MLE-REOPEN, still in service.
+    #[test]
+    fn test_available_while_in_service_is_noop() {
+        let mut mle = ms_mle();
+        camp(&mut mle);
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_monitor_ind(&mut queue, true);
+
+        assert!(!mle.out_of_service);
+        assert!(mle.serving_cell.is_some(), "serving cell untouched");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LcmcMleReopenInd(_))).count(),
+            0,
+            "no reopen when never broken"
+        );
     }
 }

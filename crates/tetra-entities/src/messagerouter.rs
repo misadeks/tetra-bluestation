@@ -44,6 +44,11 @@ impl MessageQueue {
     pub fn pop_front(&mut self) -> Option<SapMsg> {
         self.messages.pop_front()
     }
+
+    /// Iterate over the queued messages without consuming them.
+    pub fn iter(&self) -> impl Iterator<Item = &SapMsg> {
+        self.messages.iter()
+    }
 }
 
 pub struct MessageRouter {

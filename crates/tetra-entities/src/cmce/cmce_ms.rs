@@ -94,6 +94,18 @@ impl TetraEntityTrait for CmceMs {
             SapMsgInner::LcmcMleUnitdataInd(_) => {
                 self.rx_unitdata_ind(queue, message);
             }
+            SapMsgInner::LcmcMleBreakInd(_) => {
+                // MLE-BREAK (cl. 17.3.3): communication resources temporarily
+                // unavailable (serving-cell radio link failure). MS call control
+                // is not yet implemented, so there is no active call to suspend;
+                // record the loss of service.
+                tracing::warn!("CMCE: MLE-BREAK — communication resources unavailable");
+            }
+            SapMsgInner::LcmcMleReopenInd(_) => {
+                // MLE-REOPEN (cl. 17.3.3): communication resources available
+                // again (serving-cell downlink recovered).
+                tracing::info!("CMCE: MLE-REOPEN — communication resources available");
+            }
             _ => {
                 panic!();
             }
