@@ -1,6 +1,7 @@
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, unimplemented_log};
-use tetra_saps::lmm::{LmmMleActivateConf, LmmMleUnitdataReq};
+use tetra_saps::lmm::{LmmMleActivateConf, LmmMleIdentitiesReq, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
@@ -159,6 +160,13 @@ pub struct MmMs {
     /// staged to disk via `SetConfig` that only takes effect after a controlled
     /// restart (`ApplyConfig`). Surfaced in the runtime-state snapshot.
     restart_required: bool,
+    /// The full set of group identities (GSSIs) currently attached (cl. 16.8).
+    /// Seeded from `[ms].attach_groups` and updated at runtime as groups are
+    /// attached/detached (registration accept, standalone attach/detach). This
+    /// is the authoritative set MM sends to the MLE via MLE-IDENTITIES (cl.
+    /// 17.3.2) so the MAC downlink address filter (cl. 23.4.1.2.1) stays in
+    /// sync, and the set re-requested on a re-registration.
+    attached_gssis: BTreeSet<u32>,
 }
 
 /// Runtime plumbing for the Plane B management write/apply handlers
@@ -180,6 +188,15 @@ struct ManagementContext {
 impl MmMs {
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         let serving_la = config.config().cell.location_area;
+        // Seed the runtime attached-group set from config (cl. 16.8). Before any
+        // registration this is the set the MS will request; after registration it
+        // holds the SwMI-confirmed attached set.
+        let attached_gssis = config
+            .config()
+            .ms
+            .as_ref()
+            .map(|ms| ms.attach_groups.iter().copied().collect::<BTreeSet<u32>>())
+            .unwrap_or_default();
         Self {
             config,
             telemetry,
@@ -198,6 +215,7 @@ impl MmMs {
             serving_la,
             mgmt_ctx: None,
             restart_required: false,
+            attached_gssis,
         }
     }
 
@@ -228,15 +246,13 @@ impl MmMs {
             .issi
     }
 
-    /// Group identities (GSSIs) this MS is configured to attach to at
-    /// registration (ETSI TS 100 392-2 cl. 16.8 group identity attachment).
+    /// Group identities (GSSIs) this MS currently intends to have attached
+    /// (ETSI TS 100 392-2 cl. 16.8 group identity attachment). Returns the live
+    /// runtime set (seeded from config, updated by attach/detach), sorted for
+    /// deterministic PDU ordering. On an initial registration this equals the
+    /// configured set; on a re-registration it reflects the current attachments.
     fn attach_groups(&self) -> Vec<u32> {
-        self.config
-            .config()
-            .ms
-            .as_ref()
-            .map(|ms| ms.attach_groups.clone())
-            .unwrap_or_default()
+        self.attached_gssis.iter().copied().collect()
     }
 
     /// Own Mobile Network Identity (MNI) as the 24-bit value carried in the
@@ -986,7 +1002,7 @@ impl MmMs {
             MmPduTypeDl::DCkChangeDemand => unimplemented_log!("DCkChangeDemand"),
             MmPduTypeDl::DDisable => unimplemented_log!("DDisable"),
             MmPduTypeDl::DEnable => unimplemented_log!("DEnable"),
-            MmPduTypeDl::DLocationUpdateAccept => self.rx_d_location_update_accept(prim.sdu.clone()),
+            MmPduTypeDl::DLocationUpdateAccept => self.rx_d_location_update_accept(queue, prim.sdu.clone()),
             MmPduTypeDl::DLocationUpdateCommand => {
                 self.rx_d_location_update_command(queue, prim.sdu.clone())
             }
@@ -1003,7 +1019,7 @@ impl MmMs {
 
     /// Handle D-LOCATION-UPDATE-ACCEPT (cl. 16.9.2.7): the SwMI has accepted our
     /// registration. Mark the MS as registered and stop the retry timer.
-    fn rx_d_location_update_accept(&mut self, mut sdu: BitBuffer) {
+    fn rx_d_location_update_accept(&mut self, queue: &mut MessageQueue, mut sdu: BitBuffer) {
         let pdu = match DLocationUpdateAccept::from_bitbuf(&mut sdu) {
             Ok(pdu) => pdu,
             Err(e) => {
@@ -1044,12 +1060,11 @@ impl MmMs {
 
         // Report the outcome of the group identity attachment requested in the
         // demand (cl. 16.8.2 / 16.10.24). The SwMI returns the accepted groups
-        // (each carrying a group_identity_attachment) and/or rejected ones. We
-        // log the result for observability; RX group filtering continues to use
-        // the configured attach_groups (dynamic granted-set tracking is a future
-        // refinement).
+        // (each carrying a group_identity_attachment) and/or rejected ones.
         let mut attached_gssis: Vec<u32> = Vec::new();
+        let mut group_accept_present = false;
         if let Some(accept) = &pdu.group_identity_location_accept {
+            group_accept_present = true;
             attached_gssis = accept
                 .group_identity_downlink
                 .as_ref()
@@ -1093,9 +1108,50 @@ impl MmMs {
         self.t351_countdown = 0;
         self.system_rejection_count = 0;
 
+        // Reconcile the runtime attached-group set with what the SwMI confirmed,
+        // then push it to the MLE so the MAC downlink address filter matches the
+        // actual affiliation (cl. 16.8.2 last paragraph / cl. 18.441-442: MM
+        // sends the accepted-and-thus-attached group identities to the MLE with
+        // the MLE-IDENTITIES request). If the SwMI returned no group accept
+        // element the attached set is left as-is (config-seeded) so the filter is
+        // unchanged, preserving prior behaviour.
+        if group_accept_present {
+            self.attached_gssis = attached_gssis.iter().copied().collect();
+        }
+        self.send_mle_identities(queue, &[]);
+
         // TNMM-SAP (cl. 15.3) outbound indications to the user application. MM has
         // just carried out the registration procedure successfully.
         self.emit_registration_success(&attached_gssis);
+    }
+
+    /// Send an MLE-IDENTITIES request (cl. 17.3.2) carrying the MS's own ISSI and
+    /// the complete current attached-group set. The MLE uses it to (re)configure
+    /// the MAC downlink address filter (cl. 23.4.1.2.1). `detached_gssis` is
+    /// purely informational (for logging on the MLE side); the authoritative
+    /// post-update set is the attached set. Called after a registration accept
+    /// and after every successful standalone group attach/detach (cl. 16.8.2).
+    fn send_mle_identities(&mut self, queue: &mut MessageQueue, detached_gssis: &[u32]) {
+        let issi = self.own_issi();
+        let attached: Vec<u32> = self.attach_groups();
+        tracing::info!(
+            "MM: -> MLE-IDENTITIES (issi={} attached_gssis={:?} detached_gssis={:?})",
+            issi,
+            attached,
+            detached_gssis
+        );
+        let m = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleIdentitiesReq(LmmMleIdentitiesReq {
+                issi,
+                assi: None,
+                attached_gssis: attached,
+                detached_gssis: detached_gssis.to_vec(),
+            }),
+        };
+        queue.push_back(m);
     }
 
     /// Handle D-LOCATION-UPDATE-REJECT (cl. 16.9.2.9 / 16.4.1.1): the SwMI
@@ -2152,6 +2208,7 @@ attach_groups = []
 
         deliver_dl(&mut mm, &mut q, build_accept());
         assert_eq!(mm.reg_state, RegState::Registered);
+        drain_mle_identities(&mut q);
 
         // No further retransmission even after the retry window elapses.
         for _ in 0..=T351_TIMEOUT_SLOTS {
@@ -2280,6 +2337,7 @@ attach_groups = []
         let _ = q.pop_front();
         deliver_dl(&mut mm, &mut q, build_accept());
         assert_eq!(mm.reg_state, RegState::Registered);
+        drain_mle_identities(&mut q);
 
         // Shutdown: a detach must be initiated.
         assert!(mm.begin_deregistration(&mut q), "detach must be initiated when registered");
@@ -2314,6 +2372,7 @@ attach_groups = []
         mm.rx_activate_conf(&mut q, &activate_conf(true));
         let _ = q.pop_front();
         deliver_dl(&mut mm, &mut q, build_accept());
+        drain_mle_identities(&mut q);
         assert!(mm.begin_deregistration(&mut q));
         let _ = q.pop_front();
 
@@ -2348,6 +2407,22 @@ attach_groups = []
         assert!(q.pop_front().is_none());
         deliver_dl(mm, q, build_accept());
         assert_eq!(mm.reg_state, RegState::Registered);
+        drain_mle_identities(q);
+        assert!(q.pop_front().is_none());
+    }
+
+    /// Drain (and validate) the MLE-IDENTITIES request MM emits after a
+    /// successful registration accept (cl. 17.3.2): it carries the MS's own ISSI
+    /// and the confirmed attached-group set so the MLE can configure the MAC
+    /// downlink address filter (cl. 23.4.1.2.1).
+    fn drain_mle_identities(q: &mut MessageQueue) {
+        let msg = q.pop_front().expect("MLE-IDENTITIES emitted after registration accept");
+        assert_eq!(msg.sap, Sap::LmmSap);
+        assert_eq!(msg.dest, TetraEntity::Mle);
+        assert!(
+            matches!(msg.msg, SapMsgInner::LmmMleIdentitiesReq(_)),
+            "expected an MLE-IDENTITIES request"
+        );
     }
 
     /// Helper: pop exactly one U-LOCATION-UPDATE-DEMAND off the queue and return its
@@ -2506,6 +2581,7 @@ attach_groups = []
         let _ = q.pop_front();
         deliver_dl(&mut mm, &mut q, build_accept_type(LocationUpdateType::MigratingLocationUpdating));
         assert!(mm.temporary_registration);
+        drain_mle_identities(&mut q);
         assert!(q.pop_front().is_none());
 
         // Same cell, normal mode (system_wide_services = true): periodic LU.

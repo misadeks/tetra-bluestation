@@ -75,12 +75,27 @@ pub struct LmmMleDisableReq {
 #[derive(Debug, Clone)]
 pub struct LmmMleEnableReq {}
 
+/// MLE-IDENTITIES request (cl. 17.3.2). MM uses this to tell the MLE the set of
+/// identities by which the MS is currently known, so the MLE (and, through it,
+/// the MAC downlink address filter, cl. 23.4.1.2.1) accepts traffic addressed to
+/// them. Per cl. 16.8.2 (last paragraph) MM sends the accepted-and-thus-attached
+/// group identities with this primitive after a successful group
+/// attach/detach; it is also sent after registration to seed the attached set.
 #[derive(Debug, Clone)]
 pub struct LmmMleIdentitiesReq {
-    pub issi: Todo,
-    pub assi: Todo,
-    pub attached_gssis: Vec<Todo>,
-    pub detached_gssis: Vec<Todo>,
+    /// The MS's own Individual Short Subscriber Identity (ISSI).
+    pub issi: u32,
+    /// Assigned/alias SSI, if the SwMI has allocated one (cl. 16.4.7). `None`
+    /// when the MS is known only by its ISSI (this stack's clear-mode default).
+    pub assi: Option<u32>,
+    /// The complete, authoritative set of group identities (GSSIs) currently
+    /// attached after the update. The MLE replaces its group-identity set with
+    /// this (and configures the MAC filter accordingly), so it is a full
+    /// snapshot rather than an increment.
+    pub attached_gssis: Vec<u32>,
+    /// Group identities (GSSIs) removed by this update, for logging/observability.
+    /// The authoritative post-update set is `attached_gssis`.
+    pub detached_gssis: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]

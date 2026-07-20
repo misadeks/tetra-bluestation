@@ -77,6 +77,10 @@ pub enum SapMsgInner {
     /// characteristics (ETSI TS 100 392-2 cl. 17.3.2). Carries whether the
     /// serving cell requires registration (from D-MLE-SYSINFO, cl. 18.4.2.2).
     LmmMleActivateConf(LmmMleActivateConf),
+    /// MM -> MLE identities request (cl. 17.3.2): the set of identities by which
+    /// the MS is currently known (own ISSI + attached GSSIs). The MLE configures
+    /// the MAC downlink address filter (cl. 23.4.1.2.1) from it.
+    LmmMleIdentitiesReq(LmmMleIdentitiesReq),
 
     // LCMC-SAP (MLE-CMCE)
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),
@@ -129,6 +133,9 @@ impl Display for SapMsgInner {
             // LCMC-SAP
             SapMsgInner::LcmcMleBreakInd(_) => write!(f, "LcmcMleBreakInd"),
             SapMsgInner::LcmcMleReopenInd(_) => write!(f, "LcmcMleReopenInd"),
+
+            // LMM-SAP
+            SapMsgInner::LmmMleIdentitiesReq(_) => write!(f, "LmmMleIdentitiesReq"),
 
             // Control/Brew
             SapMsgInner::MmSubscriberUpdate(_) => write!(f, "MmSubscriberUpdate"),

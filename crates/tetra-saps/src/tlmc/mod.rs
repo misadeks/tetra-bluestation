@@ -23,9 +23,22 @@ pub struct TlmcConfigureInd {
 #[derive(Debug, Clone)]
 /// Poorly documented, but used in TL-CONFIGURE. Signals which addresses are valid,
 /// including full MCC/MNC.
+///
+/// Extended (MS mode) to also carry the layer-2 downlink address-filter set the
+/// MLE derives from the MS's identities (own ISSI + attached GSSIs, cl. 17.3.2 /
+/// 23.4.1.2.1). The MAC accepts downlink traffic addressed to any of these. The
+/// SSI members are `None` for a scrambling-only configure (e.g. at cell
+/// selection, when only MCC/MNC are being set) so an existing filter is left
+/// unchanged.
 pub struct TlmcValidAddress {
     pub mcc: u16,
     pub mnc: u16,
+    /// The MS's own individual identity (ISSI). `None` leaves the MAC's current
+    /// individual identity unchanged.
+    pub individual_ssi: Option<u32>,
+    /// The full set of group identities (GSSIs) currently attached. `Some`
+    /// replaces the MAC's accepted-group set; `None` leaves it unchanged.
+    pub group_ssis: Option<Vec<u32>>,
 }
 /// Clause 20.4.3 and 20.3.5.4.1c
 /// TMC-CONFIGURE request, see below. When used by MLE:

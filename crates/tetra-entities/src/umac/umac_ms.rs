@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::panic;
 
 use tetra_config::bluestation::{SharedConfig, StackMode};
@@ -126,10 +127,33 @@ pub struct UmacMs {
     /// a capacity request) is in `pending_uplink`; the remainder here is sent as
     /// a MAC-END-HU once the BS grants an uplink subslot (cl. 23.5.2).
     pending_fragment: Option<UplinkFragment>,
+
+    /// Runtime downlink address-filter set (cl. 23.4.1.2.1). Seeded from
+    /// `[ms].issi` / `[ms].attach_groups` at construction and updated at runtime
+    /// via TL-CONFIGURE (from the MLE-IDENTITIES chain, cl. 17.3.2) so that
+    /// dynamic group attach/detach changes which downlink traffic the MAC
+    /// accepts. The MAC receive filter consults these instead of reading the
+    /// static config, so `accept_downlink_address` reflects the live attached set.
+    valid_individual_ssi: Option<u32>,
+    valid_group_ssis: BTreeSet<u32>,
 }
 
 impl UmacMs {
     pub fn new(config: SharedConfig) -> Self {
+        // Seed the runtime downlink address-filter set from config (cl.
+        // 23.4.1.2.1). This preserves pre-registration behaviour: before any
+        // MLE-IDENTITIES update the MS accepts its own ISSI and the configured
+        // groups. Runtime group attach/detach later replaces the group set.
+        let (valid_individual_ssi, valid_group_ssis) = {
+            let cfg = config.config();
+            match cfg.ms.as_ref() {
+                Some(ms) => (
+                    Some(ms.issi),
+                    ms.attach_groups.iter().copied().collect::<BTreeSet<u32>>(),
+                ),
+                None => (None, BTreeSet::new()),
+            }
+        };
         Self {
             dltime: TdmaTime::default(),
             self_component: TetraEntity::Umac,
@@ -144,6 +168,8 @@ impl UmacMs {
             access_params: AccessParamStore::new(),
             random_access: MsRandomAccess::new(),
             pending_fragment: None,
+            valid_individual_ssi,
+            valid_group_ssis,
         }
     }
 
@@ -1443,13 +1469,15 @@ impl UmacMs {
         if addr.ssi == BROADCAST_SSI {
             return true;
         }
-        let Some(ms) = cfg.ms.as_ref() else {
+        if cfg.ms.is_none() {
             // No MS section (should not happen in MS mode): preserve prior
             // unfiltered behaviour rather than silently dropping traffic.
             return true;
-        };
-        // Own individual identity or any attached group.
-        addr.ssi == ms.issi || ms.attach_groups.contains(&addr.ssi)
+        }
+        // Own individual identity or any currently-attached group. The runtime
+        // sets are seeded from config and kept live by the MLE-IDENTITIES chain
+        // (cl. 17.3.2), so dynamic group attach/detach changes what is accepted.
+        self.valid_individual_ssi == Some(addr.ssi) || self.valid_group_ssis.contains(&addr.ssi)
     }
 
     fn rx_tlmb_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
@@ -1493,6 +1521,23 @@ impl UmacMs {
 
             self.mcc = Some(valid_addresses.mcc);
             self.mnc = Some(valid_addresses.mnc);
+
+            // Update the runtime downlink address filter when the MLE supplies
+            // the MS's identities (cl. 17.3.2 / 23.4.1.2.1). `None` members mean
+            // "leave unchanged" (e.g. a scrambling-only configure at cell
+            // selection), so the filter is only touched by an MLE-IDENTITIES
+            // request carrying the attached set.
+            if let Some(individual_ssi) = valid_addresses.individual_ssi {
+                self.valid_individual_ssi = Some(individual_ssi);
+            }
+            if let Some(group_ssis) = &valid_addresses.group_ssis {
+                self.valid_group_ssis = group_ssis.iter().copied().collect();
+                tracing::info!(
+                    "MS downlink address filter updated: issi={:?} groups={:?}",
+                    self.valid_individual_ssi,
+                    self.valid_group_ssis
+                );
+            }
 
             // Attempt to update scrambling code (if cc is also known)
             self.update_scrambing_and_submit_to_lmac(queue);
@@ -1560,6 +1605,7 @@ impl TetraEntityTrait for UmacMs {
 mod tests {
     use super::*;
     use tetra_config::bluestation::from_toml_str;
+    use tetra_saps::tlmc::{TlmcConfigureReq, TlmcValidAddress};
     use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
     use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
     use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
@@ -1884,5 +1930,63 @@ colour_code = 1
         assert!(umac.accept_downlink_address(&ssi_addr(2200699)));
         assert!(umac.accept_downlink_address(&ssi_addr(1)));
         assert!(umac.accept_downlink_address(&ssi_addr(BROADCAST_SSI)));
+    }
+
+    /// G1 (cl. 17.3.2 / 23.4.1.2.1): a TL-CONFIGURE carrying the MS's identities
+    /// (from the MLE-IDENTITIES chain) replaces the runtime downlink address
+    /// filter, so a newly-attached group is accepted and a dropped one rejected.
+    #[test]
+    fn test_tlmc_configure_updates_runtime_filter() {
+        let mut umac = umac_cfg("Ms", 1000001, &[91]);
+        // Seeded from config: own ISSI + group 91 accepted, 220 not.
+        assert!(umac.accept_downlink_address(&ssi_addr(91)));
+        assert!(!umac.accept_downlink_address(&ssi_addr(220)));
+
+        // MLE reconfigures the filter: detach 91, attach 220.
+        let mut q = MessageQueue::new();
+        let msg = SapMsg {
+            sap: Sap::TlmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TlmcConfigureReq(TlmcConfigureReq {
+                valid_addresses: Some(TlmcValidAddress {
+                    mcc: 901,
+                    mnc: 9999,
+                    individual_ssi: Some(1000001),
+                    group_ssis: Some(vec![220]),
+                }),
+                ..Default::default()
+            }),
+        };
+        umac.rx_tlmc_configure_req(&mut q, msg);
+
+        assert!(umac.accept_downlink_address(&ssi_addr(1000001)), "own ISSI still accepted");
+        assert!(umac.accept_downlink_address(&ssi_addr(220)), "newly attached group accepted");
+        assert!(!umac.accept_downlink_address(&ssi_addr(91)), "detached group now rejected");
+    }
+
+    /// G1: a scrambling-only TL-CONFIGURE (no SSI members) leaves the runtime
+    /// downlink address filter untouched (e.g. at cell selection).
+    #[test]
+    fn test_tlmc_configure_scrambling_only_preserves_filter() {
+        let mut umac = umac_cfg("Ms", 1000001, &[91]);
+        let mut q = MessageQueue::new();
+        let msg = SapMsg {
+            sap: Sap::TlmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TlmcConfigureReq(TlmcConfigureReq {
+                valid_addresses: Some(TlmcValidAddress {
+                    mcc: 901,
+                    mnc: 9999,
+                    individual_ssi: None,
+                    group_ssis: None,
+                }),
+                ..Default::default()
+            }),
+        };
+        umac.rx_tlmc_configure_req(&mut q, msg);
+        assert!(umac.accept_downlink_address(&ssi_addr(91)), "group filter preserved");
+        assert!(umac.accept_downlink_address(&ssi_addr(1000001)), "own ISSI preserved");
     }
 }

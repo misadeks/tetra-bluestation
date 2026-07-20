@@ -600,6 +600,11 @@ impl MleMs {
                 valid_addresses: Some(TlmcValidAddress {
                     mcc: pdu.mcc,
                     mnc: pdu.mnc,
+                    // Scrambling-only configure at cell selection: leave the MAC
+                    // downlink address filter unchanged (it is seeded from config
+                    // and updated via the MLE-IDENTITIES chain, cl. 17.3.2).
+                    individual_ssi: None,
+                    group_ssis: None,
                 }),
                 ..Default::default()
             }),
@@ -655,8 +660,50 @@ impl MleMs {
             SapMsgInner::LmmMleUnitdataReq(_prim) => {
                 self.rx_lmm_mle_unitdata_req(queue, message);
             }
+            SapMsgInner::LmmMleIdentitiesReq(_prim) => {
+                self.rx_lmm_mle_identities_req(queue, message);
+            }
             _ => panic!(),
         }
+    }
+
+    /// MLE-IDENTITIES request from MM (cl. 17.3.2): the set of identities by
+    /// which the MS is currently known (own ISSI + the full attached-group set).
+    /// The MLE holds no air-interface state for this; it configures the layer-2
+    /// (MAC) downlink address filter (cl. 23.4.1.2.1) via TL-CONFIGURE so the MAC
+    /// accepts traffic addressed to the MS's own ISSI and each attached GSSI, and
+    /// drops everything else. Called after registration (to seed the set) and
+    /// after every successful standalone group attach/detach (cl. 16.8.2).
+    fn rx_lmm_mle_identities_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        let SapMsgInner::LmmMleIdentitiesReq(prim) = &message.msg else {
+            panic!()
+        };
+        tracing::info!(
+            "MLE: <- MLE-IDENTITIES (issi={} attached_gssis={:?} detached_gssis={:?}); configuring MAC address filter",
+            prim.issi,
+            prim.attached_gssis,
+            prim.detached_gssis
+        );
+
+        // Use the configured home network MCC/MNC for the valid-address element.
+        // These match what UMAC already holds; supplying them keeps the element
+        // well-formed and does not change the derived scrambling code.
+        let cfg = self.config.config();
+        let m = SapMsg {
+            sap: Sap::TlmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TlmcConfigureReq(TlmcConfigureReq {
+                valid_addresses: Some(TlmcValidAddress {
+                    mcc: cfg.net.mcc,
+                    mnc: cfg.net.mnc,
+                    individual_ssi: Some(prim.issi),
+                    group_ssis: Some(prim.attached_gssis.clone()),
+                }),
+                ..Default::default()
+            }),
+        };
+        queue.push_back(m);
     }
 
     fn rx_tlpd_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
@@ -753,6 +800,7 @@ impl TetraEntityTrait for MleMs {
 mod tests {
     use super::*;
     use tetra_config::bluestation::from_toml_str;
+    use tetra_saps::lmm::LmmMleIdentitiesReq;
 
     const MS_TOML: &str = r#"
 config_version = "0.6"
@@ -891,5 +939,40 @@ attach_groups = []
             0,
             "no reopen when never broken"
         );
+    }
+
+    /// G1 (cl. 17.3.2 / 23.4.1.2.1): an MLE-IDENTITIES request from MM makes the
+    /// MLE configure the MAC downlink address filter, forwarding the own ISSI and
+    /// the full attached-group set to UMAC in a TL-CONFIGURE.
+    #[test]
+    fn test_mle_identities_configures_mac_filter() {
+        let mut mle = ms_mle();
+        let mut queue = MessageQueue::new();
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleIdentitiesReq(LmmMleIdentitiesReq {
+                issi: 1000001,
+                assi: None,
+                attached_gssis: vec![91, 220],
+                detached_gssis: vec![],
+            }),
+        };
+        mle.rx_lmm_prim(&mut queue, msg);
+
+        let out = queue.pop_front().expect("a TL-CONFIGURE must be emitted");
+        assert_eq!(out.sap, Sap::TlmcSap);
+        assert_eq!(out.dest, TetraEntity::Umac);
+        let SapMsgInner::TlmcConfigureReq(req) = out.msg else {
+            panic!("expected TlmcConfigureReq");
+        };
+        let va = req.valid_addresses.expect("valid addresses set");
+        assert_eq!(va.individual_ssi, Some(1000001));
+        assert_eq!(va.group_ssis, Some(vec![91, 220]));
+        // MCC/MNC are the configured home network so the element stays well-formed.
+        assert_eq!(va.mcc, 901);
+        assert_eq!(va.mnc, 9999);
     }
 }
