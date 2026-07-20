@@ -1,5 +1,4 @@
 use core::fmt;
-use std::panic;
 
 use tetra_core::{BitBuffer, pdu_parse_error::PduParseErr};
 
@@ -92,13 +91,20 @@ impl AccessAssignFr18 {
                 });
             }
             3 => {
-                // UL usage counts as CommonAndAssigned, but with traffic marker
-                let ul_usage = AccessAssignUlUsage::from_usage_marker(field1);
-                s.ul_usage = ul_usage.ok_or(PduParseErr::InvalidValue {
-                    field: "ul_usage",
-                    value: field1 as u64,
-                })?;
-                assert!(ul_usage.unwrap().is_traffic());
+                // Frame 18, header 112 (Table 21.82): UL access rights "common
+                // and assigned", Field 1 is a Traffic usage marker (UMt) and
+                // Field 2 is an access field. Per Table 21.81 the pre-set markers
+                // UMr/UMc/UMa/UMx (values 0..=3) are EXCLUDED as traffic usage
+                // markers, so any Field 1 < 4 here is a malformed / reserved
+                // ACCESS-ASSIGN. Reject it as a parse error so the caller can
+                // discard the AACH and treat it as not received (cl. 21.4.7.1) —
+                // a receive-path parser must never panic on received bits.
+                s.ul_usage = AccessAssignUlUsage::from_usage_marker(field1)
+                    .filter(AccessAssignUlUsage::is_traffic)
+                    .ok_or(PduParseErr::InvalidValue {
+                        field: "ul_usage",
+                        value: field1 as u64,
+                    })?;
 
                 s.f2_af = Some(AccessField {
                     access_code: (field2 >> 4) & 0x3,
@@ -169,3 +175,47 @@ impl fmt::Display for AccessAssignFr18 {
         write!(f, " }}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame-18 ACCESS-ASSIGN with header 112 but Field 1 = 0 (UMx) is a
+    /// malformed / reserved PDU (Table 21.82 requires a Traffic usage marker
+    /// UMt, and Table 21.81 excludes values 0..=3). The parser must reject it
+    /// with a parse error, NOT panic — this is exactly the on-air `11 000000
+    /// 000000` AACH that previously crashed the whole MS stack.
+    #[test]
+    fn header3_non_traffic_marker_is_rejected_not_panicked() {
+        for field1 in 0u8..=3 {
+            let mut buf = BitBuffer::new_autoexpand(2);
+            buf.write_bits(0b11, 2); // header
+            buf.write_bits(field1 as u64, 6); // field 1 (usage marker)
+            buf.write_bits(0, 6); // field 2
+            buf.seek(0);
+            let res = AccessAssignFr18::from_bitbuf(&mut buf);
+            assert!(
+                matches!(res, Err(PduParseErr::InvalidValue { field: "ul_usage", .. })),
+                "field1={field1} must be rejected as an invalid UL usage marker, got {res:?}"
+            );
+        }
+    }
+
+    /// A frame-18 ACCESS-ASSIGN with header 112 and a valid Traffic usage marker
+    /// (UMt, value >= 4) parses to a Traffic ul_usage plus the access field.
+    #[test]
+    fn header3_traffic_marker_parses() {
+        let mut buf = BitBuffer::new_autoexpand(2);
+        buf.write_bits(0b11, 2); // header
+        buf.write_bits(4, 6); // field 1 = UMt(4)
+        buf.write_bits(0b010011, 6); // field 2 = access field (code 1, len 3)
+        buf.seek(0);
+        let pdu = AccessAssignFr18::from_bitbuf(&mut buf).expect("valid traffic marker parses");
+        assert_eq!(pdu.ul_usage, AccessAssignUlUsage::Traffic(4));
+        let af = pdu.f2_af.expect("access field present");
+        assert_eq!(af.access_code, 1);
+        assert_eq!(af.base_frame_len, 3);
+        assert!(pdu.f1_af1.is_none());
+    }
+}
+
