@@ -29,6 +29,13 @@ pub struct LmmMleActivateConf {
     pub mcc: u16,
     pub mnc: u16,
     pub la: u16,
+    /// BS service details "system wide services" flag of the selected cell
+    /// (cl. 18.5.2.1 Table 18.26). `false` means the cell advertises "system wide
+    /// services temporarily not supported"; per cl. 16.4.1.0 cond. 5 the MS must
+    /// then register even inside its registered area. A transition back to `true`
+    /// (normal mode) while the MS holds a temporary registration triggers a
+    /// periodic location update (cl. 16.4.8 / 16.4.1.0 NOTE).
+    pub system_wide_services: bool,
     pub cell_type: Todo,
 }
 

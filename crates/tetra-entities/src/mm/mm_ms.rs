@@ -7,6 +7,7 @@ use tetra_saps::lmm::{LmmMleActivateConf, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
+use tetra_pdus::mm::enums::location_update_accept_type::LocationUpdateAcceptType;
 use tetra_pdus::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use tetra_pdus::mm::enums::reject_cause::RejectCause;
 use tetra_pdus::mm::enums::type34_elem_id_ul::MmType34ElemIdUl;
@@ -126,6 +127,11 @@ pub struct MmMs {
     /// Location-updating type of the in-flight attempt, so a T351 resend
     /// (cl. 16.4.5) repeats the same request type.
     pending_lu_type: LocationUpdateType,
+    /// Set when the last accept carried the "Temporary registration" status
+    /// (cl. 16.4.8, accept type 0012, Table 16.68). While held, a cell
+    /// reselection requires re-registration even inside the registered area, and
+    /// a cell returning to "normal mode" triggers a periodic location update.
+    temporary_registration: bool,
 }
 
 impl MmMs {
@@ -142,6 +148,7 @@ impl MmMs {
             registered_cell: None,
             pending_cell: None,
             pending_lu_type: LocationUpdateType::ItsiAttach,
+            temporary_registration: false,
         }
     }
 
@@ -296,17 +303,47 @@ impl MmMs {
         // Apply the registration conditions of ETSI TS 100 392-2 cl. 18.3.4.7.1a
         // (see also cl. 16.4.1.0). Decide both *whether* to register and *which*
         // location-updating type applies.
+        //
+        // cl. 16.4.1.0 cond. 5 / cl. 16.4.8: a cell advertising "system wide
+        // services temporarily not supported" (system_wide_services == false)
+        // requires registration even inside the registered area and even if the
+        // cell does not otherwise set the registration flag.
+        let restricted = !conf.system_wide_services;
         let lu_type = if self.reg_state == RegState::Registered {
             match self.registered_cell {
-                // Same cell/LA as where we are registered: no location update is
-                // required (cl. 18.3.4.7.1a NOTE 2 — returning to / staying on a
-                // cell requires registration only if a normal condition applies).
+                // Same cell/LA as where we are registered.
                 Some(reg) if reg == cell => {
-                    tracing::debug!(
-                        "MM: activate-conf for the registered cell (MCC={} MNC={} LA={}); no re-registration",
-                        cell.mcc, cell.mnc, cell.la
-                    );
-                    return;
+                    if self.temporary_registration && conf.system_wide_services {
+                        // We held a temporary registration and the cell has
+                        // returned to normal mode: perform a periodic location
+                        // update (cl. 16.4.8 para 3 / cl. 16.4.1.0 NOTE).
+                        tracing::info!(
+                            "MM: cell returned to normal mode while temporarily registered; \
+                             periodic location updating (cl. 16.4.8)"
+                        );
+                        LocationUpdateType::PeriodicLocationUpdating
+                    } else if self.temporary_registration || restricted {
+                        // Still holding a temporary registration (cond. 4) or the
+                        // cell is in "system wide services temporarily not
+                        // supported" state (cond. 5): registration is required even
+                        // on the registered cell. Same network => roaming.
+                        tracing::info!(
+                            "MM: re-registration required on the registered cell \
+                             (temporary_registration={}, system_wide_services={}); \
+                             roaming location updating (cl. 16.4.1.0 cond. 4/5)",
+                            self.temporary_registration, conf.system_wide_services
+                        );
+                        LocationUpdateType::RoamingLocationUpdating
+                    } else {
+                        // No condition applies: returning to / staying on the
+                        // registered cell requires no location update
+                        // (cl. 18.3.4.7.1a NOTE 2).
+                        tracing::debug!(
+                            "MM: activate-conf for the registered cell (MCC={} MNC={} LA={}); no re-registration",
+                            cell.mcc, cell.mnc, cell.la
+                        );
+                        return;
+                    }
                 }
                 // Different network (MNI): migrating location updating is required
                 // regardless of the new cell's registration flag
@@ -319,10 +356,11 @@ impl MmMs {
                     LocationUpdateType::MigratingLocationUpdating
                 }
                 // Same network, LA outside the registered area: roaming location
-                // updating is required only if the new cell requires registration
-                // (cl. 18.3.4.7.1a cond. 2).
+                // updating is required if the new cell requires registration
+                // (cond. 2), or if the cell is restricted (cond. 5), or if we hold
+                // a temporary registration (cond. 4).
                 _ => {
-                    if !conf.registration_required {
+                    if !conf.registration_required && !restricted && !self.temporary_registration {
                         tracing::info!(
                             "MM: LA changed to {} but new cell does not require registration; \
                              not registering (cl. 18.3.4.7.1a cond. 2)",
@@ -340,8 +378,10 @@ impl MmMs {
             }
         } else {
             // Not registered: initial registration / ITSI attach (cl. 16.9.3.4),
-            // performed only when the selected cell requires registration.
-            if !conf.registration_required {
+            // performed when the selected cell requires registration (registration
+            // flag) or advertises "system wide services temporarily not supported"
+            // (cl. 16.4.1.0 cond. 5).
+            if !conf.registration_required && !restricted {
                 tracing::info!(
                     "MM: serving cell (LA={}) does not require registration; not registering",
                     conf.la
@@ -710,10 +750,29 @@ impl MmMs {
             return;
         }
 
+        // Reinterpret the accepted location-update type through the *accept-type*
+        // enumeration (cl. 16.10.35a, Table 16.68). The shared D-LOCATION-UPDATE-
+        // ACCEPT PDU types this field as `LocationUpdateType` (the *demand* type,
+        // Table 16.67), but the two tables diverge at raw values 1 and 5 — most
+        // importantly raw 0012 means "Temporary registration" on accept versus
+        // "migrating" on demand. Recover the true accepted type MS-side without
+        // touching the shared PDU/BS decode.
+        let accept_type = LocationUpdateAcceptType::try_from(pdu.location_update_accept_type.into_raw());
+
+        // cl. 16.4.8: an accept with status "Temporary registration" means the
+        // registration was accepted only temporarily. Remember it so a later cell
+        // reselection / a return of the cell to normal mode triggers the required
+        // re-registration (cl. 16.4.1.0 cond. 4 / periodic update).
+        self.temporary_registration =
+            matches!(accept_type, Ok(LocationUpdateAcceptType::TemporaryRegistration));
+
         tracing::info!(
-            "MM: <- D-LOCATION-UPDATE-ACCEPT type={:?} ssi={:?}: registration COMPLETE",
-            pdu.location_update_accept_type,
-            pdu.ssi
+            "MM: <- D-LOCATION-UPDATE-ACCEPT type={} ssi={:?}: registration COMPLETE{}",
+            accept_type
+                .map(|t| t.to_string())
+                .unwrap_or_else(|_| format!("raw={}", pdu.location_update_accept_type.into_raw())),
+            pdu.ssi,
+            if self.temporary_registration { " (TEMPORARY registration, cl. 16.4.8)" } else { "" },
         );
 
         // Report the outcome of the group identity attachment requested in the
@@ -1077,11 +1136,22 @@ attach_groups = []
     }
 
     fn activate_conf_cell(registration_required: bool, mcc: u16, mnc: u16, la: u16) -> LmmMleActivateConf {
+        activate_conf_cell_sws(registration_required, mcc, mnc, la, true)
+    }
+
+    fn activate_conf_cell_sws(
+        registration_required: bool,
+        mcc: u16,
+        mnc: u16,
+        la: u16,
+        system_wide_services: bool,
+    ) -> LmmMleActivateConf {
         LmmMleActivateConf {
             registration_required,
             mcc,
             mnc,
             la,
+            system_wide_services,
             cell_type: 0,
         }
     }
@@ -1646,5 +1716,112 @@ attach_groups = []
                 la: 1
             })
         );
+    }
+
+    /// R2 helper: build a D-LOCATION-UPDATE-ACCEPT whose accept-type field carries
+    /// the given raw value. The shared PDU types this field as `LocationUpdateType`
+    /// (Table 16.67), but on the wire it is a raw 3-bit value the MS reinterprets
+    /// through `LocationUpdateAcceptType` (Table 16.68). Passing
+    /// `LocationUpdateType::MigratingLocationUpdating` (raw 1) therefore simulates
+    /// a "Temporary registration" accept (accept-type raw 1).
+    fn build_accept_type(raw_type: LocationUpdateType) -> BitBuffer {
+        let pdu = DLocationUpdateAccept {
+            location_update_accept_type: raw_type,
+            ssi: Some(MS_ISSI as u64),
+            address_extension: None,
+            subscriber_class: None,
+            energy_saving_information: None,
+            scch_information_and_distribution_on_18th_frame: None,
+            new_registered_area: None,
+            security_downlink: None,
+            group_identity_location_accept: None,
+            default_group_attachment_lifetime: None,
+            authentication_downlink: None,
+            group_identity_security_related_information: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu
+    }
+
+    /// R2 (cl. 16.4.8 / Table 16.68): an accept whose accept-type field is raw 0012
+    /// means "Temporary registration" — the MS must reinterpret it through the
+    /// accept-type table (not the demand table, where raw 1 = migrating) and hold
+    /// the temporary-registration state. A normal ITSI-attach accept (raw 3) does
+    /// not set the flag.
+    #[test]
+    fn test_temporary_registration_accept_sets_flag() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        // Raw 1 on the wire → "Temporary registration" per the accept table.
+        deliver_dl(&mut mm, &mut q, build_accept_type(LocationUpdateType::MigratingLocationUpdating));
+        assert_eq!(mm.reg_state, RegState::Registered);
+        assert!(mm.temporary_registration, "raw-1 accept is a temporary registration");
+
+        // A normal ITSI-attach accept (raw 3) leaves the flag clear.
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept_type(LocationUpdateType::ItsiAttach));
+        assert!(!mm.temporary_registration, "raw-3 accept is a full registration");
+    }
+
+    /// R2 (cl. 16.4.8 para 3 / 16.4.1.0 NOTE): a temporarily-registered MS whose
+    /// cell returns to normal mode ("system wide services" restored) performs a
+    /// periodic location update on the same cell.
+    #[test]
+    fn test_temporary_registration_triggers_periodic_on_normal_mode() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept_type(LocationUpdateType::MigratingLocationUpdating));
+        assert!(mm.temporary_registration);
+        assert!(q.pop_front().is_none());
+
+        // Same cell, normal mode (system_wide_services = true): periodic LU.
+        mm.rx_activate_conf(&mut q, &activate_conf_cell_sws(true, 901, 9999, 1, true));
+        assert_eq!(mm.reg_state, RegState::Registering);
+        assert_eq!(
+            pop_demand_lu_type(&mut q),
+            LocationUpdateType::PeriodicLocationUpdating
+        );
+    }
+
+    /// R2 (cl. 16.4.1.0 cond. 5): a cell advertising "system wide services
+    /// temporarily not supported" (system_wide_services = false) forces
+    /// registration on the registered cell even though nothing else changed.
+    #[test]
+    fn test_system_wide_services_false_forces_registration() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        register_on_default_cell(&mut mm, &mut q);
+        assert!(!mm.temporary_registration);
+
+        // Same cell, but now restricted: roaming LU required (cond. 5).
+        mm.rx_activate_conf(&mut q, &activate_conf_cell_sws(true, 901, 9999, 1, false));
+        assert_eq!(mm.reg_state, RegState::Registering);
+        assert_eq!(
+            pop_demand_lu_type(&mut q),
+            LocationUpdateType::RoamingLocationUpdating
+        );
+    }
+
+    /// R2 (cl. 16.4.1.0 cond. 5): even when the cell does NOT set the registration
+    /// flag, a restricted cell (system_wide_services = false) still requires an
+    /// initial registration.
+    #[test]
+    fn test_restricted_cell_forces_initial_registration() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        // registration_required = false, but system_wide_services = false.
+        mm.rx_activate_conf(&mut q, &activate_conf_cell_sws(false, 901, 9999, 1, false));
+        assert_eq!(mm.reg_state, RegState::Registering);
+        assert_eq!(pop_demand_lu_type(&mut q), LocationUpdateType::ItsiAttach);
     }
 }

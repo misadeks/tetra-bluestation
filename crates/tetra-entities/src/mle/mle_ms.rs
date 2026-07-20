@@ -30,6 +30,10 @@ struct ServingCell {
     /// D-MLE-SYSINFO BS service details "registration" flag (cl. 18.4.2.2).
     /// `None` until the first SYSINFO for this cell is received.
     registration_required: Option<bool>,
+    /// BS service details "system wide services" flag (cl. 18.5.2.1 Table 18.26).
+    /// `false` = the cell advertises "system wide services temporarily not
+    /// supported" (cl. 16.4.8). `None` until the first SYSINFO for this cell.
+    system_wide_services: Option<bool>,
 }
 
 /// MS-side Mobile Link Entity.
@@ -326,20 +330,32 @@ impl MleMs {
         // ETSI cl. 18.4.2.2: the BS service details "registration" flag tells the
         // MS whether registration is required on this cell.
         let registration_required = pdu.bs_service_details.registration;
+        // cl. 18.5.2.1 / 16.4.8: "system wide services" flag. `false` = the cell
+        // advertises "system wide services temporarily not supported".
+        let system_wide_services = pdu.bs_service_details.system_wide_services;
 
         let confirm = match self.serving_cell.as_mut() {
             Some(cell) => {
-                let changed = cell.location_area != Some(pdu.location_area);
+                let la_changed = cell.location_area != Some(pdu.location_area);
+                // Re-confirm to MM when the cell returns to normal mode from
+                // "system wide services temporarily not supported" (or vice
+                // versa): a temporarily-registered MS must then perform a periodic
+                // location update (cl. 16.4.8 / 16.4.1.0 NOTE, cond. 5).
+                let sws_changed = cell.system_wide_services != Some(system_wide_services);
+                let changed = la_changed || sws_changed;
                 cell.location_area = Some(pdu.location_area);
                 cell.subscriber_class = Some(pdu.subscriber_class);
                 cell.registration_required = Some(registration_required);
+                cell.system_wide_services = Some(system_wide_services);
                 let (mcc, mnc) = (cell.mcc, cell.mnc);
                 if changed {
                     tracing::info!(
-                        "MLE: serving cell SYSINFO adopted: LA={} subscriber_class={:#x} registration_required={}",
+                        "MLE: serving cell SYSINFO adopted: LA={} subscriber_class={:#x} \
+                         registration_required={} system_wide_services={}",
                         pdu.location_area,
                         pdu.subscriber_class,
                         registration_required,
+                        system_wide_services,
                     );
                 }
                 // Confirm cell selection to MM exactly once per selected cell,
@@ -349,11 +365,11 @@ impl MleMs {
                 //
                 // Additionally re-confirm whenever the location area of the
                 // already-selected cell changes (cl. 16.4.1.0 / 18.3.4.7.1a
-                // cond. 2): an LA change may require a roaming location update, so
-                // MM must be re-notified to re-evaluate against its registered
-                // area. Repeated identical SYSINFO (no LA change) is suppressed.
+                // cond. 2), or its "system wide services" status changes
+                // (cl. 16.4.8): MM must re-evaluate registration. Repeated
+                // identical SYSINFO (no change) is suppressed.
                 if !self.activate_confirmed || changed {
-                    Some((mcc, mnc, pdu.location_area, registration_required))
+                    Some((mcc, mnc, pdu.location_area, registration_required, system_wide_services))
                 } else {
                     None
                 }
@@ -366,9 +382,9 @@ impl MleMs {
             }
         };
 
-        if let Some((mcc, mnc, la, registration_required)) = confirm {
+        if let Some((mcc, mnc, la, registration_required, system_wide_services)) = confirm {
             self.activate_confirmed = true;
-            self.send_mle_activate_conf(queue, mcc, mnc, la, registration_required);
+            self.send_mle_activate_conf(queue, mcc, mnc, la, registration_required, system_wide_services);
         }
     }
 
@@ -385,13 +401,16 @@ impl MleMs {
         mnc: u16,
         la: u16,
         registration_required: bool,
+        system_wide_services: bool,
     ) {
         tracing::info!(
-            "MLE: cell selection complete, confirming to MM (MCC={}, MNC={}, LA={}, registration_required={})",
+            "MLE: cell selection complete, confirming to MM (MCC={}, MNC={}, LA={}, \
+             registration_required={}, system_wide_services={})",
             mcc,
             mnc,
             la,
-            registration_required
+            registration_required,
+            system_wide_services,
         );
         let m = SapMsg {
             sap: Sap::LmmSap,
@@ -402,6 +421,7 @@ impl MleMs {
                 mcc,
                 mnc,
                 la,
+                system_wide_services,
                 cell_type: 0, // Todo (cl. 18): cell type not modelled yet
             }),
         };
@@ -439,12 +459,18 @@ impl MleMs {
             .unwrap_or(true);
 
         // Adopt the cell identity, preserving any SYSINFO learned for the same cell.
-        let (location_area, subscriber_class, registration_required) = if newly_selected {
-            (None, None, None)
-        } else {
-            let c = self.serving_cell.as_ref().unwrap();
-            (c.location_area, c.subscriber_class, c.registration_required)
-        };
+        let (location_area, subscriber_class, registration_required, system_wide_services) =
+            if newly_selected {
+                (None, None, None, None)
+            } else {
+                let c = self.serving_cell.as_ref().unwrap();
+                (
+                    c.location_area,
+                    c.subscriber_class,
+                    c.registration_required,
+                    c.system_wide_services,
+                )
+            };
         self.serving_cell = Some(ServingCell {
             mcc: pdu.mcc,
             mnc: pdu.mnc,
@@ -454,6 +480,7 @@ impl MleMs {
             location_area,
             subscriber_class,
             registration_required,
+            system_wide_services,
         });
 
         if newly_selected {
