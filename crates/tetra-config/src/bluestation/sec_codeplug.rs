@@ -224,8 +224,31 @@ impl CfgFrequencyList {
     }
 }
 
+/// A named **scan list**: a set of talkgroups the radio monitors together
+/// (**[impl policy]**). A scan list references programmed talkgroups by GSSI; on
+/// the air "activating" a scan list means the MS attaches to (affiliates with)
+/// those group identities via the standalone group attach/detach procedure
+/// (EN 300 392-2 cl. 16.8.2), so their downlink traffic is received.
+/// De-activating detaches the groups that no other active scan list still needs.
+///
+/// `active` is the *default* (programmed) activation state loaded at start-up;
+/// the management UI can toggle a scan list live at runtime (which the stack
+/// resolves to a group attach/detach), so the running state may differ from this
+/// programmed default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfgScanlist {
+    /// Human-readable label (unique within the codeplug).
+    pub name: String,
+    /// Member talkgroups, by GSSI (each must reference a programmed talkgroup).
+    pub talkgroups: Vec<u32>,
+    /// Programmed default: whether this scan list is active at start-up.
+    pub active: bool,
+    /// Display order within the scan-list menu (ascending; ties broken by name).
+    pub order: u32,
+}
+
 /// The complete codeplug: folders, talkgroups, allowed networks, carrier
-/// overrides and frequency lists.
+/// overrides, frequency lists and scan lists.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CfgCodeplug {
     pub folders: Vec<CfgFolder>,
@@ -237,6 +260,9 @@ pub struct CfgCodeplug {
     /// Programmed frequency lists the radio scans (combined into one candidate
     /// set). Empty = no scanning (stay on the single configured carrier).
     pub frequency_lists: Vec<CfgFrequencyList>,
+    /// Programmed talkgroup scan lists (groups the radio monitors together).
+    /// The UI can activate/deactivate these at runtime.
+    pub scanlists: Vec<CfgScanlist>,
 }
 
 impl CfgCodeplug {
@@ -248,6 +274,37 @@ impl CfgCodeplug {
             && self.networks.is_empty()
             && self.carrier_overrides.is_empty()
             && self.frequency_lists.is_empty()
+            && self.scanlists.is_empty()
+    }
+
+    /// Scan lists in display order (`order` ascending, ties broken by `name`).
+    pub fn scanlists_sorted(&self) -> Vec<&CfgScanlist> {
+        let mut v: Vec<&CfgScanlist> = self.scanlists.iter().collect();
+        v.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
+        v
+    }
+
+    /// Look up a scan list by name.
+    pub fn scanlist(&self, name: &str) -> Option<&CfgScanlist> {
+        self.scanlists.iter().find(|s| s.name == name)
+    }
+
+    /// Union of the GSSIs of every scan list whose programmed default is
+    /// `active` (in display order, duplicates removed). This is the set of
+    /// groups the radio affiliates to at start-up on top of any base
+    /// `[ms] attach_groups`.
+    pub fn default_active_scanlist_gssis(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for sl in self.scanlists_sorted() {
+            if sl.active {
+                for &g in &sl.talkgroups {
+                    if !out.contains(&g) {
+                        out.push(g);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The combined downlink candidate set (Hz) the radio scans across ALL
@@ -457,6 +514,34 @@ impl CfgCodeplug {
             }
         }
 
+        // Scan lists: unique non-empty names, at least one member, each member
+        // GSSI references a programmed talkgroup, no duplicate GSSIs within a
+        // list.
+        let mut scanlist_names: HashSet<&str> = HashSet::new();
+        for sl in &self.scanlists {
+            if sl.name.trim().is_empty() {
+                return Err("scanlist name must not be empty".to_string());
+            }
+            if !scanlist_names.insert(sl.name.as_str()) {
+                return Err(format!("duplicate scanlist name '{}'", sl.name));
+            }
+            if sl.talkgroups.is_empty() {
+                return Err(format!("scanlist '{}' requires at least one talkgroup", sl.name));
+            }
+            let mut seen: HashSet<u32> = HashSet::new();
+            for &g in &sl.talkgroups {
+                if !seen.insert(g) {
+                    return Err(format!("scanlist '{}' has duplicate talkgroup gssi {}", sl.name, g));
+                }
+                if !gssis.contains(&g) {
+                    return Err(format!(
+                        "scanlist '{}' references unknown talkgroup gssi {}",
+                        sl.name, g
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -545,6 +630,16 @@ pub struct FrequencyListDto {
     pub extra: HashMap<String, Value>,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+pub struct ScanlistDto {
+    pub name: String,
+    pub talkgroups: Vec<u32>,
+    pub active: Option<bool>,
+    pub order: Option<u32>,
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
 fn folder_dto_to_cfg(dto: FolderDto) -> CfgFolder {
     CfgFolder {
         id: dto.id,
@@ -622,6 +717,15 @@ fn frequency_list_dto_to_cfg(dto: FrequencyListDto) -> CfgFrequencyList {
     }
 }
 
+fn scanlist_dto_to_cfg(dto: ScanlistDto) -> CfgScanlist {
+    CfgScanlist {
+        name: dto.name,
+        talkgroups: dto.talkgroups,
+        active: dto.active.unwrap_or(false),
+        order: dto.order.unwrap_or(0),
+    }
+}
+
 /// Assemble a [`CfgCodeplug`] from the parsed DTO sections. RF resolution errors
 /// (e.g. an off-grid `dl_freq`) surface here; range/cross-reference validation is
 /// performed separately by [`CfgCodeplug::validate`].
@@ -631,6 +735,7 @@ pub fn codeplug_dto_to_cfg(
     networks: Option<Vec<NetworkDto>>,
     carrier_overrides: Option<Vec<CarrierOverrideDto>>,
     frequency_lists: Option<Vec<FrequencyListDto>>,
+    scanlists: Option<Vec<ScanlistDto>>,
 ) -> Result<CfgCodeplug, String> {
     let folders = folders.unwrap_or_default().into_iter().map(folder_dto_to_cfg).collect();
     let talkgroups = talkgroups.unwrap_or_default().into_iter().map(talkgroup_dto_to_cfg).collect();
@@ -645,12 +750,14 @@ pub fn codeplug_dto_to_cfg(
         .into_iter()
         .map(frequency_list_dto_to_cfg)
         .collect();
+    let scanlists = scanlists.unwrap_or_default().into_iter().map(scanlist_dto_to_cfg).collect();
     Ok(CfgCodeplug {
         folders,
         talkgroups,
         networks,
         carrier_overrides,
         frequency_lists,
+        scanlists,
     })
 }
 
@@ -752,6 +859,24 @@ pub fn cfg_to_frequency_list_dtos(cp: &CfgCodeplug) -> Option<Vec<FrequencyListD
                     extra: HashMap::new(),
                 }),
                 dwell_ms: Some(s.dwell_ms),
+                extra: HashMap::new(),
+            })
+            .collect(),
+    )
+}
+
+pub fn cfg_to_scanlist_dtos(cp: &CfgCodeplug) -> Option<Vec<ScanlistDto>> {
+    if cp.scanlists.is_empty() {
+        return None;
+    }
+    Some(
+        cp.scanlists
+            .iter()
+            .map(|s| ScanlistDto {
+                name: s.name.clone(),
+                talkgroups: s.talkgroups.clone(),
+                active: Some(s.active),
+                order: Some(s.order),
                 extra: HashMap::new(),
             })
             .collect(),
@@ -865,6 +990,12 @@ mod tests {
                 frequencies: vec![439_825_000, 439_850_000],
                 ..CfgFrequencyList::default()
             }],
+            scanlists: vec![CfgScanlist {
+                name: "Alpha".to_string(),
+                talkgroups: vec![101],
+                active: true,
+                order: 0,
+            }],
         };
         assert!(cp.validate().is_ok(), "{:?}", cp.validate());
     }
@@ -879,6 +1010,75 @@ mod tests {
                 class_of_usage: None,
                 order: 0,
             }],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err());
+    }
+
+    fn codeplug_with_scanlist(sl: CfgScanlist) -> CfgCodeplug {
+        CfgCodeplug {
+            talkgroups: vec![
+                CfgTalkgroup { gssi: 101, name: "A".to_string(), folder: None, class_of_usage: None, order: 0 },
+                CfgTalkgroup { gssi: 102, name: "B".to_string(), folder: None, class_of_usage: None, order: 0 },
+            ],
+            scanlists: vec![sl],
+            ..CfgCodeplug::default()
+        }
+    }
+
+    #[test]
+    fn test_scanlist_accepts_valid() {
+        let cp = codeplug_with_scanlist(CfgScanlist {
+            name: "Alpha".to_string(),
+            talkgroups: vec![101, 102],
+            active: true,
+            order: 0,
+        });
+        assert!(cp.validate().is_ok(), "{:?}", cp.validate());
+        assert_eq!(cp.default_active_scanlist_gssis(), vec![101, 102]);
+    }
+
+    #[test]
+    fn test_scanlist_rejects_unknown_gssi() {
+        let cp = codeplug_with_scanlist(CfgScanlist {
+            name: "Alpha".to_string(),
+            talkgroups: vec![101, 999],
+            active: true,
+            order: 0,
+        });
+        assert!(cp.validate().is_err());
+    }
+
+    #[test]
+    fn test_scanlist_rejects_duplicate_gssi() {
+        let cp = codeplug_with_scanlist(CfgScanlist {
+            name: "Alpha".to_string(),
+            talkgroups: vec![101, 101],
+            active: false,
+            order: 0,
+        });
+        assert!(cp.validate().is_err());
+    }
+
+    #[test]
+    fn test_scanlist_rejects_empty_members() {
+        let cp = codeplug_with_scanlist(CfgScanlist {
+            name: "Alpha".to_string(),
+            talkgroups: vec![],
+            active: false,
+            order: 0,
+        });
+        assert!(cp.validate().is_err());
+    }
+
+    #[test]
+    fn test_scanlist_rejects_duplicate_name() {
+        let cp = CfgCodeplug {
+            talkgroups: vec![CfgTalkgroup { gssi: 101, name: "A".to_string(), folder: None, class_of_usage: None, order: 0 }],
+            scanlists: vec![
+                CfgScanlist { name: "Dup".to_string(), talkgroups: vec![101], active: true, order: 0 },
+                CfgScanlist { name: "Dup".to_string(), talkgroups: vec![101], active: false, order: 1 },
+            ],
             ..CfgCodeplug::default()
         };
         assert!(cp.validate().is_err());

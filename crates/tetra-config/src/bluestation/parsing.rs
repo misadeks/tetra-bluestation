@@ -8,9 +8,9 @@ use toml::Value;
 
 use crate::bluestation::{
     CarrierOverrideDto, CellInfoDto, CfgControlDto, CfgMsDto, DuplexTableDto, FolderDto, FrequencyListDto, NetInfoDto,
-    NetworkDto, TalkgroupDto, apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_carrier_override_dtos,
+    NetworkDto, ScanlistDto, TalkgroupDto, apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_carrier_override_dtos,
     cfg_to_cell_dto, cfg_to_duplex_dto, cfg_to_folder_dtos, cfg_to_frequency_list_dtos, cfg_to_ms_dto, cfg_to_net_dto,
-    cfg_to_network_dtos, cfg_to_phy_dto, cfg_to_talkgroup_dtos, codeplug_dto_to_cfg, duplex_dto_to_cfg,
+    cfg_to_network_dtos, cfg_to_phy_dto, cfg_to_scanlist_dtos, cfg_to_talkgroup_dtos, codeplug_dto_to_cfg, duplex_dto_to_cfg,
     duplex_table_is_default, ms_dto_to_cfg, net_dto_to_cfg,
 };
 
@@ -107,7 +107,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
 
     // Build the codeplug (Plane B, optional). RF resolution + validation errors
     // surface here with a descriptive message.
-    let codeplug = codeplug_dto_to_cfg(root.folder, root.talkgroup, root.network, root.carrier_override, root.frequency_list)?;
+    let codeplug = codeplug_dto_to_cfg(root.folder, root.talkgroup, root.network, root.carrier_override, root.frequency_list, root.scanlist)?;
     codeplug.validate()?;
 
     // Build config from required and optional values
@@ -216,6 +216,8 @@ struct TomlConfigRoot {
     carrier_override: Option<Vec<CarrierOverrideDto>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     frequency_list: Option<Vec<FrequencyListDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scanlist: Option<Vec<ScanlistDto>>,
 
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     extra: HashMap<String, Value>,
@@ -250,6 +252,7 @@ fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
         network: cfg_to_network_dtos(&cfg.codeplug),
         carrier_override: cfg_to_carrier_override_dtos(&cfg.codeplug),
         frequency_list: cfg_to_frequency_list_dtos(&cfg.codeplug),
+        scanlist: cfg_to_scanlist_dtos(&cfg.codeplug),
         extra: HashMap::new(),
     }
 }
@@ -657,6 +660,12 @@ folder = "work"
 class_of_usage = 0
 order = 1
 
+[[talkgroup]]
+gssi = 102
+name = "Ops"
+folder = "work"
+order = 2
+
 [[network]]
 mcc = 901
 mnc = 9999
@@ -682,6 +691,18 @@ name = "primary"
 mode = "List"
 frequencies = [439825000, 439850000]
 dwell_ms = 800
+
+[[scanlist]]
+name = "Alpha"
+talkgroups = [101, 102]
+active = true
+order = 1
+
+[[scanlist]]
+name = "Bravo"
+talkgroups = [102]
+active = false
+order = 2
 "#;
 
     #[test]
@@ -689,9 +710,14 @@ dwell_ms = 800
         let cfg = from_toml_str(MS_TOML_CODEPLUG).expect("parse codeplug config");
         assert_eq!(cfg.codeplug.carrier_overrides.len(), 2);
         assert_eq!(cfg.codeplug.folders.len(), 1);
-        assert_eq!(cfg.codeplug.talkgroups.len(), 1);
+        assert_eq!(cfg.codeplug.talkgroups.len(), 2);
         assert_eq!(cfg.codeplug.networks.len(), 1);
         assert_eq!(cfg.codeplug.frequency_lists.len(), 1);
+        assert_eq!(cfg.codeplug.scanlists.len(), 2);
+        // Only the default-active scanlist ("Alpha") contributes GSSIs.
+        assert_eq!(cfg.codeplug.default_active_scanlist_gssis(), vec![101, 102]);
+        assert!(cfg.codeplug.scanlist("Alpha").expect("Alpha").active);
+        assert!(!cfg.codeplug.scanlist("Bravo").expect("Bravo").active);
         // dl_freq form resolved to band/carrier.
         let co2 = cfg.codeplug.carrier_override("BS-2-byfreq").expect("carrier_override");
         assert_eq!(co2.dl_freq_hz(), 439_850_000);
@@ -701,6 +727,7 @@ dwell_ms = 800
         let rendered = to_toml_string(&cfg).expect("serialize");
         assert!(rendered.contains("[[carrier_override]]"));
         assert!(rendered.contains("[[frequency_list]]"));
+        assert!(rendered.contains("[[scanlist]]"));
         let reparsed = from_toml_str(&rendered).expect("reparse");
         assert_eq!(reparsed.codeplug, cfg.codeplug);
     }

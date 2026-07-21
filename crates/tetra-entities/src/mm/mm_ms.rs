@@ -220,6 +220,13 @@ pub struct MmMs {
     /// (cl. 16.8.2), if any. `None` when no U-ATTACH/DETACH GROUP IDENTITY is
     /// awaiting its acknowledgement.
     pending_group_op: Option<PendingGroupOp>,
+    /// Names of the scan lists currently active (**NON-STANDARD**, Plane B).
+    /// The desired group-affiliation set is the base `[ms].attach_groups` union
+    /// the GSSIs of every active scan list. Seeded from the codeplug scan lists
+    /// whose programmed default is `active`; toggled at runtime by
+    /// `ManagementCommand::ActivateScanlist`, which resolves the change to a
+    /// standalone group attach/detach (cl. 16.8.2).
+    active_scanlists: BTreeSet<String>,
 }
 
 /// Runtime plumbing for the Plane B management write/apply handlers
@@ -243,13 +250,27 @@ impl MmMs {
         let serving_la = config.config().cell.location_area;
         // Seed the runtime attached-group set from config (cl. 16.8). Before any
         // registration this is the set the MS will request; after registration it
-        // holds the SwMI-confirmed attached set.
-        let attached_gssis = config
+        // holds the SwMI-confirmed attached set. The desired set is the base
+        // `[ms].attach_groups` union the GSSIs of every scan list whose
+        // programmed default is `active` (Plane B), so default-active scan lists
+        // are affiliated at the first registration.
+        let mut attached_gssis = config
             .config()
             .ms
             .as_ref()
             .map(|ms| ms.attach_groups.iter().copied().collect::<BTreeSet<u32>>())
             .unwrap_or_default();
+        let active_scanlists: BTreeSet<String> = config
+            .config()
+            .codeplug
+            .scanlists
+            .iter()
+            .filter(|s| s.active)
+            .map(|s| s.name.clone())
+            .collect();
+        for g in config.config().codeplug.default_active_scanlist_gssis() {
+            attached_gssis.insert(g);
+        }
         Self {
             config,
             telemetry,
@@ -272,6 +293,7 @@ impl MmMs {
             restart_required: false,
             attached_gssis,
             pending_group_op: None,
+            active_scanlists,
         }
     }
 
@@ -309,6 +331,41 @@ impl MmMs {
     /// configured set; on a re-registration it reflects the current attachments.
     fn attach_groups(&self) -> Vec<u32> {
         self.attached_gssis.iter().copied().collect()
+    }
+
+    /// Base group identities the MS always affiliates to, from
+    /// `[ms].attach_groups` (independent of any scan-list activation).
+    fn base_attach_groups(&self) -> BTreeSet<u32> {
+        self.config
+            .config()
+            .ms
+            .as_ref()
+            .map(|ms| ms.attach_groups.iter().copied().collect::<BTreeSet<u32>>())
+            .unwrap_or_default()
+    }
+
+    /// Union of the GSSIs of every scan list currently marked active (looked up
+    /// by name in the codeplug). Unknown names (e.g. a scan list removed by a
+    /// later config edit) contribute nothing.
+    fn active_scanlist_gssis(&self) -> BTreeSet<u32> {
+        let cfg = self.config.config();
+        let mut out = BTreeSet::new();
+        for name in &self.active_scanlists {
+            if let Some(sl) = cfg.codeplug.scanlist(name) {
+                for &g in &sl.talkgroups {
+                    out.insert(g);
+                }
+            }
+        }
+        out
+    }
+
+    /// The desired group-affiliation set: base `[ms].attach_groups` union the
+    /// GSSIs of every active scan list (**NON-STANDARD**, Plane B superset control).
+    fn desired_affiliation_set(&self) -> BTreeSet<u32> {
+        let mut set = self.base_attach_groups();
+        set.extend(self.active_scanlist_gssis());
+        set
     }
 
     /// Own Mobile Network Identity (MNI) as the 24-bit value carried in the
@@ -711,6 +768,157 @@ impl MmMs {
             handle: 0,
             t353_countdown: T353_TIMEOUT_SLOTS,
         });
+    }
+
+    /// Handle a Plane B `ActivateScanlist` management command (**NON-STANDARD**):
+    /// activate or deactivate a programmed scan list and reconcile the group
+    /// affiliation to the resulting desired set (base `[ms].attach_groups` union
+    /// the GSSIs of every active scan list). When registered, the delta is
+    /// applied on air via a standalone U-ATTACH/DETACH GROUP IDENTITY (cl. 16.8.2)
+    /// amendment; otherwise the desired set is updated locally so it is
+    /// affiliated at the next registration. Responds with a management `Ack`.
+    fn handle_activate_scanlist(&mut self, handle: u32, name: String, active: bool, queue: &mut MessageQueue) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+
+        let ack = |accepted: bool, message: String| {
+            ControlResponse::Management(ManagementResponse::Ack {
+                handle,
+                accepted,
+                restart_required: false,
+                message,
+            })
+        };
+
+        // The scan list must exist in the codeplug.
+        if self.config.config().codeplug.scanlist(&name).is_none() {
+            self.respond(ack(false, format!("unknown scanlist '{name}'")));
+            return;
+        }
+
+        // Update the active-scan-list set (idempotent).
+        let changed = if active {
+            self.active_scanlists.insert(name.clone())
+        } else {
+            self.active_scanlists.remove(&name)
+        };
+        if !changed {
+            self.respond(ack(
+                true,
+                format!("scanlist '{name}' already {}", if active { "active" } else { "inactive" }),
+            ));
+            return;
+        }
+
+        // Reconcile the desired affiliation set against the currently attached
+        // set to find what must be attached/detached on air.
+        let desired = self.desired_affiliation_set();
+        let to_attach: Vec<u32> = desired.difference(&self.attached_gssis).copied().collect();
+        let to_detach: Vec<u32> = self.attached_gssis.difference(&desired).copied().collect();
+
+        // Not registered: no on-air action; just update the desired runtime set
+        // so it is affiliated at the next registration.
+        if self.reg_state != RegState::Registered {
+            self.attached_gssis = desired;
+            tracing::info!(
+                "MM(MS): scanlist '{name}' {} (not registered); desired groups now {:?}",
+                if active { "activated" } else { "deactivated" },
+                self.attach_groups()
+            );
+            self.respond(ack(true, "scanlist state updated; will affiliate at next registration".to_string()));
+            return;
+        }
+
+        // Already in the desired affiliation state on air (e.g. the scan list's
+        // groups overlap other active lists / the base set): nothing to send.
+        if to_attach.is_empty() && to_detach.is_empty() {
+            tracing::info!(
+                "MM(MS): scanlist '{name}' {}; no group affiliation change required",
+                if active { "activated" } else { "deactivated" }
+            );
+            self.respond(ack(true, "scanlist state updated; no affiliation change required".to_string()));
+            return;
+        }
+
+        // Registered: apply the delta via a standalone group attach/detach
+        // amendment (cl. 16.8.2). The confirmed attached set is reconciled from
+        // the SwMI acknowledgement (G3), not predicted here.
+        match self.begin_group_amendment(queue, &to_attach, &to_detach, 0) {
+            Ok(()) => {
+                tracing::info!(
+                    "MM(MS): scanlist '{name}' {}; standalone group amendment attach {:?} detach {:?} (cl. 16.8.2)",
+                    if active { "activated" } else { "deactivated" },
+                    to_attach,
+                    to_detach
+                );
+                self.respond(ack(true, "scanlist activation in progress (group attach/detach)".to_string()));
+            }
+            Err(reason) => {
+                // Roll back the active-set change so a later retry re-derives the
+                // same delta.
+                if active {
+                    self.active_scanlists.remove(&name);
+                } else {
+                    self.active_scanlists.insert(name.clone());
+                }
+                self.respond(ack(false, format!("scanlist activation deferred: {reason}")));
+            }
+        }
+    }
+
+    /// Begin a standalone group-identity amendment (cl. 16.8.2) that attaches
+    /// `attach` and detaches `detach` GSSIs in a single U-ATTACH/DETACH GROUP
+    /// IDENTITY (amendment mode), WITHOUT emitting any control-plane response.
+    /// Used internally for scan-list-driven affiliation changes. Returns `Err`
+    /// with a human-readable reason when it cannot start (not registered, an op
+    /// already outstanding, or an empty delta).
+    fn begin_group_amendment(
+        &mut self,
+        queue: &mut MessageQueue,
+        attach: &[u32],
+        detach: &[u32],
+        handle: u32,
+    ) -> Result<(), String> {
+        if self.reg_state != RegState::Registered {
+            return Err("not registered".to_string());
+        }
+        if self.pending_group_op.is_some() {
+            return Err("a group attach/detach is already in progress".to_string());
+        }
+        if attach.is_empty() && detach.is_empty() {
+            return Err("no group identity changes".to_string());
+        }
+
+        let mut uplink: Vec<GroupIdentityUplink> = Vec::with_capacity(attach.len() + detach.len());
+        for &gssi in attach {
+            uplink.push(GroupIdentityUplink {
+                class_of_usage: Some(GROUP_CLASS_OF_USAGE),
+                group_identity_detachment_uplink: None,
+                gssi: Some(gssi),
+                address_extension: None,
+                vgssi: None,
+            });
+        }
+        for &gssi in detach {
+            uplink.push(GroupIdentityUplink {
+                class_of_usage: None,
+                // "User initiated" detachment (cl. 16.10.21, Table 16.53 = 102).
+                group_identity_detachment_uplink: Some(0b10),
+                gssi: Some(gssi),
+                address_extension: None,
+                vgssi: None,
+            });
+        }
+
+        // Amendment mode (detach_all = false, cl. 16.10.17 Table 16.49 value 0).
+        self.send_attach_detach_group_identity(queue, false, uplink);
+        self.pending_group_op = Some(PendingGroupOp {
+            detach_all: false,
+            report_requested: false,
+            handle,
+            t353_countdown: T353_TIMEOUT_SLOTS,
+        });
+        Ok(())
     }
 
     /// LMM-ACTIVATE confirmation from MLE (cl. 17.3.2): a serving cell has been
@@ -2060,6 +2268,10 @@ impl MmMs {
             ManagementCommand::ApplyConfig { handle } => {
                 self.handle_apply_config(handle, queue);
             }
+            // Activate/deactivate a programmed scan list at runtime (Plane B).
+            ManagementCommand::ActivateScanlist { handle, name, active } => {
+                self.handle_activate_scanlist(handle, name, active, queue);
+            }
         }
     }
 
@@ -2229,6 +2441,7 @@ impl MmMs {
             rssi_dbfs: self.serving_rssi_dbfs,
             colour_code: cfg.cell.colour_code,
             attached_groups: self.attach_groups(),
+            active_scanlists: self.active_scanlists.iter().cloned().collect(),
             restart_required: self.restart_required,
         }
     }
@@ -4261,6 +4474,211 @@ attach_groups = []
         let (_handle, state) = last_state(&dispatcher);
         assert_eq!(state.registration_state, RegistrationState::Registered);
         assert_eq!(state.service_status, ServiceStatus::InService);
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan lists (Plane B, NON-STANDARD): programmed talkgroup sets that are
+    // resolved into the desired group-affiliation superset and activated /
+    // deactivated live via `ManagementCommand::ActivateScanlist`. Runtime
+    // changes reuse the standalone group attach/detach amendment (cl. 16.8.2).
+    // -----------------------------------------------------------------------
+
+    /// Build an MS config whose codeplug carries three talkgroups (100/200/300)
+    /// and two scan lists: "Alpha" (100, 200) and "Bravo" (200, 300). `alpha_active`
+    /// controls Alpha's programmed-default `active` flag; Bravo is always inactive.
+    fn scanlist_toml(alpha_active: bool) -> String {
+        format!(
+            "{MS_TOML}\n\
+[[folder]]\n\
+id = \"main\"\n\
+name = \"Main\"\n\
+order = 1\n\
+\n\
+[[talkgroup]]\n\
+gssi = 100\n\
+name = \"TG100\"\n\
+folder = \"main\"\n\
+order = 1\n\
+\n\
+[[talkgroup]]\n\
+gssi = 200\n\
+name = \"TG200\"\n\
+folder = \"main\"\n\
+order = 2\n\
+\n\
+[[talkgroup]]\n\
+gssi = 300\n\
+name = \"TG300\"\n\
+folder = \"main\"\n\
+order = 3\n\
+\n\
+[[scanlist]]\n\
+name = \"Alpha\"\n\
+talkgroups = [100, 200]\n\
+active = {alpha_active}\n\
+order = 1\n\
+\n\
+[[scanlist]]\n\
+name = \"Bravo\"\n\
+talkgroups = [200, 300]\n\
+active = false\n\
+order = 2\n"
+        )
+    }
+
+    /// Wired MM built from an arbitrary config TOML (mirrors `ms_mm_wired`).
+    fn ms_mm_wired_from(
+        toml: &str,
+    ) -> (MmMs, crate::net_telemetry::TelemetrySource, crate::net_control::CommandDispatcher) {
+        use crate::net_control::channel::make_control_link;
+        use crate::net_telemetry::telemetry_channel;
+        let cfg = from_toml_str(toml).expect("valid MS test config");
+        let (sink, source) = telemetry_channel();
+        let (dispatcher, endpoint) = make_control_link();
+        let mm = MmMs::new(SharedConfig::from_parts(cfg, None), Some(sink), Some(endpoint));
+        (mm, source, dispatcher)
+    }
+
+    fn activate_scanlist_cmd(handle: u32, name: &str, active: bool) -> ControlCommand {
+        use crate::management::ManagementCommand;
+        ControlCommand::Management(ManagementCommand::ActivateScanlist {
+            handle,
+            name: name.to_string(),
+            active,
+        })
+    }
+
+    /// A scan list whose programmed default is `active` seeds its GSSIs into the
+    /// desired affiliation set at construction, so they are affiliated at the
+    /// first registration; the runtime snapshot reflects the active-list name.
+    #[test]
+    fn test_scanlist_default_active_seeded() {
+        let cfg = from_toml_str(&scanlist_toml(true)).expect("valid scanlist config");
+        let mm = MmMs::new(SharedConfig::from_parts(cfg, None), None, None);
+
+        assert_eq!(mm.attach_groups(), vec![100, 200], "Alpha's GSSIs seeded");
+        assert!(mm.active_scanlists.contains("Alpha"));
+        assert!(!mm.active_scanlists.contains("Bravo"));
+
+        let snap = mm.runtime_snapshot();
+        assert_eq!(snap.active_scanlists, vec!["Alpha".to_string()]);
+        assert_eq!(snap.attached_groups, vec![100, 200]);
+    }
+
+    /// Activating an unknown scan list is refused (`accepted = false`) with no
+    /// state change and no on-air PDU.
+    #[test]
+    fn test_activate_scanlist_unknown_rejected() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired_from(&scanlist_toml(false));
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(activate_scanlist_cmd(90, "Ghost", true));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _restart) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 90);
+        assert!(!accepted, "unknown scanlist refused");
+        assert!(mm.active_scanlists.is_empty());
+        assert!(q.pop_front().is_none(), "no PDU emitted");
+    }
+
+    /// Activating a scan list while NOT registered updates the desired
+    /// affiliation set locally (affiliated at the next registration) and emits no
+    /// on-air PDU; the request is acknowledged accepted.
+    #[test]
+    fn test_activate_scanlist_not_registered_updates_desired_set() {
+        let (mut mm, _source, dispatcher) = ms_mm_wired_from(&scanlist_toml(false));
+        let mut q = MessageQueue::new();
+        assert_eq!(mm.reg_state, RegState::Idle);
+
+        dispatcher.send(activate_scanlist_cmd(91, "Alpha", true));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _restart) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 91);
+        assert!(accepted);
+        assert!(mm.active_scanlists.contains("Alpha"));
+        assert_eq!(mm.attach_groups(), vec![100, 200], "desired set updated locally");
+        assert!(mm.pending_group_op.is_none());
+        assert!(q.pop_front().is_none(), "no PDU while unregistered");
+    }
+
+    /// Activating a scan list while registered applies the delta on air via a
+    /// standalone U-ATTACH/DETACH GROUP IDENTITY amendment (cl. 16.8.2) carrying
+    /// the to-attach GSSIs; T353 is armed and the request is acknowledged. The
+    /// confirmed set is reconciled only from the SwMI acknowledgement (G3), then
+    /// deactivating detaches those groups.
+    #[test]
+    fn test_activate_scanlist_registered_attaches_then_detaches() {
+        let (mut mm, source, dispatcher) = ms_mm_wired_from(&scanlist_toml(false));
+        let mut q = MessageQueue::new();
+        // No default-active scan lists and no base groups, so registration seeds
+        // nothing and `register_wired`'s "queue empty" assertion holds.
+        register_wired(&mut mm, &mut q, &source);
+
+        // Activate Alpha -> amendment attach of {100, 200}.
+        dispatcher.send(activate_scanlist_cmd(92, "Alpha", true));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_issi, pdu) = pop_group_pdu(&mut q);
+        assert!(q.pop_front().is_none(), "exactly one PDU emitted");
+        assert!(!pdu.group_identity_attach_detach_mode, "amendment mode");
+        let ul = pdu.group_identity_uplink.expect("uplink entries");
+        let mut attached: Vec<u32> = ul
+            .iter()
+            .filter(|e| e.group_identity_detachment_uplink.is_none())
+            .filter_map(|e| e.gssi)
+            .collect();
+        attached.sort_unstable();
+        assert_eq!(attached, vec![100, 200], "both Alpha GSSIs attached");
+        assert!(mm.pending_group_op.is_some(), "T353 armed");
+        let (handle, accepted, _restart) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 92);
+        assert!(accepted);
+
+        // SwMI confirms the attachment -> attached set reconciled from the ACK.
+        deliver_dl(&mut mm, &mut q, build_group_ack(&[100, 200], &[]));
+        assert!(mm.attached_gssis.contains(&100) && mm.attached_gssis.contains(&200));
+        assert!(mm.pending_group_op.is_none());
+        drain_mle_identities(&mut q);
+        while q.pop_front().is_some() {}
+        let _ = drain(&source);
+
+        // Deactivate Alpha -> amendment detach of {100, 200}.
+        dispatcher.send(activate_scanlist_cmd(93, "Alpha", false));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_issi, pdu) = pop_group_pdu(&mut q);
+        let ul = pdu.group_identity_uplink.expect("uplink entries");
+        let mut detached: Vec<u32> = ul
+            .iter()
+            .filter(|e| e.group_identity_detachment_uplink.is_some())
+            .filter_map(|e| e.gssi)
+            .collect();
+        detached.sort_unstable();
+        assert_eq!(detached, vec![100, 200], "both Alpha GSSIs detached");
+        assert!(!mm.active_scanlists.contains("Alpha"));
+
+        deliver_dl(&mut mm, &mut q, build_group_ack(&[], &[100, 200]));
+        assert!(!mm.attached_gssis.contains(&100) && !mm.attached_gssis.contains(&200));
+    }
+
+    /// Re-activating an already-active scan list is an idempotent no-op: accepted,
+    /// no PDU, no pending operation.
+    #[test]
+    fn test_activate_scanlist_idempotent() {
+        let (mut mm, source, dispatcher) = ms_mm_wired_from(&scanlist_toml(false));
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+        mm.active_scanlists.insert("Alpha".to_string());
+
+        dispatcher.send(activate_scanlist_cmd(94, "Alpha", true));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_handle, accepted, _restart) = last_mgmt_ack(&dispatcher);
+        assert!(accepted, "idempotent re-activate accepted");
+        assert!(mm.pending_group_op.is_none());
+        assert!(q.pop_front().is_none(), "no PDU for a no-op");
     }
 
     // -----------------------------------------------------------------------

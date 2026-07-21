@@ -32,9 +32,11 @@ use crate::tnmm::ServiceStatus;
 /// A UI discovers this at runtime via [`ManagementCommand::GetInterfaceVersion`]
 /// so it can gate on the message catalog it was built against. Bump this (and
 /// the documented message catalog) whenever the Plane A/B message shapes change
-/// in a non-backwards-compatible way. `1` is the first frozen revision covering
-/// T1 TNMM indications, T2 TNMM requests and T3 management read/write.
-pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-1";
+/// `2` adds the scan-list management command
+/// ([`ManagementCommand::ActivateScanlist`]) and the `active_scanlists` field
+/// on [`MsRuntimeState`]; `1` was the first frozen revision covering T1 TNMM
+/// indications, T2 TNMM requests and T3 management read/write.
+pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-2";
 
 /// MS registration state, mirrored for the management snapshot (non-standard).
 ///
@@ -85,6 +87,12 @@ pub struct MsRuntimeState {
     pub colour_code: u8,
     /// GSSIs configured for attachment at registration (`[ms] attach_groups`).
     pub attached_groups: Vec<u32>,
+    /// Names of the scan lists currently active (a runtime superset control over
+    /// group affiliation; **non-standard**, Plane B). Activating a scan list
+    /// affiliates its talkgroups (cl. 16.8.2 group attach); deactivating detaches
+    /// the groups no other active scan list still needs. Initialised from the
+    /// codeplug scan lists whose programmed default is `active`.
+    pub active_scanlists: Vec<String>,
     /// True when a configuration change has been staged (via `SetConfig`) that
     /// only takes effect after a controlled restart (`ApplyConfig`). Purely a
     /// UI hint so the operator can see a "pending restart" indication.
@@ -123,6 +131,13 @@ pub enum ManagementCommand {
     /// supervisor respawns the stack with the new config). No-op if nothing is
     /// staged is still honored as an explicit restart request.
     ApplyConfig { handle: u32 },
+    /// Activate or deactivate a programmed scan list at runtime (live). The
+    /// stack resolves the change to a standalone group attach/detach (cl. 16.8.2)
+    /// so the affected talkgroups start/stop being monitored. `name` must match
+    /// a codeplug scan list; an unknown name is answered with `Ack{accepted:
+    /// false}`. Applies immediately when registered; otherwise it just updates
+    /// the desired set so the groups are affiliated at the next registration.
+    ActivateScanlist { handle: u32, name: String, active: bool },
 }
 
 /// Management response (stack -> UI), **non-standard** Plane B.
