@@ -2370,6 +2370,21 @@ impl TetraEntityTrait for MmMs {
             tracing::info!("MM: shutdown while not registered; no de-registration needed");
             return false;
         }
+        // A U-ITSI DETACH (cl. 16.6.1) can only be transmitted while the MS has a
+        // usable serving-cell downlink: the uplink burst needs the recovered
+        // TDMA timing and an assigned uplink opportunity. If the serving-cell
+        // link has been lost (out of service, MLE-BREAK cl. 18.3.4.5.3) the
+        // detach cannot be sent, and the shutdown drain would otherwise stall —
+        // its countdown only advances on recovered downlink slots, of which
+        // there are none while out of coverage. Skip the detach and let the
+        // stack stop immediately; the MS is already off the air.
+        if self.out_of_service {
+            tracing::info!(
+                "MM: shutdown while registered but out of service (no downlink); \
+                 skipping U-ITSI DETACH — it cannot be transmitted, stopping now"
+            );
+            return false;
+        }
         tracing::info!("MM: shutdown while registered; sending U-ITSI DETACH (de-registration)");
         self.send_itsi_detach(queue);
         self.reg_state = RegState::Detaching;
@@ -3001,6 +3016,38 @@ attach_groups = []
         assert_eq!(mm.reg_state, RegState::Idle);
         assert!(!mm.deregistration_pending());
         assert!(q.pop_front().is_none(), "no PDU emitted when not registered");
+    }
+
+    /// On shutdown while registered but out of service (serving-cell downlink
+    /// lost, MLE-BREAK), MM must NOT start a detach drain: the U-ITSI DETACH
+    /// cannot be transmitted without a downlink, and the router's drain countdown
+    /// (advanced only on recovered downlink slots) would stall — the stack must
+    /// stop immediately instead of hanging. Regression for the "stop while not
+    /// connected hangs" bug.
+    #[test]
+    fn test_no_detach_when_registered_but_out_of_service() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        drain_mle_identities(&mut q);
+
+        // Serving-cell downlink is lost: MM goes out of service, stays Registered.
+        deliver_mle_break(&mut mm, &mut q);
+        assert!(mm.out_of_service);
+        assert_eq!(mm.reg_state, RegState::Registered);
+        while q.pop_front().is_some() {}
+
+        // Shutdown now must not start a detach and must not leave a pending drain.
+        assert!(
+            !mm.begin_deregistration(&mut q),
+            "no detach must be attempted while out of service"
+        );
+        assert_eq!(mm.reg_state, RegState::Registered, "reg state left unchanged");
+        assert!(!mm.deregistration_pending(), "no drain pending — stack can stop at once");
+        assert!(q.pop_front().is_none(), "no U-ITSI DETACH emitted with no downlink");
     }
 
     /// Helper: drive MM to Registered on the default config cell (901/9999, LA 1)
