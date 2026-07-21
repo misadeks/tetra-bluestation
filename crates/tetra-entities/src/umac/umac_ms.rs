@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::panic;
 
 use tetra_config::bluestation::{SharedConfig, StackMode};
@@ -93,6 +93,31 @@ pub struct UplinkFragment {
     pub tx_reporter: Option<TxReporter>,
 }
 
+/// A complete uplink transfer waiting behind the one currently in flight.
+///
+/// The MS-MAC can only have a single uplink transfer contending for random
+/// access at a time (`pending_uplink`/`pending_fragment`, cl. 23.5.1.4). The
+/// LLC, however, may hand down several TM-SDUs in quick succession — e.g. an
+/// unacknowledged BL-ACK auto-ack interleaved with an acknowledged group-attach
+/// — so extra transfers are held here in FIFO order and promoted into the
+/// active slots by [`UmacMs::promote_next_uplink`] once the current one
+/// completes. This prevents a later uplink from overwriting an in-flight
+/// transfer and orphaning its [`PendingUplink::tx_reporter`], which would leave
+/// the acknowledged basic link wedged (no `t_umac_done`, so the LLC T251/N252
+/// retransmit-and-give-up never runs).
+#[derive(Debug, Clone)]
+struct QueuedUplink {
+    pending: PendingUplink,
+    fragment: Option<UplinkFragment>,
+}
+
+/// Upper bound on [`UmacMs::uplink_queue`]. The basic link is effectively
+/// stop-and-wait, so only a handful of transfers ever queue (a data PDU plus a
+/// few auto-acks). The cap is a defensive guard against pathological growth; on
+/// overflow the oldest queued transfer is dropped with its receipt marked
+/// discarded so the LLC retransmits it rather than leaking memory.
+const MAX_UPLINK_QUEUE: usize = 16;
+
 pub struct UmacMs {
     // config: Option<SharedConfig>,
     dltime: TdmaTime,
@@ -112,6 +137,12 @@ pub struct UmacMs {
     /// MAC block queued for uplink transmission, awaiting an access opportunity
     /// (cl. 23.5). Consumed by the uplink PHY driver (Phase 3d).
     pending_uplink: Option<PendingUplink>,
+
+    /// Uplink transfers waiting behind `pending_uplink` (see [`QueuedUplink`]).
+    /// Populated by `rx_tma_prim` when a transfer is already in flight and
+    /// drained by `promote_next_uplink` on each downlink slot once the active
+    /// transfer completes.
+    uplink_queue: VecDeque<QueuedUplink>,
 
     /// Random access parameters advertised by the serving cell, per access code
     /// (ACCESS-DEFINE cl. 21.4.4.3 + SYSINFO default-A cl. 21.4.4.1).
@@ -165,6 +196,7 @@ impl UmacMs {
             cc: None,
             scrambling_code: None,
             pending_uplink: None,
+            uplink_queue: VecDeque::new(),
             access_params: AccessParamStore::new(),
             random_access: MsRandomAccess::new(),
             pending_fragment: None,
@@ -836,6 +868,13 @@ impl UmacMs {
     /// slot's ACCESS-ASSIGN and act on the resulting decision. No-op unless a
     /// random access attempt is currently in progress.
     fn drive_random_access(&mut self, queue: &mut MessageQueue, aa: &AccessAssign) {
+        // If the previously active uplink transfer has completed (acknowledged
+        // or abandoned), pull the next queued transfer into the active slots so
+        // it can contend for access. Done first, every slot, so a transfer that
+        // was held behind another (cl. 23.5.1.4 permits only one at a time) is
+        // never starved.
+        self.promote_next_uplink();
+
         // Access code A is the default code available to all MSs (SYSINFO
         // default-A, cl. 21.4.4.1). Without advertised parameters we cannot
         // legally access, so keep any queued uplink waiting until the BS
@@ -1168,21 +1207,23 @@ impl UmacMs {
         // a subslot (cl. 23.5.2).
         let sdu_len = prim.pdu.get_len();
         prim.pdu.seek(0);
-        match Self::build_mac_access_block(issi, &mut prim.pdu) {
+        let (new_pending, new_fragment) = match Self::build_mac_access_block(issi, &mut prim.pdu) {
             Some(mac_block) => {
                 // Fits a single access burst; no fragmentation.
-                self.pending_fragment = None;
-                self.pending_uplink = Some(PendingUplink {
-                    mac_block,
-                    logical_channel: LogicalChannel::SchHu,
-                    scrambling_code,
-                    tx_reporter,
-                });
                 tracing::debug!(
-                    "rx_tma_prim: queued MAC-ACCESS uplink for ISSI {} ({} SDU bits)",
+                    "rx_tma_prim: built MAC-ACCESS uplink for ISSI {} ({} SDU bits)",
                     issi,
                     sdu_len
                 );
+                (
+                    PendingUplink {
+                        mac_block,
+                        logical_channel: LogicalChannel::SchHu,
+                        scrambling_code,
+                        tx_reporter,
+                    },
+                    None,
+                )
             }
             None => {
                 // Oversized: fragment into MAC-ACCESS (frag start) + MAC-END-HU.
@@ -1202,17 +1243,19 @@ impl UmacMs {
                         // The receipt travels with the completing MAC-END-HU
                         // (the whole TM-SDU is only "transmitted" once the
                         // remainder is on air); the frag-start carries none.
-                        self.pending_fragment = Some(UplinkFragment {
-                            remainder,
-                            scrambling_code,
-                            tx_reporter,
-                        });
-                        self.pending_uplink = Some(PendingUplink {
-                            mac_block: frag_block,
-                            logical_channel: LogicalChannel::SchHu,
-                            scrambling_code,
-                            tx_reporter: None,
-                        });
+                        (
+                            PendingUplink {
+                                mac_block: frag_block,
+                                logical_channel: LogicalChannel::SchHu,
+                                scrambling_code,
+                                tx_reporter: None,
+                            },
+                            Some(UplinkFragment {
+                                remainder,
+                                scrambling_code,
+                                tx_reporter,
+                            }),
+                        )
                     }
                     None => {
                         tracing::warn!(
@@ -1224,6 +1267,44 @@ impl UmacMs {
                     }
                 }
             }
+        };
+
+        // Do not overwrite an uplink transfer that is already contending for
+        // random access (or whose fragment remainder is still outstanding): the
+        // in-flight `pending_uplink`/`pending_fragment` holds a `tx_reporter`
+        // shared with the LLC acknowledged-mode outbound entry, and clobbering
+        // it would orphan that receipt so it is never marked transmitted. The
+        // LLC would then never set `t_umac_done`, its T251/N252
+        // retransmit-and-give-up would never run, and the basic link would wedge
+        // (observed as endless "still blocked" when an LLC BL-ACK auto-ack
+        // interleaved with a group-attach). Queue the new transfer instead and
+        // let `promote_next_uplink` start it once the current one completes.
+        if self.pending_uplink.is_some()
+            || self.pending_fragment.is_some()
+            || self.random_access.is_active()
+        {
+            if self.uplink_queue.len() >= MAX_UPLINK_QUEUE {
+                if let Some(dropped) = self.uplink_queue.pop_front() {
+                    tracing::warn!(
+                        "rx_tma_prim: uplink queue full ({}); dropping oldest queued transfer \
+                         (LLC will retransmit)",
+                        MAX_UPLINK_QUEUE
+                    );
+                    Self::discard_queued_uplink(&dropped);
+                }
+            }
+            tracing::debug!(
+                "rx_tma_prim: uplink in flight; queueing transfer for ISSI {} ({} now waiting)",
+                issi,
+                self.uplink_queue.len() + 1
+            );
+            self.uplink_queue.push_back(QueuedUplink {
+                pending: new_pending,
+                fragment: new_fragment,
+            });
+        } else {
+            self.pending_fragment = new_fragment;
+            self.pending_uplink = Some(new_pending);
         }
 
         // Queue for transmission at the next valid random-access opportunity.
@@ -1239,6 +1320,43 @@ impl UmacMs {
         // emitted to LMAC and PHY from `drive_random_access`. If the SDU was
         // fragmented, the MAC-END-HU remainder is emitted from `rx_mac_resource`
         // when the BS grants a subslot in response to the frag-start.
+    }
+
+    /// Mark every transmit receipt carried by a queued (never-transmitted)
+    /// uplink as discarded (cl. 22.3.2.3) so the LLC retransmits it. Used when a
+    /// queued transfer is dropped on overflow without ever reaching the air.
+    fn discard_queued_uplink(dropped: &QueuedUplink) {
+        if let Some(tx_reporter) = dropped.pending.tx_reporter.as_ref() {
+            tx_reporter.try_mark_discarded();
+        }
+        if let Some(fragment) = dropped.fragment.as_ref() {
+            if let Some(tx_reporter) = fragment.tx_reporter.as_ref() {
+                tx_reporter.try_mark_discarded();
+            }
+        }
+    }
+
+    /// Promote the next queued uplink transfer (if any) into the active
+    /// `pending_uplink`/`pending_fragment` slots, but only when nothing is
+    /// currently contending for random access. Called each downlink slot from
+    /// `drive_random_access`, this is what lets a transfer queued behind another
+    /// (e.g. a group-attach behind an LLC BL-ACK) start once the earlier one has
+    /// been acknowledged or abandoned.
+    fn promote_next_uplink(&mut self) {
+        if self.pending_uplink.is_some()
+            || self.pending_fragment.is_some()
+            || self.random_access.is_active()
+        {
+            return;
+        }
+        if let Some(next) = self.uplink_queue.pop_front() {
+            tracing::debug!(
+                "promote_next_uplink: starting queued uplink transfer ({} still waiting)",
+                self.uplink_queue.len()
+            );
+            self.pending_fragment = next.fragment;
+            self.pending_uplink = Some(next.pending);
+        }
     }
 
     /// Build a MAC-ACCESS type-1 MAC block (ETSI TS 100 392-2 cl. 21.4.2.1)
@@ -1606,6 +1724,7 @@ mod tests {
     use super::*;
     use tetra_config::bluestation::from_toml_str;
     use tetra_saps::tlmc::{TlmcConfigureReq, TlmcValidAddress};
+    use tetra_saps::tma::TmaUnitdataReq;
     use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
     use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
     use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
@@ -1832,6 +1951,118 @@ attach_groups = []
         assert!(q.pop_front().is_none(), "no uplink without a grant");
         assert!(umac.pending_fragment.is_none(), "fragment consumed even without a grant");
         assert!(reporter.is_discarded(), "no-grant drop marks the receipt discarded");
+    }
+
+    // --- Uplink transfer queueing (cl. 23.5.1.4: one transfer at a time) ---
+
+    /// Build a TMA-UNITDATA request carrying `sdu_bits` for the MS's own ISSI
+    /// with `reporter` as its transmit receipt, as the LLC hands down to the MAC.
+    fn tma_uplink_req(reporter: &TxReporter, sdu_bits: &str) -> SapMsg {
+        SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: 0,
+                pdu: BitBuffer::from_bitstr(sdu_bits),
+                main_address: TetraAddress::issi(1000001),
+                link_id: 0,
+                endpoint_id: 0,
+                stealing_permission: false,
+                subscriber_class: 0,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: Some(reporter.clone()),
+            }),
+        }
+    }
+
+    /// Regression: a second uplink handed down while the first is still in
+    /// flight must be queued, not overwrite the active `pending_uplink`. The
+    /// original single-slot design silently replaced the in-flight transfer,
+    /// orphaning its `TxReporter` (never marked transmitted or discarded) so the
+    /// LLC never set `t_umac_done` and the acknowledged basic link wedged
+    /// forever (observed as endless "still blocked" when an LLC BL-ACK auto-ack
+    /// interleaved with a post-registration group attach).
+    #[test]
+    fn test_second_uplink_is_queued_not_clobbered() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        let mut q = MessageQueue::new();
+
+        let r1 = TxReporter::new();
+        let r2 = TxReporter::new();
+
+        // First transfer installs directly into the active slot.
+        umac.rx_tma_prim(&mut q, tma_uplink_req(&r1, "0110100100011110001011010010"));
+        assert!(umac.pending_uplink.is_some(), "first transfer is active");
+        assert!(umac.uplink_queue.is_empty(), "nothing queued yet");
+
+        // Second transfer arrives before the first completes: it must queue.
+        umac.rx_tma_prim(&mut q, tma_uplink_req(&r2, "1001011011100001110100101101"));
+        assert_eq!(umac.uplink_queue.len(), 1, "second transfer is queued");
+        assert!(umac.pending_uplink.is_some(), "first transfer still active");
+        // Neither receipt has been touched: the first is still awaiting its MAC
+        // acknowledgement, the second has not yet contended for access.
+        assert!(!r1.is_transmitted() && !r1.is_discarded(), "first receipt untouched");
+        assert!(!r2.is_transmitted() && !r2.is_discarded(), "second receipt untouched");
+
+        // The active slot must still hold the FIRST transfer (its receipt), not
+        // the second: marking the active receipt transmitted marks r1, not r2.
+        let active_reporter = umac
+            .pending_uplink
+            .as_ref()
+            .unwrap()
+            .tx_reporter
+            .clone()
+            .expect("active transfer carries the first receipt");
+        active_reporter.try_mark_transmitted();
+        assert!(r1.is_transmitted(), "active slot holds the first transfer");
+        assert!(!r2.is_transmitted(), "second transfer is untouched in the queue");
+
+        // Emulate the first transfer completing (MAC-RESOURCE ack took it), then
+        // promotion pulls the queued second transfer into the active slot.
+        umac.pending_uplink = None;
+        assert!(!umac.random_access.is_active());
+        umac.promote_next_uplink();
+        assert!(umac.uplink_queue.is_empty(), "queue drained");
+        let promoted = umac
+            .pending_uplink
+            .as_ref()
+            .expect("second transfer promoted")
+            .tx_reporter
+            .clone()
+            .expect("promoted transfer carries the second receipt");
+        promoted.try_mark_transmitted();
+        assert!(r2.is_transmitted(), "promoted slot holds the second transfer");
+    }
+
+    /// A queued transfer dropped on queue overflow has its receipt marked
+    /// discarded so the LLC retransmits it rather than the receipt being leaked.
+    #[test]
+    fn test_uplink_queue_overflow_discards_oldest() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        let mut q = MessageQueue::new();
+
+        // Occupy the active slot so every subsequent transfer queues.
+        umac.rx_tma_prim(&mut q, tma_uplink_req(&TxReporter::new(), "0110100100011110"));
+
+        // Fill the queue to capacity; the oldest queued receipt is the canary.
+        let oldest = TxReporter::new();
+        umac.rx_tma_prim(&mut q, tma_uplink_req(&oldest, "0110100100011110"));
+        for _ in 1..MAX_UPLINK_QUEUE {
+            umac.rx_tma_prim(&mut q, tma_uplink_req(&TxReporter::new(), "0110100100011110"));
+        }
+        assert_eq!(umac.uplink_queue.len(), MAX_UPLINK_QUEUE, "queue at capacity");
+        assert!(!oldest.is_discarded(), "oldest still queued");
+
+        // One more transfer overflows the queue, evicting the oldest.
+        umac.rx_tma_prim(&mut q, tma_uplink_req(&TxReporter::new(), "0110100100011110"));
+        assert_eq!(umac.uplink_queue.len(), MAX_UPLINK_QUEUE, "queue stays capped");
+        assert!(oldest.is_discarded(), "evicted transfer's receipt marked discarded (LLC retransmits)");
     }
 
     // --- MS MAC receive filtering (ETSI TS 100 392-2 clause 23 addressing) ---
