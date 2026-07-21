@@ -123,3 +123,30 @@ fn test_lmac_ms_tx_schf_nub() {
     assert!(crc_ok, "CRC must pass on round-trip");
     assert_eq!(bits_of(&decoded.unwrap(), 268), orig_bits, "recovered type-1 block must match original");
 }
+
+#[test]
+/// D-2 (tune plumbing): a TMV-TUNE from UMAC is forwarded down to the PHY as a
+/// TPC-TUNE carrying the same carrier (LMAC holds no radio-tuning state).
+fn test_lmac_ms_forwards_tune_to_phy() {
+    let mut test = ComponentTest::new(StackMode::Ms, None);
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Phy]);
+
+    let m = SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Lmac,
+        msg: SapMsgInner::TmvTuneReq(tetra_saps::tmv::TmvTuneReq { carrier_hz: 396_000_000 }),
+    };
+    test.submit_message(m);
+    test.deliver_all_messages();
+    let mut sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 1, "LmacMs should emit exactly one TPC request");
+    let msg = sink_msgs.remove(0);
+    assert_eq!(msg.sap, Sap::TpcSap);
+    assert_eq!(msg.dest, TetraEntity::Phy);
+    let SapMsgInner::TpcTuneReq(req) = msg.msg else {
+        panic!("expected TpcTuneReq, got {:?}", msg.msg);
+    };
+    assert_eq!(req.carrier_hz, 396_000_000);
+}

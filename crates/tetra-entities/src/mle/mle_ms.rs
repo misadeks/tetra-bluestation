@@ -6,7 +6,7 @@ use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
 use tetra_saps::lmm::{LmmMleActivateConf, LmmMleRssiInd, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
-use tetra_saps::tlmc::{TlmcConfigureReq, TlmcValidAddress};
+use tetra_saps::tlmc::{TlmcConfigureReq, TlmcTuneReq, TlmcValidAddress};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
@@ -329,8 +329,22 @@ impl MleMs {
         }
     }
 
-    fn rx_tlmb_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        tracing::trace!("rx_tlmb_prim");
+    /// Request a downlink retune of the SDR (**[impl policy]** — MLE owns MS
+    /// cell-selection policy per the agreed design). Emits a TMC-SAP tune
+    /// primitive that is forwarded MLE -> UMAC (TLMC) -> LMAC (TMV) -> PHY (TPC),
+    /// where PhyMs applies it to the device. Used by the scanning cell-selection
+    /// engine to step the receiver across candidate carriers (cl. 18.3.4).
+    fn request_tune(&self, queue: &mut MessageQueue, carrier_hz: u32) {
+        tracing::info!("MLE: requesting downlink retune to {} Hz", carrier_hz);
+        queue.push_back(SapMsg {
+            sap: Sap::TlmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TlmcTuneReq(TlmcTuneReq { carrier_hz }),
+        });
+    }
+
+    fn rx_tlmb_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {        tracing::trace!("rx_tlmb_prim");
         match message.msg {
             SapMsgInner::TlmbSysinfoInd(_) => {
                 self.rx_tlmb_tl_sysinfo_ind(queue, message);
@@ -1207,5 +1221,25 @@ attach_groups = []
             0,
             "no LMM-ACTIVATE confirmation for a barred subscriber class"
         );
+    }
+
+    /// D-2 (tune plumbing): the MLE `request_tune` helper emits a TMC-SAP
+    /// TlmcTuneReq addressed to UMAC carrying the requested carrier, so the
+    /// scanning engine can step the receiver across candidate carriers.
+    #[test]
+    fn test_request_tune_emits_tlmc_tune_req() {
+        let mle = ms_mle();
+        let mut queue = MessageQueue::new();
+
+        mle.request_tune(&mut queue, 396_000_000);
+
+        let out = queue.pop_front().expect("a TLMC-TUNE must be emitted");
+        assert_eq!(out.sap, Sap::TlmcSap);
+        assert_eq!(out.src, TetraEntity::Mle);
+        assert_eq!(out.dest, TetraEntity::Umac);
+        let SapMsgInner::TlmcTuneReq(req) = out.msg else {
+            panic!("expected TlmcTuneReq");
+        };
+        assert_eq!(req.carrier_hz, 396_000_000);
     }
 }

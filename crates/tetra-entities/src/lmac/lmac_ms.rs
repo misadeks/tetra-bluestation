@@ -7,6 +7,7 @@ use tetra_saps::tmv::TmvUnitdataInd;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::tp::TpUnitdataReqSlot;
+use tetra_saps::tpc::TpcTuneReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::lmac::components::{errorcontrol, scrambler};
@@ -306,10 +307,30 @@ impl LmacMs {
             SapMsgInner::TmvUnitdataReq(_) => {
                 self.rx_tmv_unitdata_req_slot(queue, message);
             }
+            SapMsgInner::TmvTuneReq(_) => {
+                self.rx_tmv_tune_req(queue, message);
+            }
             _ => {
                 panic!();
             }
         }
+    }
+
+    /// MS runtime downlink retune (**[impl policy]**): forward the tune request
+    /// down to the PHY (TMV -> TPC). LMAC holds no radio-tuning state; the PHY
+    /// owns the SDR and applies the retune.
+    fn rx_tmv_tune_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        let SapMsgInner::TmvTuneReq(prim) = &message.msg else {
+            panic!()
+        };
+        let carrier_hz = prim.carrier_hz;
+        tracing::info!("LMAC: forwarding MS downlink retune to {} Hz (TMV -> TPC)", carrier_hz);
+        queue.push_back(SapMsg {
+            sap: Sap::TpcSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Phy,
+            msg: SapMsgInner::TpcTuneReq(TpcTuneReq { carrier_hz }),
+        });
     }
 }
 

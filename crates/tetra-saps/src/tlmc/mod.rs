@@ -6,6 +6,19 @@ pub struct TlmcAssessmentInd;
 #[derive(Debug, Clone)]
 pub struct TlmcAssessmentListReq;
 
+/// MS only — runtime downlink retune request (**[impl policy]**).
+///
+/// MLE -> upper-MAC hop of the MLE-owned cell-selection / scan retune path
+/// (MLE -> UMAC (TLMC) -> LMAC (TMV) -> PHY (TPC)). UMAC forwards it down to
+/// LMAC as a `TmvTuneReq`. The standard scanning/selection vehicle is the
+/// TMC-SAP scan/select service (cl. 20.4.3); this direct tune models the
+/// physical retune those procedures require. Not an over-the-air primitive.
+#[derive(Debug, Clone)]
+pub struct TlmcTuneReq {
+    /// Absolute downlink centre frequency to tune to, in Hz.
+    pub carrier_hz: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct TlmcCellReadInd;
 #[derive(Debug, Clone)]

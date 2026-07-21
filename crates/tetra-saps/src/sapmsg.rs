@@ -20,6 +20,7 @@ use super::tlmc::*;
 use super::tma::*;
 use super::tmv::*;
 use super::tp::*;
+use super::tpc::*;
 
 /// Exhaustive list of SapMsgType structs for use in the SapMsg struct
 /// See Clause 19.2.1 for an overview of all lower-layer SAPs
@@ -33,11 +34,16 @@ pub enum SapMsgInner {
     TpUnitdataInd(TpUnitdataInd),
     TpUnitdataReq(TpUnitdataReqSlot),
 
+    /// TPC-SAP (PHY <-> LMAC management) — MS runtime downlink retune.
+    TpcTuneReq(TpcTuneReq),
+
     // TMV-SAP
     TmvUnitdataReq(TmvUnitdataReqSlot),
     TmvUnitdataInd(TmvUnitdataInd),
     TmvConfigureReq(TmvConfigureReq),
     TmvConfigureConf(TmvConfigureConf),
+    /// TMV-SAP — MS runtime downlink retune (UMAC -> LMAC).
+    TmvTuneReq(TmvTuneReq),
 
     // TMA-SAP
     TmaUnitdataInd(TmaUnitdataInd),
@@ -54,6 +60,8 @@ pub enum SapMsgInner {
 
     // TMC-SAP
     TlmcConfigureReq(TlmcConfigureReq),
+    /// TMC-SAP — MS runtime downlink retune (MLE -> UMAC).
+    TlmcTuneReq(TlmcTuneReq),
 
     // TMD-SAP (Uplane traffic and signalling)
     TmdCircuitDataReq(TmdCircuitDataReq),
@@ -124,6 +132,8 @@ impl Display for SapMsgInner {
             SapMsgInner::TmvUnitdataInd(_) => write!(f, "TmvUnitdataInd"),
             SapMsgInner::TmvConfigureReq(_) => write!(f, "TmvConfigureReq"),
             SapMsgInner::TmvConfigureConf(_) => write!(f, "TmvConfigureConf"),
+            SapMsgInner::TmvTuneReq(_) => write!(f, "TmvTuneReq"),
+            SapMsgInner::TpcTuneReq(_) => write!(f, "TpcTuneReq"),
 
             // TMA-SAP
             SapMsgInner::TmaUnitdataInd(_) => write!(f, "TmaUnitdataInd"),
@@ -133,6 +143,9 @@ impl Display for SapMsgInner {
             SapMsgInner::TlmbSyncInd(_) => write!(f, "TmbSyncInd"),
             SapMsgInner::TlmbSysinfoInd(_) => write!(f, "TmbSysinfoInd"),
             SapMsgInner::TlmbMonitorInd(_) => write!(f, "TlmbMonitorInd"),
+
+            // TMC-SAP
+            SapMsgInner::TlmcTuneReq(_) => write!(f, "TlmcTuneReq"),
 
             // LCMC-SAP
             SapMsgInner::LcmcMleBreakInd(_) => write!(f, "LcmcMleBreakInd"),

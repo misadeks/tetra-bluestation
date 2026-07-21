@@ -10,6 +10,7 @@ use tetra_core::{
 use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
 use tetra_saps::tma::TmaUnitdataInd;
 use tetra_saps::tmv::TmvConfigureReq;
+use tetra_saps::tmv::TmvTuneReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvUnitdataReq, TmvUnitdataReqSlot};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -1670,10 +1671,30 @@ impl UmacMs {
             SapMsgInner::TlmcConfigureReq(_) => {
                 self.rx_tlmc_configure_req(queue, message);
             }
+            SapMsgInner::TlmcTuneReq(_) => {
+                self.rx_tlmc_tune_req(queue, message);
+            }
             _ => {
                 panic!();
             }
         }
+    }
+
+    /// MS runtime downlink retune (**[impl policy]**): forward the MLE's tune
+    /// request down to the lower MAC (TLMC -> TMV). UMAC holds no radio state for
+    /// this; it is pure pass-through so the PHY ultimately retunes the SDR.
+    fn rx_tlmc_tune_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        let SapMsgInner::TlmcTuneReq(prim) = &message.msg else {
+            panic!()
+        };
+        let carrier_hz = prim.carrier_hz;
+        tracing::info!("UMAC: forwarding MS downlink retune to {} Hz (TLMC -> TMV)", carrier_hz);
+        queue.push_back(SapMsg {
+            sap: Sap::TmvSap,
+            src: TetraEntity::Umac,
+            dest: TetraEntity::Lmac,
+            msg: SapMsgInner::TmvTuneReq(TmvTuneReq { carrier_hz }),
+        });
     }
 }
 
@@ -2219,5 +2240,28 @@ colour_code = 1
         umac.rx_tlmc_configure_req(&mut q, msg);
         assert!(umac.accept_downlink_address(&ssi_addr(91)), "group filter preserved");
         assert!(umac.accept_downlink_address(&ssi_addr(1000001)), "own ISSI preserved");
+    }
+
+    /// D-2 (tune plumbing): a TLMC-TUNE from the MLE is forwarded down to LMAC as
+    /// a TMV-TUNE carrying the same carrier (UMAC holds no radio state).
+    #[test]
+    fn test_tlmc_tune_forwarded_to_lmac() {
+        let mut umac = umac_cfg("Ms", 1000001, &[]);
+        let mut q = MessageQueue::new();
+        let msg = SapMsg {
+            sap: Sap::TlmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TlmcTuneReq(tetra_saps::tlmc::TlmcTuneReq { carrier_hz: 396_000_000 }),
+        };
+        umac.rx_tlmc_prim(&mut q, msg);
+
+        let out = q.pop_front().expect("a TMV-TUNE must be emitted");
+        assert_eq!(out.sap, Sap::TmvSap);
+        assert_eq!(out.dest, TetraEntity::Lmac);
+        let SapMsgInner::TmvTuneReq(req) = out.msg else {
+            panic!("expected TmvTuneReq");
+        };
+        assert_eq!(req.carrier_hz, 396_000_000);
     }
 }

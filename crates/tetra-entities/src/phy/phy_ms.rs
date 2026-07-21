@@ -1,6 +1,6 @@
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, unimplemented_log};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence};
 use tetra_pdus::phy::traits::rxtx_dev::{RfPath, RxBurstBits, RxTxDev, TxSlotBits};
 use tetra_saps::tlmb::TlmbMonitorInd;
 use tetra_saps::tp::TpUnitdataInd;
@@ -348,7 +348,19 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 self.pending_tx = Some(pending);
             }
             Sap::TpcSap => {
-                unimplemented_log!("PhyMs TpcSap not implemented yet");
+                match message.msg {
+                    // MS runtime downlink retune (**[impl policy]**): the lowest
+                    // hop of the MLE-owned scan/cell-selection retune path. PhyMs
+                    // owns the SDR, so it applies the retune to the device (which
+                    // re-applies its PPM/IF correction).
+                    SapMsgInner::TpcTuneReq(prim) => {
+                        tracing::info!("PhyMs: retuning downlink to {} Hz (TPC-TUNE)", prim.carrier_hz);
+                        self.rxtxdev.set_rx_frequency(prim.carrier_hz as f64);
+                    }
+                    other => {
+                        tracing::warn!("PhyMs TpcSap: unhandled primitive {}", other);
+                    }
+                }
             }
             _ => {
                 panic!("PhyMs received unexpected SAP: {:?}", message.sap);
@@ -613,6 +625,29 @@ attach_groups = []
         dev.set_rx_frequency(430_425_000.0);
         dev.set_rx_frequency(390_000_000.0);
         assert_eq!(dev.rx_retunes, vec![430_425_000.0, 390_000_000.0]);
+    }
+
+    /// D-2 (tune plumbing): a TPC-TUNE primitive arriving on the control SAP
+    /// makes PhyMs retune the SDR downlink to the requested carrier — the lowest
+    /// hop of the MLE-owned scan/cell-selection retune path.
+    #[test]
+    fn test_tpc_tune_retunes_device() {
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        let msg = SapMsg {
+            sap: Sap::TpcSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Phy,
+            msg: SapMsgInner::TpcTuneReq(tetra_saps::tpc::TpcTuneReq { carrier_hz: 396_000_000 }),
+        };
+        phy.rx_prim(&mut queue, msg);
+
+        assert_eq!(
+            phy.rxtxdev.rx_retunes.last().copied(),
+            Some(396_000_000.0),
+            "PhyMs must retune the device to the requested carrier"
+        );
     }
 
     /// A TP-UNITDATA request carrying a SCH/HU control block for `time`.

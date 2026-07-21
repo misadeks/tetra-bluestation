@@ -12,6 +12,17 @@ pub struct TmvUnitdataReq {
     pub scrambling_code: u32,
 }
 
+/// MS only — runtime downlink retune request (**[impl policy]**).
+///
+/// Upper-MAC -> lower-MAC hop of the MLE-owned cell-selection / scan retune
+/// path (MLE -> UMAC (TLMC) -> LMAC (TMV) -> PHY (TPC)). LMAC forwards it to the
+/// PHY as a `TpcTuneReq`. Not an over-the-air primitive.
+#[derive(Debug, Clone)]
+pub struct TmvTuneReq {
+    /// Absolute downlink centre frequency to tune to, in Hz.
+    pub carrier_hz: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct TmvUnitdataReqSlot {
     /// Timeslot at which this block is to be transmitted
