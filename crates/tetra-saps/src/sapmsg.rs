@@ -36,6 +36,8 @@ pub enum SapMsgInner {
 
     /// TPC-SAP (PHY <-> LMAC management) — MS runtime downlink retune.
     TpcTuneReq(TpcTuneReq),
+    /// TPC-SAP (PHY <-> LMAC management) — MS runtime uplink (TX) retune.
+    TpcTxTuneReq(TpcTxTuneReq),
 
     // TMV-SAP
     TmvUnitdataReq(TmvUnitdataReqSlot),
@@ -44,6 +46,8 @@ pub enum SapMsgInner {
     TmvConfigureConf(TmvConfigureConf),
     /// TMV-SAP — MS runtime downlink retune (UMAC -> LMAC).
     TmvTuneReq(TmvTuneReq),
+    /// TMV-SAP — MS runtime uplink (TX) retune (UMAC -> LMAC).
+    TmvTxTuneReq(TmvTxTuneReq),
 
     // TMA-SAP
     TmaUnitdataInd(TmaUnitdataInd),
@@ -137,7 +141,9 @@ impl Display for SapMsgInner {
             SapMsgInner::TmvConfigureReq(_) => write!(f, "TmvConfigureReq"),
             SapMsgInner::TmvConfigureConf(_) => write!(f, "TmvConfigureConf"),
             SapMsgInner::TmvTuneReq(_) => write!(f, "TmvTuneReq"),
+            SapMsgInner::TmvTxTuneReq(_) => write!(f, "TmvTxTuneReq"),
             SapMsgInner::TpcTuneReq(_) => write!(f, "TpcTuneReq"),
+            SapMsgInner::TpcTxTuneReq(_) => write!(f, "TpcTxTuneReq"),
 
             // TMA-SAP
             SapMsgInner::TmaUnitdataInd(_) => write!(f, "TmaUnitdataInd"),

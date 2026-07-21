@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::panic;
 
 use tetra_config::bluestation::{SharedConfig, StackMode};
+use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
     BitBuffer, PhyBlockNum, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter,
@@ -11,6 +12,7 @@ use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
 use tetra_saps::tma::TmaUnitdataInd;
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::TmvTuneReq;
+use tetra_saps::tmv::TmvTxTuneReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvUnitdataReq, TmvUnitdataReqSlot};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -168,6 +170,15 @@ pub struct UmacMs {
     /// static config, so `accept_downlink_address` reflects the live attached set.
     valid_individual_ssi: Option<u32>,
     valid_group_ssis: BTreeSet<u32>,
+
+    /// Last uplink carrier (Hz) derived from the serving cell's SYSINFO duplex
+    /// parameters (band + main carrier + duplex spacing resolved through the
+    /// programmed duplex table, EN 300 392-2 cl. 18.4.2.2 / cl. 21.4.4). The MS
+    /// derives the uplink at camp — not from config — and requests the PHY
+    /// retune the transmitter (`TmvTxTuneReq`) only when this value changes, so
+    /// the retune is issued once per (re)selected cell rather than on every
+    /// SYSINFO broadcast.
+    derived_ul_freq: Option<u32>,
 }
 
 impl UmacMs {
@@ -203,6 +214,7 @@ impl UmacMs {
             pending_fragment: None,
             valid_individual_ssi,
             valid_group_ssis,
+            derived_ul_freq: None,
         }
     }
 
@@ -405,6 +417,12 @@ impl UmacMs {
             self.access_params.update_sysinfo_default_a(def);
         }
 
+        // Derive the uplink carrier from the cell's broadcast duplex parameters
+        // and retune the transmitter if it changed (EN 300 392-2 cl. 18.4.2.2 /
+        // cl. 21.4.4). The MS derives its uplink at camp from SYSINFO — not from
+        // config — so the TX chain follows whatever cell it is actually on.
+        self.maybe_retune_uplink(queue, &pdu);
+
         // TODO FIXME adopt sysinfo info into global state
         if pdu.hyperframe_number.is_some() && pdu.hyperframe_number.unwrap() != self.dltime.h {
             // Send message to Phy about new hyperframe number
@@ -442,6 +460,81 @@ impl UmacMs {
         };
 
         queue.push_back(m);
+    }
+
+    /// Derive the uplink carrier from a decoded SYSINFO and, if it differs from
+    /// the last derived value, request the PHY retune the transmitter
+    /// (`TmvTxTuneReq` -> LMAC -> PHY).
+    ///
+    /// The uplink is resolved exactly as the codeplug math would (EN 300 392-2
+    /// cl. 18.4.2.2 broadcast parameters / cl. 21.4.4 SYSINFO): the downlink is
+    /// `100 MHz * band + 25 kHz * main_carrier + freq_offset`, and the duplex
+    /// spacing is taken from the programmed [`DuplexTable`] for the broadcast
+    /// duplex-spacing index (an operator override, e.g. a non-standard split,
+    /// wins over the ETSI default). `reverse_operation` selects UL below/above
+    /// DL. Deriving here — rather than seeding from config — means the MS always
+    /// transmits on the uplink paired with the cell it actually camped on.
+    fn maybe_retune_uplink(&mut self, queue: &mut MessageQueue, pdu: &MacSysinfo) {
+        // Compute the uplink under the config guard, then drop the guard before
+        // mutating self / queueing.
+        let ul = {
+            let cfg = self.config.config();
+            if cfg.stack_mode != StackMode::Ms {
+                return;
+            }
+            // Guard the value ranges the FreqInfo constructor asserts on, so a
+            // malformed SYSINFO logs and is ignored instead of panicking.
+            if pdu.freq_band > 8 || pdu.main_carrier >= 4000 {
+                tracing::warn!(
+                    "SYSINFO out-of-range RF params (band {}, carrier {}); not deriving uplink",
+                    pdu.freq_band,
+                    pdu.main_carrier
+                );
+                return;
+            }
+            let freq_offset_hz = match FreqInfo::freq_offset_id_to_hz(pdu.freq_offset_index) {
+                Some(v) => v,
+                None => {
+                    tracing::warn!("SYSINFO invalid freq offset index {}", pdu.freq_offset_index);
+                    return;
+                }
+            };
+            match FreqInfo::from_components_with_table(
+                pdu.freq_band,
+                pdu.main_carrier,
+                freq_offset_hz,
+                pdu.reverse_operation,
+                pdu.duplex_spacing,
+                None,
+                &cfg.duplex_table,
+            ) {
+                Ok(freq_info) => freq_info.get_freqs().1,
+                Err(e) => {
+                    tracing::warn!("Cannot derive uplink from SYSINFO: {}", e);
+                    return;
+                }
+            }
+        };
+
+        if self.derived_ul_freq == Some(ul) {
+            // Unchanged since the last SYSINFO — nothing to retune.
+            return;
+        }
+        self.derived_ul_freq = Some(ul);
+        tracing::info!(
+            "UMAC: derived uplink {} Hz from SYSINFO (band {}, carrier {}, duplex idx {}, reverse {}); retuning TX",
+            ul,
+            pdu.freq_band,
+            pdu.main_carrier,
+            pdu.duplex_spacing,
+            pdu.reverse_operation
+        );
+        queue.push_back(SapMsg {
+            sap: Sap::TmvSap,
+            src: self.self_component,
+            dest: TetraEntity::Lmac,
+            msg: SapMsgInner::TmvTxTuneReq(TmvTxTuneReq { carrier_hz: ul }),
+        });
     }
 
     fn rx_mac_resource(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
@@ -1748,6 +1841,7 @@ mod tests {
     use tetra_saps::tma::TmaUnitdataReq;
     use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
     use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
+    use tetra_pdus::umac::enums::sysinfo_opt_field_flag::SysinfoOptFieldFlag;
     use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefaultDefForAccessCodeA;
     use tetra_pdus::umac::pdus::access_assign::AccessField;
 
@@ -2263,5 +2357,133 @@ colour_code = 1
             panic!("expected TmvTuneReq");
         };
         assert_eq!(req.carrier_hz, 396_000_000);
+    }
+
+    /// A SYSINFO carrying the given RF/duplex parameters (only the frequency
+    /// fields matter for uplink derivation; the rest are benign zero defaults).
+    fn sysinfo_rf(band: u8, carrier: u16, duplex_idx: u8, reverse: bool) -> MacSysinfo {
+        MacSysinfo {
+            main_carrier: carrier,
+            freq_band: band,
+            freq_offset_index: 0,
+            duplex_spacing: duplex_idx,
+            reverse_operation: reverse,
+            num_of_csch: 0,
+            ms_txpwr_max_cell: 0,
+            rxlev_access_min: 0,
+            access_parameter: 0,
+            radio_dl_timeout: 0,
+            cck_id: None,
+            hyperframe_number: None,
+            option_field: SysinfoOptFieldFlag::EvenMfDefForTsMode,
+            ts_common_frames: None,
+            default_access_code: None,
+            ext_services: None,
+        }
+    }
+
+    /// An MS UMAC whose programmed duplex table overrides index 7 with a 9.4 MHz
+    /// split (matches the serving BS), so a SYSINFO advertising duplex index 7
+    /// resolves to a known uplink.
+    fn umac_with_duplex_table() -> UmacMs {
+        let toml = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[duplex_table]
+overrides = [[7, 9400000]]
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+"#;
+        let cfg = from_toml_str(toml).expect("valid test config");
+        UmacMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// Camp-time uplink derivation: a SYSINFO advertising band 4 / carrier 1593 /
+    /// duplex index 7 (resolved via the programmed duplex table to 9.4 MHz)
+    /// yields DL 439.825 MHz, UL 430.425 MHz and emits exactly one TMV-TX-TUNE to
+    /// LMAC (EN 300 392-2 cl. 18.4.2.2 / 21.4.4).
+    #[test]
+    fn test_uplink_derived_from_sysinfo() {
+        let mut umac = umac_with_duplex_table();
+        let mut q = MessageQueue::new();
+
+        umac.maybe_retune_uplink(&mut q, &sysinfo_rf(4, 1593, 7, false));
+
+        let tunes: Vec<u32> = q
+            .iter()
+            .filter_map(|m| match &m.msg {
+                SapMsgInner::TmvTxTuneReq(p) => {
+                    assert_eq!(m.dest, TetraEntity::Lmac);
+                    assert_eq!(m.sap, Sap::TmvSap);
+                    Some(p.carrier_hz)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tunes, vec![430_425_000], "derived uplink carrier");
+        assert_eq!(umac.derived_ul_freq, Some(430_425_000));
+    }
+
+    /// The retune is issued only when the derived uplink changes: a second,
+    /// identical SYSINFO must not re-emit a TMV-TX-TUNE (avoids retune spam on
+    /// every SYSINFO broadcast).
+    #[test]
+    fn test_uplink_derivation_deduplicated() {
+        let mut umac = umac_with_duplex_table();
+        let mut q1 = MessageQueue::new();
+        umac.maybe_retune_uplink(&mut q1, &sysinfo_rf(4, 1593, 7, false));
+        assert!(q1.iter().any(|m| matches!(m.msg, SapMsgInner::TmvTxTuneReq(_))));
+
+        let mut q2 = MessageQueue::new();
+        umac.maybe_retune_uplink(&mut q2, &sysinfo_rf(4, 1593, 7, false));
+        assert!(
+            q2.iter().all(|m| !matches!(m.msg, SapMsgInner::TmvTxTuneReq(_))),
+            "unchanged uplink must not retune again"
+        );
+    }
+
+    /// A malformed SYSINFO (out-of-range band/carrier) is ignored rather than
+    /// panicking the frequency-derivation math.
+    #[test]
+    fn test_uplink_derivation_rejects_bad_sysinfo() {
+        let mut umac = umac_with_duplex_table();
+        let mut q = MessageQueue::new();
+        umac.maybe_retune_uplink(&mut q, &sysinfo_rf(15, 4095, 7, false));
+        assert!(q.iter().all(|m| !matches!(m.msg, SapMsgInner::TmvTxTuneReq(_))));
+        assert_eq!(umac.derived_ul_freq, None, "no uplink derived from bad params");
     }
 }

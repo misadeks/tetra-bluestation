@@ -108,6 +108,13 @@ pub struct PhyMs<D: RxTxDev> {
     /// on full-duplex hardware).
     tx_path_active: bool,
 
+    /// Whether the uplink carrier has been derived from the serving cell's
+    /// SYSINFO and applied to the SDR TX chain (`TpcTxTuneReq`, EN 300 392-2
+    /// cl. 18.4.2.2). The TX chain starts on a provisional centre, so no uplink
+    /// burst is transmitted until this is set — otherwise energy would be keyed
+    /// on the wrong frequency.
+    tx_frequency_set: bool,
+
     /// RX/TX device.
     rxtxdev: D,
 }
@@ -123,6 +130,7 @@ impl<D: RxTxDev> PhyMs<D> {
             unsynced_cycles: 0,
             pending_tx: None,
             tx_path_active: false,
+            tx_frequency_set: false,
             rxtxdev,
         }
     }
@@ -368,6 +376,21 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 let reserved = prim.reserved_access;
                 let granted = self.local_uplink_time();
 
+                // Refuse to transmit until the uplink carrier has been derived
+                // from the serving cell's SYSINFO and applied to the SDR TX chain
+                // (EN 300 392-2 cl. 18.4.2.2). Before that the transmitter sits
+                // on a provisional centre (the downlink carrier when no uplink is
+                // authored), so emitting here would key energy on the wrong
+                // frequency. In normal operation UMAC derives the uplink from the
+                // first SYSINFO — well before any uplink is scheduled — so this
+                // only guards the pathological ordering, not steady state.
+                if !self.tx_frequency_set {
+                    tracing::warn!(
+                        "PhyMs: dropping uplink burst — TX carrier not yet derived from SYSINFO"
+                    );
+                    return;
+                }
+
                 let pending = Self::build_pending_tx(prim, granted);
                 tracing::info!(
                     scheduled = %pending.time,
@@ -399,6 +422,19 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                         self.slots_without_burst = 0;
                         self.slots_since_rssi_report = 0;
                         self.unsynced_cycles = 0;
+                    }
+                    // MS runtime uplink (TX) retune (**[impl policy]**): the
+                    // lowest hop of the camp-time uplink derivation. UMAC derives
+                    // the uplink carrier from the serving cell's SYSINFO duplex
+                    // parameters (EN 300 392-2 cl. 18.4.2.2) and requests the PHY
+                    // move the transmitter. Nothing is transmitted until a burst
+                    // is granted, so the retune only takes effect for later
+                    // uplink bursts; the guard below refuses to transmit before
+                    // the TX carrier has been established.
+                    SapMsgInner::TpcTxTuneReq(prim) => {
+                        tracing::info!("PhyMs: retuning uplink to {} Hz (TPC-TX-TUNE)", prim.carrier_hz);
+                        self.rxtxdev.set_tx_frequency(prim.carrier_hz as f64);
+                        self.tx_frequency_set = true;
                     }
                     other => {
                         tracing::warn!("PhyMs TpcSap: unhandled primitive {}", other);
@@ -622,6 +658,9 @@ attach_groups = []
         /// Carrier frequencies (Hz) the PHY asked the radio to retune to, in the
         /// order requested via `set_rx_frequency`.
         rx_retunes: Vec<f64>,
+        /// Uplink carrier frequencies (Hz) the PHY asked the radio to retune the
+        /// transmitter to, in the order requested via `set_tx_frequency`.
+        tx_retunes: Vec<f64>,
         /// When true, `rxtx_timeslot` returns no demodulated slot at all
         /// (models `Mode::DlUnsynchronized` on an empty carrier), so `drive_rx`
         /// returns `None` — used to exercise the scan-dwell heartbeat.
@@ -675,6 +714,10 @@ attach_groups = []
         fn set_rx_frequency(&mut self, carrier_hz: f64) {
             self.rx_retunes.push(carrier_hz);
         }
+
+        fn set_tx_frequency(&mut self, carrier_hz: f64) {
+            self.tx_retunes.push(carrier_hz);
+        }
     }
 
     fn phy_ms(dev: MockRxTx) -> PhyMs<MockRxTx> {
@@ -714,6 +757,54 @@ attach_groups = []
             Some(396_000_000.0),
             "PhyMs must retune the device to the requested carrier"
         );
+    }
+
+    /// A TPC-TX-TUNE primitive on the control SAP makes PhyMs retune the SDR
+    /// transmitter to the requested uplink carrier (the lowest hop of the
+    /// camp-time uplink derivation, EN 300 392-2 cl. 18.4.2.2) and marks the TX
+    /// carrier as established so subsequent uplink bursts may transmit.
+    #[test]
+    fn test_tpc_tx_tune_retunes_device() {
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        assert!(!phy.tx_frequency_set, "TX carrier not established at boot");
+
+        let msg = SapMsg {
+            sap: Sap::TpcSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Phy,
+            msg: SapMsgInner::TpcTxTuneReq(tetra_saps::tpc::TpcTxTuneReq { carrier_hz: 430_425_000 }),
+        };
+        phy.rx_prim(&mut queue, msg);
+
+        assert_eq!(
+            phy.rxtxdev.tx_retunes.last().copied(),
+            Some(430_425_000.0),
+            "PhyMs must retune the transmitter to the derived uplink carrier"
+        );
+        assert!(phy.tx_frequency_set, "TX carrier marked established after retune");
+    }
+
+    /// Safety guard: an uplink burst requested before the TX carrier has been
+    /// derived from SYSINFO is dropped (not transmitted on the provisional
+    /// centre), so no energy is keyed on the wrong frequency.
+    #[test]
+    fn test_uplink_dropped_before_tx_tuned() {
+        let base = TdmaTime::default();
+        let ul_time = base.add_timeslots(2);
+
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        // No TPC-TX-TUNE yet: the burst must be dropped.
+        phy.rx_prim(&mut queue, cub_uplink_req(ul_time, false));
+        assert!(phy.pending_tx.is_none(), "burst dropped before TX carrier derived");
+
+        // After the uplink carrier is established, the same request is queued.
+        phy.tx_frequency_set = true;
+        phy.rx_prim(&mut queue, cub_uplink_req(ul_time, false));
+        assert!(phy.pending_tx.is_some(), "burst queued once TX carrier established");
     }
 
     /// A TP-UNITDATA request carrying a SCH/HU control block for `time`.
@@ -763,6 +854,10 @@ attach_groups = []
 
         let mut phy = phy_ms(MockRxTx::default());
         let mut queue = MessageQueue::new();
+
+        // Uplink TX carrier already derived from SYSINFO (see the TX-tune test);
+        // otherwise the burst would be dropped before scheduling.
+        phy.tx_frequency_set = true;
 
         // Upper layers request an uplink transmission.
         phy.rx_prim(&mut queue, cub_uplink_req(ul_time, false));
@@ -814,6 +909,7 @@ attach_groups = []
         for reserved in [false, true] {
             let mut phy = phy_ms(MockRxTx::default());
             let mut queue = MessageQueue::new();
+            phy.tx_frequency_set = true;
 
             // Frontier reported far ahead of the opportunity — must not matter.
             phy.rxtxdev.next_air_time = Some(base.add_timeslots(10));

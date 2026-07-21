@@ -23,6 +23,20 @@ pub struct TmvTuneReq {
     pub carrier_hz: u32,
 }
 
+/// MS only — runtime uplink (TX) retune request (**[impl policy]**).
+///
+/// Upper-MAC -> lower-MAC hop of the camp-time uplink derivation: once the MS
+/// camps on a cell, UMAC derives the uplink carrier from the cell's broadcast
+/// D-MLE-SYSINFO parameters (band + main carrier + duplex spacing resolved
+/// through the programmed duplex table, EN 300 392-2 cl. 18.4.2.2 / cl. 21.4.4)
+/// and requests the lower MAC retune the transmitter. LMAC forwards it to the
+/// PHY as a `TpcTxTuneReq`. Not an over-the-air primitive.
+#[derive(Debug, Clone)]
+pub struct TmvTxTuneReq {
+    /// Absolute uplink centre frequency to tune the transmitter to, in Hz.
+    pub carrier_hz: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct TmvUnitdataReqSlot {
     /// Timeslot at which this block is to be transmitted

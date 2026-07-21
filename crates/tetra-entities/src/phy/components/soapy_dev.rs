@@ -102,14 +102,21 @@ impl RxTxDevSoapySdr {
                 // on the uplink carrier. Only random/reserved-access bursts are
                 // emitted, and only when granted, so the TX chain is otherwise
                 // idle.
+                //
+                // The TX chain is always built (the uplink modulator sits at the
+                // provisional TX centre) so it can be retuned at runtime once the
+                // MS camps and derives the uplink carrier from the cell's SYSINFO
+                // (EN 300 392-2 cl. 18.4.2.2). The modulator centre matches the
+                // SDR TX LO (digital offset 0), so a later LO move via
+                // set_tx_frequency lands the burst exactly on the derived uplink.
+                // When no uplink is authored the provisional centre is the
+                // downlink carrier; nothing is transmitted before the camp-time
+                // retune (bursts are only scheduled after registration begins).
                 monitor_freqs = [(dl_corrected, None)];
-                ms_ul_freqs = [ul_corrected];
+                ms_ul_freqs = [if soapy_cfg.ul_freq > 0.0 { ul_corrected } else { dl_corrected }];
                 soapy_dev::PhyConfig {
                     monitor_frequencies: &monitor_freqs,
-                    // The uplink carrier is unset until the MS camps and derives
-                    // it from the cell's SYSINFO (EN 300 392-2 cl. 18.4.2.2); a
-                    // 0 Hz ul_freq means "unset" so no TX chain is built yet.
-                    ms_ul_frequencies: if soapy_cfg.ul_freq > 0.0 { &ms_ul_freqs } else { &ms_ul_freqs[..0] },
+                    ms_ul_frequencies: &ms_ul_freqs,
                     ..Default::default()
                 }
             }
@@ -262,6 +269,18 @@ impl RxTxDev for RxTxDevSoapySdr {
         // re-acquires promptly on the new carrier (scanning, cl. 18.3.4).
         if let Some(rx_dsp) = self.rx_dsp.as_mut() {
             rx_dsp.reset_dl_demodulators();
+        }
+    }
+
+    fn set_tx_frequency(&mut self, carrier_hz: f64) {
+        // Move the TX LO only. The uplink modulator was built at the provisional
+        // TX centre (digital offset 0), so the burst lands on `carrier_hz` with
+        // no channelizer/modulator rebuild — symmetric with set_rx_frequency but
+        // without the RX intermediate-frequency offset. Used by the camp-time
+        // uplink derivation once the cell's duplex parameters are known
+        // (EN 300 392-2 cl. 18.4.2.2).
+        if let Err(e) = self.sdr.set_tx_frequency(carrier_hz) {
+            tracing::error!("SoapySDR: failed to retune TX to {carrier_hz} Hz: {e}");
         }
     }
 }

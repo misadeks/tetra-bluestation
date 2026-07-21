@@ -23,6 +23,19 @@ fn rx_lo_for_carrier(carrier_hz: f64, ppm_err: f64) -> f64 {
     corrected - SOAPY_FREQ_OFFSET
 }
 
+/// Compute the TX local-oscillator frequency for a nominal uplink carrier.
+///
+/// Unlike the RX path there is no intermediate-frequency offset: the MS uplink
+/// modulator sits at digital offset 0 (its channel centre equals the TX LO at
+/// construction), so a burst lands exactly on the LO. Only the configured PPM
+/// correction is applied, matching the constructor's initial tune, so a runtime
+/// retune to `carrier_hz` lands on the same LO the start-up path would. Pure
+/// function, kept separate so the correction math is unit-testable without a
+/// radio.
+fn tx_lo_for_carrier(carrier_hz: f64, ppm_err: f64) -> f64 {
+    carrier_hz + (carrier_hz / 1_000_000.0) * ppm_err
+}
+
 pub struct RxResult {
     /// Number of samples read
     pub len: usize,
@@ -102,10 +115,15 @@ impl SoapyIo {
             ),
             StackMode::Ms => (
                 Some(dl_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
-                // TX (uplink) stays unset until the MS camps and derives the
-                // uplink from the cell's SYSINFO (EN 300 392-2 cl. 18.4.2.2). A
-                // 0 Hz ul_freq means "unset" -> the TX chain is not configured.
-                (soapy_cfg.ul_freq > 0.0).then_some(ul_corrected),
+                // The MS TX chain is always built so the uplink can be retuned
+                // at runtime once the MS camps and derives the uplink carrier
+                // from the cell's SYSINFO (EN 300 392-2 cl. 18.4.2.2). Until that
+                // retune it sits on a provisional centre (the downlink carrier
+                // when no uplink was authored) and emits nothing — the uplink is
+                // discontinuous and only keyed for a granted burst (cl. 9.4.3.4).
+                // The modulator is built at this same centre (offset 0), so a
+                // later LO move via set_tx_frequency lands the burst on target.
+                Some(if soapy_cfg.ul_freq > 0.0 { ul_corrected } else { dl_corrected }),
             ),
             StackMode::Mon => {
                 unimplemented!("Monitor mode not implemented yet");
@@ -357,6 +375,24 @@ impl SoapyIo {
 
     pub fn tx_center_frequency(&self) -> Result<f64, soapysdr::Error> {
         self.dev.frequency(soapysdr::Direction::Tx, self.tx_ch)
+    }
+
+    /// Retune the transmitter to a new uplink carrier at runtime.
+    ///
+    /// Moves the TX local oscillator to the (PPM-corrected) `carrier_hz`. The
+    /// MS uplink modulator sits at digital offset 0 (built at the provisional TX
+    /// centre), so moving the LO alone lands subsequent bursts on the new
+    /// carrier — no channelizer/modulator rebuild is needed. No-op when TX is
+    /// disabled. Used by the camp-time uplink derivation (EN 300 392-2
+    /// cl. 18.4.2.2): once the MS decodes the cell's duplex parameters it
+    /// derives the uplink carrier and retunes here.
+    pub fn set_tx_frequency(&mut self, carrier_hz: f64) -> Result<(), soapysdr::Error> {
+        if !self.tx_enabled() {
+            return Ok(());
+        }
+        let lo = tx_lo_for_carrier(carrier_hz, self.ppm_err);
+        self.dev
+            .set_frequency(soapysdr::Direction::Tx, self.tx_ch, lo, soapysdr::Args::new())
     }
 
     pub fn rx_enabled(&self) -> bool {

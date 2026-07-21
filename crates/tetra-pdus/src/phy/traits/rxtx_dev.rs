@@ -155,4 +155,19 @@ pub trait RxTxDev {
     /// The default is a no-op, appropriate for fixed-frequency devices and tests
     /// that do not receive.
     fn set_rx_frequency(&mut self, _carrier_hz: f64) {}
+
+    /// Retune the transmitter to a new uplink carrier at runtime (MS only).
+    ///
+    /// `carrier_hz` is the absolute on-air uplink carrier; the implementation
+    /// applies the same PPM correction it used at start-up (the uplink path has
+    /// no intermediate-frequency offset). It is the retune hook the camp-time
+    /// uplink derivation drives: once the MS decodes the serving cell's duplex
+    /// parameters from D-MLE-SYSINFO (ETSI TS 100 392-2 cl. 18.4.2.2) it derives
+    /// the uplink carrier and retunes the transmitter here. Only the TX local
+    /// oscillator moves; the uplink modulator (built at digital offset 0) needs
+    /// no rebuild.
+    ///
+    /// The default is a no-op, appropriate for fixed-frequency devices and tests
+    /// that do not transmit.
+    fn set_tx_frequency(&mut self, _carrier_hz: f64) {}
 }

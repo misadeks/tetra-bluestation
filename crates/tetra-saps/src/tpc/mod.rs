@@ -15,3 +15,17 @@ pub struct TpcTuneReq {
     /// Absolute downlink centre frequency to tune to, in Hz.
     pub carrier_hz: u32,
 }
+
+/// MS only — runtime uplink (TX) retune request (**[impl policy]**).
+///
+/// Commands the physical layer to tune its transmitter to a new uplink carrier
+/// frequency at runtime. It is the lowest hop of the camp-time uplink
+/// derivation path (UMAC (TMV) -> LMAC (TMV) -> PHY (TPC)): after the MS camps
+/// and decodes the cell's D-MLE-SYSINFO duplex parameters (EN 300 392-2
+/// cl. 18.4.2.2), UMAC derives the uplink carrier and the PHY applies it to the
+/// SDR TX chain via the device retune hook. Not an over-the-air primitive.
+#[derive(Debug, Clone)]
+pub struct TpcTxTuneReq {
+    /// Absolute uplink centre frequency to tune the transmitter to, in Hz.
+    pub carrier_hz: u32,
+}
