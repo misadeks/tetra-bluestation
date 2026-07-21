@@ -249,6 +249,12 @@ impl RxTxDev for RxTxDevSoapySdr {
     fn dl_rssi_dbfs(&self) -> Option<f32> {
         self.rx_dsp.as_ref()?.dl_rssi_dbfs()
     }
+
+    fn set_rx_frequency(&mut self, carrier_hz: f64) {
+        if let Err(e) = self.sdr.set_rx_frequency(carrier_hz) {
+            tracing::error!("SoapySDR: failed to retune RX to {carrier_hz} Hz: {e}");
+        }
+    }
 }
 
 struct RxDsp {

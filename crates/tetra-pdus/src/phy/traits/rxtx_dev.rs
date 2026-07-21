@@ -137,4 +137,22 @@ pub trait RxTxDev {
     fn dl_rssi_dbfs(&self) -> Option<f32> {
         None
     }
+
+    /// Retune the receiver to a new downlink carrier centre frequency, in Hz.
+    ///
+    /// `carrier_hz` is the **nominal TETRA downlink carrier** the MS wants to
+    /// receive (e.g. a channel from the codeplug or a step in a scan range). The
+    /// implementation applies the same corrections it used at start-up — the
+    /// configured PPM error and the fixed RX intermediate-frequency offset — so
+    /// callers always pass the on-air carrier and never the hardware LO value.
+    ///
+    /// This only moves the RX local oscillator; it does not reset the
+    /// demodulator, which will lose and then re-acquire downlink lock on the new
+    /// carrier (surfaced to the MLE via `TlmbMonitorInd`). It is the retune hook
+    /// the cell-selection / scanning logic (ETSI TS 100 392-2 cl. 18.3.4) drives
+    /// while searching for a serving cell.
+    ///
+    /// The default is a no-op, appropriate for fixed-frequency devices and tests
+    /// that do not receive.
+    fn set_rx_frequency(&mut self, _carrier_hz: f64) {}
 }

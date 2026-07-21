@@ -11,6 +11,18 @@ use super::soapy_time::{ticks_to_time_ns, time_ns_to_ticks};
 type StreamType = ComplexSample;
 const SOAPY_FREQ_OFFSET: f64 = 20000.0;
 
+/// Compute the RX local-oscillator frequency for a nominal downlink carrier.
+///
+/// Applies the configured PPM error correction and the fixed RX intermediate-
+/// frequency offset, exactly as the constructor does for the initial tune, so a
+/// runtime retune to `carrier_hz` lands on the same LO the start-up path would.
+/// Pure function, kept separate so the correction math is unit-testable without
+/// a radio.
+fn rx_lo_for_carrier(carrier_hz: f64, ppm_err: f64) -> f64 {
+    let corrected = carrier_hz + (carrier_hz / 1_000_000.0) * ppm_err;
+    corrected - SOAPY_FREQ_OFFSET
+}
+
 pub struct RxResult {
     /// Number of samples read
     pub len: usize,
@@ -36,6 +48,9 @@ pub struct SoapyIo {
     use_get_hardware_time: bool,
 
     dev: soapysdr::Device,
+    /// Configured PPM frequency-error correction, retained so runtime retunes
+    /// (`set_rx_frequency`) apply the same correction the constructor did.
+    ppm_err: f64,
     /// Receive stream. None if receiving is disabled.
     rx: Option<soapysdr::RxStream<StreamType>>,
     /// Transmit stream. None if transmitting is disabled.
@@ -190,6 +205,7 @@ impl SoapyIo {
             prev_time_ns: -1,
             use_get_hardware_time: sdr_settings.use_get_hardware_time,
             dev,
+            ppm_err: soapy_cfg.ppm_err,
             rx,
             tx,
         })
@@ -321,6 +337,19 @@ impl SoapyIo {
 
     pub fn rx_center_frequency(&self) -> Result<f64, soapysdr::Error> {
         self.dev.frequency(soapysdr::Direction::Rx, self.rx_ch)
+    }
+
+    /// Retune the RX local oscillator to receive the nominal downlink carrier
+    /// `carrier_hz` (Hz). Applies the same PPM correction and RX IF offset the
+    /// constructor used, so the caller passes the on-air carrier, not the LO
+    /// value. No-op (returns `Ok`) when RX is disabled.
+    pub fn set_rx_frequency(&mut self, carrier_hz: f64) -> Result<(), soapysdr::Error> {
+        if !self.rx_enabled() {
+            return Ok(());
+        }
+        let lo = rx_lo_for_carrier(carrier_hz, self.ppm_err);
+        self.dev
+            .set_frequency(soapysdr::Direction::Rx, self.rx_ch, lo, soapysdr::Args::new())
     }
 
     pub fn tx_center_frequency(&self) -> Result<f64, soapysdr::Error> {
@@ -473,4 +502,29 @@ fn open_device(soapy_cfg: &CfgSoapySdr, mode: StackMode) -> Result<(soapysdr::De
     }
 
     Ok((opened_device.dev, sdr_settings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SOAPY_FREQ_OFFSET, rx_lo_for_carrier};
+
+    #[test]
+    fn rx_lo_matches_startup_tune() {
+        // With zero PPM error the LO is just the carrier minus the RX IF offset,
+        // exactly as the constructor computes `dl_corrected - SOAPY_FREQ_OFFSET`.
+        let carrier = 430_425_000.0;
+        assert_eq!(rx_lo_for_carrier(carrier, 0.0), carrier - SOAPY_FREQ_OFFSET);
+    }
+
+    #[test]
+    fn rx_lo_applies_ppm_correction() {
+        // PPM correction scales with the carrier: err = (carrier / 1e6) * ppm.
+        let carrier = 400_000_000.0;
+        let ppm = 2.5;
+        let expected = carrier + (carrier / 1_000_000.0) * ppm - SOAPY_FREQ_OFFSET;
+        let got = rx_lo_for_carrier(carrier, ppm);
+        assert!((got - expected).abs() < 1e-6, "got {got}, expected {expected}");
+        // 400 MHz at 2.5 ppm = +1 kHz, so LO = 400.001 MHz - 20 kHz.
+        assert!((got - (400_001_000.0 - SOAPY_FREQ_OFFSET)).abs() < 1e-6);
+    }
 }

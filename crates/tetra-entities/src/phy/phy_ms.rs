@@ -551,6 +551,9 @@ attach_groups = []
         rx_burst: bool,
         /// Downlink RSSI (dBFS) the device reports via `dl_rssi_dbfs`.
         dl_rssi: Option<f32>,
+        /// Carrier frequencies (Hz) the PHY asked the radio to retune to, in the
+        /// order requested via `set_rx_frequency`.
+        rx_retunes: Vec<f64>,
     }
 
     impl RxTxDev for MockRxTx {
@@ -590,11 +593,26 @@ attach_groups = []
         fn dl_rssi_dbfs(&self) -> Option<f32> {
             self.dl_rssi
         }
+
+        fn set_rx_frequency(&mut self, carrier_hz: f64) {
+            self.rx_retunes.push(carrier_hz);
+        }
     }
 
     fn phy_ms(dev: MockRxTx) -> PhyMs<MockRxTx> {
         let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
         PhyMs::new(SharedConfig::from_parts(cfg, None), dev)
+    }
+
+    /// The `set_rx_frequency` retune hook reaches the device: each requested
+    /// carrier is delivered in order. (The SoapySDR PPM/IF correction math is
+    /// covered by the `soapyio` unit tests; here we check the trait plumbing.)
+    #[test]
+    fn test_set_rx_frequency_reaches_device() {
+        let mut dev = MockRxTx::default();
+        dev.set_rx_frequency(430_425_000.0);
+        dev.set_rx_frequency(390_000_000.0);
+        assert_eq!(dev.rx_retunes, vec![430_425_000.0, 390_000_000.0]);
     }
 
     /// A TP-UNITDATA request carrying a SCH/HU control block for `time`.
