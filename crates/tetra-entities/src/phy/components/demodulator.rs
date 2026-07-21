@@ -110,6 +110,14 @@ impl Demodulator {
         self_
     }
 
+    /// Reset the demodulator to a fresh state in the given mode, discarding all
+    /// synchronization/timing state. Used when the MS retunes the downlink to a
+    /// new carrier during scanning cell selection (cl. 18.3.4): the old carrier's
+    /// recovered timing is invalid, so re-acquire from scratch.
+    pub fn reset(&mut self, mode: Mode) {
+        *self = Self::new(mode);
+    }
+
     fn add_slots(&mut self, slots: i32) {
         self.set_slot(self.current_slot.add_timeslots(slots));
     }

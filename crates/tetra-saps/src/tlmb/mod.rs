@@ -58,3 +58,21 @@ pub struct TlmbMonitorInd {
     pub downlink_available: bool,
     pub rssi_dbfs: Option<f32>,
 }
+
+/// MS only — internal scan-dwell-elapsed indication (**[impl policy]**).
+///
+/// NOT an over-the-air PDU. While the MS is NOT camped (the downlink demodulator
+/// is un-synchronized, ETSI TS 100 392-2 cl. 18.3.4 initial cell selection), the
+/// PHY cannot emit the per-slot [`TlmbMonitorInd`] it produces while camped
+/// (the demodulator exposes no slots until it locks). This primitive is the
+/// PHY's heartbeat during acquisition: it is raised once a scan *dwell window*
+/// has elapsed on the currently-tuned candidate carrier without acquiring a
+/// serving-cell downlink. The MLE's scanning cell-selection engine uses it to
+/// advance to the next candidate frequency (cl. 18.3.4). `rssi_dbfs` is the
+/// current receive level (the candidate's noise floor when nothing is present),
+/// uncalibrated dBFS relative to demodulator full-scale, or `None` before the
+/// first measurement.
+#[derive(Debug, Clone)]
+pub struct TlmbScanDwellInd {
+    pub rssi_dbfs: Option<f32>,
+}

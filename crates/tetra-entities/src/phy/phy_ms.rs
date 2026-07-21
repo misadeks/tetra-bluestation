@@ -2,7 +2,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence};
 use tetra_pdus::phy::traits::rxtx_dev::{RfPath, RxBurstBits, RxTxDev, TxSlotBits};
-use tetra_saps::tlmb::TlmbMonitorInd;
+use tetra_saps::tlmb::{TlmbMonitorInd, TlmbScanDwellInd};
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -26,6 +26,21 @@ const DOWNLINK_FAILURE_SLOTS: u32 = 50;
 /// for the MLE (ETSI TS 100 392-2 cl. 18.3.4) without flooding the SAP with a
 /// per-slot message.
 const RSSI_REPORT_SLOTS: u32 = 18;
+
+/// Consecutive **unsynchronized** `drive_rx` cycles (SDR read quanta with no
+/// demodulated slot) after which the MS PHY emits a scan-dwell heartbeat
+/// (`TlmbScanDwellInd`) to the MLE so the scanning cell-selection engine can
+/// advance across a candidate carrier that carries no detectable downlink
+/// (ETSI TS 100 392-2 cl. 18.3.4 initial cell selection).
+///
+/// **[impl policy]** — not an air-interface value. While unsynchronized the
+/// demodulator never marks a slot available, so `drive_rx` returns `None` and
+/// the run loop cannot advance a tick-based dwell; counting these sample-paced
+/// cycles gives an approximate, time-proportional dwell instead. The codeplug
+/// `dwell_ms` is therefore honoured only approximately; this count is the
+/// hardware-tunable knob (raise for a longer dwell per empty carrier, lower for
+/// a faster sweep).
+const SCAN_DWELL_CYCLES: u32 = 200;
 
 /// A fully-built uplink burst waiting to be transmitted in a specific slot.
 ///
@@ -77,6 +92,12 @@ pub struct PhyMs<D: RxTxDev> {
     /// MLE. Throttles the periodic monitor indication to [`RSSI_REPORT_SLOTS`].
     slots_since_rssi_report: u32,
 
+    /// Consecutive unsynchronized `drive_rx` cycles with no demodulated slot.
+    /// Drives the scan-dwell heartbeat to the MLE once it reaches
+    /// [`SCAN_DWELL_CYCLES`] so scanning advances across an empty candidate
+    /// carrier (cl. 18.3.4). Reset on synchronization and after each heartbeat.
+    unsynced_cycles: u32,
+
     /// Uplink burst awaiting transmission in a granted slot, if any. `None`
     /// means the TX stream stays idle (silence) this cycle — the MS only puts
     /// energy on air during a granted opportunity.
@@ -99,6 +120,7 @@ impl<D: RxTxDev> PhyMs<D> {
             synced: false,
             slots_without_burst: 0,
             slots_since_rssi_report: 0,
+            unsynced_cycles: 0,
             pending_tx: None,
             tx_path_active: false,
             rxtxdev,
@@ -122,6 +144,19 @@ impl<D: RxTxDev> PhyMs<D> {
                 downlink_available,
                 rssi_dbfs,
             }),
+        });
+    }
+
+    /// Emit a scan-dwell heartbeat to the MLE (**[impl policy]**, cl. 18.3.4):
+    /// the currently-tuned candidate carrier has yielded no downlink within the
+    /// dwell window, so the scanning cell-selection engine should advance to the
+    /// next candidate. Internal IPC only (not an air-interface PDU).
+    fn emit_scan_dwell_ind(queue: &mut MessageQueue, rssi_dbfs: Option<f32>) {
+        queue.push_back(SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Phy,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbScanDwellInd(TlmbScanDwellInd { rssi_dbfs }),
         });
     }
 
@@ -356,6 +391,14 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                     SapMsgInner::TpcTuneReq(prim) => {
                         tracing::info!("PhyMs: retuning downlink to {} Hz (TPC-TUNE)", prim.carrier_hz);
                         self.rxtxdev.set_rx_frequency(prim.carrier_hz as f64);
+                        // A retune abandons the old carrier's downlink: drop sync
+                        // and reset the acquisition/failure counters so the MS
+                        // re-acquires (and re-dwells) promptly on the new carrier
+                        // (cl. 18.3.4 scanning cell selection).
+                        self.synced = false;
+                        self.slots_without_burst = 0;
+                        self.slots_since_rssi_report = 0;
+                        self.unsynced_cycles = 0;
                     }
                     other => {
                         tracing::warn!("PhyMs TpcSap: unhandled primitive {}", other);
@@ -432,6 +475,7 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 if !self.synced {
                     self.synced = true;
                     self.slots_since_rssi_report = 0;
+                    self.unsynced_cycles = 0;
                     tracing::info!(ts = %self.dltime, "PhyMs: downlink synchronized");
                     Self::emit_monitor_ind(queue, true, rssi);
                 } else {
@@ -483,6 +527,18 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                     self.rxtxdev.set_rf_path(RfPath::Rx);
                     self.tx_path_active = false;
                 }
+            }
+        } else if !self.synced {
+            // No slot was demodulated this cycle and we are not synchronized:
+            // the currently-tuned carrier is (so far) empty. Count these
+            // sample-paced cycles and, once the dwell window elapses, emit a
+            // scan-dwell heartbeat so the MLE scanning engine advances to the
+            // next candidate carrier (cl. 18.3.4). Reset after each heartbeat so
+            // the next candidate gets a full dwell.
+            self.unsynced_cycles = self.unsynced_cycles.saturating_add(1);
+            if self.unsynced_cycles >= SCAN_DWELL_CYCLES {
+                self.unsynced_cycles = 0;
+                Self::emit_scan_dwell_ind(queue, self.rxtxdev.dl_rssi_dbfs());
             }
         }
 
@@ -566,6 +622,10 @@ attach_groups = []
         /// Carrier frequencies (Hz) the PHY asked the radio to retune to, in the
         /// order requested via `set_rx_frequency`.
         rx_retunes: Vec<f64>,
+        /// When true, `rxtx_timeslot` returns no demodulated slot at all
+        /// (models `Mode::DlUnsynchronized` on an empty carrier), so `drive_rx`
+        /// returns `None` — used to exercise the scan-dwell heartbeat.
+        no_demod: bool,
     }
 
     impl RxTxDev for MockRxTx {
@@ -574,6 +634,12 @@ attach_groups = []
                 .first()
                 .map(|s| (s.time, s.slot.map(<[u8]>::to_vec).unwrap_or_default()));
             self.tx_calls.push(record);
+
+            // Model an un-synchronized empty carrier: no slot demodulated, so
+            // drive_rx recovers no time and returns None.
+            if self.no_demod {
+                return Ok(vec![]);
+            }
 
             let time = self.next_time;
             let train_type = if self.rx_burst {
@@ -886,5 +952,101 @@ attach_groups = []
         phy.drive_rx(&mut queue);
         assert!(phy.synced, "re-synchronized on burst return");
         assert_eq!(monitor_inds(&queue), vec![true, false, true], "recovery indication emitted");
+    }
+
+    /// Count the scan-dwell heartbeats the PHY emitted to the MLE.
+    fn scan_dwell_count(queue: &MessageQueue) -> usize {
+        queue
+            .iter()
+            .filter(|m| match &m.msg {
+                SapMsgInner::TlmbScanDwellInd(_) => {
+                    assert_eq!(m.dest, TetraEntity::Mle, "scan-dwell addressed to MLE");
+                    true
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    /// D-3: while unsynchronized on an empty carrier, `drive_rx` returns no slot;
+    /// after [`SCAN_DWELL_CYCLES`] such cycles the PHY emits exactly one
+    /// scan-dwell heartbeat to the MLE (so scanning advances), carrying the
+    /// device's current downlink level, then re-arms for the next dwell.
+    #[test]
+    fn test_unsynced_dwell_emits_scan_dwell_ind() {
+        let mut phy = phy_ms(MockRxTx::default());
+        phy.rxtxdev.no_demod = true;
+        phy.rxtxdev.dl_rssi = Some(-97.0);
+        let mut queue = MessageQueue::new();
+
+        // Just below the threshold: no heartbeat yet.
+        for _ in 0..(SCAN_DWELL_CYCLES - 1) {
+            phy.drive_rx(&mut queue);
+        }
+        assert_eq!(scan_dwell_count(&queue), 0, "no heartbeat below the dwell window");
+
+        // Cross the threshold: exactly one heartbeat.
+        phy.drive_rx(&mut queue);
+        assert_eq!(scan_dwell_count(&queue), 1, "one heartbeat at the dwell window");
+        let dwell = queue
+            .iter()
+            .find_map(|m| match &m.msg {
+                SapMsgInner::TlmbScanDwellInd(inner) => Some(inner.rssi_dbfs),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(dwell, Some(-97.0), "heartbeat carries the current downlink level");
+
+        // Re-arms: another full dwell window yields a second heartbeat.
+        for _ in 0..SCAN_DWELL_CYCLES {
+            phy.drive_rx(&mut queue);
+        }
+        assert_eq!(scan_dwell_count(&queue), 2, "re-armed for the next candidate");
+    }
+
+    /// D-3: once synchronized, an un-demodulated cycle does NOT emit a scan-dwell
+    /// heartbeat — the dwell heartbeat is only for the unsynchronized scan.
+    #[test]
+    fn test_no_scan_dwell_while_synced() {
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        // Acquire sync.
+        phy.rxtxdev.rx_burst = true;
+        phy.drive_rx(&mut queue);
+        assert!(phy.synced);
+
+        // Now stop demodulating entirely (recovered None) for many cycles.
+        phy.rxtxdev.no_demod = true;
+        for _ in 0..(SCAN_DWELL_CYCLES * 2) {
+            phy.drive_rx(&mut queue);
+        }
+        assert_eq!(scan_dwell_count(&queue), 0, "no scan-dwell heartbeat while synced");
+    }
+
+    /// D-3: a TPC-TUNE retune drops synchronization and resets the acquisition
+    /// counters, so the MS re-acquires (and re-dwells) on the new carrier.
+    #[test]
+    fn test_tpc_tune_resets_sync() {
+        let mut phy = phy_ms(MockRxTx::default());
+        let mut queue = MessageQueue::new();
+
+        // Acquire sync first.
+        phy.rxtxdev.rx_burst = true;
+        phy.drive_rx(&mut queue);
+        assert!(phy.synced, "synced before retune");
+
+        // Retune: sync is dropped.
+        let msg = SapMsg {
+            sap: Sap::TpcSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Phy,
+            msg: SapMsgInner::TpcTuneReq(tetra_saps::tpc::TpcTuneReq { carrier_hz: 396_000_000 }),
+        };
+        phy.rx_prim(&mut queue, msg);
+
+        assert!(!phy.synced, "retune drops synchronization");
+        assert_eq!(phy.unsynced_cycles, 0, "dwell counter reset on retune");
+        assert_eq!(phy.slots_without_burst, 0, "failure counter reset on retune");
     }
 }

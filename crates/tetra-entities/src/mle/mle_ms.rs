@@ -1,5 +1,5 @@
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{ScanMode, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, unimplemented_log};
 use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
@@ -66,6 +66,17 @@ pub struct MleMs {
     /// input (cl. 18.3.4) and surfaced to the MS management UI. `None` while
     /// out of service or before the first measurement.
     serving_cell_rssi_dbfs: Option<f32>,
+    /// Scanning cell-selection engine state (ETSI TS 100 392-2 cl. 18.3.4 â€”
+    /// initial cell selection; radio-style **[impl policy]** for how the
+    /// candidate set is enumerated). `true` while the MS is actively stepping
+    /// candidate downlink carriers looking for a suitable serving cell; cleared
+    /// once a suitable cell is confirmed and camped, or when the codeplug
+    /// programs no scan (single fixed carrier). The candidate set is derived
+    /// from the codeplug and cached at scan start; `scan_index` is the position
+    /// within it.
+    scanning: bool,
+    scan_candidates: Vec<u32>,
+    scan_index: usize,
 }
 
 impl MleMs {
@@ -76,6 +87,9 @@ impl MleMs {
             activate_confirmed: false,
             out_of_service: false,
             serving_cell_rssi_dbfs: None,
+            scanning: false,
+            scan_candidates: Vec::new(),
+            scan_index: 0,
         }
     }
 
@@ -303,7 +317,7 @@ impl MleMs {
         }
     }
 
-    /// Radio-style cell suitability — allowed network (ETSI TS 100 392-2
+    /// Radio-style cell suitability â€” allowed network (ETSI TS 100 392-2
     /// cl. 18.3.4 initial cell selection). The cell's network identity is its
     /// D-MLE-SYNC MCC/MNC (cl. 18.4.2.1); it is usable only when programmed as
     /// allowed (codeplug allowed-network list, **[impl policy]**; empty list =>
@@ -313,7 +327,7 @@ impl MleMs {
         cfg.codeplug.is_network_allowed(mcc, mnc, cfg.net.mcc, cfg.net.mnc)
     }
 
-    /// Radio-style cell suitability — subscriber-class permission (ETSI
+    /// Radio-style cell suitability â€” subscriber-class permission (ETSI
     /// TS 100 392-2 cl. 18.4.2.2 / 18.3.4). The cell advertises a 16-bit
     /// subscriber-class bitmap in D-MLE-SYSINFO where bit `n` set means class
     /// `n+1` is permitted access. The cell is usable only if the MS's own
@@ -329,7 +343,7 @@ impl MleMs {
         }
     }
 
-    /// Request a downlink retune of the SDR (**[impl policy]** — MLE owns MS
+    /// Request a downlink retune of the SDR (**[impl policy]** â€” MLE owns MS
     /// cell-selection policy per the agreed design). Emits a TMC-SAP tune
     /// primitive that is forwarded MLE -> UMAC (TLMC) -> LMAC (TMV) -> PHY (TPC),
     /// where PhyMs applies it to the device. Used by the scanning cell-selection
@@ -344,7 +358,82 @@ impl MleMs {
         });
     }
 
-    fn rx_tlmb_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {        tracing::trace!("rx_tlmb_prim");
+    /// The codeplug-programmed scan candidate downlink carriers (Hz), or empty
+    /// when the codeplug does not program a multi-candidate scan.
+    ///
+    /// A `Fixed` scan mode (or no `[scan]` section) means the radio stays on its
+    /// single configured carrier, so no scanning is performed and the pre-scan
+    /// single-frequency behaviour is preserved. Only `List` / `Range` modes
+    /// enumerate a candidate set for the scanning cell-selection engine
+    /// (ETSI TS 100 392-2 cl. 18.3.4; the enumeration itself is **[impl policy]**).
+    fn scan_candidate_carriers(&self) -> Vec<u32> {
+        let cfg = self.config.config();
+        let Some(scan) = cfg.codeplug.scan.as_ref() else {
+            return Vec::new();
+        };
+        match scan.mode {
+            ScanMode::Fixed => Vec::new(),
+            ScanMode::List | ScanMode::Range => scan.candidate_frequencies(),
+        }
+    }
+
+    /// Whether the codeplug programs a multi-candidate scan (so the MLE drives
+    /// cell selection by stepping carriers rather than camping on the single
+    /// configured one).
+    fn scan_enabled(&self) -> bool {
+        !self.scan_candidate_carriers().is_empty()
+    }
+
+    /// Begin (or restart) the scanning cell-selection engine (ETSI TS 100 392-2
+    /// cl. 18.3.4 initial cell selection). Caches the codeplug candidate set and
+    /// retunes to the first candidate. No-op when scanning is not enabled or is
+    /// already in progress.
+    fn start_scan(&mut self, queue: &mut MessageQueue) {
+        if self.scanning || !self.scan_enabled() {
+            return;
+        }
+        self.scan_candidates = self.scan_candidate_carriers();
+        self.scan_index = 0;
+        self.scanning = true;
+        let first = self.scan_candidates[0];
+        tracing::info!(
+            "MLE: starting cell-selection scan over {} candidate carrier(s); first {} Hz (cl. 18.3.4)",
+            self.scan_candidates.len(),
+            first
+        );
+        self.request_tune(queue, first);
+    }
+
+    /// Advance the scan to the next candidate carrier (wrapping). Called when the
+    /// current candidate yields no suitable serving cell â€” either no carrier at
+    /// all (PHY scan-dwell elapsed) or a carrier that failed suitability
+    /// (disallowed network / barred subscriber class). No-op when not scanning.
+    fn advance_scan(&mut self, queue: &mut MessageQueue) {
+        if !self.scanning || self.scan_candidates.is_empty() {
+            return;
+        }
+        self.scan_index = (self.scan_index + 1) % self.scan_candidates.len();
+        let next = self.scan_candidates[self.scan_index];
+        tracing::info!(
+            "MLE: scan advancing to candidate {}/{}: {} Hz (cl. 18.3.4)",
+            self.scan_index + 1,
+            self.scan_candidates.len(),
+            next
+        );
+        self.request_tune(queue, next);
+    }
+
+    /// Stop the scanning cell-selection engine â€” a suitable serving cell has
+    /// been confirmed and camped (cl. 18.3.4.6).
+    fn stop_scan(&mut self) {
+        if self.scanning {
+            tracing::info!("MLE: suitable serving cell camped â€” stopping scan (cl. 18.3.4.6)");
+            self.scanning = false;
+        }
+    }
+
+    fn rx_tlmb_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        tracing::trace!("rx_tlmb_prim");
         match message.msg {
             SapMsgInner::TlmbSysinfoInd(_) => {
                 self.rx_tlmb_tl_sysinfo_ind(queue, message);
@@ -363,9 +452,33 @@ impl MleMs {
                 let available = inner.downlink_available;
                 self.rx_tlmb_monitor_ind(queue, available);
             }
+            SapMsgInner::TlmbScanDwellInd(_) => {
+                self.rx_tlmb_scan_dwell_ind(queue);
+            }
             _ => {
                 panic!();
             }
+        }
+    }
+
+    /// Handle the PHY scan-dwell-elapsed heartbeat (**[impl policy]**, cl. 18.3.4
+    /// initial cell selection): the currently-tuned candidate carrier yielded no
+    /// serving-cell downlink within the dwell window. If a multi-candidate scan
+    /// is programmed and we are not already camped, start the scan (on the very
+    /// first heartbeat) or advance it to the next candidate carrier. When camped
+    /// or no scan is programmed this is ignored (the PHY only emits it while
+    /// un-synchronized, so a camped MS normally never sees it).
+    fn rx_tlmb_scan_dwell_ind(&mut self, queue: &mut MessageQueue) {
+        if self.serving_cell.is_some() {
+            // Already camped: nothing to select. (A brief pre-recovery window
+            // could see a stray heartbeat; ignore it â€” link failure is handled
+            // by the monitoring indication path.)
+            return;
+        }
+        if self.scanning {
+            self.advance_scan(queue);
+        } else {
+            self.start_scan(queue);
         }
     }
 
@@ -375,7 +488,7 @@ impl MleMs {
     /// On a declared downlink failure the MLE declares the cell out of service,
     /// issues MLE-BREAK to the upper layers (CMCE), and re-arms cell selection
     /// so that when the downlink recovers the cell is re-selected and the
-    /// LMM-ACTIVATE confirmation re-fired to MM — which then re-evaluates
+    /// LMM-ACTIVATE confirmation re-fired to MM â€” which then re-evaluates
     /// registration against cl. 18.3.4.7.1a (same cell/LA => no re-registration,
     /// NOTE 2; a changed LA/network => a location update). On recovery the MLE
     /// issues MLE-REOPEN.
@@ -385,7 +498,7 @@ impl MleMs {
                 // Serving-cell radio link failure: declare out of service.
                 self.out_of_service = true;
                 tracing::warn!(
-                    "MLE: serving-cell downlink failure — declaring out of service, \
+                    "MLE: serving-cell downlink failure â€” declaring out of service, \
                      MLE-BREAK to upper layers (cl. 18.3.4.5.3)"
                 );
                 // MLE-BREAK to CMCE (cl. 17.3.3): communication resources are
@@ -413,7 +526,7 @@ impl MleMs {
             (true, true) => {
                 // Downlink recovered: reopen the link (cl. 18.3.4.7).
                 self.out_of_service = false;
-                tracing::info!("MLE: serving-cell downlink recovered — MLE-REOPEN (cl. 18.3.4.7)");
+                tracing::info!("MLE: serving-cell downlink recovered â€” MLE-REOPEN (cl. 18.3.4.7)");
                 queue.push_back(SapMsg {
                     sap: Sap::LcmcSap,
                     src: TetraEntity::Mle,
@@ -537,14 +650,26 @@ impl MleMs {
             if !self.subscriber_class_permitted(pdu.subscriber_class) {
                 tracing::warn!(
                     "MLE: serving cell {}/{} does not permit our subscriber class \
-                     (cell class bitmap {:#06x}) — cell unsuitable, not confirming (cl. 18.4.2.2)",
+                     (cell class bitmap {:#06x}) â€” cell unsuitable, not confirming (cl. 18.4.2.2)",
                     mcc,
                     mnc,
                     pdu.subscriber_class,
                 );
+                // Scanning: the adopted cell turned out unsuitable on its
+                // subscriber-class bitmap. Drop it so the scan-dwell heartbeat
+                // can advance across subsequent (possibly empty) candidates, and
+                // step on now (cl. 18.3.4 / 18.4.2.2).
+                if self.scanning {
+                    self.serving_cell = None;
+                    self.activate_confirmed = false;
+                    self.advance_scan(queue);
+                }
                 return;
             }
             self.activate_confirmed = true;
+            // A suitable cell has been confirmed: end the scan and camp on it
+            // (cl. 18.3.4.6).
+            self.stop_scan();
             self.send_mle_activate_conf(queue, mcc, mnc, la, registration_required, system_wide_services);
         }
     }
@@ -623,17 +748,23 @@ impl MleMs {
         // is allowed. The network identity is the D-MLE-SYNC MCC/MNC
         // (cl. 18.4.2.1). This was previously a warning-only TODO ("proper
         // allowed-network handling is out of Phase 2 scope"); enforcing it is
-        // the Phase-D radio-style behaviour — a radio does not camp on a cell
+        // the Phase-D radio-style behaviour â€” a radio does not camp on a cell
         // outside its programmed allowed-network set. A disallowed cell is
         // simply not selected: an already-camped (allowed) cell is retained,
         // and while scanning this rejection lets the scan advance to the next
         // candidate.
         if newly_selected && !self.network_allowed(pdu.mcc, pdu.mnc) {
             tracing::warn!(
-                "MLE: cell MCC/MNC {}/{} is not an allowed network — not selecting (cl. 18.3.4)",
+                "MLE: cell MCC/MNC {}/{} is not an allowed network â€” not selecting (cl. 18.3.4)",
                 pdu.mcc,
                 pdu.mnc
             );
+            // Scanning: this candidate carrier has a serving cell, but on a
+            // network the codeplug does not allow. It is unsuitable, so step the
+            // scan on to the next candidate (cl. 18.3.4).
+            if self.scanning {
+                self.advance_scan(queue);
+            }
             return;
         }
 
@@ -1151,7 +1282,7 @@ attach_groups = []
         }
     }
 
-    /// Suitability (cl. 18.3.4): a SYNC for the home network is selected — the
+    /// Suitability (cl. 18.3.4): a SYNC for the home network is selected â€” the
     /// serving cell is adopted and the MAC is configured with its scrambling.
     #[test]
     fn test_allowed_home_network_selected() {
@@ -1169,7 +1300,7 @@ attach_groups = []
     }
 
     /// Suitability (cl. 18.3.4): a SYNC for a foreign, non-programmed network is
-    /// rejected — no cell is selected and the MAC is not configured.
+    /// rejected â€” no cell is selected and the MAC is not configured.
     #[test]
     fn test_disallowed_network_not_selected() {
         let mut mle = ms_mle();
@@ -1205,7 +1336,7 @@ attach_groups = []
     }
 
     /// Suitability (cl. 18.4.2.2): a SYSINFO whose subscriber-class bitmap does
-    /// NOT admit our class leaves the cell unconfirmed — no registration.
+    /// NOT admit our class leaves the cell unconfirmed â€” no registration.
     #[test]
     fn test_subscriber_class_not_permitted_not_confirmed() {
         let mut mle = ms_mle();
@@ -1241,5 +1372,193 @@ attach_groups = []
             panic!("expected TlmcTuneReq");
         };
         assert_eq!(req.carrier_hz, 396_000_000);
+    }
+
+    // ----------------------------------------------------------------------
+    // Phase D-3: scanning cell-selection engine (ETSI TS 100 392-2 cl. 18.3.4)
+    // ----------------------------------------------------------------------
+
+    /// A List-mode scan codeplug programming two candidate downlink carriers.
+    /// (Home network 901/9999 stays always-allowed; no extra allowed networks.)
+    const MS_TOML_SCAN: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+
+[scan]
+mode = "List"
+frequencies = [390000000, 396000000]
+dwell_ms = 500
+"#;
+
+    /// Two candidate carriers programmed in the scan config above.
+    const SCAN_F0: u32 = 390_000_000;
+    const SCAN_F1: u32 = 396_000_000;
+
+    fn ms_mle_scan() -> MleMs {
+        let cfg = from_toml_str(MS_TOML_SCAN).expect("valid MS scan test config");
+        MleMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// A PHY scan-dwell-elapsed heartbeat (no carrier on the current candidate).
+    fn scan_dwell_ind() -> SapMsg {
+        use tetra_saps::tlmb::TlmbScanDwellInd;
+        SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Phy,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbScanDwellInd(TlmbScanDwellInd { rssi_dbfs: Some(-95.0) }),
+        }
+    }
+
+    /// The single tune carrier emitted since the queue was last drained, or
+    /// `None` if no TlmcTuneReq is present.
+    fn tuned_carrier(queue: &MessageQueue) -> Option<u32> {
+        queue.iter().find_map(|m| match &m.msg {
+            SapMsgInner::TlmcTuneReq(t) => Some(t.carrier_hz),
+            _ => None,
+        })
+    }
+
+    /// D-3: the first scan-dwell heartbeat with no serving cell starts the scan
+    /// and retunes to the first programmed candidate (cl. 18.3.4).
+    #[test]
+    fn test_scan_starts_on_first_dwell() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind());
+
+        assert!(mle.scanning, "scan started");
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F0), "tuned to first candidate");
+    }
+
+    /// D-3: subsequent dwell heartbeats step through the candidate list and wrap.
+    #[test]
+    fn test_scan_advances_and_wraps_on_dwell() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind()); // start -> F0
+        queue = MessageQueue::new();
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind()); // -> F1
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced to second candidate");
+        queue = MessageQueue::new();
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind()); // wrap -> F0
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F0), "wrapped back to first candidate");
+    }
+
+    /// D-3: a candidate carrying a cell on a disallowed network is unsuitable, so
+    /// the scan advances to the next candidate (cl. 18.3.4).
+    #[test]
+    fn test_scan_advances_on_disallowed_network() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind()); // start -> F0
+        queue = MessageQueue::new();
+
+        // A foreign cell appears on F0: reject and step to F1.
+        mle.rx_tlmb_prim(&mut queue, sync_ind(238, 6));
+
+        assert!(mle.serving_cell.is_none(), "foreign cell not adopted");
+        assert!(mle.scanning, "still scanning");
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced past the disallowed cell");
+    }
+
+    /// D-3: a candidate whose cell bars our subscriber class is unsuitable â€” the
+    /// adopted cell is dropped and the scan advances (cl. 18.4.2.2 / 18.3.4).
+    #[test]
+    fn test_scan_advances_on_barred_class() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind()); // start -> F0
+        queue = MessageQueue::new();
+
+        // Home cell adopted from SYNC (network allowed)...
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+        assert!(mle.serving_cell.is_some(), "home cell adopted pending SYSINFO");
+        queue = MessageQueue::new();
+
+        // ...but its SYSINFO bars our class (only classes 2/3): drop and advance.
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(1, 0b110));
+
+        assert!(mle.serving_cell.is_none(), "unsuitable cell dropped");
+        assert!(mle.scanning, "still scanning");
+        assert!(!mle.activate_confirmed, "not confirmed");
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced past the barred cell");
+    }
+
+    /// D-3: a suitable candidate ends the scan â€” the cell is confirmed to MM and
+    /// no further candidate retune happens on a later stray dwell (cl. 18.3.4.6).
+    #[test]
+    fn test_scan_camps_on_suitable_cell_and_stops() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind()); // start -> F0
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999)); // adopt home cell
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(1, 0b1)); // class permitted -> camp
+
+        assert!(mle.activate_confirmed, "cell confirmed");
+        assert!(!mle.scanning, "scan stopped after camping");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LmmMleActivateConf(_))).count(),
+            1,
+            "LMM-ACTIVATE confirmation sent to MM"
+        );
+
+        // A later stray dwell must not retune (we are camped).
+        queue = MessageQueue::new();
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind());
+        assert_eq!(tuned_carrier(&queue), None, "no retune while camped");
+    }
+
+    /// D-3: with no scan programmed (default codeplug), a dwell heartbeat is a
+    /// no-op â€” the radio stays on its single configured carrier.
+    #[test]
+    fn test_no_scan_when_not_programmed() {
+        let mut mle = ms_mle();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind());
+
+        assert!(!mle.scanning, "scanning not enabled without a scan codeplug");
+        assert_eq!(tuned_carrier(&queue), None, "no retune when not scanning");
     }
 }

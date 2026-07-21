@@ -328,28 +328,35 @@ impl MessageRouter {
                 None
             };
 
-            let Some(ts) = recovered else {
-                // Still searching for the downlink; no slot to process yet.
-                continue;
-            };
-            self.ts = ts;
+            // Run a full tick only when a downlink slot was recovered: the
+            // recovered TDMA time is the stack clock and drives tick_start /
+            // tick_end. While unsynchronized (no recovered slot, e.g. scanning
+            // across an empty candidate carrier) there is no clock to tick.
+            if let Some(ts) = recovered {
+                self.ts = ts;
+                self.tick_start();
+            }
 
-            // Send tick_start event
-            self.tick_start();
-
-            // Deliver messages until queue empty
+            // Always drain the message queue after driving the PHY, even when no
+            // slot was recovered. While unsynchronized the PHY still emits
+            // primitives that must propagate — the scan-dwell heartbeat
+            // (TlmbScanDwellInd) to the MLE and the resulting cell-selection
+            // retunes (TlmcTuneReq) down to the PHY — so the receiver can step
+            // across candidate carriers before it is camped (cl. 18.3.4).
             while self.get_msgqueue_len() > 0 {
                 self.deliver_all_messages();
             }
 
-            // Send tick_end event without advancing the clock (RX drives time).
-            self.run_tick_end(false);
+            if recovered.is_some() {
+                // Send tick_end event without advancing the clock (RX drives time).
+                self.run_tick_end(false);
 
-            // Check if we should stop
-            ticks += 1;
-            if let Some(num_ticks) = num_ticks {
-                if ticks >= num_ticks {
-                    break;
+                // Check if we should stop
+                ticks += 1;
+                if let Some(num_ticks) = num_ticks {
+                    if ticks >= num_ticks {
+                        break;
+                    }
                 }
             }
         }

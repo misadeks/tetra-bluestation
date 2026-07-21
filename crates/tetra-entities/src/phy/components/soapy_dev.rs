@@ -253,6 +253,12 @@ impl RxTxDev for RxTxDevSoapySdr {
     fn set_rx_frequency(&mut self, carrier_hz: f64) {
         if let Err(e) = self.sdr.set_rx_frequency(carrier_hz) {
             tracing::error!("SoapySDR: failed to retune RX to {carrier_hz} Hz: {e}");
+            return;
+        }
+        // Drop the previous carrier's recovered downlink timing so the MS
+        // re-acquires promptly on the new carrier (scanning, cl. 18.3.4).
+        if let Some(rx_dsp) = self.rx_dsp.as_mut() {
+            rx_dsp.reset_dl_demodulators();
         }
     }
 }
@@ -320,6 +326,17 @@ impl RxDsp {
         self.monitors
             .iter()
             .find_map(|pair| pair.dl.demodulator.synchronized_reference_time())
+    }
+
+    /// Reset every serving-cell downlink demodulator to `DlUnsynchronized`,
+    /// discarding the previous carrier's recovered timing. Called on a downlink
+    /// retune (MS scanning cell selection, cl. 18.3.4) so re-acquisition starts
+    /// immediately on the new carrier instead of after the demodulator's own
+    /// ~100-slot sync-loss revert.
+    fn reset_dl_demodulators(&mut self) {
+        for pair in self.monitors.iter_mut() {
+            pair.dl.demodulator.reset(demodulator::Mode::DlUnsynchronized);
+        }
     }
 
     /// Most recent uncalibrated downlink RSSI (dBFS) from the serving-cell

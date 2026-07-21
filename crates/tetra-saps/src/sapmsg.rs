@@ -57,6 +57,10 @@ pub enum SapMsgInner {
     /// indication (radio link failure / recovery, cl. 18.3.4.5.3 / 18.3.4.7).
     /// Not an air-interface PDU.
     TlmbMonitorInd(TlmbMonitorInd),
+    /// MS only — internal PHY -> MLE scan-dwell-elapsed indication used by the
+    /// scanning cell-selection engine during acquisition (cl. 18.3.4). Not an
+    /// air-interface PDU.
+    TlmbScanDwellInd(TlmbScanDwellInd),
 
     // TMC-SAP
     TlmcConfigureReq(TlmcConfigureReq),
@@ -143,6 +147,7 @@ impl Display for SapMsgInner {
             SapMsgInner::TlmbSyncInd(_) => write!(f, "TmbSyncInd"),
             SapMsgInner::TlmbSysinfoInd(_) => write!(f, "TmbSysinfoInd"),
             SapMsgInner::TlmbMonitorInd(_) => write!(f, "TlmbMonitorInd"),
+            SapMsgInner::TlmbScanDwellInd(_) => write!(f, "TlmbScanDwellInd"),
 
             // TMC-SAP
             SapMsgInner::TlmcTuneReq(_) => write!(f, "TlmcTuneReq"),
