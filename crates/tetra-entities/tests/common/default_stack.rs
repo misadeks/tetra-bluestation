@@ -17,6 +17,7 @@ pub fn default_test_config_bs() -> StackConfig {
         net: net_info,
         cell: cell_info,
         duplex_table: Default::default(),
+        codeplug: Default::default(),
         ms: None,
         brew: None,
         telemetry: None,

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::{DuplexTable, FreqInfo};
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgMs, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
+use crate::bluestation::{CfgCellInfo, CfgCodeplug, CfgControl, CfgMs, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
 
 use super::sec_brew::CfgBrew;
 use super::sec_telemetry::CfgTelemetry;
@@ -65,6 +65,12 @@ pub struct StackConfig {
     /// to the ETSI spec table when no `[duplex_table]` section is configured.
     pub duplex_table: DuplexTable,
 
+    /// Radio-style codeplug (channels/folders/talkgroups/scan) — **Plane B**.
+    /// Empty for BS mode and legacy MS configs. Data only: read by the
+    /// management/TNMM UI and the cell-selection engine; does not itself change
+    /// on-air behaviour.
+    pub codeplug: CfgCodeplug,
+
     /// Mobile Station configuration. Required when `stack_mode == Ms`.
     pub ms: Option<CfgMs>,
 
@@ -119,16 +125,45 @@ impl StackConfig {
             println!("    {:?}", freq_info);
             println!("    Derived DL freq: {} Hz, UL freq: {} Hz\n", dlfreq, ulfreq);
 
-            if soapy_cfg.dl_freq as u32 != dlfreq {
-                return Err("PhyIo DlFrequency does not match computed FreqInfo");
-            };
-            if soapy_cfg.ul_freq as u32 != ulfreq {
-                return Err("PhyIo UlFrequency does not match computed FreqInfo");
-            };
+            let dl_matches = soapy_cfg.dl_freq as u32 == dlfreq;
+            let ul_matches = soapy_cfg.ul_freq as u32 == ulfreq;
+
+            match self.stack_mode {
+                StackMode::Bs => {
+                    // A BS *defines* the cell, so its configured RF must be exactly
+                    // the carrier it broadcasts.
+                    if !dl_matches {
+                        return Err("PhyIo DlFrequency does not match computed FreqInfo");
+                    }
+                    if !ul_matches {
+                        return Err("PhyIo UlFrequency does not match computed FreqInfo");
+                    }
+                }
+                StackMode::Ms | StackMode::Mon => {
+                    // A radio-style MS is programmed by downlink; the uplink/duplex
+                    // is derived at camp time from the cell's own D-MLE-SYSINFO
+                    // (EN 300 392-2 cl. 18.4.2.2), not pre-computed. So a mismatch
+                    // here is a warning, not a hard error — the PHY still tunes from
+                    // the configured soapy freqs until the scan/camp engine retunes.
+                    if !dl_matches || !ul_matches {
+                        eprintln!(
+                            "    WARNING: MS soapy tx_freq/rx_freq ({}/{} Hz) differ from cell_info-derived \
+                             DL/UL ({}/{} Hz); the MS derives UL from the cell's SYSINFO at camp time.",
+                            soapy_cfg.dl_freq as u32, soapy_cfg.ul_freq as u32, dlfreq, ulfreq
+                        );
+                    }
+                }
+            }
         }
 
         if self.cell.ms_txpwr_max_cell > 7 {
             return Err("ms_txpwr_max_cell must be 0-7 (3 bits)");
+        }
+
+        // Validate the codeplug (Plane B). Empty codeplug is a no-op.
+        // Note: kept as an owned String on the error path, mapped to &str below.
+        if let Err(_e) = self.codeplug.validate() {
+            return Err("Invalid codeplug configuration");
         }
 
         // MS mode requires an [ms] section with a valid own ISSI.

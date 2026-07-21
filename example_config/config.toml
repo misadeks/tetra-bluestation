@@ -2,7 +2,7 @@
 # This is an example configuration file for the TETRA base station stack
 # DO NOT RUN without editing to stay within legal limits of your jurisdiction
 
-config_version = "0.6"
+config_version = "0.7"
 
 # Stack operation mode: "Bs" (Base Station), "Ms" (Mobile Station), or "Mon" (Monitor)
 stack_mode = "Bs"

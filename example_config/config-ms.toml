@@ -4,13 +4,17 @@
 # Direction note: DL and UL are ABSOLUTE frequencies (independent of Bs/Ms mode).
 #   - tx_freq  -> dl_freq (BS transmits, MS RECEIVES) = 439.825 MHz
 #   - rx_freq  -> ul_freq (MS transmits, BS receives) = 430.425 MHz
-# The MS keeps the same tx_freq/rx_freq and cell_info as the BS; the PHY layer
-# handles the RX(DL)/TX(UL) direction. Validation recomputes DL/UL from
-# cell_info and requires them to match tx_freq/rx_freq exactly.
+#
+# Radio-style programming (v0.7): an MS is programmed by DOWNLINK. The uplink and
+# duplex spacing are derived at camp time from the cell's own D-MLE-SYSINFO
+# (EN 300 392-2 cl. 18.4.2.2), so for stack_mode = "Ms" the DL/UL derived from
+# cell_info no longer has to match tx_freq/rx_freq EXACTLY -- a mismatch is only a
+# warning (BS mode still requires an exact match). The PHY still tunes to the
+# configured soapy freqs at startup; the scan/camp engine retunes at runtime.
 #   band 4: 400_000_000 + main_carrier 1593 * 25_000            = 439_825_000 (DL)
 #   DL - custom_duplex_spacing 9_400_000                        = 430_425_000 (UL)
 
-config_version = "0.6"
+config_version = "0.7"
 
 # Stack operation mode: "Bs" (Base Station), "Ms" (Mobile Station), or "Mon" (Monitor)
 stack_mode = "Ms"
@@ -28,8 +32,9 @@ stack_mode = "Ms"
 backend = "SoapySdr"
 
 [phy_io.soapysdr]
-# Transmit tx(dl) and rx(ul) frequencies in Hz. Kept identical to the BS:
-# the MS receives on tx_freq (DL) and (later) transmits on rx_freq (UL).
+# Transmit tx(dl) and rx(ul) frequencies in Hz. Startup tune target; the MS
+# receives on tx_freq (DL) and (later) transmits on rx_freq (UL). In radio mode
+# the scan/camp engine retunes the RX from the selected codeplug channel.
 tx_freq = 439825000
 rx_freq = 430425000
 
@@ -63,14 +68,16 @@ tx_gain_mixer = 0.0
 
 ###############################################################################
 
-# Network Information - must match the BS to recognize the network.
+# Network Information - home network (MCC/MNC) the MS belongs to.
 [net_info]
-# Mobile Country Code (MCC)
+# Mobile Country Code (MCC), 10-bit
 mcc = 901
-# Mobile Network Code (MNC)
+# Mobile Network Code (MNC), 14-bit
 mnc = 9999
 
-# Cell Information - RF band/carrier/duplex the MS tunes to. Must match the BS.
+# Cell Information - RF band/carrier/duplex reference. For an MS this is the
+# startup tune reference; the actual serving-cell parameters are adopted from
+# the received SYNC/SYSINFO once camped.
 [cell_info]
 freq_band = 4                       # 400MHz band
 main_carrier = 1593                 # 400_000_000 + 1593 * 25kHz = 439.825 MHz DL
@@ -87,6 +94,16 @@ colour_code = 1
 
 ###############################################################################
 
+# Duplex-spacing table (OPTIONAL, TS 100 392-15 cl. 6). A programmed radio may
+# override the standardized duplex spacing for specific 3-bit duplex indices.
+# Each entry is [duplex_index (0-7), spacing_hz]; unlisted indices use the ETSI
+# defaults for the operating band. Index 7 has no ETSI default, so we program it
+# here to the 9.4 MHz spacing this network uses.
+[duplex_table]
+overrides = [[7, 9400000]]
+
+###############################################################################
+
 # Mobile Station (MS) identity/affiliation. REQUIRED when stack_mode = "Ms".
 [ms]
 # Own Individual Short Subscriber Identity (ISSI), 24-bit (1..=16777215).
@@ -100,3 +117,74 @@ subscriber_class = 1
 # Group identities (GSSIs) to attach to once registered. Empty = receive-only
 # monitoring (no uplink), which matches the current phase.
 attach_groups = []
+
+###############################################################################
+# CODEPLUG (Plane B, non-standard management structure). Data only: read by the
+# management/TNMM UI and (in a later phase) the scan/camp engine. All values map
+# to real air-interface elements and are validated against their ETSI ranges.
+###############################################################################
+
+# Group folders for organizing channels/talkgroups in the UI tree.
+[[folder]]
+id = "work"
+name = "Work"
+order = 1
+
+[[folder]]
+id = "test"
+name = "Test Net"
+order = 2
+
+# Talkgroups (GSSI = 24-bit; class_of_usage = 3-bit, EN 300 392-2 group identity).
+[[talkgroup]]
+gssi = 101
+name = "Dispatch"
+folder = "work"
+class_of_usage = 0
+
+[[talkgroup]]
+gssi = 102
+name = "Ops"
+folder = "work"
+class_of_usage = 1
+
+# Channels: an RF carrier the MS may camp on. Program by explicit band+carrier
+# (+optional freq_offset) OR by absolute dl_freq (Hz). Optional colour_code
+# restricts camping to a cell with that colour code; rx_only suppresses uplink.
+[[channel]]
+name = "BS-1"
+band = 4
+carrier = 1593                      # 439.825 MHz DL
+freq_offset = 0
+colour_code = 1
+duplex_index = 7
+custom_duplex_spacing = 9400000
+folder = "work"
+rx_only = true
+default_talkgroups = [101, 102]
+
+[[channel]]
+name = "BS-2"
+dl_freq = 439850000                 # same as band 4 / carrier 1594
+folder = "test"
+rx_only = true
+
+# Scan / channel-selection settings.
+#   mode = "Fixed" -> camp on the single listed channel
+#   mode = "List"  -> cycle the listed channels, camp on the best suitable cell
+#   mode = "Range" -> enumerate a carrier range (see [scan.range] below)
+# allowed_networks: permitted MCC/MNC pairs for camping. Empty = home MCC/MNC only.
+[scan]
+mode = "List"
+channels = ["BS-1", "BS-2"]
+dwell_ms = 800
+allowed_networks = [{ mcc = 901, mnc = 9999 }]
+
+# Range-scan example (used when mode = "Range"). Enumerates band 4 carriers from
+# start to stop in `step` carrier units (multiples of 25 kHz).
+# [scan.range]
+# band = 4
+# start_carrier = 1500
+# stop_carrier = 1700
+# step = 1
+

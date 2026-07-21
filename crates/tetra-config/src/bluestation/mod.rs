@@ -31,5 +31,8 @@ pub use sec_ms::*;
 pub mod sec_duplex;
 pub use sec_duplex::*;
 
+pub mod sec_codeplug;
+pub use sec_codeplug::*;
+
 pub mod state;
 pub use state::*;

@@ -102,6 +102,9 @@ pub struct StackState {
     pub network_connected: bool,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
+    /// Name of the codeplug channel the MS last camped on (radio mode). Used to
+    /// bias re-acquisition on the next boot/scan. `None` until the MS camps.
+    pub last_camped_channel: Option<String>,
 }
 
 #[cfg(test)]
@@ -179,6 +182,7 @@ impl Default for StackState {
             timeslot_alloc: TimeslotAllocator::default(),
             network_connected: false,
             subscribers: SubscriberRegistry::new(),
+            last_camped_channel: None,
         }
     }
 }

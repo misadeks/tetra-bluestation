@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::bluestation::{
-    CellInfoDto, CfgControlDto, CfgMsDto, DuplexTableDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg,
-    cfg_control_to_dto, cfg_to_cell_dto, cfg_to_duplex_dto, cfg_to_ms_dto, cfg_to_net_dto, cfg_to_phy_dto,
-    duplex_dto_to_cfg, duplex_table_is_default, ms_dto_to_cfg, net_dto_to_cfg,
+    CellInfoDto, CfgControlDto, CfgMsDto, ChannelDto, DuplexTableDto, FolderDto, NetInfoDto, ScanDto, TalkgroupDto,
+    apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_cell_dto, cfg_to_channel_dtos, cfg_to_duplex_dto,
+    cfg_to_folder_dtos, cfg_to_ms_dto, cfg_to_net_dto, cfg_to_phy_dto, cfg_to_scan_dto, cfg_to_talkgroup_dtos,
+    codeplug_dto_to_cfg, duplex_dto_to_cfg, duplex_table_is_default, ms_dto_to_cfg, net_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -17,16 +18,23 @@ use super::sec_brew::{CfgBrewDto, apply_brew_patch, cfg_brew_to_dto};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch, cfg_telemetry_to_dto};
 use super::{PhyIoDto, phy_dto_to_cfg};
 
+/// Current on-disk config schema version emitted by the serializer.
+pub const CURRENT_CONFIG_VERSION: &str = "0.7";
+
+/// Config schema versions this build can load. `0.6` is the legacy (pre-codeplug)
+/// schema and is accepted for backward compatibility; it migrates trivially since
+/// the codeplug is an optional additive section (a legacy config simply has none).
+pub const SUPPORTED_CONFIG_VERSIONS: &[&str] = &["0.6", "0.7"];
+
 /// Build `StackConfig` from a TOML configuration file
 pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::Error>> {
     let root: TomlConfigRoot = toml::from_str(toml_str)?;
 
     // Various sanity checks
-    let expected_config_version = "0.6";
-    if !root.config_version.eq(expected_config_version) {
+    if !SUPPORTED_CONFIG_VERSIONS.contains(&root.config_version.as_str()) {
         return Err(format!(
-            "Unrecognized config_version: {}, expect {}",
-            root.config_version, expected_config_version
+            "Unrecognized config_version: {}, expected one of {:?}",
+            root.config_version, SUPPORTED_CONFIG_VERSIONS
         )
         .into());
     }
@@ -82,6 +90,11 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     }
 
+    // Build the codeplug (Plane B, optional). RF resolution + validation errors
+    // surface here with a descriptive message.
+    let codeplug = codeplug_dto_to_cfg(root.folder, root.channel, root.talkgroup, root.scan)?;
+    codeplug.validate()?;
+
     // Build config from required and optional values
     let mut cfg = StackConfig {
         stack_mode: root.stack_mode,
@@ -93,6 +106,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
             Some(dt) => duplex_dto_to_cfg(dt)?,
             None => Default::default(),
         },
+        codeplug,
         ms: root.ms.map(ms_dto_to_cfg),
         brew: None,
         telemetry: None,
@@ -160,6 +174,16 @@ struct TomlConfigRoot {
     #[serde(skip_serializing_if = "Option::is_none")]
     duplex_table: Option<DuplexTableDto>,
 
+    // Codeplug sections (Plane B, arrays-of-tables). All optional/additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    folder: Option<Vec<FolderDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<Vec<ChannelDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    talkgroup: Option<Vec<TalkgroupDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan: Option<ScanDto>,
+
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     extra: HashMap<String, Value>,
 }
@@ -173,7 +197,7 @@ pub const REDACTED_SECRET: &str = "********";
 
 fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
     TomlConfigRoot {
-        config_version: "0.6".to_string(),
+        config_version: CURRENT_CONFIG_VERSION.to_string(),
         stack_mode: cfg.stack_mode,
         debug_log: cfg.debug_log.clone(),
         phy_io: cfg_to_phy_dto(&cfg.phy_io),
@@ -188,6 +212,10 @@ fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
         } else {
             Some(cfg_to_duplex_dto(&cfg.duplex_table))
         },
+        folder: cfg_to_folder_dtos(&cfg.codeplug),
+        channel: cfg_to_channel_dtos(&cfg.codeplug),
+        talkgroup: cfg_to_talkgroup_dtos(&cfg.codeplug),
+        scan: cfg_to_scan_dto(&cfg.codeplug),
         extra: HashMap::new(),
     }
 }
@@ -365,7 +393,7 @@ attach_groups = []
     fn to_toml_string_emits_config_version() {
         let cfg = from_toml_str(MS_TOML).expect("initial parse");
         let rendered = to_toml_string(&cfg).expect("serialize");
-        assert!(rendered.contains("config_version = \"0.6\""));
+        assert!(rendered.contains(&format!("config_version = \"{}\"", CURRENT_CONFIG_VERSION)));
     }
 
     // An MS config whose duplex spacing comes from a programmed [duplex_table]
@@ -437,6 +465,130 @@ attach_groups = []
     fn duplex_table_rejects_bad_index() {
         let bad = MS_TOML_DUPLEX_TABLE.replace("[[7, 9400000]]", "[[9, 9400000]]");
         assert!(from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn legacy_config_version_still_accepted() {
+        // MS_TOML declares config_version = "0.6" (legacy, pre-codeplug).
+        assert!(MS_TOML.contains("config_version = \"0.6\""));
+        let cfg = from_toml_str(MS_TOML).expect("legacy 0.6 config must still load");
+        assert!(cfg.codeplug.is_empty());
+    }
+
+    #[test]
+    fn unsupported_config_version_rejected() {
+        let bad = MS_TOML.replace("config_version = \"0.6\"", "config_version = \"9.9\"");
+        assert!(from_toml_str(&bad).is_err());
+    }
+
+    // A radio-style MS config carrying a codeplug: folders, channels (both RF
+    // forms), talkgroups, and a list-mode scan set.
+    const MS_TOML_CODEPLUG: &str = r#"
+config_version = "0.7"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+tx_gain_dac = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+
+[[folder]]
+id = "work"
+name = "Work"
+order = 1
+
+[[talkgroup]]
+gssi = 101
+name = "Dispatch"
+folder = "work"
+class_of_usage = 0
+
+[[channel]]
+name = "BS-1"
+band = 4
+carrier = 1593
+freq_offset = 0
+colour_code = 1
+duplex_index = 7
+custom_duplex_spacing = 9400000
+folder = "work"
+rx_only = true
+default_talkgroups = [101]
+
+[[channel]]
+name = "BS-2-byfreq"
+dl_freq = 439850000
+folder = "work"
+
+[scan]
+mode = "List"
+channels = ["BS-1", "BS-2-byfreq"]
+dwell_ms = 800
+allowed_networks = [{ mcc = 901, mnc = 9999 }]
+"#;
+
+    #[test]
+    fn codeplug_parses_and_roundtrips() {
+        let cfg = from_toml_str(MS_TOML_CODEPLUG).expect("parse codeplug config");
+        assert_eq!(cfg.codeplug.channels.len(), 2);
+        assert_eq!(cfg.codeplug.folders.len(), 1);
+        assert_eq!(cfg.codeplug.talkgroups.len(), 1);
+        // dl_freq form resolved to band/carrier.
+        let ch2 = cfg.codeplug.channel("BS-2-byfreq").expect("channel");
+        assert_eq!(ch2.dl_freq_hz(), 439_850_000);
+        assert_eq!((ch2.freq_band, ch2.main_carrier, ch2.freq_offset_hz), (4, 1594, 0));
+
+        // Round-trip: serialize -> reparse must preserve the codeplug.
+        let rendered = to_toml_string(&cfg).expect("serialize");
+        assert!(rendered.contains("[[channel]]"));
+        assert!(rendered.contains("[scan]"));
+        let reparsed = from_toml_str(&rendered).expect("reparse");
+        assert_eq!(reparsed.codeplug, cfg.codeplug);
+    }
+
+    #[test]
+    fn codeplug_invalid_reference_rejected() {
+        // Scan references a channel that does not exist.
+        let bad = MS_TOML_CODEPLUG.replace(r#"channels = ["BS-1", "BS-2-byfreq"]"#, r#"channels = ["ghost"]"#);
+        assert!(from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn shipped_example_configs_parse_and_validate() {
+        // The example configs at the repo root must always load and validate.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/");
+        for name in ["config.toml", "config-ms.toml"] {
+            let path = format!("{root}{name}");
+            let cfg = from_file(&path).unwrap_or_else(|e| panic!("failed to parse {name}: {e}"));
+            cfg.validate().unwrap_or_else(|e| panic!("failed to validate {name}: {e}"));
+        }
     }
 
     // An MS config that additionally configures a control endpoint with HTTP
