@@ -303,6 +303,32 @@ impl MleMs {
         }
     }
 
+    /// Radio-style cell suitability — allowed network (ETSI TS 100 392-2
+    /// cl. 18.3.4 initial cell selection). The cell's network identity is its
+    /// D-MLE-SYNC MCC/MNC (cl. 18.4.2.1); it is usable only when programmed as
+    /// allowed (codeplug allowed-network list, **[impl policy]**; empty list =>
+    /// home network only). The home network from `[net_info]` is always allowed.
+    fn network_allowed(&self, mcc: u16, mnc: u16) -> bool {
+        let cfg = self.config.config();
+        cfg.codeplug.is_network_allowed(mcc, mnc, cfg.net.mcc, cfg.net.mnc)
+    }
+
+    /// Radio-style cell suitability — subscriber-class permission (ETSI
+    /// TS 100 392-2 cl. 18.4.2.2 / 18.3.4). The cell advertises a 16-bit
+    /// subscriber-class bitmap in D-MLE-SYSINFO where bit `n` set means class
+    /// `n+1` is permitted access. The cell is usable only if the MS's own
+    /// configured subscriber class (1..=16) is set. When the MS has no
+    /// configured class (pure receive-only monitor) the check passes so
+    /// monitoring is never blocked.
+    fn subscriber_class_permitted(&self, cell_bitmap: u16) -> bool {
+        match self.config.config().ms.as_ref() {
+            Some(ms) if (1..=16).contains(&ms.subscriber_class) => {
+                (cell_bitmap >> (ms.subscriber_class - 1)) & 1 == 1
+            }
+            _ => true,
+        }
+    }
+
     fn rx_tlmb_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tlmb_prim");
         match message.msg {
@@ -488,6 +514,22 @@ impl MleMs {
         };
 
         if let Some((mcc, mnc, la, registration_required, system_wide_services)) = confirm {
+            // Cell suitability (ETSI cl. 18.4.2.2 / 18.3.4): the cell must admit
+            // the MS's subscriber class before it can be used for
+            // registration/service. If not permitted, do not confirm the cell to
+            // MM (so no registration is attempted) and leave the one-shot
+            // confirmation un-armed; while scanning this keeps the cell
+            // unsuitable so selection moves on.
+            if !self.subscriber_class_permitted(pdu.subscriber_class) {
+                tracing::warn!(
+                    "MLE: serving cell {}/{} does not permit our subscriber class \
+                     (cell class bitmap {:#06x}) — cell unsuitable, not confirming (cl. 18.4.2.2)",
+                    mcc,
+                    mnc,
+                    pdu.subscriber_class,
+                );
+                return;
+            }
             self.activate_confirmed = true;
             self.send_mle_activate_conf(queue, mcc, mnc, la, registration_required, system_wide_services);
         }
@@ -563,6 +605,24 @@ impl MleMs {
             .map(|c| c.mcc != pdu.mcc || c.mnc != pdu.mnc)
             .unwrap_or(true);
 
+        // Cell suitability (ETSI cl. 18.3.4): only camp on a cell whose network
+        // is allowed. The network identity is the D-MLE-SYNC MCC/MNC
+        // (cl. 18.4.2.1). This was previously a warning-only TODO ("proper
+        // allowed-network handling is out of Phase 2 scope"); enforcing it is
+        // the Phase-D radio-style behaviour — a radio does not camp on a cell
+        // outside its programmed allowed-network set. A disallowed cell is
+        // simply not selected: an already-camped (allowed) cell is retained,
+        // and while scanning this rejection lets the scan advance to the next
+        // candidate.
+        if newly_selected && !self.network_allowed(pdu.mcc, pdu.mnc) {
+            tracing::warn!(
+                "MLE: cell MCC/MNC {}/{} is not an allowed network — not selecting (cl. 18.3.4)",
+                pdu.mcc,
+                pdu.mnc
+            );
+            return;
+        }
+
         // Adopt the cell identity, preserving any SYSINFO learned for the same cell.
         let (location_area, subscriber_class, registration_required, system_wide_services) =
             if newly_selected {
@@ -608,20 +668,6 @@ impl MleMs {
             pdu.late_entry_supported,
             pdu.cell_load_ca
         );
-
-        // Log if the cell does not match the configured home network. We do not
-        // reject it here: proper allowed-network handling is out of Phase 2 scope
-        // and must not be invented.
-        let cfg = self.config.config();
-        if pdu.mcc != cfg.net.mcc || pdu.mnc != cfg.net.mnc {
-            tracing::warn!(
-                "MLE: serving cell MCC/MNC {}/{} differs from configured {}/{}",
-                pdu.mcc,
-                pdu.mnc,
-                cfg.net.mcc,
-                cfg.net.mnc
-            );
-        }
 
         // Configure layer 2 for the chosen cell (cl. 18.3.4.6 / 20.3.5.4.1c):
         // provide the valid MCC/MNC so UMAC derives and installs the scrambling code.
@@ -1034,5 +1080,132 @@ attach_groups = []
         // MCC/MNC are the configured home network so the element stays well-formed.
         assert_eq!(va.mcc, 901);
         assert_eq!(va.mnc, 9999);
+    }
+
+    use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
+    use tetra_saps::tlmb::{TlmbSyncInd, TlmbSysinfoInd};
+
+    /// Build a D-MLE-SYNC monitoring indication (cl. 18.4.2.1) for a cell.
+    fn sync_ind(mcc: u16, mnc: u16) -> SapMsg {
+        let mut tl_sdu = BitBuffer::new(64);
+        DMleSync {
+            mcc,
+            mnc,
+            neighbor_cell_broadcast: 0,
+            cell_load_ca: 0,
+            late_entry_supported: false,
+        }
+        .to_bitbuf(&mut tl_sdu);
+        tl_sdu.seek(0);
+        SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Phy,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbSyncInd(TlmbSyncInd { endpoint_id: 0, tl_sdu }),
+        }
+    }
+
+    /// Build a D-MLE-SYSINFO monitoring indication (cl. 18.4.2.2) carrying a
+    /// subscriber-class bitmap; all BS service-detail flags off except
+    /// registration + system-wide-services.
+    fn sysinfo_ind(location_area: u16, subscriber_class: u16) -> SapMsg {
+        let bs_service_details = BsServiceDetails {
+            registration: true,
+            deregistration: false,
+            priority_cell: false,
+            no_minimum_mode: false,
+            migration: false,
+            system_wide_services: true,
+            voice_service: false,
+            circuit_mode_data_service: false,
+            sndcp_service: false,
+            aie_service: false,
+            advanced_link: false,
+        };
+        let mut tl_sdu = BitBuffer::new(64);
+        DMleSysinfo { location_area, subscriber_class, bs_service_details }.to_bitbuf(&mut tl_sdu);
+        tl_sdu.seek(0);
+        SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Phy,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbSysinfoInd(TlmbSysinfoInd {
+                endpoint_id: 0,
+                tl_sdu,
+                mac_broadcast_info: None,
+            }),
+        }
+    }
+
+    /// Suitability (cl. 18.3.4): a SYNC for the home network is selected — the
+    /// serving cell is adopted and the MAC is configured with its scrambling.
+    #[test]
+    fn test_allowed_home_network_selected() {
+        let mut mle = ms_mle();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+
+        assert!(mle.serving_cell.is_some(), "home cell selected");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::TlmcConfigureReq(_))).count(),
+            1,
+            "MAC configured for the selected cell"
+        );
+    }
+
+    /// Suitability (cl. 18.3.4): a SYNC for a foreign, non-programmed network is
+    /// rejected — no cell is selected and the MAC is not configured.
+    #[test]
+    fn test_disallowed_network_not_selected() {
+        let mut mle = ms_mle();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, sync_ind(238, 6));
+
+        assert!(mle.serving_cell.is_none(), "foreign cell not selected");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::TlmcConfigureReq(_))).count(),
+            0,
+            "MAC not configured for a disallowed network"
+        );
+    }
+
+    /// Suitability (cl. 18.4.2.2): once camped, a SYSINFO whose subscriber-class
+    /// bitmap admits our class (1 => bit 0) confirms the cell to MM.
+    #[test]
+    fn test_subscriber_class_permitted_confirms() {
+        let mut mle = ms_mle();
+        let mut queue = MessageQueue::new();
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+
+        // class 1 permitted => bit 0 set.
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(1, 0b1));
+
+        assert!(mle.activate_confirmed, "cell confirmed");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LmmMleActivateConf(_))).count(),
+            1,
+            "LMM-ACTIVATE confirmation sent to MM"
+        );
+    }
+
+    /// Suitability (cl. 18.4.2.2): a SYSINFO whose subscriber-class bitmap does
+    /// NOT admit our class leaves the cell unconfirmed — no registration.
+    #[test]
+    fn test_subscriber_class_not_permitted_not_confirmed() {
+        let mut mle = ms_mle();
+        let mut queue = MessageQueue::new();
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+
+        // class 1 NOT permitted (bit 0 clear; only classes 2 and 3 allowed).
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(1, 0b110));
+
+        assert!(!mle.activate_confirmed, "cell not confirmed for a barred class");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LmmMleActivateConf(_))).count(),
+            0,
+            "no LMM-ACTIVATE confirmation for a barred subscriber class"
+        );
     }
 }

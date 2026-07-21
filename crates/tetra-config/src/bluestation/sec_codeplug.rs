@@ -287,6 +287,22 @@ impl CfgCodeplug {
         v
     }
 
+    /// True when a cell advertising `(mcc, mnc)` belongs to an allowed network.
+    ///
+    /// Radio-style cell suitability (**[impl policy]** built on the codeplug
+    /// allowed-network list; the network identity itself is the D-MLE-SYNC
+    /// MCC/MNC, EN 300 392-2 cl. 18.4.2.1). The home network
+    /// (`home_mcc`/`home_mnc`, from `[net_info]`) is always allowed so a
+    /// correctly-programmed radio never rejects its own cell. When the codeplug
+    /// programs no additional networks, only the home network is allowed;
+    /// otherwise the cell's network must also appear in the programmed list.
+    pub fn is_network_allowed(&self, mcc: u16, mnc: u16, home_mcc: u16, home_mnc: u16) -> bool {
+        if mcc == home_mcc && mnc == home_mnc {
+            return true;
+        }
+        self.networks.iter().any(|n| n.mcc == mcc && n.mnc == mnc)
+    }
+
     /// Validate ranges (against ETSI bit-widths) and cross-references
     /// (folder ids). Returns a human-readable error string.
     pub fn validate(&self) -> Result<(), String> {
@@ -923,6 +939,32 @@ mod tests {
         };
         let freqs = scan.candidate_frequencies();
         assert_eq!(freqs, vec![439_825_000, 439_850_000, 439_875_000]);
+    }
+
+    #[test]
+    fn test_is_network_allowed_home_only() {
+        // Empty codeplug network list => only the home network is allowed.
+        let cp = CfgCodeplug::default();
+        assert!(cp.is_network_allowed(901, 9999, 901, 9999), "home network allowed");
+        assert!(!cp.is_network_allowed(238, 6, 901, 9999), "foreign network rejected");
+    }
+
+    #[test]
+    fn test_is_network_allowed_with_list() {
+        let cp = CfgCodeplug {
+            networks: vec![
+                CfgNetwork { mcc: 238, mnc: 6, name: None, priority: 0 },
+                CfgNetwork { mcc: 244, mnc: 5, name: None, priority: 1 },
+            ],
+            ..CfgCodeplug::default()
+        };
+        // Home is always allowed even when not in the list.
+        assert!(cp.is_network_allowed(901, 9999, 901, 9999), "home always allowed");
+        // Programmed networks are allowed.
+        assert!(cp.is_network_allowed(238, 6, 901, 9999), "listed network allowed");
+        assert!(cp.is_network_allowed(244, 5, 901, 9999), "listed network allowed");
+        // Everything else is rejected.
+        assert!(!cp.is_network_allowed(238, 7, 901, 9999), "unlisted network rejected");
     }
 
     #[test]

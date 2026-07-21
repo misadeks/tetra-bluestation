@@ -143,7 +143,13 @@ fn test_sysinfo() {
 /// A test containing a SYNC frame, parsed by UMAC and MLE
 fn test_sync() {
     debug::setup_logging_verbose();
-    let mut test = ComponentTest::new(StackMode::Ms, None);
+    // The SYNC test vector below advertises MCC=420, MNC=555. Radio-style cell
+    // selection (cl. 18.3.4) now only camps on an allowed network, so program
+    // that network as the home network for this test.
+    let mut config = ComponentTest::get_default_test_config(StackMode::Ms);
+    config.net.mcc = 420;
+    config.net.mnc = 555;
+    let mut test = ComponentTest::from_config(config, None);
     let components = vec![TetraEntity::Umac, TetraEntity::Llc, TetraEntity::Mle];
     let sinks = vec![TetraEntity::Lmac];
     test.populate_entities(components, sinks);
