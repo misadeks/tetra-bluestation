@@ -91,9 +91,12 @@ enum RegState {
     Registering,
     /// Registration accepted by the SwMI.
     Registered,
-    /// De-registration in progress: a U-ITSI DETACH has been sent at shutdown
-    /// and the stack is being drained so the burst can be transmitted
-    /// (cl. 16.6.1). Terminal — the MS is stopping.
+    /// De-registration in progress: a U-ITSI DETACH has been sent and the stack
+    /// is being drained (`detach_countdown`) so the burst can be transmitted
+    /// (cl. 16.6.1). U-ITSI DETACH is unacknowledged (cl. 16.9.3.3), so once the
+    /// drain completes the MS considers itself de-registered: at shutdown the
+    /// process exits; for a command-initiated de-registration (TNMM-DEREGISTRATION,
+    /// Table 15.2) the MS returns to `Idle` so it can register again.
     Detaching,
 }
 
@@ -661,7 +664,8 @@ impl MmMs {
             return;
         }
         if self.reg_state == RegState::Detaching {
-            // Shutting down; do not start a new registration.
+            // De-registration draining; do not start a new registration until it
+            // completes and the MS returns to Idle (see tick_start).
             tracing::debug!("MM: activate-conf received while detaching; ignoring");
             return;
         }
@@ -2188,10 +2192,26 @@ impl TetraEntityTrait for MmMs {
         // TNMM requests (ETSI TS 100 392-2 cl. 15.3) are handled here in T2.
         self.poll_control(queue);
 
-        // While detaching at shutdown, count down the bounded drain that gives
-        // the MAC/PHY time to transmit the U-ITSI DETACH (cl. 16.6.1).
+        // While detaching, count down the bounded drain that gives the MAC/PHY
+        // time to transmit the U-ITSI DETACH (cl. 16.6.1). U-ITSI DETACH is an
+        // unacknowledged PDU (cl. 16.9.3.3) — the SwMI returns no confirmation —
+        // so once the drain completes the MS is de-registered and returns to
+        // Idle. This lets a subsequent TNMM-REGISTRATION request (Table 15.5) or
+        // a fresh cell (re)selection start a new ITSI attach. At shutdown the
+        // router has already stopped ticking (deregistration_pending() went false
+        // when the countdown reached 0), so the Idle transition below only takes
+        // effect for a command-initiated de-registration where the MS keeps
+        // running.
         if self.reg_state == RegState::Detaching {
-            self.detach_countdown = self.detach_countdown.saturating_sub(1);
+            if self.detach_countdown > 0 {
+                self.detach_countdown = self.detach_countdown.saturating_sub(1);
+                return;
+            }
+            tracing::info!(
+                "MM(MS): de-registration drain complete; U-ITSI DETACH is unacknowledged \
+                 (cl. 16.9.3.3), returning to Idle (ready to register again)"
+            );
+            self.reg_state = RegState::Idle;
             return;
         }
 
@@ -3440,9 +3460,32 @@ attach_groups = []
         );
         let (accepted, _detail) = last_ack(&dispatcher);
         assert!(accepted);
-    }
 
-    /// A TNMM-DEREGISTRATION request while not registered is a no-op that is
+        // The bounded drain (cl. 16.6.1) counts down while Detaching. U-ITSI
+        // DETACH is unacknowledged (cl. 16.9.3.3): once the drain completes the
+        // MS must return to Idle rather than staying stuck in Detaching (which
+        // previously rejected any later registration with "de-registration in
+        // progress").
+        for _ in 0..=DETACH_DRAIN_SLOTS {
+            mm.tick_start(&mut q, TdmaTime::default());
+        }
+        assert_eq!(
+            mm.reg_state,
+            RegState::Idle,
+            "MS returns to Idle after the de-registration drain"
+        );
+
+        // A subsequent TNMM-REGISTRATION request is now accepted (was rejected
+        // with 'de-registration in progress' while stuck in Detaching).
+        dispatcher.send(ControlCommand::TnmmRegistration {
+            handle: 23,
+            request: Box::new(own_registration_request()),
+        });
+        mm.tick_start(&mut q, TdmaTime::default());
+        assert_eq!(mm.reg_state, RegState::Registering);
+        let (accepted, _detail) = last_ack(&dispatcher);
+        assert!(accepted, "re-registration accepted after returning to Idle");
+    }
     /// acknowledged with a documented detail.
     #[test]
     fn test_tnmm_deregistration_request_when_not_registered() {
