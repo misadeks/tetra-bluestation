@@ -6,6 +6,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use toml::Value;
 
+use tetra_core::freqs::FreqInfo;
+
 use crate::bluestation::{
     CarrierOverrideDto, CellInfoDto, CfgControlDto, CfgMsDto, DuplexTableDto, FolderDto, FrequencyListDto, NetInfoDto,
     NetworkDto, TalkgroupDto, apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_carrier_override_dtos,
@@ -139,6 +141,35 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
                 if let Some(first) = cfg.codeplug.scan_candidate_frequencies().first().copied() {
                     soapy.dl_freq = first as f64;
                     soapy.dl_freq_seeded = true;
+                }
+            }
+
+            // Seed the uplink center when the seeded/authored DL carrier has a
+            // matching [[carrier_override]] that pins a duplex spacing. The SDR
+            // TX chain is built at startup from ul_freq, so without this the MS
+            // could camp but never transmit (uplink dead, registration fails).
+            // Deriving UL = DL - duplex here (standard reverse_operation = false;
+            // custom spacing wins, else the duplex-table index) restores uplink
+            // TX without re-authoring a fixed rx_freq. When no override matches
+            // (or it is rx_only), the uplink stays unset for camp-time SYSINFO
+            // derivation.
+            if soapy.ul_freq == 0.0 && soapy.dl_freq > 0.0 {
+                if let Some(co) = cfg.codeplug.carrier_override_for_freq(soapy.dl_freq as u32) {
+                    if !co.rx_only && (co.duplex_index.is_some() || co.custom_duplex_spacing.is_some()) {
+                        if let Ok(freq_info) = FreqInfo::from_components_with_table(
+                            co.freq_band,
+                            co.main_carrier,
+                            co.freq_offset_hz,
+                            false,
+                            co.duplex_index.unwrap_or(0),
+                            co.custom_duplex_spacing,
+                            &cfg.duplex_table,
+                        ) {
+                            let (_dl, ul) = freq_info.get_freqs();
+                            soapy.ul_freq = ul as f64;
+                            soapy.ul_freq_seeded = true;
+                        }
+                    }
                 }
             }
         }
@@ -487,6 +518,65 @@ dwell_ms = 800
         assert!(!rendered.contains("freq_band"), "MS cell RF must stay omitted");
         // Re-parses through the same validator.
         from_toml_str(&rendered).expect("reparse").validate().expect("revalidate");
+    }
+
+    #[test]
+    fn ms_derives_uplink_from_matching_carrier_override() {
+        // A scan-driven MS whose DL scan candidate matches a [[carrier_override]]
+        // carrying a custom duplex spacing must derive the uplink center at
+        // config-load so the SDR TX chain is built (uplink alive) without an
+        // authored rx_freq.
+        const MS_OVERRIDE: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+ppm_err = 0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1234567
+subscriber_class = 1
+attach_groups = []
+
+[[frequency_list]]
+name = "home"
+mode = "List"
+frequencies = [439825000]
+dwell_ms = 800
+
+[[carrier_override]]
+name = "BS"
+band = 4
+carrier = 1593
+colour_code = 1
+duplex_index = 7
+custom_duplex_spacing = 9400000
+"#;
+        let cfg = from_toml_str(MS_OVERRIDE).expect("parse MS with carrier override");
+        cfg.validate().expect("validate");
+
+        let soapy = cfg.phy_io.soapysdr.as_ref().expect("soapy");
+        assert_eq!(soapy.dl_freq, 439_825_000.0);
+        assert!(soapy.dl_freq_seeded);
+        // UL = DL - 9.4 MHz custom duplex spacing (reverse_operation = false).
+        assert_eq!(soapy.ul_freq, 430_425_000.0);
+        assert!(soapy.ul_freq_seeded);
+
+        // The derived uplink must not round-trip back as a fixed rx_freq.
+        let rendered = to_toml_string(&cfg).expect("serialize");
+        assert!(!rendered.contains("rx_freq"), "derived UL must not serialize as rx_freq");
+        assert!(!rendered.contains("tx_freq"), "seeded RX must not serialize as tx_freq");
     }
 
     #[test]

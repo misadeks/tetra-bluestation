@@ -50,6 +50,7 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> CfgPhyIo {
             ul_freq: soapy_dto.rx_freq.unwrap_or(0.0),
             dl_freq: soapy_dto.tx_freq.unwrap_or(0.0),
             dl_freq_seeded: false,
+            ul_freq_seeded: false,
             ppm_err: soapy_dto.ppm_err.unwrap_or(0.0),
             device: soapy_dto.device,
             fs: soapy_dto.sample_rate,

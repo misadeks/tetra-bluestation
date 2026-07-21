@@ -14,6 +14,11 @@ pub struct CfgSoapySdr {
     /// the serialized form so an MS config round-trips without a spurious
     /// `tx_freq`.
     pub dl_freq_seeded: bool,
+    /// True when `ul_freq` was auto-derived (MS mode) from a matching
+    /// `[[carrier_override]]` duplex spacing rather than authored in the config.
+    /// Kept out of the serialized form so an MS config round-trips without a
+    /// spurious `rx_freq`.
+    pub ul_freq_seeded: bool,
     /// PPM frequency error correction
     pub ppm_err: f64,
     /// Argument string to select a specific SDR device.
@@ -97,7 +102,7 @@ pub fn cfg_to_soapy_dto(s: &CfgSoapySdr) -> SoapySdrDto {
     SoapySdrDto {
         // A 0 Hz value means "unset" (MS mode: seeded from scan / derived at
         // camp), so it is omitted from the serialized form.
-        rx_freq: (s.ul_freq > 0.0).then_some(s.ul_freq),
+        rx_freq: (s.ul_freq > 0.0 && !s.ul_freq_seeded).then_some(s.ul_freq),
         tx_freq: (s.dl_freq > 0.0 && !s.dl_freq_seeded).then_some(s.dl_freq),
         ppm_err: Some(s.ppm_err),
         device: s.device.clone(),
