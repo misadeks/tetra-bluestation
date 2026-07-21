@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::bluestation::{
-    CellInfoDto, CfgControlDto, CfgMsDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_cell_dto,
-    cfg_to_ms_dto, cfg_to_net_dto, cfg_to_phy_dto, ms_dto_to_cfg, net_dto_to_cfg,
+    CellInfoDto, CfgControlDto, CfgMsDto, DuplexTableDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg,
+    cfg_control_to_dto, cfg_to_cell_dto, cfg_to_duplex_dto, cfg_to_ms_dto, cfg_to_net_dto, cfg_to_phy_dto,
+    duplex_dto_to_cfg, duplex_table_is_default, ms_dto_to_cfg, net_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -74,6 +75,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     }
 
+    // Optional duplex_table section
+    if let Some(ref dt) = root.duplex_table {
+        if !dt.extra.is_empty() {
+            return Err(format!("Unrecognized fields in duplex_table config: {:?}", sorted_keys(&dt.extra)).into());
+        }
+    }
+
     // Build config from required and optional values
     let mut cfg = StackConfig {
         stack_mode: root.stack_mode,
@@ -81,6 +89,10 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         phy_io: phy_dto_to_cfg(root.phy_io),
         net: net_dto_to_cfg(root.net_info),
         cell: cell_dto_to_cfg(root.cell_info),
+        duplex_table: match root.duplex_table {
+            Some(dt) => duplex_dto_to_cfg(dt)?,
+            None => Default::default(),
+        },
         ms: root.ms.map(ms_dto_to_cfg),
         brew: None,
         telemetry: None,
@@ -145,6 +157,8 @@ struct TomlConfigRoot {
     command: Option<CfgControlDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ms: Option<CfgMsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duplex_table: Option<DuplexTableDto>,
 
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     extra: HashMap<String, Value>,
@@ -169,6 +183,11 @@ fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
         telemetry: cfg.telemetry.as_ref().map(cfg_telemetry_to_dto),
         command: cfg.control.as_ref().map(cfg_control_to_dto),
         ms: cfg.ms.as_ref().map(cfg_to_ms_dto),
+        duplex_table: if duplex_table_is_default(&cfg.duplex_table) {
+            None
+        } else {
+            Some(cfg_to_duplex_dto(&cfg.duplex_table))
+        },
         extra: HashMap::new(),
     }
 }
@@ -347,6 +366,77 @@ attach_groups = []
         let cfg = from_toml_str(MS_TOML).expect("initial parse");
         let rendered = to_toml_string(&cfg).expect("serialize");
         assert!(rendered.contains("config_version = \"0.6\""));
+    }
+
+    // An MS config whose duplex spacing comes from a programmed [duplex_table]
+    // override (index 7) instead of a per-channel custom_duplex_spacing.
+    const MS_TOML_DUPLEX_TABLE: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+tx_gain_dac = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[duplex_table]
+overrides = [[7, 9400000]]
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+"#;
+
+    #[test]
+    fn duplex_table_section_drives_resolution_and_roundtrips() {
+        // Parsing succeeds only because the [duplex_table] override supplies the
+        // spacing for index 7 (which has no ETSI default), letting validate()'s
+        // derived DL/UL match the configured soapy freqs.
+        let cfg = from_toml_str(MS_TOML_DUPLEX_TABLE).expect("parse with duplex_table");
+        assert_eq!(cfg.duplex_table.entries()[7], Some(9_400_000));
+
+        // Round-trip: the section must survive serialize -> reparse.
+        let rendered = to_toml_string(&cfg).expect("serialize");
+        assert!(rendered.contains("[duplex_table]"));
+        let reparsed = from_toml_str(&rendered).expect("reparse");
+        assert_eq!(reparsed.duplex_table.entries()[7], Some(9_400_000));
+    }
+
+    #[test]
+    fn default_config_omits_duplex_table_section() {
+        // MS_TOML has no [duplex_table]; the serialized form must not invent one.
+        let cfg = from_toml_str(MS_TOML).expect("parse");
+        assert!(super::duplex_table_is_default(&cfg.duplex_table));
+        let rendered = to_toml_string(&cfg).expect("serialize");
+        assert!(!rendered.contains("[duplex_table]"));
+    }
+
+    #[test]
+    fn duplex_table_rejects_bad_index() {
+        let bad = MS_TOML_DUPLEX_TABLE.replace("[[7, 9400000]]", "[[9, 9400000]]");
+        assert!(from_toml_str(&bad).is_err());
     }
 
     // An MS config that additionally configures a control endpoint with HTTP

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
-use tetra_core::freqs::FreqInfo;
+use tetra_core::freqs::{DuplexTable, FreqInfo};
 
 use crate::bluestation::{CfgCellInfo, CfgControl, CfgMs, CfgNetInfo, CfgPhyIo, PhyBackend, StackState};
 
@@ -61,6 +61,10 @@ pub struct StackConfig {
     pub net: CfgNetInfo,
     pub cell: CfgCellInfo,
 
+    /// Programmable 8-entry duplex-spacing table (TS 100 392-15 cl. 6). Defaults
+    /// to the ETSI spec table when no `[duplex_table]` section is configured.
+    pub duplex_table: DuplexTable,
+
     /// Mobile Station configuration. Required when `stack_mode == Ms`.
     pub ms: Option<CfgMs>,
 
@@ -98,13 +102,14 @@ impl StackConfig {
                 .as_ref()
                 .expect("SoapySdr config must be set for SoapySdr PhyIo");
 
-            let Ok(freq_info) = FreqInfo::from_components(
+            let Ok(freq_info) = FreqInfo::from_components_with_table(
                 self.cell.freq_band,
                 self.cell.main_carrier,
                 self.cell.freq_offset_hz,
                 self.cell.reverse_operation,
                 self.cell.duplex_spacing_id,
                 self.cell.custom_duplex_spacing,
+                &self.duplex_table,
             ) else {
                 return Err("Invalid cell info frequency settings");
             };

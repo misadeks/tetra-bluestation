@@ -28,5 +28,8 @@ pub use sec_control::*;
 pub mod sec_ms;
 pub use sec_ms::*;
 
+pub mod sec_duplex;
+pub use sec_duplex::*;
+
 pub mod state;
 pub use state::*;

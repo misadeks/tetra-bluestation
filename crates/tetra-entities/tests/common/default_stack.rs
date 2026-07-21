@@ -16,6 +16,7 @@ pub fn default_test_config_bs() -> StackConfig {
         phy_io,
         net: net_info,
         cell: cell_info,
+        duplex_table: Default::default(),
         ms: None,
         brew: None,
         telemetry: None,
