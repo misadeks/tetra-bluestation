@@ -75,6 +75,10 @@ pub struct Demodulator {
     /// Absolute values of past samples,
     /// used for symbol timing estimation.
     past_samples_abs: history::History<RealSample, { SPS * 512 }>,
+
+    /// Most recent downlink RSSI measurement (uncalibrated dBFS), updated once
+    /// per demodulated downlink slot. `None` until the first DL slot is measured.
+    last_dl_rssi_dbfs: Option<f32>,
 }
 
 impl Demodulator {
@@ -99,6 +103,7 @@ impl Demodulator {
             matched_filter: fir::FirComplexSym::new(CHANNEL_FILTER_TAPS.len()),
             past_samples: history::History::new(num::zero()),
             past_samples_abs: history::History::new(num::zero()),
+            last_dl_rssi_dbfs: None,
         };
 
         self_.set_slot_ready_time();
@@ -222,9 +227,40 @@ impl Demodulator {
                 self.process_slot(SPS * 256 - SPS * 255 / 2, 128, 2);
             }
             Mode::Dl | Mode::DlUnsynchronized => {
+                self.measure_dl_rssi(SPS * 256, SPS * 255);
                 self.process_slot(SPS * 256, 256, 0);
             } // TODO: a shorter window could be used for Mode::DlUnsynchronized
         }
+    }
+
+    /// Measure downlink RSSI over one slot window as **uncalibrated dBFS**.
+    ///
+    /// Mean power of the matched-filtered sample magnitudes (`past_samples_abs`)
+    /// over `n` samples ending `d` samples in the past, expressed relative to a
+    /// full-scale sample magnitude of 1.0:
+    /// `rssi_dbfs = 10*log10(mean(|s|^2))` — equivalent to flowstation's
+    /// `20*log10(sqrt(mean(|s|^2)))`. This is a relative measure of received
+    /// signal strength (not calibrated to dBm); a full-scale carrier reads 0 dBFS
+    /// and weaker signals read negative. Used by the scan/camp engine to compare
+    /// candidate cells and for RSSI monitoring in the UI.
+    fn measure_dl_rssi(&mut self, d: usize, n: usize) {
+        let mut sum_sq: f64 = 0.0;
+        for i in 0..n {
+            let a = self.past_samples_abs.delayed(d - i) as f64;
+            sum_sq += a * a;
+        }
+        let mean_power = sum_sq / n as f64;
+        self.last_dl_rssi_dbfs = Some(if mean_power > 0.0 {
+            (10.0 * mean_power.log10()) as f32
+        } else {
+            f32::NEG_INFINITY
+        });
+    }
+
+    /// Most recent downlink RSSI measurement (uncalibrated dBFS), or `None`
+    /// before the first downlink slot has been demodulated.
+    pub fn dl_rssi_dbfs(&self) -> Option<f32> {
+        self.last_dl_rssi_dbfs
     }
 
     /// Try to find bursts from a slot.
@@ -597,5 +633,51 @@ impl SlotBurstFinder {
             train_type: self.train_type,
             bits: &self.bits[self.burst_pos..self.burst_pos + self.burst_len],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fill the entire magnitude history with a constant amplitude so any slot
+    /// window reads that amplitude, then measure. `mean(|s|^2) = amp^2`, so the
+    /// RSSI must equal `20*log10(amp)` dBFS regardless of the window.
+    fn rssi_for_constant_amplitude(amp: RealSample) -> f32 {
+        let mut demod = Demodulator::new(Mode::Dl);
+        for _ in 0..(SPS * 512) {
+            demod.past_samples_abs.write(amp);
+        }
+        demod.measure_dl_rssi(SPS * 256, SPS * 255);
+        demod.dl_rssi_dbfs().expect("rssi measured")
+    }
+
+    #[test]
+    fn test_dl_rssi_full_scale_is_zero_dbfs() {
+        // A full-scale magnitude (1.0) is the 0 dBFS reference.
+        let rssi = rssi_for_constant_amplitude(1.0);
+        assert!((rssi as f64).abs() < 1e-3, "expected ~0 dBFS, got {rssi}");
+    }
+
+    #[test]
+    fn test_dl_rssi_half_scale_is_minus_six_dbfs() {
+        // Half amplitude -> 20*log10(0.5) = -6.0206 dBFS.
+        let rssi = rssi_for_constant_amplitude(0.5);
+        let expected = 20.0 * 0.5_f64.log10();
+        assert!((rssi as f64 - expected).abs() < 1e-3, "expected {expected} dBFS, got {rssi}");
+    }
+
+    #[test]
+    fn test_dl_rssi_none_before_measurement() {
+        let demod = Demodulator::new(Mode::Dl);
+        assert!(demod.dl_rssi_dbfs().is_none());
+    }
+
+    #[test]
+    fn test_dl_rssi_zero_signal_is_neg_infinity() {
+        // A fresh demodulator's history is all zeros -> no power -> -inf dBFS.
+        let mut demod = Demodulator::new(Mode::Dl);
+        demod.measure_dl_rssi(SPS * 256, SPS * 255);
+        assert_eq!(demod.dl_rssi_dbfs(), Some(f32::NEG_INFINITY));
     }
 }
