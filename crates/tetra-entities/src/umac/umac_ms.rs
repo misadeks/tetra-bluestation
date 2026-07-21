@@ -29,6 +29,7 @@ use tetra_pdus::umac::pdus::access_define::AccessDefine;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
+use tetra_pdus::umac::pdus::mac_end_ul::MacEndUl;
 use tetra_pdus::umac::pdus::mac_frag_dl::MacFragDl;
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_pdus::umac::pdus::mac_sync::MacSync;
@@ -50,6 +51,17 @@ const SCH_HU_TYPE1_BITS: usize = 92;
 /// PDU type (1) + fill-bit indication (1) + length-indication-or-capacity-
 /// request flag (1) + length indication (4).
 const MAC_END_HU_HEADER_BITS: usize = 7;
+
+/// SCH/F (Normal Uplink Burst) type-1 MAC block length in bits (ETSI TS 100
+/// 392-2 SCH/F coding parameters — the same 268-bit block as the downlink
+/// SCH/F). Used for a reserved-access MAC-END-UL completing a fragmented
+/// uplink transfer whose remainder is too large for a MAC-END-HU subslot.
+const SCH_F_TYPE1_BITS: usize = 268;
+
+/// MAC-END-UL fixed header length in bits (ETSI TS 100 392-2 cl. 21.4.2.5):
+/// PDU type (2) + PDU subtype (1) + fill-bit indication (1) + length-indication-
+/// or-capacity-request (6).
+const MAC_END_UL_HEADER_BITS: usize = 10;
 
 /// TETRA broadcast identity: the 24-bit SSI with all bits set (ETSI TS 100
 /// 392-2 addressing). MAC PDUs addressed to it are processed by every MS.
@@ -77,21 +89,41 @@ pub struct PendingUplink {
     pub tx_reporter: Option<TxReporter>,
 }
 
+/// How the remainder of a fragmented uplink transfer is completed, chosen from
+/// the remainder size when the frag-start is built (ETSI TS 100 392-2
+/// cl. 23.4.2.1.2). The capacity request in the frag-start MAC-ACCESS asks the
+/// BS for the matching resource (cl. 23.5.2); the grant it returns is checked
+/// against this before the fragment end is emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragEndKind {
+    /// MAC-END-HU on a single granted SCH/HU subslot (Control Uplink Burst).
+    /// Requested with `Req1Subslot`; the remainder fits ~81 TM-SDU bits.
+    MacEndHu,
+    /// MAC-END-UL on a granted SCH/F full slot (Normal Uplink Burst). Requested
+    /// with `Req1Slot`; the remainder fits ~254 TM-SDU bits.
+    MacEndUl,
+}
+
 /// The remaining TM-SDU of an uplink transfer that did not fit a single
 /// MAC-ACCESS random-access burst and was fragmented (ETSI TS 100 392-2
 /// cl. 23.4.2.1.2). The first fragment (a MAC-ACCESS "start of fragmentation"
 /// carrying a capacity request) is transmitted by random access; this holds
-/// the remainder, sent as a MAC-END-HU once the BS grants an uplink subslot
-/// (cl. 23.5.2 basic slot granting).
+/// the remainder, sent as a MAC-END-HU (subslot) or MAC-END-UL (full slot)
+/// once the BS grants the requested uplink capacity (cl. 23.5.2 basic slot
+/// granting).
 #[derive(Debug, Clone)]
 pub struct UplinkFragment {
-    /// TM-SDU bits after the first fragment, to be carried by the MAC-END-HU.
+    /// TM-SDU bits after the first fragment, carried by the fragment-end PDU.
     pub remainder: BitBuffer,
     pub scrambling_code: u32,
+    /// Which fragment-end PDU/channel completes this transfer (chosen from the
+    /// remainder size when the frag-start was built) and the capacity the BS
+    /// grant must match.
+    pub end_kind: FragEndKind,
     /// Transmit receipt for the whole fragmented TM-SDU (see [`PendingUplink::tx_reporter`]).
     /// The receipt travels with the completing fragment: the MS-MAC marks it
-    /// *transmitted* when the MAC-END-HU is emitted and *discarded* if the
-    /// remainder cannot be sent (no grant / unsupported allocation), so the LLC
+    /// *transmitted* when the fragment end is emitted and *discarded* if the
+    /// remainder cannot be sent (no grant / mismatched allocation), so the LLC
     /// retransmits the whole transfer.
     pub tx_reporter: Option<TxReporter>,
 }
@@ -577,7 +609,7 @@ impl UmacMs {
                 // (cl. 23.5.2 basic slot granting). Emit it now; the transmit
                 // receipt (held on the fragment) is marked there.
                 if self.pending_fragment.is_some() {
-                    self.emit_mac_end_hu(queue, pdu.slot_granting_element.as_ref());
+                    self.emit_fragment_end(queue, pdu.slot_granting_element.as_ref());
                 } else if let Some(pending) = completed {
                     // Unfragmented: the whole TM-SDU is now delivered to the
                     // BS-MAC. Mark the LLC transmit receipt so the acknowledged
@@ -1081,22 +1113,43 @@ impl UmacMs {
         queue.push_back(m);
     }
 
-    /// Emit the MAC-END-HU that completes a fragmented uplink transfer, on the
-    /// subslot the base station granted in `grant` (ETSI TS 100 392-2 cl. 23.5.2
-    /// basic slot granting; cl. 23.4.2.1.2 uplink fragmentation form i). This is
-    /// a **reserved-access** transmission (the BS reserved the slot in response
-    /// to our frag-start capacity request), so it does not contend via the
-    /// random access algorithm. Consumes `pending_fragment`.
+    /// Mark a fragmented transfer's transmit receipt discarded so the LLC
+    /// acknowledged basic link retransmits the whole SDU (cl. 22.3.2.3). Used on
+    /// every path where the fragment end cannot be emitted.
+    fn discard_fragment(frag: &UplinkFragment) {
+        if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
+            tx_reporter.try_mark_discarded();
+        }
+    }
+
+    /// Emit the fragment-end PDU that completes a fragmented uplink transfer, on
+    /// the capacity the base station granted in `grant` (ETSI TS 100 392-2
+    /// cl. 23.5.2 basic slot granting; cl. 23.4.2.1.2 uplink fragmentation
+    /// form i). This is a **reserved-access** transmission (the BS reserved the
+    /// slot in response to our frag-start capacity request), so it does not
+    /// contend via the random access algorithm. Consumes `pending_fragment`.
     ///
-    /// Only the single-subslot "next opportunity" grant produced for a
-    /// two-fragment transfer is handled; any other capacity allocation or
-    /// granting delay is logged as unimplemented and the remainder dropped (the
-    /// MM layer retransmits the whole demand). For granting delay "capacity
-    /// allocation at next opportunity" (cl. 23.5.2.2.2), the reserved slot is the
-    /// same-numbered uplink timeslot in the same TDMA frame as the downlink slot
-    /// carrying the grant; since the uplink frame is a fixed 2-timeslot delay
-    /// from the downlink (cl. 9.3.9 Frame alignment), that is `dltime + 2`.
-    fn emit_mac_end_hu(&mut self, queue: &mut MessageQueue, grant: Option<&BasicSlotgrant>) {
+    /// The fragment-end PDU and channel are chosen by the remainder size at
+    /// frag-start time ([`FragEndKind`]) and must match the grant:
+    /// - `Req1Subslot` -> `FirstSubslotGranted` -> MAC-END-HU on SCH/HU (Control
+    ///   Uplink Burst) — remainder up to ~81 TM-SDU bits;
+    /// - `Req1Slot` -> `Grant1Slot` -> MAC-END-UL on SCH/F (Normal Uplink Burst)
+    ///   — remainder up to ~254 TM-SDU bits.
+    ///
+    /// Only the "next opportunity" granting delay (cl. 23.5.2.2.2) is handled;
+    /// any other capacity allocation / granting delay, or a grant that does not
+    /// match the requested [`FragEndKind`], is logged and the remainder dropped
+    /// (the MM layer retransmits the whole demand). For "capacity allocation at
+    /// next opportunity" the reserved slot is the same-numbered uplink timeslot
+    /// in the same TDMA frame as the downlink slot carrying the grant; since the
+    /// uplink frame is a fixed 2-timeslot delay from the downlink (cl. 9.3.9
+    /// Frame alignment), that is `dltime + 2`.
+    ///
+    /// Remainders larger than one full slot would need true multi-slot
+    /// fragmentation (MAC-FRAG-UL continuations across consecutive reserved
+    /// slots); those are rejected earlier in `build_mac_access_frag_start` and
+    /// never reach here.
+    fn emit_fragment_end(&mut self, queue: &mut MessageQueue, grant: Option<&BasicSlotgrant>) {
         let Some(mut frag) = self.pending_fragment.take() else {
             return;
         };
@@ -1105,54 +1158,70 @@ impl UmacMs {
         let Some(grant) = grant else {
             tracing::warn!(
                 "uplink fragmentation: frag-start acknowledged but MAC-RESOURCE carried no slot grant; \
-                 cannot send MAC-END-HU (LLC/MM will retransmit)"
+                 cannot send fragment end (LLC/MM will retransmit)"
             );
-            if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
-                tx_reporter.try_mark_discarded();
-            }
+            Self::discard_fragment(&frag);
             return;
         };
 
-        // We requested a single subslot, so we expect a first-subslot grant at
-        // the next opportunity. Anything else is not needed for a two-fragment
-        // transfer and is out of scope.
-        match grant.capacity_allocation {
-            BasicSlotgrantCapAlloc::FirstSubslotGranted => {}
-            other => {
-                unimplemented_log!(
-                    "uplink fragmentation: unsupported capacity allocation {:?}; dropping MAC-END-HU",
-                    other
-                );
-                if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
-                    tx_reporter.try_mark_discarded();
-                }
-                return;
-            }
-        }
+        // Only the "next opportunity" granting delay is used for a two-fragment
+        // transfer (cl. 23.5.2.2.2).
         match grant.granting_delay {
             BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity => {}
             other => {
                 unimplemented_log!(
-                    "uplink fragmentation: unsupported granting delay {:?}; dropping MAC-END-HU",
+                    "uplink fragmentation: unsupported granting delay {:?}; dropping fragment end",
                     other
                 );
-                if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
-                    tx_reporter.try_mark_discarded();
-                }
+                Self::discard_fragment(&frag);
                 return;
             }
         }
 
-        let Some(block) = Self::build_mac_end_hu_block(&mut frag.remainder) else {
-            tracing::warn!(
-                "uplink fragmentation: {}-bit remainder too large for a single MAC-END-HU; \
-                 multi-slot fragmentation not implemented",
-                rem_len
-            );
-            if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
-                tx_reporter.try_mark_discarded();
+        // The grant's capacity allocation must match the capacity we requested
+        // in the frag-start (cl. 23.5.2): a subslot for a MAC-END-HU, a full
+        // slot for a MAC-END-UL. Build the matching fragment-end block on its
+        // logical channel; the LMAC turns SCH/HU -> Control Uplink Burst and
+        // SCH/F -> Normal Uplink Burst (cl. 9.4.4.2).
+        let (block, logical_channel) = match (frag.end_kind, grant.capacity_allocation) {
+            (FragEndKind::MacEndHu, BasicSlotgrantCapAlloc::FirstSubslotGranted) => {
+                match Self::build_mac_end_hu_block(&mut frag.remainder) {
+                    Some(block) => (block, LogicalChannel::SchHu),
+                    None => {
+                        tracing::warn!(
+                            "uplink fragmentation: {}-bit remainder too large for a single MAC-END-HU; \
+                             dropping (LLC/MM will retransmit)",
+                            rem_len
+                        );
+                        Self::discard_fragment(&frag);
+                        return;
+                    }
+                }
             }
-            return;
+            (FragEndKind::MacEndUl, BasicSlotgrantCapAlloc::Grant1Slot) => {
+                match Self::build_mac_end_ul_block(&mut frag.remainder) {
+                    Some(block) => (block, LogicalChannel::SchF),
+                    None => {
+                        tracing::warn!(
+                            "uplink fragmentation: {}-bit remainder too large for a single MAC-END-UL; \
+                             multi-slot fragmentation not implemented, dropping (LLC/MM will retransmit)",
+                            rem_len
+                        );
+                        Self::discard_fragment(&frag);
+                        return;
+                    }
+                }
+            }
+            (kind, other) => {
+                unimplemented_log!(
+                    "uplink fragmentation: grant capacity {:?} does not match requested {:?}; \
+                     dropping fragment end",
+                    other,
+                    kind
+                );
+                Self::discard_fragment(&frag);
+                return;
+            }
         };
 
         // Granting delay "capacity allocation at next opportunity"
@@ -1162,26 +1231,27 @@ impl UmacMs {
         // dltime + 2 -- the same offset the random access path uses.
         let ul_time = self.dltime.add_timeslots(2);
         tracing::info!(
-            "uplink fragmentation: BS granted a subslot; transmitting MAC-END-HU ({} SDU bits) at UL {:?}",
+            "uplink fragmentation: BS granted {:?}; transmitting {:?} ({} SDU bits) at UL {:?} on {:?}",
+            grant.capacity_allocation,
+            frag.end_kind,
             rem_len,
-            ul_time
+            ul_time,
+            logical_channel
         );
 
-        // NOTE: this MAC-END-HU is a reserved-access burst that must land in the
-        // exact granted uplink slot for the BS's per-slot ownership check
-        // (cl. 23.5.2) to accept it -- a burst outside the reserved slot is
-        // rejected ("MAC-END-HU for unassigned block"). TETRA has no
-        // timing-advance procedure; the uplink/downlink timing is fixed
+        // NOTE: this fragment-end burst is a reserved-access transmission that
+        // must land in the exact granted uplink slot for the BS's per-slot
+        // ownership check (cl. 23.5.2) to accept it -- a burst outside the
+        // reserved slot is rejected ("MAC-END-* for unassigned block"). TETRA
+        // has no timing-advance procedure; the uplink/downlink timing is fixed
         // (cl. 9.3.9) and the grant here is "next opportunity" (cl. 23.5.2.2.2),
         // so the target slot is exactly dltime + 2, computed above. We mark the
-        // request `reserved_access: true`; PhyMs then transmits it only if that
-        // exact slot is still reachable ahead of the TX generation frontier, and
-        // drops it (MM retransmits the whole demand) rather than frame-advancing
-        // it into an unreserved slot. Reaching the reserved slot is otherwise an
-        // SDR RX->TX timing concern, not a spec feature.
+        // request `reserved_access: true`; PhyMs transmits it at exactly
+        // `ul_time` (with discontinuous TX the exact slot is reachable) rather
+        // than frame-advancing it into an unreserved slot.
         let blk = TmvUnitdataReq {
             mac_block: block,
-            logical_channel: LogicalChannel::SchHu,
+            logical_channel,
             scrambling_code: frag.scrambling_code,
         };
         let m = SapMsg {
@@ -1320,21 +1390,24 @@ impl UmacMs {
                 )
             }
             None => {
-                // Oversized: fragment into MAC-ACCESS (frag start) + MAC-END-HU.
+                // Oversized: fragment into MAC-ACCESS (frag start) + MAC-END-HU
+                // (subslot) or MAC-END-UL (full slot), chosen by the remainder
+                // size in `build_mac_access_frag_start` (cl. 23.4.2.1.2).
                 prim.pdu.seek(0);
                 match Self::build_mac_access_frag_start(issi, &mut prim.pdu) {
-                    Some((frag_block, remainder)) => {
+                    Some((frag_block, remainder, end_kind)) => {
                         let first_bits = sdu_len - remainder.get_len();
                         tracing::info!(
                             "rx_tma_prim: TM-SDU {} bits exceeds a single MAC-ACCESS; fragmenting into \
-                             MAC-ACCESS frag-start ({} SDU bits, capacity request) + MAC-END-HU ({} SDU bits) \
+                             MAC-ACCESS frag-start ({} SDU bits, capacity request) + {:?} ({} SDU bits) \
                              for ISSI {}",
                             sdu_len,
                             first_bits,
+                            end_kind,
                             remainder.get_len(),
                             issi
                         );
-                        // The receipt travels with the completing MAC-END-HU
+                        // The receipt travels with the completing fragment end
                         // (the whole TM-SDU is only "transmitted" once the
                         // remainder is on air); the frag-start carries none.
                         (
@@ -1347,6 +1420,7 @@ impl UmacMs {
                             Some(UplinkFragment {
                                 remainder,
                                 scrambling_code,
+                                end_kind,
                                 tx_reporter,
                             }),
                         )
@@ -1354,7 +1428,8 @@ impl UmacMs {
                     None => {
                         tracing::warn!(
                             "rx_tma_prim: TM-SDU ({} bits) exceeds two-fragment (MAC-ACCESS + \
-                             MAC-END-HU) capacity; multi-slot uplink fragmentation not implemented, dropping",
+                             MAC-END-UL full slot) capacity; multi-slot uplink fragmentation not \
+                             implemented, dropping",
                             sdu_len
                         );
                         return;
@@ -1521,23 +1596,45 @@ impl UmacMs {
         Some(block)
     }
 
+    /// Largest TM-SDU remainder (in bits) that a single MAC-END-HU can carry on
+    /// an SCH/HU subslot: header + SDU + fill must be a whole number of octets
+    /// not exceeding the 92-bit block (cl. 21.4.2.2 / 23.4.2.2).
+    const fn max_end_hu_sdu_bits() -> usize {
+        (SCH_HU_TYPE1_BITS / 8) * 8 - MAC_END_HU_HEADER_BITS
+    }
+
+    /// Largest TM-SDU remainder (in bits) that a single MAC-END-UL can carry on
+    /// an SCH/F full slot: header + SDU + fill must be a whole number of octets
+    /// not exceeding the 268-bit block (cl. 21.4.2.5 / 23.4.2.2).
+    const fn max_end_ul_sdu_bits() -> usize {
+        (SCH_F_TYPE1_BITS / 8) * 8 - MAC_END_UL_HEADER_BITS
+    }
+
     /// Build the first fragment of an oversized uplink TM-SDU: a MAC-ACCESS
     /// "start of fragmentation" block (ETSI TS 100 392-2 cl. 21.4.2.1,
     /// cl. 23.4.2.1.2). The block is addressed with the MS's own ISSI and
     /// carries a **capacity request** — the fragmentation flag set plus a
-    /// "reservation requirement" of one subslot — so the base station grants an
-    /// uplink subslot for the remainder (cl. 23.5.2). The first fragment carries
-    /// as many TM-SDU bits as exactly fill the MAC block after the header, so
-    /// there are no fill bits (cl. 23.4.2.1.2).
+    /// "reservation requirement" sized to the remainder — so the base station
+    /// grants uplink capacity for the remainder (cl. 23.5.2): one subslot
+    /// (`Req1Subslot`) for a MAC-END-HU remainder, or one full slot
+    /// (`Req1Slot`) for a MAC-END-UL remainder. The first fragment carries as
+    /// many TM-SDU bits as exactly fill the MAC block after the header, so there
+    /// are no fill bits (cl. 23.4.2.1.2).
     ///
-    /// Returns the full 92-bit type-1 block and a `BitBuffer` holding the
-    /// remaining TM-SDU bits (to be sent in a MAC-END-HU), or `None` if the SDU
-    /// is not actually larger than one fragment (caller should use the
-    /// self-contained [`Self::build_mac_access_block`] path instead).
-    pub fn build_mac_access_frag_start(issi: u32, sdu: &mut BitBuffer) -> Option<(BitBuffer, BitBuffer)> {
+    /// Returns the full 92-bit type-1 block, a `BitBuffer` holding the remaining
+    /// TM-SDU bits, and the [`FragEndKind`] the remainder must be completed
+    /// with. Returns `None` if the SDU is not actually larger than one fragment
+    /// (caller should use the self-contained [`Self::build_mac_access_block`]
+    /// path instead), or if the remainder is larger than a single full slot can
+    /// carry (true multi-slot fragmentation with MAC-FRAG-UL continuations is
+    /// not implemented).
+    pub fn build_mac_access_frag_start(
+        issi: u32,
+        sdu: &mut BitBuffer,
+    ) -> Option<(BitBuffer, BitBuffer, FragEndKind)> {
         let sdu_len = sdu.get_len();
 
-        let pdu = MacAccess {
+        let mut pdu = MacAccess {
             fill_bits: false,
             encrypted: false,
             addr: Some(TetraAddress {
@@ -1548,8 +1645,10 @@ impl UmacMs {
             length_ind: None,
             // Capacity request (cl. 21.4.2.1): fragmentation flag set marks this
             // as the start of a fragmented transfer; the reservation requirement
-            // asks the BS for one subslot to send the (single) MAC-END-HU
-            // remainder (cl. 23.5.2 / Table 21.55).
+            // (chosen below from the remainder size) asks the BS for the uplink
+            // capacity to send the fragment end (cl. 23.5.2 / Table 21.55). The
+            // reservation-requirement field is a fixed 4 bits, so the header
+            // length does not depend on the value used here.
             frag_flag: Some(true),
             reservation_req: Some(ReservationRequirement::Req1Subslot),
         };
@@ -1568,6 +1667,22 @@ impl UmacMs {
             // Not actually oversized for a fragmented transfer.
             return None;
         }
+        let remainder_len = sdu_len - frag_bits;
+
+        // Choose the fragment-end PDU and matching capacity request from the
+        // remainder size (cl. 23.4.2.1.2 / 23.5.2): a small remainder fits a
+        // MAC-END-HU on one granted subslot; a larger one needs a MAC-END-UL on
+        // a granted SCH/F full slot. A remainder larger than one full slot would
+        // need true multi-slot fragmentation (MAC-FRAG-UL continuations across
+        // consecutive reserved slots), which is not implemented.
+        let (reservation_req, end_kind) = if remainder_len <= Self::max_end_hu_sdu_bits() {
+            (ReservationRequirement::Req1Subslot, FragEndKind::MacEndHu)
+        } else if remainder_len <= Self::max_end_ul_sdu_bits() {
+            (ReservationRequirement::Req1Slot, FragEndKind::MacEndUl)
+        } else {
+            return None;
+        };
+        pdu.reservation_req = Some(reservation_req);
 
         // Assemble the 92-bit type-1 block: frag-start MAC-ACCESS header + first
         // `frag_bits` of the TM-SDU (fills the block exactly).
@@ -1579,12 +1694,11 @@ impl UmacMs {
 
         // The remainder (TM-SDU bits after the first fragment); `sdu` is now
         // positioned at `frag_bits` from the copy above.
-        let remainder_len = sdu_len - frag_bits;
         let mut remainder = BitBuffer::new(remainder_len);
         remainder.copy_bits(sdu, remainder_len);
         remainder.seek(0);
 
-        Some((block, remainder))
+        Some((block, remainder, end_kind))
     }
 
     /// Build the MAC-END-HU block that completes a fragmented uplink transfer
@@ -1598,8 +1712,8 @@ impl UmacMs {
     /// receiver (it reads only `length_ind * 8` bits).
     ///
     /// Returns the full 92-bit type-1 block, or `None` if the remainder is too
-    /// large for one MAC-END-HU (which would require further fragmentation —
-    /// out of scope; the registration SDUs handled here fit two fragments).
+    /// large for one MAC-END-HU (the caller then uses the full-slot MAC-END-UL
+    /// path instead).
     pub fn build_mac_end_hu_block(remainder: &mut BitBuffer) -> Option<BitBuffer> {
         let sdu_len = remainder.get_len();
         let content_len = MAC_END_HU_HEADER_BITS + sdu_len;
@@ -1609,7 +1723,7 @@ impl UmacMs {
         let num_fill = fillbits::addition::compute_required_bytealigned(content_len);
         let total_len = content_len + num_fill;
         if total_len > SCH_HU_TYPE1_BITS {
-            // Would not fit one MAC-END-HU block; needs multi-slot fragmentation.
+            // Would not fit one MAC-END-HU block; needs a full-slot MAC-END-UL.
             return None;
         }
         debug_assert!(total_len % 8 == 0);
@@ -1630,6 +1744,60 @@ impl UmacMs {
             fillbits::addition::write(&mut block, Some(num_fill));
         }
         // Pad the rest of the physical 92-bit block with zeros so the whole
+        // type-1 block is defined for channel encoding; the receiver ignores
+        // these bits (they are beyond `length_ind * 8`).
+        let remaining = block.get_len_remaining();
+        if remaining > 0 {
+            block.write_zeroes(remaining);
+        }
+        block.seek(0);
+        Some(block)
+    }
+
+    /// Build the MAC-END-UL block that completes a fragmented uplink transfer on
+    /// a granted SCH/F full slot (ETSI TS 100 392-2 cl. 21.4.2.5,
+    /// cl. 23.4.2.1.2). It carries the `remainder` of the TM-SDU in the 268-bit
+    /// SCH/F block, terminated by a **length indication** (octet count) so the
+    /// receiver reassembles exactly the original TM-SDU. Fill bits pad the PDU
+    /// to a byte boundary (cl. 23.4.2.2). The remaining bits of the 268-bit
+    /// block (beyond the length indication) are left zero and are ignored by the
+    /// receiver (it reads only `length_ind * 8` bits).
+    ///
+    /// Returns the full 268-bit type-1 block, or `None` if the remainder is too
+    /// large for one MAC-END-UL (which would require multi-slot fragmentation
+    /// with MAC-FRAG-UL continuations — not implemented).
+    pub fn build_mac_end_ul_block(remainder: &mut BitBuffer) -> Option<BitBuffer> {
+        let sdu_len = remainder.get_len();
+        let content_len = MAC_END_UL_HEADER_BITS + sdu_len;
+
+        // Fill bits to the next byte boundary (the length indication counts
+        // whole octets, cl. 21.4.2.5 / 23.4.2.2).
+        let num_fill = fillbits::addition::compute_required_bytealigned(content_len);
+        let total_len = content_len + num_fill;
+        if total_len > SCH_F_TYPE1_BITS {
+            // Would not fit one full slot; needs multi-slot fragmentation.
+            return None;
+        }
+        debug_assert!(total_len % 8 == 0);
+        let length_ind = (total_len / 8) as u8;
+
+        let pdu = MacEndUl {
+            fill_bits: num_fill != 0,
+            length_ind: Some(length_ind),
+            reservation_req: None,
+        };
+
+        let mut block = BitBuffer::new(SCH_F_TYPE1_BITS);
+        // MAC-END-UL to_bitbuf validates its own fields; a length indication we
+        // computed here is always in range, so this cannot fail in practice.
+        pdu.to_bitbuf(&mut block).ok()?;
+        remainder.seek(0);
+        block.copy_bits(remainder, sdu_len);
+        // Fill bits: "1" then "0"s to the octet boundary (cl. 23.4.2.2).
+        if num_fill != 0 {
+            fillbits::addition::write(&mut block, Some(num_fill));
+        }
+        // Pad the rest of the physical 268-bit block with zeros so the whole
         // type-1 block is defined for channel encoding; the receiver ignores
         // these bits (they are beyond `length_ind * 8`).
         let remaining = block.get_len_remaining();
@@ -2019,6 +2187,7 @@ attach_groups = []
         umac.pending_fragment = Some(UplinkFragment {
             remainder: BitBuffer::from_bitstr(&"1".repeat(40)),
             scrambling_code: 0xABCD_1234,
+            end_kind: FragEndKind::MacEndHu,
             tx_reporter: Some(reporter.clone()),
         });
         let mut q = MessageQueue::new();
@@ -2027,7 +2196,7 @@ attach_groups = []
             capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,
             granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
         };
-        umac.emit_mac_end_hu(&mut q, Some(&grant));
+        umac.emit_fragment_end(&mut q, Some(&grant));
 
         let msg = q.pop_front().expect("MAC-END-HU should be emitted");
         assert!(q.pop_front().is_none(), "exactly one message emitted");
@@ -2036,6 +2205,7 @@ attach_groups = []
             panic!("expected TmvUnitdataReq");
         };
         assert_eq!(slot.ts, umac.dltime.add_timeslots(2), "MAC-END-HU at DL + 2 timeslots");
+        assert!(slot.reserved_access, "MAC-END-HU is a reserved-access burst");
         let blk = slot.blk1.expect("blk1 carries the MAC-END-HU");
         assert_eq!(blk.logical_channel, LogicalChannel::SchHu);
         assert_eq!(blk.scrambling_code, 0xABCD_1234);
@@ -2044,6 +2214,76 @@ attach_groups = []
         // The LLC transmit receipt is marked transmitted so the acknowledged
         // basic link starts its ack-wait/retransmit timer (cl. 22.3.2.3).
         assert!(reporter.is_transmitted(), "MAC-END-HU emission marks the receipt transmitted");
+    }
+
+    /// A remainder too large for a MAC-END-HU subslot is completed by a
+    /// MAC-END-UL on a granted SCH/F full slot (Normal Uplink Burst): once the
+    /// BS acknowledges the frag-start granting one full slot (`Grant1Slot`), the
+    /// UMAC transmits the remainder as a 268-bit MAC-END-UL on SCH/F at DL + 2
+    /// timeslots as a reserved-access burst (cl. 23.4.2.1.2 / 23.5.2).
+    #[test]
+    fn test_grant_emits_mac_end_ul_full_slot() {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let reporter = TxReporter::new();
+        // 160-bit remainder: too large for a MAC-END-HU (max ~81 bits), fits a
+        // MAC-END-UL full slot (max ~254 bits).
+        umac.pending_fragment = Some(UplinkFragment {
+            remainder: BitBuffer::from_bitstr(&"1".repeat(160)),
+            scrambling_code: 0x0BAD_F00D,
+            end_kind: FragEndKind::MacEndUl,
+            tx_reporter: Some(reporter.clone()),
+        });
+        let mut q = MessageQueue::new();
+
+        let grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::Grant1Slot,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        };
+        umac.emit_fragment_end(&mut q, Some(&grant));
+
+        let msg = q.pop_front().expect("MAC-END-UL should be emitted");
+        assert!(q.pop_front().is_none(), "exactly one message emitted");
+        assert_eq!(msg.dest, TetraEntity::Lmac);
+        let SapMsgInner::TmvUnitdataReq(slot) = msg.msg else {
+            panic!("expected TmvUnitdataReq");
+        };
+        assert_eq!(slot.ts, umac.dltime.add_timeslots(2), "MAC-END-UL at DL + 2 timeslots");
+        assert!(slot.reserved_access, "MAC-END-UL is a reserved-access burst");
+        let blk = slot.blk1.expect("blk1 carries the MAC-END-UL");
+        assert_eq!(blk.logical_channel, LogicalChannel::SchF, "full-slot end uses SCH/F");
+        assert_eq!(blk.scrambling_code, 0x0BAD_F00D);
+        assert_eq!(blk.mac_block.get_len(), SCH_F_TYPE1_BITS, "268-bit SCH/F type-1 block");
+        assert!(umac.pending_fragment.is_none(), "fragment consumed");
+        assert!(reporter.is_transmitted(), "MAC-END-UL emission marks the receipt transmitted");
+    }
+
+    /// A grant whose capacity does not match the requested fragment-end kind
+    /// (here a subslot grant when a full slot was requested) cannot complete the
+    /// transfer: nothing is transmitted, the fragment is dropped and its receipt
+    /// marked discarded so the LLC retransmits (cl. 23.5.2 / 22.3.2.3).
+    #[test]
+    fn test_mismatched_grant_drops_fragment() {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let reporter = TxReporter::new();
+        umac.pending_fragment = Some(UplinkFragment {
+            remainder: BitBuffer::from_bitstr(&"1".repeat(160)),
+            scrambling_code: 0,
+            end_kind: FragEndKind::MacEndUl,
+            tx_reporter: Some(reporter.clone()),
+        });
+        let mut q = MessageQueue::new();
+
+        let grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        };
+        umac.emit_fragment_end(&mut q, Some(&grant));
+
+        assert!(q.pop_front().is_none(), "no uplink on a mismatched grant");
+        assert!(umac.pending_fragment.is_none(), "fragment consumed even on mismatch");
+        assert!(reporter.is_discarded(), "mismatched-grant drop marks the receipt discarded");
     }
 
     /// A MAC-RESOURCE that carries no slot grant cannot complete the fragmented
@@ -2057,11 +2297,12 @@ attach_groups = []
         umac.pending_fragment = Some(UplinkFragment {
             remainder: BitBuffer::from_bitstr(&"1".repeat(40)),
             scrambling_code: 0,
+            end_kind: FragEndKind::MacEndHu,
             tx_reporter: Some(reporter.clone()),
         });
         let mut q = MessageQueue::new();
 
-        umac.emit_mac_end_hu(&mut q, None);
+        umac.emit_fragment_end(&mut q, None);
 
         assert!(q.pop_front().is_none(), "no uplink without a grant");
         assert!(umac.pending_fragment.is_none(), "fragment consumed even without a grant");
