@@ -159,6 +159,24 @@ pub struct LmmMleReportInd {
     pub transfer_result: Todo,
 }
 
+/// MLE -> MM break indication (ETSI TS 100 392-2 cl. 18.3.3 / cl. 17.x MLE
+/// service description): access to the communication resources is temporarily
+/// unavailable (serving-cell radio link failure, cl. 18.3.4.5.3), so MM should
+/// regard itself as out of service and inform the TNMM-SAP user (TNMM-SERVICE
+/// "out of service", cl. 15.3.4). The MLE offers MLE-BREAK at every upper-layer
+/// SAP (LCMC to CMCE, LMM to MM); this is the LMM-SAP form. No graceful
+/// service-degradation service list is modelled.
+#[derive(Debug, Clone)]
+pub struct LmmMleBreakInd {}
+
+/// MLE -> MM reopen indication (ETSI TS 100 392-2 cl. 18.3.4.7): access to the
+/// communication resources has been restored (serving-cell downlink recovered).
+/// MM leaves out-of-service; the subsequent cell re-selection / registration
+/// re-evaluation determines the final service state. LMM-SAP counterpart of the
+/// LCMC `LcmcMleReopenInd`.
+#[derive(Debug, Clone)]
+pub struct LmmMleReopenInd {}
+
 /// MLE -> MM serving-cell receive-level indication (**implementation-defined**,
 /// NOT an ETSI LMM-SAP primitive).
 ///

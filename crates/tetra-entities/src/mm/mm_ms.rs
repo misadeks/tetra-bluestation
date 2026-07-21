@@ -192,6 +192,14 @@ pub struct MmMs {
     /// first measurement or while out of service. Surfaced in the management
     /// runtime state so the UI can show a receive-level meter. **NON-STANDARD**.
     serving_rssi_dbfs: Option<f32>,
+    /// Coverage / serving-cell link status, driven by MLE-BREAK / MLE-REOPEN over
+    /// the LMM-SAP (ETSI TS 100 392-2 cl. 18.3.3 / 18.3.4.5.3 / 18.3.4.7). `true`
+    /// while the serving-cell downlink has failed (radio link failure). This is
+    /// deliberately kept SEPARATE from `reg_state`: TETRA distinguishes
+    /// registration from service availability, so a transient link break leaves
+    /// the MS registered but out of service (TNMM-SERVICE "out of service",
+    /// cl. 15.3.4). Cleared on MLE-REOPEN.
+    out_of_service: bool,
     /// Runtime plumbing needed by the Plane B management write/apply handlers
     /// (config file path + process restart signalling). `None` in unit tests
     /// and read-only deployments, in which case `SetConfig`/`ApplyConfig` are
@@ -259,6 +267,7 @@ impl MmMs {
             temporary_registration: false,
             serving_la,
             serving_rssi_dbfs: None,
+            out_of_service: false,
             mgmt_ctx: None,
             restart_required: false,
             attached_gssis,
@@ -370,6 +379,63 @@ impl MmMs {
                 group_identity_detachment_reason: None,
             })
             .collect()
+    }
+
+    /// Map the current MM state to the derived TNMM service status (the same
+    /// vocabulary as the TNMM-SERVICE indication, Table 15.6 / cl. 15.3.4).
+    ///
+    /// Service availability is kept distinct from registration (cl. 18.3.3): a
+    /// serving-cell radio link failure (`out_of_service`) makes the MS out of
+    /// service even though it may still hold a valid registration. Only when the
+    /// link is up does the status follow the registration state.
+    fn derived_service_status(&self) -> crate::tnmm::ServiceStatus {
+        use crate::tnmm::ServiceStatus;
+        if self.out_of_service {
+            return ServiceStatus::OutOfService;
+        }
+        match self.reg_state {
+            RegState::Registered => ServiceStatus::InService,
+            RegState::Registering => ServiceStatus::InServiceWaitingForRegistration,
+            RegState::Idle | RegState::Detaching => ServiceStatus::OutOfService,
+        }
+    }
+
+    /// Handle an MLE-BREAK indication (LMM-SAP, cl. 18.3.3 / 18.3.4.5.3): the
+    /// serving-cell downlink has failed. Declare the MS out of service and inform
+    /// the TNMM user (TNMM-SERVICE "out of service", cl. 15.3.4). The registration
+    /// state is intentionally left unchanged — the MS is still registered, just
+    /// without a usable radio link.
+    fn rx_mle_break(&mut self) {
+        if self.out_of_service {
+            return; // idempotent: already out of service
+        }
+        self.out_of_service = true;
+        tracing::warn!(
+            "MM: MLE-BREAK — serving-cell link lost; declaring out of service \
+             (reg_state={:?} unchanged), TNMM-SERVICE(OutOfService)",
+            self.reg_state
+        );
+        self.emit_service(crate::tnmm::ServiceStatus::OutOfService);
+    }
+
+    /// Handle an MLE-REOPEN indication (LMM-SAP, cl. 18.3.4.7): the serving-cell
+    /// downlink has recovered. Leave out-of-service and emit a TNMM-SERVICE
+    /// indication reflecting the restored state. MLE re-runs cell selection and
+    /// re-fires the LMM-ACTIVATE confirmation, so any needed re-registration is
+    /// evaluated there (cl. 18.3.4.7.1a); this only restores the service view.
+    fn rx_mle_reopen(&mut self) {
+        if !self.out_of_service {
+            return; // idempotent: already in service
+        }
+        self.out_of_service = false;
+        let status = self.derived_service_status();
+        tracing::info!(
+            "MM: MLE-REOPEN — serving-cell link restored; service status {:?} \
+             (reg_state={:?})",
+            status,
+            self.reg_state
+        );
+        self.emit_service(status);
     }
 
     /// Emit a TNMM-SERVICE indication (Table 15.6, cl. 15.3.3.8) reflecting the
@@ -2140,7 +2206,6 @@ impl MmMs {
     /// single writer of MS runtime state, so no locking is required.
     fn runtime_snapshot(&self) -> crate::management::MsRuntimeState {
         use crate::management::{MsRuntimeState, RegistrationState};
-        use crate::tnmm::ServiceStatus;
 
         let registration_state = match self.reg_state {
             RegState::Idle => RegistrationState::Idle,
@@ -2150,11 +2215,9 @@ impl MmMs {
         };
         // Derived service status: mirrors the vocabulary of the TNMM-SERVICE
         // indication (Plane A) without asserting a standardized primitive.
-        let service_status = match self.reg_state {
-            RegState::Registered => ServiceStatus::InService,
-            RegState::Registering => ServiceStatus::InServiceWaitingForRegistration,
-            RegState::Idle | RegState::Detaching => ServiceStatus::OutOfService,
-        };
+        // Reflects both registration state and serving-cell link status
+        // (out_of_service), so a link break shows OutOfService in the snapshot.
+        let service_status = self.derived_service_status();
         let cfg = self.config.config();
         MsRuntimeState {
             registration_state,
@@ -2286,6 +2349,12 @@ impl TetraEntityTrait for MmMs {
                 // Implementation-defined (Plane B): cache the serving-cell level
                 // for the management runtime state / UI receive-level meter.
                 self.serving_rssi_dbfs = ind.rssi_dbfs;
+            }
+            SapMsgInner::LmmMleBreakInd(_) => {
+                self.rx_mle_break();
+            }
+            SapMsgInner::LmmMleReopenInd(_) => {
+                self.rx_mle_reopen();
             }
             _ => {
                 panic!();
@@ -3390,6 +3459,132 @@ attach_groups = []
                 TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
             )),
             "de-registration emits 'out of service'"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Service-loss indication (cl. 18.3.3 / 18.3.4.5.3 / 18.3.4.7): MLE-BREAK /
+    // MLE-REOPEN over the LMM-SAP drive TNMM-SERVICE without touching reg_state.
+    // -----------------------------------------------------------------------
+
+    /// Feed an MLE-BREAK indication (LMM-SAP) into MM.
+    fn deliver_mle_break(mm: &mut MmMs, q: &mut MessageQueue) {
+        mm.rx_prim(
+            q,
+            SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Mm,
+                msg: SapMsgInner::LmmMleBreakInd(tetra_saps::lmm::LmmMleBreakInd {}),
+            },
+        );
+    }
+
+    /// Feed an MLE-REOPEN indication (LMM-SAP) into MM.
+    fn deliver_mle_reopen(mm: &mut MmMs, q: &mut MessageQueue) {
+        mm.rx_prim(
+            q,
+            SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Mm,
+                msg: SapMsgInner::LmmMleReopenInd(tetra_saps::lmm::LmmMleReopenInd {}),
+            },
+        );
+    }
+
+    /// A registered MS that receives MLE-BREAK declares itself out of service and
+    /// emits TNMM-SERVICE(OutOfService), but stays Registered (cl. 18.3.3 — the
+    /// registration/service split): the runtime snapshot then shows Registered +
+    /// OutOfService.
+    #[test]
+    fn test_mle_break_emits_out_of_service_keeps_registered() {
+        use crate::management::RegistrationState;
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        register_on_default_cell(&mut mm, &mut q);
+        let _ = drain(&source); // discard registration/service events
+
+        deliver_mle_break(&mut mm, &mut q);
+
+        assert_eq!(mm.reg_state, RegState::Registered, "reg state must be unchanged by a link break");
+        assert!(mm.out_of_service, "MS must be out of service after MLE-BREAK");
+
+        let events = drain(&source);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::OutOfService
+            )),
+            "MLE-BREAK emits TNMM-SERVICE 'out of service'"
+        );
+
+        let snap = mm.runtime_snapshot();
+        assert_eq!(snap.registration_state, RegistrationState::Registered);
+        assert_eq!(snap.service_status, ServiceStatus::OutOfService);
+    }
+
+    /// MLE-BREAK is idempotent: a second break while already out of service emits
+    /// no further TNMM-SERVICE indication.
+    #[test]
+    fn test_mle_break_idempotent() {
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        register_on_default_cell(&mut mm, &mut q);
+        deliver_mle_break(&mut mm, &mut q);
+        let _ = drain(&source);
+
+        deliver_mle_break(&mut mm, &mut q);
+        assert!(
+            drain(&source).is_empty(),
+            "a repeated MLE-BREAK must not re-emit a service indication"
+        );
+    }
+
+    /// MLE-REOPEN restores service: out_of_service clears and MM emits a
+    /// TNMM-SERVICE indication reflecting the (still) Registered state, so the
+    /// UI sees InService again.
+    #[test]
+    fn test_mle_reopen_restores_service() {
+        use crate::tnmm::ServiceStatus;
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        register_on_default_cell(&mut mm, &mut q);
+        deliver_mle_break(&mut mm, &mut q);
+        let _ = drain(&source);
+
+        deliver_mle_reopen(&mut mm, &mut q);
+        assert!(!mm.out_of_service, "MLE-REOPEN clears out-of-service");
+        assert_eq!(mm.reg_state, RegState::Registered);
+
+        let events = drain(&source);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TelemetryEvent::TnmmServiceIndication(s) if s.service_status == ServiceStatus::InService
+            )),
+            "MLE-REOPEN emits TNMM-SERVICE 'in service' for a registered MS"
+        );
+    }
+
+    /// MLE-REOPEN without a preceding break is a no-op (idempotent): no service
+    /// indication is emitted.
+    #[test]
+    fn test_mle_reopen_without_break_is_noop() {
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        register_on_default_cell(&mut mm, &mut q);
+        let _ = drain(&source);
+
+        deliver_mle_reopen(&mut mm, &mut q);
+        assert!(
+            drain(&source).is_empty(),
+            "MLE-REOPEN with no prior break must not emit a service indication"
         );
     }
 

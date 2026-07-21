@@ -3,7 +3,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, unimplemented_log};
 use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
-use tetra_saps::lmm::{LmmMleActivateConf, LmmMleRssiInd, LmmMleUnitdataInd};
+use tetra_saps::lmm::{LmmMleActivateConf, LmmMleBreakInd, LmmMleReopenInd, LmmMleRssiInd, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcTuneReq, TlmcValidAddress};
@@ -506,6 +506,16 @@ impl MleMs {
                         permitted_services_in_ms_graceful_service_degradation_mode: 0,
                     }),
                 });
+                // MLE-BREAK to MM (cl. 18.3.3 / 18.3.4.5.3) over the LMM-SAP:
+                // MM regards itself as out of service and informs the TNMM user
+                // (TNMM-SERVICE "out of service", cl. 15.3.4) so a UI reflects
+                // the link loss. Registration state itself is unaffected.
+                queue.push_back(SapMsg {
+                    sap: Sap::LmmSap,
+                    src: TetraEntity::Mle,
+                    dest: TetraEntity::Mm,
+                    msg: SapMsgInner::LmmMleBreakInd(LmmMleBreakInd {}),
+                });
                 // Drop the serving cell and re-arm the one-shot activate
                 // confirmation so that re-acquisition (a new SYNC) re-runs cell
                 // selection (cl. 18.3.4.6) and re-confirms to MM.
@@ -526,6 +536,15 @@ impl MleMs {
                     src: TetraEntity::Mle,
                     dest: TetraEntity::Cmce,
                     msg: SapMsgInner::LcmcMleReopenInd(LcmcMleReopenInd {}),
+                });
+                // MLE-REOPEN to MM over the LMM-SAP: MM leaves out of service.
+                // The subsequent cell re-selection / registration re-evaluation
+                // (re-armed above) determines the final service state.
+                queue.push_back(SapMsg {
+                    sap: Sap::LmmSap,
+                    src: TetraEntity::Mle,
+                    dest: TetraEntity::Mm,
+                    msg: SapMsgInner::LmmMleReopenInd(LmmMleReopenInd {}),
                 });
                 // Cell selection re-runs on the next SYNC (serving_cell was
                 // cleared on break), re-firing the LMM-ACTIVATE confirmation so
@@ -1100,6 +1119,15 @@ attach_groups = []
             .collect();
         assert_eq!(breaks.len(), 1, "exactly one MLE-BREAK");
         assert_eq!(breaks[0].dest, TetraEntity::Cmce, "MLE-BREAK addressed to CMCE");
+
+        // The break is ALSO routed to MM over the LMM-SAP so MM can go out of
+        // service and inform the TNMM user (cl. 18.3.3 / 15.3.4).
+        let mm_breaks: Vec<_> = queue
+            .iter()
+            .filter(|m| matches!(m.msg, SapMsgInner::LmmMleBreakInd(_)))
+            .collect();
+        assert_eq!(mm_breaks.len(), 1, "exactly one LMM MLE-BREAK");
+        assert_eq!(mm_breaks[0].dest, TetraEntity::Mm, "LMM MLE-BREAK addressed to MM");
     }
 
     /// A second failure indication while already out of service is idempotent:
@@ -1138,6 +1166,14 @@ attach_groups = []
             .collect();
         assert_eq!(reopens.len(), 1, "exactly one MLE-REOPEN");
         assert_eq!(reopens[0].dest, TetraEntity::Cmce, "MLE-REOPEN addressed to CMCE");
+
+        // Reopen is ALSO routed to MM over the LMM-SAP (restores service view).
+        let mm_reopens: Vec<_> = queue
+            .iter()
+            .filter(|m| matches!(m.msg, SapMsgInner::LmmMleReopenInd(_)))
+            .collect();
+        assert_eq!(mm_reopens.len(), 1, "exactly one LMM MLE-REOPEN");
+        assert_eq!(mm_reopens[0].dest, TetraEntity::Mm, "LMM MLE-REOPEN addressed to MM");
     }
 
     /// A monitoring refresh carrying a signal level caches it as the serving-cell

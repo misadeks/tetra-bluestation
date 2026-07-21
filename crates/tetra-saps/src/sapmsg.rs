@@ -101,6 +101,13 @@ pub enum SapMsgInner {
     /// Plane B; NOT an ETSI LMM primitive). Carries the current serving-cell
     /// downlink RSSI so MM can surface it in the management runtime state.
     LmmMleRssiInd(LmmMleRssiInd),
+    /// MLE -> MM break indication (cl. 18.3.3 / 18.3.4.5.3): communication
+    /// resources are temporarily unavailable (serving-cell radio link failure).
+    /// MM goes out of service and emits TNMM-SERVICE "out of service".
+    LmmMleBreakInd(LmmMleBreakInd),
+    /// MLE -> MM reopen indication (cl. 18.3.4.7): communication resources are
+    /// available again (serving-cell downlink recovered).
+    LmmMleReopenInd(LmmMleReopenInd),
 
     // LCMC-SAP (MLE-CMCE)
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),
@@ -165,6 +172,8 @@ impl Display for SapMsgInner {
             // LMM-SAP
             SapMsgInner::LmmMleIdentitiesReq(_) => write!(f, "LmmMleIdentitiesReq"),
             SapMsgInner::LmmMleRssiInd(_) => write!(f, "LmmMleRssiInd"),
+            SapMsgInner::LmmMleBreakInd(_) => write!(f, "LmmMleBreakInd"),
+            SapMsgInner::LmmMleReopenInd(_) => write!(f, "LmmMleReopenInd"),
 
             // Control/Brew
             SapMsgInner::MmSubscriberUpdate(_) => write!(f, "MmSubscriberUpdate"),
