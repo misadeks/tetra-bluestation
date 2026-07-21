@@ -63,6 +63,20 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         return Err(format!("Unrecognized fields in cell_info: {:?}", sorted_keys(&root.cell_info.extra)).into());
     }
 
+    // BS mode defines the cell, so its RF must be authored explicitly. A
+    // radio-style MS omits these (RX seeded from the scan list, UL derived from
+    // the cell's SYSINFO at camp time).
+    if root.stack_mode == StackMode::Bs {
+        if root.cell_info.main_carrier.is_none() || root.cell_info.freq_band.is_none() {
+            return Err("BS mode requires [cell_info] main_carrier and freq_band".into());
+        }
+        if let Some(ref soapy) = root.phy_io.soapysdr {
+            if soapy.tx_freq.is_none() || soapy.rx_freq.is_none() {
+                return Err("BS mode requires [phy_io.soapysdr] tx_freq and rx_freq".into());
+            }
+        }
+    }
+
     // Optional brew section
     if let Some(ref brew) = root.brew {
         if !brew.extra.is_empty() {
@@ -113,6 +127,22 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         telemetry: None,
         control: None,
     };
+
+    // Radio-style MS: seed the SDR's initial RX (downlink) center from the first
+    // programmed scan candidate when no explicit tx_freq was authored. The MLE
+    // scan/cell-selection engine retunes it at runtime; the uplink is left unset
+    // until the MS camps and derives it from the cell's SYSINFO (EN 300 392-2
+    // cl. 18.4.2.2).
+    if cfg.stack_mode == StackMode::Ms {
+        if let Some(soapy) = cfg.phy_io.soapysdr.as_mut() {
+            if soapy.dl_freq == 0.0 {
+                if let Some(first) = cfg.codeplug.scan_candidate_frequencies().first().copied() {
+                    soapy.dl_freq = first as f64;
+                    soapy.dl_freq_seeded = true;
+                }
+            }
+        }
+    }
 
     if let Some(brew) = root.brew {
         cfg.brew = Some(apply_brew_patch(brew));
@@ -391,6 +421,98 @@ attach_groups = []
         assert_eq!(ms_a.issi, ms_b.issi);
         assert_eq!(ms_a.subscriber_class, ms_b.subscriber_class);
         assert_eq!(ms_a.attach_groups, ms_b.attach_groups);
+    }
+
+    // A radio-style MS that omits tx_freq/rx_freq and the [cell_info] RF block:
+    // the RX is seeded from the scan list and the UL is derived over the air.
+    const MS_TOML_NO_FIXED_RF: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+
+[[frequency_list]]
+name = "primary"
+mode = "List"
+frequencies = [439825000, 439850000]
+dwell_ms = 800
+"#;
+
+    #[test]
+    fn ms_without_fixed_rf_seeds_rx_and_validates() {
+        let cfg = from_toml_str(MS_TOML_NO_FIXED_RF).expect("parse radio-style MS");
+        cfg.validate().expect("validate radio-style MS");
+
+        let soapy = cfg.phy_io.soapysdr.as_ref().expect("soapy");
+        // RX seeded from the first scan candidate; UL left unset until camp.
+        assert_eq!(soapy.dl_freq, 439_825_000.0);
+        assert!(soapy.dl_freq_seeded);
+        assert_eq!(soapy.ul_freq, 0.0);
+
+        // cell_info RF fields are absent -> default to zero (unused for MS).
+        assert_eq!(cfg.cell.freq_band, 0);
+        assert_eq!(cfg.cell.main_carrier, 0);
+        // Non-RF identity fields still parse.
+        assert_eq!(cfg.cell.location_area, 1);
+    }
+
+    #[test]
+    fn ms_without_fixed_rf_roundtrips_without_reintroducing_rf() {
+        let cfg = from_toml_str(MS_TOML_NO_FIXED_RF).expect("parse");
+        let rendered = to_toml_string(&cfg).expect("serialize");
+        // The seeded RX and unset UL must NOT be written back as fixed freqs,
+        // and the cell RF block must stay omitted.
+        assert!(!rendered.contains("tx_freq"), "seeded RX must not serialize as tx_freq");
+        assert!(!rendered.contains("rx_freq"), "unset UL must not serialize as rx_freq");
+        assert!(!rendered.contains("main_carrier"), "MS cell RF must stay omitted");
+        assert!(!rendered.contains("freq_band"), "MS cell RF must stay omitted");
+        // Re-parses through the same validator.
+        from_toml_str(&rendered).expect("reparse").validate().expect("revalidate");
+    }
+
+    #[test]
+    fn bs_requires_cell_and_soapy_rf() {
+        // A BS config lacking cell_info RF must be rejected (the BS defines the cell).
+        const BS_NO_RF: &str = r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+location_area = 1
+colour_code = 1
+"#;
+        assert!(from_toml_str(BS_NO_RF).is_err(), "BS without cell_info RF must error");
     }
 
     #[test]

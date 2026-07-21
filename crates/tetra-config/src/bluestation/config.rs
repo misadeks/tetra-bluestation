@@ -108,48 +108,47 @@ impl StackConfig {
                 .as_ref()
                 .expect("SoapySdr config must be set for SoapySdr PhyIo");
 
-            let Ok(freq_info) = FreqInfo::from_components_with_table(
-                self.cell.freq_band,
-                self.cell.main_carrier,
-                self.cell.freq_offset_hz,
-                self.cell.reverse_operation,
-                self.cell.duplex_spacing_id,
-                self.cell.custom_duplex_spacing,
-                &self.duplex_table,
-            ) else {
-                return Err("Invalid cell info frequency settings");
-            };
-
-            let (dlfreq, ulfreq) = freq_info.get_freqs();
-
-            println!("    {:?}", freq_info);
-            println!("    Derived DL freq: {} Hz, UL freq: {} Hz\n", dlfreq, ulfreq);
-
-            let dl_matches = soapy_cfg.dl_freq as u32 == dlfreq;
-            let ul_matches = soapy_cfg.ul_freq as u32 == ulfreq;
-
             match self.stack_mode {
                 StackMode::Bs => {
-                    // A BS *defines* the cell, so its configured RF must be exactly
-                    // the carrier it broadcasts.
-                    if !dl_matches {
+                    // A BS *defines* the cell, so its configured RF must be
+                    // exactly the carrier it broadcasts. Derive the DL/UL from
+                    // cell_info and require the soapy freqs to match.
+                    let Ok(freq_info) = FreqInfo::from_components_with_table(
+                        self.cell.freq_band,
+                        self.cell.main_carrier,
+                        self.cell.freq_offset_hz,
+                        self.cell.reverse_operation,
+                        self.cell.duplex_spacing_id,
+                        self.cell.custom_duplex_spacing,
+                        &self.duplex_table,
+                    ) else {
+                        return Err("Invalid cell info frequency settings");
+                    };
+
+                    let (dlfreq, ulfreq) = freq_info.get_freqs();
+
+                    println!("    {:?}", freq_info);
+                    println!("    Derived DL freq: {} Hz, UL freq: {} Hz\n", dlfreq, ulfreq);
+
+                    if soapy_cfg.dl_freq as u32 != dlfreq {
                         return Err("PhyIo DlFrequency does not match computed FreqInfo");
                     }
-                    if !ul_matches {
+                    if soapy_cfg.ul_freq as u32 != ulfreq {
                         return Err("PhyIo UlFrequency does not match computed FreqInfo");
                     }
                 }
                 StackMode::Ms | StackMode::Mon => {
-                    // A radio-style MS is programmed by downlink; the uplink/duplex
-                    // is derived at camp time from the cell's own D-MLE-SYSINFO
-                    // (EN 300 392-2 cl. 18.4.2.2), not pre-computed. So a mismatch
-                    // here is a warning, not a hard error — the PHY still tunes from
-                    // the configured soapy freqs until the scan/camp engine retunes.
-                    if !dl_matches || !ul_matches {
-                        eprintln!(
-                            "    WARNING: MS soapy tx_freq/rx_freq ({}/{} Hz) differ from cell_info-derived \
-                             DL/UL ({}/{} Hz); the MS derives UL from the cell's SYSINFO at camp time.",
-                            soapy_cfg.dl_freq as u32, soapy_cfg.ul_freq as u32, dlfreq, ulfreq
+                    // A radio-style MS is programmed by downlink: its RX is seeded
+                    // from the scan list (or an explicit tx_freq) and the uplink is
+                    // derived at camp time from the cell's own D-MLE-SYSINFO
+                    // (EN 300 392-2 cl. 18.4.2.2). cell_info RF is not required.
+                    // It must, however, have *some* RX source to tune.
+                    let has_rx_source =
+                        soapy_cfg.dl_freq > 0.0 || !self.codeplug.scan_candidate_frequencies().is_empty();
+                    if !has_rx_source {
+                        return Err(
+                            "MS mode requires an RX source: program at least one [[frequency_list]] \
+                             or set [phy_io.soapysdr] tx_freq",
                         );
                     }
                 }

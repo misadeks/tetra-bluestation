@@ -9,6 +9,11 @@ pub struct CfgSoapySdr {
     pub ul_freq: f64,
     /// Downlink frequency in Hz
     pub dl_freq: f64,
+    /// True when `dl_freq` was auto-seeded from the first `[[frequency_list]]`
+    /// scan candidate (MS mode) rather than authored in the config. Kept out of
+    /// the serialized form so an MS config round-trips without a spurious
+    /// `tx_freq`.
+    pub dl_freq_seeded: bool,
     /// PPM frequency error correction
     pub ppm_err: f64,
     /// Argument string to select a specific SDR device.
@@ -50,8 +55,18 @@ impl CfgSoapySdr {
 
 #[derive(Deserialize, Serialize)]
 pub struct SoapySdrDto {
-    pub rx_freq: f64,
-    pub tx_freq: f64,
+    /// Downlink (DL) hardware center frequency in Hz. Optional for MS mode: when
+    /// omitted the MS seeds its initial RX from the first `[[frequency_list]]`
+    /// scan candidate and the scan/camp engine retunes at runtime. Required for
+    /// BS mode (the BS defines the carrier).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_freq: Option<f64>,
+    /// Uplink (UL) hardware center frequency in Hz. Optional for MS mode: the
+    /// uplink is derived from the cell's own D-MLE-SYSINFO at camp time
+    /// (EN 300 392-2 cl. 18.4.2.2), so an MS leaves it unset until it camps.
+    /// Required for BS mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_freq: Option<f64>,
     pub ppm_err: Option<f64>,
 
     pub device: Option<String>,
@@ -80,8 +95,10 @@ pub fn cfg_to_soapy_dto(s: &CfgSoapySdr) -> SoapySdrDto {
         extra.insert(format!("tx_gain_{name}"), Value::Float(*val));
     }
     SoapySdrDto {
-        rx_freq: s.ul_freq,
-        tx_freq: s.dl_freq,
+        // A 0 Hz value means "unset" (MS mode: seeded from scan / derived at
+        // camp), so it is omitted from the serialized form.
+        rx_freq: (s.ul_freq > 0.0).then_some(s.ul_freq),
+        tx_freq: (s.dl_freq > 0.0 && !s.dl_freq_seeded).then_some(s.dl_freq),
         ppm_err: Some(s.ppm_err),
         device: s.device.clone(),
         rx_antenna: s.rx_ant.clone(),

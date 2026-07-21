@@ -63,11 +63,19 @@ pub struct CfgCellInfo {
 
 #[derive(Default, Deserialize, Serialize)]
 pub struct CellInfoDto {
-    pub main_carrier: u16,
-    pub freq_band: u8,
-    pub freq_offset: i16,
-    pub duplex_spacing: u8,
-    pub reverse_operation: bool,
+    /// RF/frequency-derivation fields. Optional: for an MS these are learned
+    /// from the cell's own D-MLE-SYNC/SYSINFO over the air (EN 300 392-2
+    /// cl. 18.4.2), so a radio-style MS config omits them. Required for BS mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_carrier: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freq_band: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freq_offset: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplex_spacing: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reverse_operation: Option<bool>,
     pub custom_duplex_spacing: Option<u32>,
 
     pub location_area: u16,
@@ -106,11 +114,11 @@ pub struct CellInfoDto {
 
 pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
     CfgCellInfo {
-        main_carrier: ci.main_carrier,
-        freq_band: ci.freq_band,
-        freq_offset_hz: ci.freq_offset,
-        duplex_spacing_id: ci.duplex_spacing,
-        reverse_operation: ci.reverse_operation,
+        main_carrier: ci.main_carrier.unwrap_or(0),
+        freq_band: ci.freq_band.unwrap_or(0),
+        freq_offset_hz: ci.freq_offset.unwrap_or(0),
+        duplex_spacing_id: ci.duplex_spacing.unwrap_or(0),
+        reverse_operation: ci.reverse_operation.unwrap_or(false),
         custom_duplex_spacing: ci.custom_duplex_spacing,
         location_area: ci.location_area,
         neighbor_cell_broadcast: ci.neighbor_cell_broadcast.unwrap_or(0),
@@ -152,17 +160,22 @@ fn default_tetrapack_local_ranges() -> SortedDisjointSsiRanges {
 /// Inverse of [`cell_dto_to_cfg`] for TOML write-back (Plane B, non-standard).
 ///
 /// The runtime `CfgCellInfo` holds concrete values (defaults already applied at
-/// load), so every optional DTO field is emitted as `Some(..)`; the resulting
-/// TOML re-parses to an identical `CfgCellInfo`. `freq_offset_hz`/
+/// load), so the identity/service fields are emitted as `Some(..)`. The RF
+/// fields are emitted only for a real (BS) cell definition and omitted for a
+/// radio-style MS (which learns them over the air). `freq_offset_hz`/
 /// `duplex_spacing_id` map back to the DTO's `freq_offset`/`duplex_spacing`
 /// (the exact inverse of [`cell_dto_to_cfg`]).
 pub fn cfg_to_cell_dto(ci: &CfgCellInfo) -> CellInfoDto {
+    // A real (BS-authored) cell has a non-zero carrier/band; a radio-style MS
+    // leaves the RF fields unset (learned over the air), so omit them entirely
+    // rather than writing back zeros.
+    let has_rf = ci.freq_band != 0 || ci.main_carrier != 0;
     CellInfoDto {
-        main_carrier: ci.main_carrier,
-        freq_band: ci.freq_band,
-        freq_offset: ci.freq_offset_hz,
-        duplex_spacing: ci.duplex_spacing_id,
-        reverse_operation: ci.reverse_operation,
+        main_carrier: has_rf.then_some(ci.main_carrier),
+        freq_band: has_rf.then_some(ci.freq_band),
+        freq_offset: has_rf.then_some(ci.freq_offset_hz),
+        duplex_spacing: has_rf.then_some(ci.duplex_spacing_id),
+        reverse_operation: has_rf.then_some(ci.reverse_operation),
         custom_duplex_spacing: ci.custom_duplex_spacing,
         location_area: ci.location_area,
         neighbor_cell_broadcast: Some(ci.neighbor_cell_broadcast),

@@ -106,7 +106,10 @@ impl RxTxDevSoapySdr {
                 ms_ul_freqs = [ul_corrected];
                 soapy_dev::PhyConfig {
                     monitor_frequencies: &monitor_freqs,
-                    ms_ul_frequencies: &ms_ul_freqs,
+                    // The uplink carrier is unset until the MS camps and derives
+                    // it from the cell's SYSINFO (EN 300 392-2 cl. 18.4.2.2); a
+                    // 0 Hz ul_freq means "unset" so no TX chain is built yet.
+                    ms_ul_frequencies: if soapy_cfg.ul_freq > 0.0 { &ms_ul_freqs } else { &ms_ul_freqs[..0] },
                     ..Default::default()
                 }
             }

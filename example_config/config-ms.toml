@@ -1,18 +1,13 @@
 # TETRA BlueStation - Mobile Station (MS) configuration
-# Camps on / connects to the BS described by the matching BS config.
+# Camps on / connects to a BS found by scanning the programmed frequency lists.
 #
-# Direction note: DL and UL are ABSOLUTE frequencies (independent of Bs/Ms mode).
-#   - tx_freq  -> dl_freq (BS transmits, MS RECEIVES) = 439.825 MHz
-#   - rx_freq  -> ul_freq (MS transmits, BS receives) = 430.425 MHz
-#
-# Radio-style programming (v0.7): an MS is programmed by DOWNLINK. The uplink and
-# duplex spacing are derived at camp time from the cell's own D-MLE-SYSINFO
-# (EN 300 392-2 cl. 18.4.2.2), so for stack_mode = "Ms" the DL/UL derived from
-# cell_info no longer has to match tx_freq/rx_freq EXACTLY -- a mismatch is only a
-# warning (BS mode still requires an exact match). The PHY still tunes to the
-# configured soapy freqs at startup; the scan/camp engine retunes at runtime.
-#   band 4: 400_000_000 + main_carrier 1593 * 25_000            = 439_825_000 (DL)
-#   DL - custom_duplex_spacing 9_400_000                        = 430_425_000 (UL)
+# Radio-style programming: an MS is programmed by DOWNLINK. It does NOT hard-code
+# a serving carrier or duplex spacing. Instead it scans the [[frequency_list]]
+# carriers, selects the best suitable cell, and adopts that cell's RF / uplink /
+# duplex parameters from its own D-MLE-SYNC/SYSINFO at camp time (EN 300 392-2
+# cl. 18.4.2). So there is no tx_freq/rx_freq and no [cell_info] RF block here:
+#   - initial RX (downlink) center = first [[frequency_list]] scan candidate
+#   - uplink (TX) = derived from the camped cell's SYSINFO (unset until camped)
 
 config_version = "0.7"
 
@@ -32,11 +27,12 @@ stack_mode = "Ms"
 backend = "SoapySdr"
 
 [phy_io.soapysdr]
-# Transmit tx(dl) and rx(ul) frequencies in Hz. Startup tune target; the MS
-# receives on tx_freq (DL) and (later) transmits on rx_freq (UL). In radio mode
-# the scan/camp engine retunes the RX to the selected scan frequency.
-tx_freq = 439825000
-rx_freq = 430425000
+# No fixed tx_freq/rx_freq for a radio-style MS. The initial RX (downlink) center
+# is seeded from the first [[frequency_list]] scan candidate below, and the MLE
+# scan/cell-selection engine retunes it at runtime. The uplink (TX) stays unset
+# until the MS camps and derives it from the cell's SYSINFO (EN 300 392-2
+# cl. 18.4.2.2). To force a specific startup RX carrier you may still set
+# tx_freq = <dl_hz>, but it is not required.
 
 ppm_err = 0 # Adjust if your SDR has a non-negligible tuning error
 
@@ -75,17 +71,12 @@ mcc = 901
 # Mobile Network Code (MNC), 14-bit
 mnc = 9999
 
-# Cell Information - RF band/carrier/duplex reference. For an MS this is the
-# startup tune reference; the actual serving-cell parameters are adopted from
-# the received SYNC/SYSINFO once camped.
+# Cell Information. For a radio-style MS the RF band/carrier/duplex parameters
+# are NOT configured here: they are learned over the air from the serving cell's
+# own D-MLE-SYNC/SYSINFO once camped (EN 300 392-2 cl. 18.4.2). The MS finds the
+# cell by scanning the [[frequency_list]] carriers above. Only non-RF identity
+# fields (e.g. location_area) are kept here.
 [cell_info]
-freq_band = 4                       # 400MHz band
-main_carrier = 1593                 # 400_000_000 + 1593 * 25kHz = 439.825 MHz DL
-duplex_spacing = 7                  # duplex table index (overridden by custom below)
-custom_duplex_spacing = 9400000     # 9.4 MHz DL-UL spacing (matches the BS)
-freq_offset = 0                     # Offset from carrier. Options: 0, 6250, -6250, 12500.
-reverse_operation = false           # False: UL below DL. True: UL above DL.
-
 # Location Area identifier
 location_area = 1
 

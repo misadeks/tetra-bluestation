@@ -102,7 +102,10 @@ impl SoapyIo {
             ),
             StackMode::Ms => (
                 Some(dl_corrected - SOAPY_FREQ_OFFSET), // Offset RX center frequency from carrier frequency
-                Some(ul_corrected),
+                // TX (uplink) stays unset until the MS camps and derives the
+                // uplink from the cell's SYSINFO (EN 300 392-2 cl. 18.4.2.2). A
+                // 0 Hz ul_freq means "unset" -> the TX chain is not configured.
+                (soapy_cfg.ul_freq > 0.0).then_some(ul_corrected),
             ),
             StackMode::Mon => {
                 unimplemented!("Monitor mode not implemented yet");
