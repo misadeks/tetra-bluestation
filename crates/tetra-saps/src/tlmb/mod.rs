@@ -46,7 +46,15 @@ pub struct TlmbSysinfoInd {
 /// (cl. 18.3.4.7). `downlink_available == false` signals a declared downlink
 /// failure; `true` signals recovery. The MLE turns this into the standardized
 /// MLE-BREAK / MLE-REOPEN primitives towards the upper layers.
+///
+/// It additionally carries the most recent serving-cell downlink signal level
+/// (`rssi_dbfs`), which the PHY refreshes periodically while camped. The MLE
+/// uses signal strength as a reselection input (cl. 18.3.4) and it is surfaced
+/// to the MS management UI as a receive-level indicator. `None` before the first
+/// downlink slot has been measured. The value is uncalibrated dBFS relative to
+/// the demodulator full-scale magnitude, not absolute antenna power.
 #[derive(Debug, Clone)]
 pub struct TlmbMonitorInd {
     pub downlink_available: bool,
+    pub rssi_dbfs: Option<f32>,
 }

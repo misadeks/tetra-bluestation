@@ -157,6 +157,7 @@ mod tests {
             home_mcc: 901,
             home_mnc: 9999,
             serving_la: 1,
+            rssi_dbfs: Some(-42.5),
             colour_code: 1,
             attached_groups: vec![100, 200],
             restart_required: false,

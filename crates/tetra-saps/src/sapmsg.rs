@@ -81,6 +81,10 @@ pub enum SapMsgInner {
     /// the MS is currently known (own ISSI + attached GSSIs). The MLE configures
     /// the MAC downlink address filter (cl. 23.4.1.2.1) from it.
     LmmMleIdentitiesReq(LmmMleIdentitiesReq),
+    /// MLE -> MM serving-cell receive-level indication (implementation-defined,
+    /// Plane B; NOT an ETSI LMM primitive). Carries the current serving-cell
+    /// downlink RSSI so MM can surface it in the management runtime state.
+    LmmMleRssiInd(LmmMleRssiInd),
 
     // LCMC-SAP (MLE-CMCE)
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),
@@ -136,6 +140,7 @@ impl Display for SapMsgInner {
 
             // LMM-SAP
             SapMsgInner::LmmMleIdentitiesReq(_) => write!(f, "LmmMleIdentitiesReq"),
+            SapMsgInner::LmmMleRssiInd(_) => write!(f, "LmmMleRssiInd"),
 
             // Control/Brew
             SapMsgInner::MmSubscriberUpdate(_) => write!(f, "MmSubscriberUpdate"),

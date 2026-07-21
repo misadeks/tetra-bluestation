@@ -19,6 +19,14 @@ use crate::{MessageQueue, TetraEntityTrait};
 /// ticking — rather than after it has stopped, when no ticks would run.
 const DOWNLINK_FAILURE_SLOTS: u32 = 50;
 
+/// Cadence (in demodulated downlink slots) at which the MS PHY refreshes the
+/// serving-cell RSSI to the MLE while camped, in addition to the transition
+/// indications on sync/failure. One TDMA multiframe (18 slots, ~255 ms) gives a
+/// smooth receive-level readout for the management UI and a reselection input
+/// for the MLE (ETSI TS 100 392-2 cl. 18.3.4) without flooding the SAP with a
+/// per-slot message.
+const RSSI_REPORT_SLOTS: u32 = 18;
+
 /// A fully-built uplink burst waiting to be transmitted in a specific slot.
 ///
 /// Held between the `TpUnitdataReq` that produces it and the `drive_rx` call
@@ -65,6 +73,10 @@ pub struct PhyMs<D: RxTxDev> {
     /// [`DOWNLINK_FAILURE_SLOTS`] (cl. 18.3.4.5.3).
     slots_without_burst: u32,
 
+    /// Decodable downlink slots since the last serving-cell RSSI refresh to the
+    /// MLE. Throttles the periodic monitor indication to [`RSSI_REPORT_SLOTS`].
+    slots_since_rssi_report: u32,
+
     /// Uplink burst awaiting transmission in a granted slot, if any. `None`
     /// means the TX stream stays idle (silence) this cycle — the MS only puts
     /// energy on air during a granted opportunity.
@@ -86,6 +98,7 @@ impl<D: RxTxDev> PhyMs<D> {
             dltime: TdmaTime::default(),
             synced: false,
             slots_without_burst: 0,
+            slots_since_rssi_report: 0,
             pending_tx: None,
             tx_path_active: false,
             rxtxdev,
@@ -94,16 +107,21 @@ impl<D: RxTxDev> PhyMs<D> {
 
     /// Notify the MLE of a serving-cell downlink monitoring transition.
     ///
-    /// Emitted only on a change of the downlink-available state (failure or
-    /// recovery). Internal IPC only (not an air-interface PDU); the MLE maps it
-    /// onto the standardized MLE-BREAK / MLE-REOPEN primitives
-    /// (cl. 18.3.4.5.3 / 18.3.4.7).
-    fn emit_monitor_ind(queue: &mut MessageQueue, downlink_available: bool) {
+    /// Emitted on a change of the downlink-available state (failure or recovery)
+    /// and periodically to refresh the serving-cell RSSI while camped. Internal
+    /// IPC only (not an air-interface PDU); the MLE maps the availability
+    /// transitions onto the standardized MLE-BREAK / MLE-REOPEN primitives
+    /// (cl. 18.3.4.5.3 / 18.3.4.7) and uses `rssi_dbfs` as a reselection input
+    /// (cl. 18.3.4) / receive-level readout for the management UI.
+    fn emit_monitor_ind(queue: &mut MessageQueue, downlink_available: bool, rssi_dbfs: Option<f32>) {
         queue.push_back(SapMsg {
             sap: Sap::TlmbSap,
             src: TetraEntity::Phy,
             dest: TetraEntity::Mle,
-            msg: SapMsgInner::TlmbMonitorInd(TlmbMonitorInd { downlink_available }),
+            msg: SapMsgInner::TlmbMonitorInd(TlmbMonitorInd {
+                downlink_available,
+                rssi_dbfs,
+            }),
         });
     }
 
@@ -398,10 +416,23 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 // acquisition the MLE is not out-of-service, so the recovery
                 // indication is an idempotent no-op there.
                 self.slots_without_burst = 0;
+                let rssi = self.rxtxdev.dl_rssi_dbfs();
                 if !self.synced {
                     self.synced = true;
+                    self.slots_since_rssi_report = 0;
                     tracing::info!(ts = %self.dltime, "PhyMs: downlink synchronized");
-                    Self::emit_monitor_ind(queue, true);
+                    Self::emit_monitor_ind(queue, true, rssi);
+                } else {
+                    // Camped: periodically refresh the serving-cell RSSI to the
+                    // MLE (reselection input, cl. 18.3.4 / management-UI receive
+                    // level). Throttled to one multiframe so this is not a
+                    // per-slot flood; only counts decodable slots, so a downlink
+                    // failure ramp does not emit spurious "available".
+                    self.slots_since_rssi_report = self.slots_since_rssi_report.saturating_add(1);
+                    if self.slots_since_rssi_report >= RSSI_REPORT_SLOTS {
+                        self.slots_since_rssi_report = 0;
+                        Self::emit_monitor_ind(queue, true, rssi);
+                    }
                 }
             } else if self.synced {
                 // Synchronized but this demodulated slot carried no decodable
@@ -411,12 +442,13 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 self.slots_without_burst = self.slots_without_burst.saturating_add(1);
                 if self.slots_without_burst >= DOWNLINK_FAILURE_SLOTS {
                     self.synced = false;
+                    let rssi = self.rxtxdev.dl_rssi_dbfs();
                     tracing::warn!(
                         ts = %self.dltime,
                         slots = self.slots_without_burst,
                         "PhyMs: serving-cell downlink failure (cl. 18.3.4.5.3)"
                     );
-                    Self::emit_monitor_ind(queue, false);
+                    Self::emit_monitor_ind(queue, false, rssi);
                 }
             }
 
@@ -517,6 +549,8 @@ attach_groups = []
         /// bits is used so `split_dl_slot_and_send_to_lmac` takes its warn-and-
         /// drop path (no full burst buffer needed).
         rx_burst: bool,
+        /// Downlink RSSI (dBFS) the device reports via `dl_rssi_dbfs`.
+        dl_rssi: Option<f32>,
     }
 
     impl RxTxDev for MockRxTx {
@@ -551,6 +585,10 @@ attach_groups = []
 
         fn tx_air_time(&self) -> Option<TdmaTime> {
             self.next_air_time
+        }
+
+        fn dl_rssi_dbfs(&self) -> Option<f32> {
+            self.dl_rssi
         }
     }
 
@@ -703,6 +741,40 @@ attach_groups = []
 
         assert!(phy.synced, "synchronized after a decodable burst");
         assert_eq!(monitor_inds(&queue), vec![true], "exactly one available indication");
+    }
+
+    /// While camped the PHY refreshes the serving-cell RSSI to the MLE once per
+    /// [`RSSI_REPORT_SLOTS`] (not every slot), carrying the device's current
+    /// downlink level. The transition indication at sync counts separately.
+    #[test]
+    fn test_rssi_refreshed_periodically_while_camped() {
+        let mut phy = phy_ms(MockRxTx::default());
+        phy.rxtxdev.rx_burst = true;
+        phy.rxtxdev.dl_rssi = Some(-6.0);
+        let mut queue = MessageQueue::new();
+
+        // Sync (1 emit), then exactly RSSI_REPORT_SLOTS more decodable slots to
+        // trigger a single periodic refresh.
+        for _ in 0..(RSSI_REPORT_SLOTS + 1) {
+            phy.drive_rx(&mut queue);
+        }
+
+        let rssis: Vec<Option<f32>> = queue
+            .iter()
+            .filter_map(|m| match &m.msg {
+                SapMsgInner::TlmbMonitorInd(inner) => {
+                    assert!(inner.downlink_available, "camped indications report available");
+                    Some(inner.rssi_dbfs)
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            rssis,
+            vec![Some(-6.0), Some(-6.0)],
+            "one sync + one periodic RSSI refresh, both carrying the current level"
+        );
     }
 
     /// After sync, a sustained run of demodulated-but-undecodable slots (past

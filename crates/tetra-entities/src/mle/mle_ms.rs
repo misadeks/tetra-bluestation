@@ -3,7 +3,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, unimplemented_log};
 use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
-use tetra_saps::lmm::{LmmMleActivateConf, LmmMleUnitdataInd};
+use tetra_saps::lmm::{LmmMleActivateConf, LmmMleRssiInd, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcValidAddress};
@@ -61,6 +61,11 @@ pub struct MleMs {
     /// out of service the MLE has issued MLE-BREAK to the upper layers and is
     /// waiting for the downlink to recover (cl. 18.3.4.7).
     out_of_service: bool,
+    /// Most recent serving-cell downlink signal level (uncalibrated dBFS),
+    /// refreshed from the PHY monitoring indication. Used as a reselection
+    /// input (cl. 18.3.4) and surfaced to the MS management UI. `None` while
+    /// out of service or before the first measurement.
+    serving_cell_rssi_dbfs: Option<f32>,
 }
 
 impl MleMs {
@@ -70,6 +75,7 @@ impl MleMs {
             serving_cell: None,
             activate_confirmed: false,
             out_of_service: false,
+            serving_cell_rssi_dbfs: None,
         }
     }
 
@@ -307,6 +313,13 @@ impl MleMs {
                 self.rx_tlmb_tl_sync_ind(queue, message);
             }
             SapMsgInner::TlmbMonitorInd(ref inner) => {
+                // Cache the serving-cell downlink level whenever the PHY refreshes
+                // it (reselection input, cl. 18.3.4 / management-UI receive level)
+                // and forward it to MM so it can surface it in the runtime state.
+                if inner.rssi_dbfs.is_some() && self.serving_cell_rssi_dbfs != inner.rssi_dbfs {
+                    self.serving_cell_rssi_dbfs = inner.rssi_dbfs;
+                    self.emit_rssi_to_mm(queue);
+                }
                 let available = inner.downlink_available;
                 self.rx_tlmb_monitor_ind(queue, available);
             }
@@ -351,6 +364,11 @@ impl MleMs {
                 // selection (cl. 18.3.4.6) and re-confirms to MM.
                 self.serving_cell = None;
                 self.activate_confirmed = false;
+                // No serving-cell signal while out of service (UI shows no level).
+                if self.serving_cell_rssi_dbfs.is_some() {
+                    self.serving_cell_rssi_dbfs = None;
+                    self.emit_rssi_to_mm(queue);
+                }
             }
             (true, true) => {
                 // Downlink recovered: reopen the link (cl. 18.3.4.7).
@@ -376,6 +394,21 @@ impl MleMs {
                 );
             }
         }
+    }
+
+    /// Forward the current serving-cell downlink level to MM (implementation-
+    /// defined Plane B primitive) so it can surface it in the management runtime
+    /// state the UI reads. Not an ETSI LMM primitive; RSSI is an MLE-internal
+    /// reselection input (cl. 18.3.4) and is passed up only as a convenience.
+    fn emit_rssi_to_mm(&self, queue: &mut MessageQueue) {
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Mm,
+            msg: SapMsgInner::LmmMleRssiInd(LmmMleRssiInd {
+                rssi_dbfs: self.serving_cell_rssi_dbfs,
+            }),
+        });
     }
 
     /// ETSI TS 100 392-2 cl. 18.3.4 / 18.4.2.2: adopt the SYSINFO parameters
@@ -920,6 +953,33 @@ attach_groups = []
             .collect();
         assert_eq!(reopens.len(), 1, "exactly one MLE-REOPEN");
         assert_eq!(reopens[0].dest, TetraEntity::Cmce, "MLE-REOPEN addressed to CMCE");
+    }
+
+    /// A monitoring refresh carrying a signal level caches it as the serving-cell
+    /// RSSI (reselection input, cl. 18.3.4 / management-UI readout); a subsequent
+    /// downlink failure clears it (no serving-cell signal while out of service).
+    #[test]
+    fn test_serving_cell_rssi_cached_and_cleared() {
+        use tetra_saps::tlmb::TlmbMonitorInd;
+        let mut mle = ms_mle();
+        camp(&mut mle);
+        let mut queue = MessageQueue::new();
+
+        let monitor = |downlink_available, rssi_dbfs| SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Phy,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbMonitorInd(TlmbMonitorInd {
+                downlink_available,
+                rssi_dbfs,
+            }),
+        };
+
+        mle.rx_tlmb_prim(&mut queue, monitor(true, Some(-12.5)));
+        assert_eq!(mle.serving_cell_rssi_dbfs, Some(-12.5), "level cached from refresh");
+
+        mle.rx_tlmb_prim(&mut queue, monitor(false, None));
+        assert_eq!(mle.serving_cell_rssi_dbfs, None, "cleared on out of service");
     }
 
     /// An "available" indication while in service (initial acquisition) is a

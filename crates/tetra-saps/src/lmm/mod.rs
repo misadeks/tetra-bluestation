@@ -159,6 +159,22 @@ pub struct LmmMleReportInd {
     pub transfer_result: Todo,
 }
 
+/// MLE -> MM serving-cell receive-level indication (**implementation-defined**,
+/// NOT an ETSI LMM-SAP primitive).
+///
+/// TETRA does not carry a signal-strength value to MM over the standardized
+/// LMM-SAP: RSSI/path-loss is an MLE-internal reselection input (cl. 18.3.4),
+/// consumed by the MLE, not surfaced up. This primitive is a local Plane B
+/// convenience so MM can include the current serving-cell downlink level in the
+/// management runtime-state snapshot the UI reads (a receive-level meter, as in
+/// the flowstation reference). `rssi_dbfs` is uncalibrated dBFS relative to the
+/// demodulator full-scale magnitude; `None` while the serving cell is out of
+/// service or before the first measurement.
+#[derive(Debug, Clone)]
+pub struct LmmMleRssiInd {
+    pub rssi_dbfs: Option<f32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LmmMleUnitdataReq {
     pub sdu: BitBuffer,

@@ -59,7 +59,9 @@ pub enum RegistrationState {
 /// active configuration (single-writer: MM). Feeds `GetState` and mirrors the
 /// information the standardized TNMM-SERVICE/REGISTRATION indications carry
 /// (Plane A), but is itself an implementation-defined convenience type.
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
+///
+/// Note: `Eq` is intentionally NOT derived because `rssi_dbfs` is an `f32`.
+#[derive(Debug, Clone, PartialEq, Encode, Decode, Serialize, Deserialize)]
 pub struct MsRuntimeState {
     /// Current MM registration state.
     pub registration_state: RegistrationState,
@@ -74,6 +76,11 @@ pub struct MsRuntimeState {
     /// Location Area of the serving cell (cached from the last LMM-ACTIVATE
     /// confirmation; defaults to the configured cell LA before cell selection).
     pub serving_la: u16,
+    /// Serving-cell downlink receive level in uncalibrated dBFS relative to the
+    /// demodulator full-scale magnitude (**non-standard**, Plane B telemetry;
+    /// an MLE reselection input per cl. 18.3.4 surfaced for a UI receive-level
+    /// meter). `None` before the first measurement or while out of service.
+    pub rssi_dbfs: Option<f32>,
     /// Colour code of the configured serving cell (`[cell_info] colour_code`).
     pub colour_code: u8,
     /// GSSIs configured for attachment at registration (`[ms] attach_groups`).

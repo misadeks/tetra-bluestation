@@ -245,6 +245,10 @@ impl RxTxDev for RxTxDevSoapySdr {
     fn ms_tx_lookahead(&self) -> Option<MsTxLookahead> {
         self.tx_dsp.as_ref()?.lookahead(&self.sdr)
     }
+
+    fn dl_rssi_dbfs(&self) -> Option<f32> {
+        self.rx_dsp.as_ref()?.dl_rssi_dbfs()
+    }
 }
 
 struct RxDsp {
@@ -310,6 +314,15 @@ impl RxDsp {
         self.monitors
             .iter()
             .find_map(|pair| pair.dl.demodulator.synchronized_reference_time())
+    }
+
+    /// Most recent uncalibrated downlink RSSI (dBFS) from the serving-cell
+    /// downlink demodulator (the first monitor pair's downlink channel). `None`
+    /// until a downlink slot has been demodulated. Measured relative to the
+    /// demodulator full-scale magnitude, so it tracks receive level for the MLE
+    /// reselection input (cl. 18.3.4) and the management UI, not absolute power.
+    fn dl_rssi_dbfs(&self) -> Option<f32> {
+        self.monitors.iter().find_map(|pair| pair.dl.demodulator.dl_rssi_dbfs())
     }
 
     fn process_block(&mut self, sdr: &mut soapyio::SoapyIo) -> Result<bool, RxTxDevError> {

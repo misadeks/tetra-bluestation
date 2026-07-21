@@ -123,4 +123,18 @@ pub trait RxTxDev {
     fn ms_tx_lookahead(&self) -> Option<MsTxLookahead> {
         None
     }
+
+    /// Most recent uncalibrated downlink RSSI (dBFS) measured on the serving-cell
+    /// downlink, or `None` before the first downlink slot has been demodulated /
+    /// on devices that do not receive.
+    ///
+    /// The value is relative to the demodulator full-scale magnitude
+    /// (`1.0 == 0 dBFS`), i.e. `10*log10(mean(|s|^2))` over a downlink slot; it
+    /// is not referenced to an absolute antenna power. The MLE uses serving-cell
+    /// signal strength as a reselection input (ETSI TS 100 392-2 cl. 18.3.4) and
+    /// it is surfaced to the MS management UI as a receive-level indicator. The
+    /// default is `None`, appropriate for devices/tests that never receive.
+    fn dl_rssi_dbfs(&self) -> Option<f32> {
+        None
+    }
 }

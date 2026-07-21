@@ -187,6 +187,11 @@ pub struct MmMs {
     /// indication/confirm can report "LA (where registered)" (Table 15.5).
     /// Defaults to the configured cell LA until a serving cell is selected.
     serving_la: u16,
+    /// Latest serving-cell downlink receive level (uncalibrated dBFS) reported by
+    /// MLE (implementation-defined Plane B `LmmMleRssiInd`). `None` before the
+    /// first measurement or while out of service. Surfaced in the management
+    /// runtime state so the UI can show a receive-level meter. **NON-STANDARD**.
+    serving_rssi_dbfs: Option<f32>,
     /// Runtime plumbing needed by the Plane B management write/apply handlers
     /// (config file path + process restart signalling). `None` in unit tests
     /// and read-only deployments, in which case `SetConfig`/`ApplyConfig` are
@@ -253,6 +258,7 @@ impl MmMs {
             pending_lu_type: LocationUpdateType::ItsiAttach,
             temporary_registration: false,
             serving_la,
+            serving_rssi_dbfs: None,
             mgmt_ctx: None,
             restart_required: false,
             attached_gssis,
@@ -2157,6 +2163,7 @@ impl MmMs {
             home_mcc: cfg.net.mcc,
             home_mnc: cfg.net.mnc,
             serving_la: self.serving_la,
+            rssi_dbfs: self.serving_rssi_dbfs,
             colour_code: cfg.cell.colour_code,
             attached_groups: self.attach_groups(),
             restart_required: self.restart_required,
@@ -2275,6 +2282,11 @@ impl TetraEntityTrait for MmMs {
                 let conf = conf.clone();
                 self.rx_activate_conf(queue, &conf);
             }
+            SapMsgInner::LmmMleRssiInd(ind) => {
+                // Implementation-defined (Plane B): cache the serving-cell level
+                // for the management runtime state / UI receive-level meter.
+                self.serving_rssi_dbfs = ind.rssi_dbfs;
+            }
             _ => {
                 panic!();
             }
@@ -2312,6 +2324,7 @@ mod tests {
     use crate::net_telemetry::TelemetryEvent;
     use tetra_config::bluestation::from_toml_str;
     use tetra_saps::lmm::LmmMleUnitdataInd;
+    use tetra_saps::lmm::LmmMleRssiInd;
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
     use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 
@@ -2431,6 +2444,37 @@ attach_groups = []
         let mut sdu = BitBuffer::new_autoexpand(8);
         pdu.to_bitbuf(&mut sdu).unwrap();
         sdu
+    }
+
+    /// The serving-cell RSSI reported by MLE (implementation-defined Plane B
+    /// `LmmMleRssiInd`) is cached by MM and surfaced in the `GetState` runtime
+    /// snapshot the UI reads.
+    #[test]
+    fn test_rssi_reported_in_runtime_state() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        // No measurement yet.
+        assert_eq!(mm.runtime_snapshot().rssi_dbfs, None);
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Mm,
+            msg: SapMsgInner::LmmMleRssiInd(LmmMleRssiInd { rssi_dbfs: Some(-63.0) }),
+        };
+        mm.rx_prim(&mut q, msg);
+        assert_eq!(mm.runtime_snapshot().rssi_dbfs, Some(-63.0));
+
+        // A subsequent out-of-service clear (None) is reflected too.
+        let clear = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Mm,
+            msg: SapMsgInner::LmmMleRssiInd(LmmMleRssiInd { rssi_dbfs: None }),
+        };
+        mm.rx_prim(&mut q, clear);
+        assert_eq!(mm.runtime_snapshot().rssi_dbfs, None);
     }
 
     /// The demand MM emits on cell selection must be a valid, BS-acceptable
