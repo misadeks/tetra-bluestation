@@ -1,5 +1,5 @@
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::{ScanMode, SharedConfig};
+use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, unimplemented_log};
 use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
@@ -359,22 +359,16 @@ impl MleMs {
     }
 
     /// The codeplug-programmed scan candidate downlink carriers (Hz), or empty
-    /// when the codeplug does not program a multi-candidate scan.
+    /// when the codeplug does not program any frequency lists.
     ///
-    /// A `Fixed` scan mode (or no `[scan]` section) means the radio stays on its
-    /// single configured carrier, so no scanning is performed and the pre-scan
-    /// single-frequency behaviour is preserved. Only `List` / `Range` modes
-    /// enumerate a candidate set for the scanning cell-selection engine
-    /// (ETSI TS 100 392-2 cl. 18.3.4; the enumeration itself is **[impl policy]**).
+    /// With no `[[frequency_list]]` programmed the radio stays on its single
+    /// configured carrier, so no scanning is performed and the pre-scan
+    /// single-frequency behaviour is preserved. Otherwise the candidates from
+    /// all programmed lists are combined (deduplicated) into one set for the
+    /// scanning cell-selection engine (ETSI TS 100 392-2 cl. 18.3.4; the
+    /// enumeration itself is **[impl policy]**).
     fn scan_candidate_carriers(&self) -> Vec<u32> {
-        let cfg = self.config.config();
-        let Some(scan) = cfg.codeplug.scan.as_ref() else {
-            return Vec::new();
-        };
-        match scan.mode {
-            ScanMode::Fixed => Vec::new(),
-            ScanMode::List | ScanMode::Range => scan.candidate_frequencies(),
-        }
+        self.config.config().codeplug.scan_candidate_frequencies()
     }
 
     /// Whether the codeplug programs a multi-candidate scan (so the MLE drives
@@ -1419,7 +1413,8 @@ issi = 1000001
 subscriber_class = 1
 attach_groups = []
 
-[scan]
+[[frequency_list]]
+name = "scan"
 mode = "List"
 frequencies = [390000000, 396000000]
 dwell_ms = 500

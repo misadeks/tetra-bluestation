@@ -1,0 +1,19 @@
+Refactor codeplug scan config into named [[frequency_list]] tables
+
+Replace the single [scan] section with multiple named [[frequency_list]]
+array-of-tables. Each list is List or Range (the old Fixed mode is removed
+- a single-frequency setup is just a List with one frequency). The radio
+scans all lists combined into one candidate set (deduplicated, order
+preserved).
+
+- sec_codeplug: ScanMode -> FrequencyListMode (List/Range only), CfgScan ->
+  CfgFrequencyList (+ name), CfgScanRange -> CfgFrequencyRange; codeplug field
+  scan: Option<CfgScan> -> frequency_lists: Vec<CfgFrequencyList>; add
+  scan_candidate_frequencies() combining+deduping all lists; per-list
+  validation (unique non-empty names, List needs >=1 freq, Range needs range).
+- parsing: TomlConfigRoot.scan -> frequency_list array; DTO/serialize plumbing.
+- mle_ms: scan_candidate_carriers() now returns the combined set; drop
+  ScanMode import.
+- example_config/config-ms.toml: [[frequency_list]] with List + commented Range.
+
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>

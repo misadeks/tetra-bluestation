@@ -78,20 +78,19 @@ fn components_from_dl_hz(dl_hz: u32) -> Result<(u8, u16, i16), String> {
     Ok((band, carrier, freq_offset))
 }
 
-/// Operating mode for the MS channel selector (**[impl policy]**).
+/// How a programmed frequency list enumerates its downlink carriers
+/// (**[impl policy]**). A single-frequency `List` is the former "fixed channel".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum ScanMode {
-    /// Camp on a single programmed frequency; no scanning.
-    Fixed,
-    /// Cycle through a programmed list of frequencies.
+pub enum FrequencyListMode {
+    /// An explicit list of downlink frequencies.
     List,
-    /// Enumerate a frequency range (band + carrier start/stop/step).
+    /// A frequency range (band + carrier start/stop/step) enumerated on the fly.
     Range,
 }
 
-impl Default for ScanMode {
+impl Default for FrequencyListMode {
     fn default() -> Self {
-        ScanMode::Fixed
+        FrequencyListMode::List
     }
 }
 
@@ -163,9 +162,9 @@ impl CfgCarrierOverride {
     }
 }
 
-/// A carrier range for `ScanMode::Range` enumeration.
+/// A carrier range for a `FrequencyListMode::Range` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CfgScanRange {
+pub struct CfgFrequencyRange {
     pub band: u8,
     pub start_carrier: u16,
     pub stop_carrier: u16,
@@ -173,23 +172,29 @@ pub struct CfgScanRange {
     pub step: u16,
 }
 
-/// Scan / channel-selection configuration.
+/// A named frequency list the radio scans (**[impl policy]**). Each list is
+/// either an explicit set of downlink frequencies (`List`) or an enumerated
+/// carrier range (`Range`). The radio scans every programmed list, combined
+/// into one candidate set (see [`CfgCodeplug::scan_candidate_frequencies`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CfgScan {
-    pub mode: ScanMode,
-    /// Absolute downlink frequencies (Hz) used for `Fixed` (first entry) and
-    /// `List` modes.
+pub struct CfgFrequencyList {
+    /// Human-readable label (unique within the codeplug).
+    pub name: String,
+    pub mode: FrequencyListMode,
+    /// Absolute downlink frequencies (Hz) for a `List` list (a single entry is
+    /// the former "fixed channel").
     pub frequencies: Vec<u32>,
-    /// Carrier range used for `Range` mode.
-    pub range: Option<CfgScanRange>,
+    /// Carrier range for a `Range` list.
+    pub range: Option<CfgFrequencyRange>,
     /// Per-candidate dwell time in milliseconds.
     pub dwell_ms: u32,
 }
 
-impl Default for CfgScan {
+impl Default for CfgFrequencyList {
     fn default() -> Self {
         Self {
-            mode: ScanMode::Fixed,
+            name: String::new(),
+            mode: FrequencyListMode::List,
             frequencies: Vec::new(),
             range: None,
             dwell_ms: 1000,
@@ -197,14 +202,13 @@ impl Default for CfgScan {
     }
 }
 
-impl CfgScan {
-    /// Enumerate the downlink frequencies (Hz) this scan covers. For `Range`
-    /// mode the carriers are expanded on the fly.
+impl CfgFrequencyList {
+    /// Enumerate the downlink frequencies (Hz) this list covers. For a `Range`
+    /// list the carriers are expanded on the fly.
     pub fn candidate_frequencies(&self) -> Vec<u32> {
         match self.mode {
-            ScanMode::Fixed => self.frequencies.iter().take(1).copied().collect(),
-            ScanMode::List => self.frequencies.clone(),
-            ScanMode::Range => {
+            FrequencyListMode::List => self.frequencies.clone(),
+            FrequencyListMode::Range => {
                 let mut out = Vec::new();
                 if let Some(ref r) = self.range {
                     let step = r.step.max(1);
@@ -221,7 +225,7 @@ impl CfgScan {
 }
 
 /// The complete codeplug: folders, talkgroups, allowed networks, carrier
-/// overrides and scan settings.
+/// overrides and frequency lists.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CfgCodeplug {
     pub folders: Vec<CfgFolder>,
@@ -230,8 +234,9 @@ pub struct CfgCodeplug {
     pub networks: Vec<CfgNetwork>,
     /// Per-frequency overrides, matched by downlink frequency.
     pub carrier_overrides: Vec<CfgCarrierOverride>,
-    /// Present only when a `[scan]` section is configured.
-    pub scan: Option<CfgScan>,
+    /// Programmed frequency lists the radio scans (combined into one candidate
+    /// set). Empty = no scanning (stay on the single configured carrier).
+    pub frequency_lists: Vec<CfgFrequencyList>,
 }
 
 impl CfgCodeplug {
@@ -242,7 +247,23 @@ impl CfgCodeplug {
             && self.talkgroups.is_empty()
             && self.networks.is_empty()
             && self.carrier_overrides.is_empty()
-            && self.scan.is_none()
+            && self.frequency_lists.is_empty()
+    }
+
+    /// The combined downlink candidate set (Hz) the radio scans across ALL
+    /// programmed frequency lists, in list-then-entry order with duplicates
+    /// removed (**[impl policy]**). Empty when no list is programmed, in which
+    /// case the radio stays on its single configured carrier (no scanning).
+    pub fn scan_candidate_frequencies(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for list in &self.frequency_lists {
+            for f in list.candidate_frequencies() {
+                if !out.contains(&f) {
+                    out.push(f);
+                }
+            }
+        }
+        out
     }
 
     /// Look up a carrier override by name.
@@ -387,42 +408,50 @@ impl CfgCodeplug {
             }
         }
 
-        // Scan.
-        if let Some(ref scan) = self.scan {
-            if scan.dwell_ms == 0 {
-                return Err("scan dwell_ms must be greater than 0".to_string());
+        // Frequency lists.
+        let mut list_names: HashSet<&str> = HashSet::new();
+        for fl in &self.frequency_lists {
+            if fl.name.trim().is_empty() {
+                return Err("frequency_list name must not be empty".to_string());
             }
-            for f in &scan.frequencies {
+            if !list_names.insert(fl.name.as_str()) {
+                return Err(format!("duplicate frequency_list name '{}'", fl.name));
+            }
+            if fl.dwell_ms == 0 {
+                return Err(format!("frequency_list '{}' dwell_ms must be greater than 0", fl.name));
+            }
+            for f in &fl.frequencies {
                 if *f == 0 {
-                    return Err("scan frequency must be greater than 0 Hz".to_string());
+                    return Err(format!("frequency_list '{}' frequency must be greater than 0 Hz", fl.name));
                 }
             }
-            match scan.mode {
-                ScanMode::Fixed => {
-                    if scan.frequencies.len() != 1 {
-                        return Err("scan mode 'Fixed' requires exactly one frequency".to_string());
+            match fl.mode {
+                FrequencyListMode::List => {
+                    if fl.frequencies.is_empty() {
+                        return Err(format!(
+                            "frequency_list '{}' (List) requires at least one frequency",
+                            fl.name
+                        ));
                     }
                 }
-                ScanMode::List => {
-                    if scan.frequencies.is_empty() {
-                        return Err("scan mode 'List' requires at least one frequency".to_string());
-                    }
-                }
-                ScanMode::Range => {
-                    let Some(ref r) = scan.range else {
-                        return Err("scan mode 'Range' requires a [scan.range] section".to_string());
+                FrequencyListMode::Range => {
+                    let Some(ref r) = fl.range else {
+                        return Err(format!(
+                            "frequency_list '{}' (Range) requires a [[frequency_list.range]] section",
+                            fl.name
+                        ));
                     };
                     if r.band > MAX_FREQ_BAND {
-                        return Err(format!("scan range band must be 0..={}", MAX_FREQ_BAND));
+                        return Err(format!("frequency_list '{}' range band must be 0..={}", fl.name, MAX_FREQ_BAND));
                     }
                     if r.step == 0 {
-                        return Err("scan range step must be >= 1".to_string());
+                        return Err(format!("frequency_list '{}' range step must be >= 1", fl.name));
                     }
                     if r.start_carrier > MAX_CARRIER || r.stop_carrier > MAX_CARRIER {
-                        return Err(format!("scan range carriers must be 0..={}", MAX_CARRIER));
+                        return Err(format!("frequency_list '{}' range carriers must be 0..={}", fl.name, MAX_CARRIER));
                     }
                     if r.start_carrier >= r.stop_carrier {
-                        return Err("scan range start_carrier must be < stop_carrier".to_string());
+                        return Err(format!("frequency_list '{}' range start_carrier must be < stop_carrier", fl.name));
                     }
                 }
             }
@@ -496,7 +525,7 @@ pub struct CarrierOverrideDto {
 }
 
 #[derive(Default, Deserialize, Serialize)]
-pub struct ScanRangeDto {
+pub struct FrequencyRangeDto {
     pub band: u8,
     pub start_carrier: u16,
     pub stop_carrier: u16,
@@ -506,10 +535,11 @@ pub struct ScanRangeDto {
 }
 
 #[derive(Default, Deserialize, Serialize)]
-pub struct ScanDto {
-    pub mode: Option<ScanMode>,
+pub struct FrequencyListDto {
+    pub name: String,
+    pub mode: Option<FrequencyListMode>,
     pub frequencies: Option<Vec<u32>>,
-    pub range: Option<ScanRangeDto>,
+    pub range: Option<FrequencyRangeDto>,
     pub dwell_ms: Option<u32>,
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
@@ -577,11 +607,12 @@ fn carrier_override_dto_to_cfg(dto: CarrierOverrideDto) -> Result<CfgCarrierOver
     })
 }
 
-fn scan_dto_to_cfg(dto: ScanDto) -> CfgScan {
-    CfgScan {
+fn frequency_list_dto_to_cfg(dto: FrequencyListDto) -> CfgFrequencyList {
+    CfgFrequencyList {
+        name: dto.name,
         mode: dto.mode.unwrap_or_default(),
         frequencies: dto.frequencies.unwrap_or_default(),
-        range: dto.range.map(|r| CfgScanRange {
+        range: dto.range.map(|r| CfgFrequencyRange {
             band: r.band,
             start_carrier: r.start_carrier,
             stop_carrier: r.stop_carrier,
@@ -599,7 +630,7 @@ pub fn codeplug_dto_to_cfg(
     talkgroups: Option<Vec<TalkgroupDto>>,
     networks: Option<Vec<NetworkDto>>,
     carrier_overrides: Option<Vec<CarrierOverrideDto>>,
-    scan: Option<ScanDto>,
+    frequency_lists: Option<Vec<FrequencyListDto>>,
 ) -> Result<CfgCodeplug, String> {
     let folders = folders.unwrap_or_default().into_iter().map(folder_dto_to_cfg).collect();
     let talkgroups = talkgroups.unwrap_or_default().into_iter().map(talkgroup_dto_to_cfg).collect();
@@ -609,13 +640,17 @@ pub fn codeplug_dto_to_cfg(
         .into_iter()
         .map(carrier_override_dto_to_cfg)
         .collect::<Result<Vec<_>, _>>()?;
-    let scan = scan.map(scan_dto_to_cfg);
+    let frequency_lists = frequency_lists
+        .unwrap_or_default()
+        .into_iter()
+        .map(frequency_list_dto_to_cfg)
+        .collect();
     Ok(CfgCodeplug {
         folders,
         talkgroups,
         networks,
         carrier_overrides,
-        scan,
+        frequency_lists,
     })
 }
 
@@ -698,20 +733,29 @@ pub fn cfg_to_carrier_override_dtos(cp: &CfgCodeplug) -> Option<Vec<CarrierOverr
     )
 }
 
-pub fn cfg_to_scan_dto(cp: &CfgCodeplug) -> Option<ScanDto> {
-    cp.scan.as_ref().map(|s| ScanDto {
-        mode: Some(s.mode),
-        frequencies: if s.frequencies.is_empty() { None } else { Some(s.frequencies.clone()) },
-        range: s.range.as_ref().map(|r| ScanRangeDto {
-            band: r.band,
-            start_carrier: r.start_carrier,
-            stop_carrier: r.stop_carrier,
-            step: Some(r.step),
-            extra: HashMap::new(),
-        }),
-        dwell_ms: Some(s.dwell_ms),
-        extra: HashMap::new(),
-    })
+pub fn cfg_to_frequency_list_dtos(cp: &CfgCodeplug) -> Option<Vec<FrequencyListDto>> {
+    if cp.frequency_lists.is_empty() {
+        return None;
+    }
+    Some(
+        cp.frequency_lists
+            .iter()
+            .map(|s| FrequencyListDto {
+                name: s.name.clone(),
+                mode: Some(s.mode),
+                frequencies: if s.frequencies.is_empty() { None } else { Some(s.frequencies.clone()) },
+                range: s.range.as_ref().map(|r| FrequencyRangeDto {
+                    band: r.band,
+                    start_carrier: r.start_carrier,
+                    stop_carrier: r.stop_carrier,
+                    step: Some(r.step),
+                    extra: HashMap::new(),
+                }),
+                dwell_ms: Some(s.dwell_ms),
+                extra: HashMap::new(),
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -815,11 +859,12 @@ mod tests {
                 priority: 0,
             }],
             carrier_overrides: vec![sample_override("BS-1")],
-            scan: Some(CfgScan {
-                mode: ScanMode::List,
+            frequency_lists: vec![CfgFrequencyList {
+                name: "primary".to_string(),
+                mode: FrequencyListMode::List,
                 frequencies: vec![439_825_000, 439_850_000],
-                ..CfgScan::default()
-            }),
+                ..CfgFrequencyList::default()
+            }],
         };
         assert!(cp.validate().is_ok(), "{:?}", cp.validate());
     }
@@ -840,13 +885,34 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_fixed_mode_requires_one_freq() {
+    fn test_validate_list_requires_freq() {
         let cp = CfgCodeplug {
-            scan: Some(CfgScan {
-                mode: ScanMode::Fixed,
-                frequencies: vec![439_825_000, 439_850_000],
-                ..CfgScan::default()
-            }),
+            frequency_lists: vec![CfgFrequencyList {
+                name: "empty".to_string(),
+                mode: FrequencyListMode::List,
+                frequencies: vec![],
+                ..CfgFrequencyList::default()
+            }],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_list_name() {
+        let cp = CfgCodeplug {
+            frequency_lists: vec![
+                CfgFrequencyList {
+                    name: "dup".to_string(),
+                    frequencies: vec![439_825_000],
+                    ..CfgFrequencyList::default()
+                },
+                CfgFrequencyList {
+                    name: "dup".to_string(),
+                    frequencies: vec![439_850_000],
+                    ..CfgFrequencyList::default()
+                },
+            ],
             ..CfgCodeplug::default()
         };
         assert!(cp.validate().is_err());
@@ -891,11 +957,12 @@ mod tests {
     #[test]
     fn test_validate_range_mode_requires_range() {
         let cp = CfgCodeplug {
-            scan: Some(CfgScan {
-                mode: ScanMode::Range,
+            frequency_lists: vec![CfgFrequencyList {
+                name: "r".to_string(),
+                mode: FrequencyListMode::Range,
                 range: None,
-                ..CfgScan::default()
-            }),
+                ..CfgFrequencyList::default()
+            }],
             ..CfgCodeplug::default()
         };
         assert!(cp.validate().is_err());
@@ -932,13 +999,41 @@ mod tests {
 
     #[test]
     fn test_range_candidate_frequencies() {
-        let scan = CfgScan {
-            mode: ScanMode::Range,
-            range: Some(CfgScanRange { band: 4, start_carrier: 1593, stop_carrier: 1595, step: 1 }),
-            ..CfgScan::default()
+        let list = CfgFrequencyList {
+            name: "r".to_string(),
+            mode: FrequencyListMode::Range,
+            range: Some(CfgFrequencyRange { band: 4, start_carrier: 1593, stop_carrier: 1595, step: 1 }),
+            ..CfgFrequencyList::default()
         };
-        let freqs = scan.candidate_frequencies();
+        let freqs = list.candidate_frequencies();
         assert_eq!(freqs, vec![439_825_000, 439_850_000, 439_875_000]);
+    }
+
+    #[test]
+    fn test_scan_candidate_frequencies_combines_lists_deduped() {
+        let cp = CfgCodeplug {
+            frequency_lists: vec![
+                CfgFrequencyList {
+                    name: "a".to_string(),
+                    mode: FrequencyListMode::List,
+                    frequencies: vec![439_825_000, 439_850_000],
+                    ..CfgFrequencyList::default()
+                },
+                CfgFrequencyList {
+                    name: "b".to_string(),
+                    mode: FrequencyListMode::Range,
+                    // 439_850_000 overlaps list "a" and must be deduped.
+                    range: Some(CfgFrequencyRange { band: 4, start_carrier: 1594, stop_carrier: 1595, step: 1 }),
+                    ..CfgFrequencyList::default()
+                },
+            ],
+            ..CfgCodeplug::default()
+        };
+        assert_eq!(
+            cp.scan_candidate_frequencies(),
+            vec![439_825_000, 439_850_000, 439_875_000],
+            "all lists combined in order, duplicates removed"
+        );
     }
 
     #[test]

@@ -194,19 +194,27 @@ name = "BS-2"
 dl_freq = 439850000                 # same as band 4 / carrier 1594
 rx_only = true
 
-# Scan / channel-selection settings.
-#   mode = "Fixed" -> camp on the single listed frequency
-#   mode = "List"  -> scan the listed frequencies, camp on the best suitable cell
-#   mode = "Range" -> enumerate a carrier range (see [scan.range] below)
-# frequencies: absolute downlink frequencies in Hz to scan.
-[scan]
+# Frequency lists — the candidate downlink carriers the MS scans to find a serving
+# cell. Define one or more named lists; the radio scans ALL lists combined into a
+# single candidate set (duplicates removed) and camps on the best suitable cell.
+#   mode = "List"  -> scan the explicitly listed frequencies
+#   mode = "Range" -> enumerate a carrier range (see [[frequency_list.range]] below)
+# A single-frequency "camp on one carrier" setup is just a List with one frequency.
+# With no [[frequency_list]] programmed, the MS does not scan.
+[[frequency_list]]
+name = "primary"
 mode = "List"
 frequencies = [439825000, 439850000]
 dwell_ms = 800
 
-# Range-scan example (used when mode = "Range"). Enumerates band 4 carriers from
-# start to stop in `step` carrier units (multiples of 25 kHz).
-# [scan.range]
+# Range-based list example. Enumerates band 4 carriers from start to stop in `step`
+# carrier units (multiples of 25 kHz). Uncomment to add it to the scan set.
+# [[frequency_list]]
+# name = "band4-sweep"
+# mode = "Range"
+# dwell_ms = 800
+#
+# [[frequency_list.range]]
 # band = 4
 # start_carrier = 1500
 # stop_carrier = 1700
