@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::bluestation::{
-    CellInfoDto, CfgControlDto, CfgMsDto, ChannelDto, DuplexTableDto, FolderDto, NetInfoDto, ScanDto, TalkgroupDto,
-    apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_cell_dto, cfg_to_channel_dtos, cfg_to_duplex_dto,
-    cfg_to_folder_dtos, cfg_to_ms_dto, cfg_to_net_dto, cfg_to_phy_dto, cfg_to_scan_dto, cfg_to_talkgroup_dtos,
-    codeplug_dto_to_cfg, duplex_dto_to_cfg, duplex_table_is_default, ms_dto_to_cfg, net_dto_to_cfg,
+    CarrierOverrideDto, CellInfoDto, CfgControlDto, CfgMsDto, DuplexTableDto, FolderDto, NetInfoDto, NetworkDto,
+    ScanDto, TalkgroupDto, apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_carrier_override_dtos,
+    cfg_to_cell_dto, cfg_to_duplex_dto, cfg_to_folder_dtos, cfg_to_ms_dto, cfg_to_net_dto, cfg_to_network_dtos,
+    cfg_to_phy_dto, cfg_to_scan_dto, cfg_to_talkgroup_dtos, codeplug_dto_to_cfg, duplex_dto_to_cfg,
+    duplex_table_is_default, ms_dto_to_cfg, net_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -92,7 +93,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
 
     // Build the codeplug (Plane B, optional). RF resolution + validation errors
     // surface here with a descriptive message.
-    let codeplug = codeplug_dto_to_cfg(root.folder, root.channel, root.talkgroup, root.scan)?;
+    let codeplug = codeplug_dto_to_cfg(root.folder, root.talkgroup, root.network, root.carrier_override, root.scan)?;
     codeplug.validate()?;
 
     // Build config from required and optional values
@@ -178,9 +179,11 @@ struct TomlConfigRoot {
     #[serde(skip_serializing_if = "Option::is_none")]
     folder: Option<Vec<FolderDto>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    channel: Option<Vec<ChannelDto>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     talkgroup: Option<Vec<TalkgroupDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<Vec<NetworkDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carrier_override: Option<Vec<CarrierOverrideDto>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scan: Option<ScanDto>,
 
@@ -213,8 +216,9 @@ fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
             Some(cfg_to_duplex_dto(&cfg.duplex_table))
         },
         folder: cfg_to_folder_dtos(&cfg.codeplug),
-        channel: cfg_to_channel_dtos(&cfg.codeplug),
         talkgroup: cfg_to_talkgroup_dtos(&cfg.codeplug),
+        network: cfg_to_network_dtos(&cfg.codeplug),
+        carrier_override: cfg_to_carrier_override_dtos(&cfg.codeplug),
         scan: cfg_to_scan_dto(&cfg.codeplug),
         extra: HashMap::new(),
     }
@@ -481,8 +485,8 @@ attach_groups = []
         assert!(from_toml_str(&bad).is_err());
     }
 
-    // A radio-style MS config carrying a codeplug: folders, channels (both RF
-    // forms), talkgroups, and a list-mode scan set.
+    // A radio-style MS config carrying a codeplug: folders, talkgroups, allowed
+    // networks, carrier overrides (both RF forms), and a list-mode scan set.
     const MS_TOML_CODEPLUG: &str = r#"
 config_version = "0.7"
 stack_mode = "Ms"
@@ -529,8 +533,15 @@ gssi = 101
 name = "Dispatch"
 folder = "work"
 class_of_usage = 0
+order = 1
 
-[[channel]]
+[[network]]
+mcc = 901
+mnc = 9999
+name = "Home"
+priority = 0
+
+[[carrier_override]]
 name = "BS-1"
 band = 4
 carrier = 1593
@@ -538,36 +549,33 @@ freq_offset = 0
 colour_code = 1
 duplex_index = 7
 custom_duplex_spacing = 9400000
-folder = "work"
 rx_only = true
-default_talkgroups = [101]
 
-[[channel]]
+[[carrier_override]]
 name = "BS-2-byfreq"
 dl_freq = 439850000
-folder = "work"
 
 [scan]
 mode = "List"
-channels = ["BS-1", "BS-2-byfreq"]
+frequencies = [439825000, 439850000]
 dwell_ms = 800
-allowed_networks = [{ mcc = 901, mnc = 9999 }]
 "#;
 
     #[test]
     fn codeplug_parses_and_roundtrips() {
         let cfg = from_toml_str(MS_TOML_CODEPLUG).expect("parse codeplug config");
-        assert_eq!(cfg.codeplug.channels.len(), 2);
+        assert_eq!(cfg.codeplug.carrier_overrides.len(), 2);
         assert_eq!(cfg.codeplug.folders.len(), 1);
         assert_eq!(cfg.codeplug.talkgroups.len(), 1);
+        assert_eq!(cfg.codeplug.networks.len(), 1);
         // dl_freq form resolved to band/carrier.
-        let ch2 = cfg.codeplug.channel("BS-2-byfreq").expect("channel");
-        assert_eq!(ch2.dl_freq_hz(), 439_850_000);
-        assert_eq!((ch2.freq_band, ch2.main_carrier, ch2.freq_offset_hz), (4, 1594, 0));
+        let co2 = cfg.codeplug.carrier_override("BS-2-byfreq").expect("carrier_override");
+        assert_eq!(co2.dl_freq_hz(), 439_850_000);
+        assert_eq!((co2.freq_band, co2.main_carrier, co2.freq_offset_hz), (4, 1594, 0));
 
         // Round-trip: serialize -> reparse must preserve the codeplug.
         let rendered = to_toml_string(&cfg).expect("serialize");
-        assert!(rendered.contains("[[channel]]"));
+        assert!(rendered.contains("[[carrier_override]]"));
         assert!(rendered.contains("[scan]"));
         let reparsed = from_toml_str(&rendered).expect("reparse");
         assert_eq!(reparsed.codeplug, cfg.codeplug);
@@ -575,8 +583,8 @@ allowed_networks = [{ mcc = 901, mnc = 9999 }]
 
     #[test]
     fn codeplug_invalid_reference_rejected() {
-        // Scan references a channel that does not exist.
-        let bad = MS_TOML_CODEPLUG.replace(r#"channels = ["BS-1", "BS-2-byfreq"]"#, r#"channels = ["ghost"]"#);
+        // Talkgroup references a folder that does not exist.
+        let bad = MS_TOML_CODEPLUG.replace(r#"folder = "work""#, r#"folder = "ghost""#);
         assert!(from_toml_str(&bad).is_err());
     }
 

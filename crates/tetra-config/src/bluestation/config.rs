@@ -65,7 +65,7 @@ pub struct StackConfig {
     /// to the ETSI spec table when no `[duplex_table]` section is configured.
     pub duplex_table: DuplexTable,
 
-    /// Radio-style codeplug (channels/folders/talkgroups/scan) — **Plane B**.
+    /// Radio-style codeplug (folders/talkgroups/networks/carrier_overrides/scan) — **Plane B**.
     /// Empty for BS mode and legacy MS configs. Data only: read by the
     /// management/TNMM UI and the cell-selection engine; does not itself change
     /// on-air behaviour.
