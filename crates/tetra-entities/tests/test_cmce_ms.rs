@@ -217,7 +217,7 @@ fn cmce_ms_downlink_setup_emits_tncc_setup_indication() {
 }
 #[test]
 fn ms_originated_setup_pdus_decode_with_tetra_pdus() {
-    let mut cc = CcMsSubentity::new(None);
+    let mut cc = CcMsSubentity::new_with_config(shared_ms_config(), None);
     let mut q = MessageQueue::new();
 
     cc.originate_group_call(&mut q, GSSI, speech_service(CommunicationType::P2Mp), false);

@@ -10,6 +10,18 @@ impl CcMsSubentity {
         simplex_duplex_selection: bool,
         request_to_transmit: bool,
     ) {
+        // Uplink CMCE signalling to the SwMI travels over the individual,
+        // acknowledged basic link identified by the MS's own individual short
+        // subscriber identity (cl. 14.5 / basic link addressing cl. 21 & 23).
+        // The called identity (ISSI or GSSI) is carried *inside* the U-SETUP as
+        // the Called party SSI element (cl. 14.8.28), NOT as the layer-2
+        // address: a group address here would force the LLC onto the
+        // unacknowledged basic link (BL-UDATA), which the SwMI rejects.
+        let Some(own_issi) = self.own_issi else {
+            tracing::error!("CMCE-MS: cannot originate call — own ISSI not configured; dropping U-SETUP");
+            return;
+        };
+        let source_address = TetraAddress::new(own_issi, SsiType::Issi);
         let pdu = USetup {
             area_selection: 0,
             hook_method_selection,
@@ -36,7 +48,7 @@ impl CcMsSubentity {
             queue,
             &pdu,
             CallRoute {
-                main_address: called_party,
+                main_address: source_address,
                 handle: 0,
                 endpoint_id: 0,
                 link_id: 0,

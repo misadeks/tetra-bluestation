@@ -90,6 +90,23 @@ mod tests {
     }
 
     #[test]
+    fn mo_group_setup_addresses_swmi_with_own_issi() {
+        // Regression: an MO group-call U-SETUP must travel on the individual,
+        // acknowledged basic link keyed on the MS's own ISSI. Addressing it with
+        // the called GSSI forces the LLC onto BL-UDATA and the SwMI drops it.
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        cc.originate_group_call(&mut q, 220, default_speech_basic_service(), true);
+        let msg = q.pop_front().expect("U-SETUP should be queued");
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = msg.msg else {
+            panic!("expected LcmcMleUnitdataReq");
+        };
+        assert_eq!(prim.main_address.ssi, 1234567);
+        assert!(matches!(prim.main_address.ssi_type, SsiType::Issi));
+    }
+
+    #[test]
     fn grant_self_switches_uplane_tx() {
         let mut cc = CcMsSubentity::new(None);
         let mut q = MessageQueue::new();
