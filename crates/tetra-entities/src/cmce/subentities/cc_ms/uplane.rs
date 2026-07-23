@@ -70,4 +70,37 @@ impl CcMsSubentity {
             }),
         });
     }
+
+    /// Deliver a decoded downlink TCH/S speech frame into the U-plane.
+    ///
+    /// The lower MAC (LMAC → UMAC) forwards decoded traffic frames tagged with
+    /// the timeslot they arrived on. Per ETSI TS 100 392-2 cl. 14.5.1.4, received
+    /// U-plane traffic is only meaningful while the CC has switched the U-plane
+    /// on for an active call (call present / receiving speech), so a frame that
+    /// arrives while every call has the U-plane switched off is discarded. When
+    /// a U-plane-on call is present the frame is accepted into that call's
+    /// receive path — the minimal audio egress until a vocoder/audio sink is
+    /// wired.
+    pub fn rx_downlink_traffic(&mut self, _ts: u8, data: &[u8]) {
+        // Find the active call currently receiving on the U-plane. M1 assumes a
+        // single simultaneous call on the serving carrier; the assigned-timeslot
+        // demux (matching `_ts` to a specific call) arrives with the
+        // channel-allocation handling in a later milestone.
+        let Some(call) = self
+            .calls
+            .values_mut()
+            .find(|c| c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false))
+        else {
+            tracing::trace!("rx_downlink_traffic: no call with U-plane switched on, dropping speech frame");
+            return;
+        };
+
+        call.rx_speech_frames = call.rx_speech_frames.saturating_add(1);
+        tracing::info!(
+            call = call.call_identifier,
+            frames = call.rx_speech_frames,
+            bits = data.len(),
+            "CC-MS: received downlink speech frame (U-plane)"
+        );
+    }
 }

@@ -8,6 +8,17 @@ pub struct TpUnitdataInd {
     /// Undefined for BBK. For all others: [ Block1 | Block2 | Both ]
     pub block_num: PhyBlockNum,
     pub block: BitBuffer,
+
+    /// Absolute TDMA time of the slot this burst was demodulated in.
+    ///
+    /// The downlink demodulator walks every timeslot of the frame (ETSI TS 100
+    /// 392-2 cl. 9.3), so a single received frame yields bursts on several
+    /// timeslots. The receiving MAC needs the slot number to tell them apart —
+    /// in particular to distinguish the control-channel timeslot from an
+    /// assigned traffic channel (TCH), which generally lives on a *different*
+    /// timeslot of the same carrier. This mirrors the uplink
+    /// [`TpUnitdataReqSlot::time`] on the transmit path.
+    pub time: TdmaTime,
 }
 
 #[derive(Debug, Clone)]

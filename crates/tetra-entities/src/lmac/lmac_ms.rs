@@ -1,7 +1,7 @@
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{PhyBlockNum, PhyBlockType, Sap, TdmaTime, unimplemented_log};
+use tetra_core::{PhyBlockNum, PhyBlockType, Sap, TdmaTime};
 use tetra_core::{BurstType, TrainingSequence};
 use tetra_saps::tmv::TmvUnitdataInd;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
@@ -146,8 +146,61 @@ impl LmacMs {
         }
     }
 
-    fn rx_blk_traffic(&mut self, _queue: &mut MessageQueue, _blk: TpUnitdataInd, _lchan: LogicalChannel) {
-        unimplemented_log!("rx_blk_traffic: Traffic channel reception not implemented yet");
+    /// Decode a received downlink traffic burst (TCH/S speech) and deliver the
+    /// ACELP frame to the upper MAC, tagged with the timeslot it arrived on.
+    ///
+    /// Mirrors the BS uplink receive path (`LmacBs::rx_blk_traffic`) but for the
+    /// MS downlink: the assigned traffic channel is a full-slot TCH/S on a
+    /// (generally non-control) timeslot of the serving carrier. Channel decode
+    /// is TCH/S per ETSI TS 100 392-2 cl. 8.2 (channel coding) / cl. 23.4.2. A
+    /// failed CRC is still forwarded (bad-frame indication) so the vocoder can
+    /// run error concealment rather than gapping the audio.
+    fn rx_blk_traffic(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel, dl_time: TdmaTime) {
+        // Only full-slot TCH/S is supported for now (cl. 9.4.4.2 NDB full slot).
+        if lchan != LogicalChannel::TchS || blk.block_num != PhyBlockNum::Both {
+            tracing::trace!(
+                "rx_blk_traffic: ignoring partial/unsupported lchan={:?} blk_num={:?}",
+                lchan,
+                blk.block_num
+            );
+            return;
+        }
+
+        // The serving-cell scrambling code is recovered from SYNC while camping;
+        // a traffic burst can only arrive once camped, so this is set. Guard
+        // rather than unwrap to stay robust to out-of-order bursts.
+        let Some(scrambling_code) = self.scrambling_code else {
+            tracing::warn!("rx_blk_traffic: no scrambling code set, dropping traffic burst");
+            return;
+        };
+
+        let (decoded, crc_ok) = errorcontrol::decode_tp(lchan, blk.block, scrambling_code);
+        let Some(acelp_bits) = decoded else {
+            tracing::warn!("rx_blk_traffic: decode_tp returned None");
+            return;
+        };
+
+        if !crc_ok {
+            tracing::trace!("rx_blk_traffic: CRC fail (BFI), still forwarding for concealment");
+        }
+
+        // Convert the ACELP type-1 BitBuffer to a one-bit-per-byte Vec<u8>
+        // (matches the BS producer and the TMD-SAP circuit-data convention).
+        let mut data = vec![0u8; acelp_bits.get_len()];
+        let mut bb = acelp_bits;
+        bb.seek(0);
+        bb.to_bitarr(&mut data);
+
+        // Deliver to the upper MAC over the TMD-SAP, tagged with the downlink
+        // timeslot the burst was received on (M0). The UMAC gates this on the
+        // call's U-plane state before it reaches the speech sink.
+        let msg = SapMsg {
+            sap: Sap::TmdSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: dl_time.t, data }),
+        };
+        queue.push_back(msg);
     }
 
     fn rx_blk_cp(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) {
@@ -203,12 +256,19 @@ impl LmacMs {
         let SapMsgInner::TpUnitdataInd(prim) = message.msg else { panic!() };
         let lchan = self.determine_logical_channel_dl(&prim, self.ts.as_ref().unwrap_or(&TdmaTime::default()));
 
+        // Absolute TDMA time of the slot this burst was demodulated in (M0),
+        // used to tag delivered traffic with its timeslot. A downlink traffic
+        // channel generally lives on a different timeslot than the MCCH, so the
+        // per-burst slot — not the maintained control-channel clock — is the
+        // correct label (ETSI TS 100 392-2 cl. 23.4.2 traffic channels).
+        let dl_time = prim.time;
+
         match lchan {
             LogicalChannel::Aach => {
                 self.rx_bbk(queue, prim);
             }
             LogicalChannel::TchS | LogicalChannel::Tch24 | LogicalChannel::Tch48 | LogicalChannel::Tch72 => {
-                self.rx_blk_traffic(queue, prim, lchan)
+                self.rx_blk_traffic(queue, prim, lchan, dl_time)
             }
             _ => {
                 self.rx_blk_cp(queue, prim, lchan);
@@ -235,6 +295,15 @@ impl LmacMs {
         if let Some(is_traffic) = prim.is_traffic {
             self.cur_burst.is_traffic = is_traffic;
             tracing::debug!("rx_tmv_configure_req: set cur_burst.is_traffic {}", is_traffic);
+        }
+
+        // The UMAC signals, per timeslot, when the second half-slot of a traffic
+        // burst has been stolen for signalling (STCH). Honour it so the stolen
+        // half is routed to the signalling decode path rather than the vocoder
+        // (ETSI TS 100 392-2 cl. 23, channel stealing). Mirrors `LmacBs`.
+        if let Some(blk2_stolen) = prim.blk2_stolen {
+            self.cur_burst.blk2_stolen = blk2_stolen;
+            tracing::debug!("rx_tmv_configure_req: set cur_burst.blk2_stolen {}", blk2_stolen);
         }
     }
 

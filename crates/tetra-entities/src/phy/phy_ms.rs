@@ -176,6 +176,7 @@ impl<D: RxTxDev> PhyMs<D> {
         block_type: PhyBlockType,
         block_num: PhyBlockNum,
         bits: BitBuffer,
+        time: TdmaTime,
     ) {
         let sapmsg = SapMsg {
             sap: Sap::TpSap,
@@ -187,6 +188,7 @@ impl<D: RxTxDev> PhyMs<D> {
                 block_type,
                 block_num,
                 block: bits,
+                time,
             }),
         };
         queue.push_back(sapmsg);
@@ -205,8 +207,10 @@ impl<D: RxTxDev> PhyMs<D> {
 
     /// Split a demodulated downlink slot into its type-5 blocks and forward
     /// them to the LMAC. The broadcast block (AACH) is sent first so the upper
-    /// MAC can interpret the rest of the slot.
-    fn split_dl_slot_and_send_to_lmac(queue: &mut MessageQueue, burst: &RxBurstBits<'_>) {
+    /// MAC can interpret the rest of the slot. `time` is the absolute TDMA time
+    /// of the demodulated slot, carried down so the LMAC can attribute each
+    /// burst to its timeslot (control vs assigned traffic channel).
+    fn split_dl_slot_and_send_to_lmac(queue: &mut MessageQueue, burst: &RxBurstBits<'_>, time: TdmaTime) {
         let train_seq = burst.train_type;
         let bits = burst.bits;
 
@@ -217,13 +221,13 @@ impl<D: RxTxDev> PhyMs<D> {
                 assert!(bits.len() == TIMESLOT_TYPE4_BITS);
 
                 let bbk = BitBuffer::from_bitarr(&bits[SB_BBK_OFFSET..SB_BBK_OFFSET + SB_BBK_BITS]);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::SDB, PhyBlockType::BBK, PhyBlockNum::Undefined, bbk);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::SDB, PhyBlockType::BBK, PhyBlockNum::Undefined, bbk, time);
 
                 let sb1 = BitBuffer::from_bitarr(&bits[SB_BLK1_OFFSET..SB_BLK1_OFFSET + SB_BLK1_BITS]);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::SDB, PhyBlockType::SB1, PhyBlockNum::Block1, sb1);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::SDB, PhyBlockType::SB1, PhyBlockNum::Block1, sb1, time);
 
                 let sb2 = BitBuffer::from_bitarr(&bits[SB_BLK2_OFFSET..SB_BLK2_OFFSET + SB_BLK2_BITS]);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::SDB, PhyBlockType::SB2, PhyBlockNum::Block2, sb2);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::SDB, PhyBlockType::SB2, PhyBlockNum::Block2, sb2, time);
             }
 
             TrainingSequence::NormalTrainSeq1 => {
@@ -232,13 +236,13 @@ impl<D: RxTxDev> PhyMs<D> {
                 assert!(bits.len() == TIMESLOT_TYPE4_BITS);
 
                 let bbk = Self::extract_ndb_bbk(bits);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::BBK, PhyBlockNum::Undefined, bbk);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::BBK, PhyBlockNum::Undefined, bbk, time);
 
                 let mut blk = BitBuffer::new(NDB_BLK_BITS * 2);
                 blk.copy_bits_from_bitarr(&bits[NDB_BLK1_OFFSET..NDB_BLK1_OFFSET + NDB_BLK_BITS]);
                 blk.copy_bits_from_bitarr(&bits[NDB_BLK2_OFFSET..NDB_BLK2_OFFSET + NDB_BLK_BITS]);
                 blk.seek(0);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::NDB, PhyBlockNum::Both, blk);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::NDB, PhyBlockNum::Both, blk, time);
             }
 
             TrainingSequence::NormalTrainSeq2 => {
@@ -247,13 +251,13 @@ impl<D: RxTxDev> PhyMs<D> {
                 assert!(bits.len() == TIMESLOT_TYPE4_BITS);
 
                 let bbk = Self::extract_ndb_bbk(bits);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::BBK, PhyBlockNum::Undefined, bbk);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::BBK, PhyBlockNum::Undefined, bbk, time);
 
                 let blk1 = BitBuffer::from_bitarr(&bits[NDB_BLK1_OFFSET..NDB_BLK1_OFFSET + NDB_BLK_BITS]);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::NDB, PhyBlockNum::Block1, blk1);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::NDB, PhyBlockNum::Block1, blk1, time);
 
                 let blk2 = BitBuffer::from_bitarr(&bits[NDB_BLK2_OFFSET..NDB_BLK2_OFFSET + NDB_BLK_BITS]);
-                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::NDB, PhyBlockNum::Block2, blk2);
+                Self::send_rxblock_to_lmac(queue, train_seq, BurstType::NDB, PhyBlockType::NDB, PhyBlockNum::Block2, blk2, time);
             }
 
             other => {
@@ -486,14 +490,17 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
 
             let rx = self.rxtxdev.rxtx_timeslot(&tx_slots).expect("Got error from rxtx_timeslot");
 
-            // The MS configures a single downlink demodulator, but the device
-            // may return several entries (e.g. an unused uplink slot); process
-            // whichever slots were actually demodulated.
+            // The MS uses a single downlink demodulator *channel*, but that
+            // channel walks every timeslot of the frame (it advances one slot
+            // per demodulated burst, cl. 9.3), so `rx` may contain several
+            // slots. Forward each demodulated slot tagged with its recovered
+            // TDMA time so the LMAC can attribute bursts to their timeslot
+            // (control channel vs an assigned traffic channel on another slot).
             for rx_slot in rx.into_iter().flatten() {
                 recovered = Some(rx_slot.time);
                 if rx_slot.slot.train_type != TrainingSequence::NotFound {
                     has_burst = true;
-                    Self::split_dl_slot_and_send_to_lmac(queue, &rx_slot.slot);
+                    Self::split_dl_slot_and_send_to_lmac(queue, &rx_slot.slot, rx_slot.time);
                 }
             }
         }

@@ -187,9 +187,25 @@ impl TetraEntityTrait for CmceMs {
         tracing::debug!("rx_prim: {:?}", message);
         // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
-        // There is only one SAP for CMCE
-        assert!(message.sap == Sap::LcmcSap);
+        match message.sap {
+            // C-plane: MLE control/unitdata over the LCMC-SAP (cl. 17.3.3).
+            Sap::LcmcSap => self.rx_lcmc_prim(queue, message),
+            // U-plane: decoded downlink circuit-mode (TCH/S) traffic relayed up
+            // from the MAC over the TMD-SAP (cl. 23). Delivered into the active
+            // call's U-plane receive path.
+            Sap::TmdSap => match message.msg {
+                SapMsgInner::TmdCircuitDataInd(ind) => {
+                    self.cc.rx_downlink_traffic(ind.ts, &ind.data);
+                }
+                _ => panic!("CMCE-MS: unexpected message on TMD-SAP: {:?}", message.msg),
+            },
+            _ => panic!("CMCE-MS: unexpected SAP {:?}", message.sap),
+        }
+    }
+}
 
+impl CmceMs {
+    fn rx_lcmc_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         match message.msg {
             SapMsgInner::LcmcMleUnitdataInd(_) => {
                 self.rx_unitdata_ind(queue, message);
