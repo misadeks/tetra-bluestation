@@ -377,15 +377,17 @@ pub struct TnmmAttachDetachGroupIdentityConfirm {
 /// application of a successful or unsuccessful transmission of U-ITSI DETACH
 /// (cl. 15.3.3.6).
 ///
-/// **Result source not yet wired (deliberate).** Emitting this indication with
-/// a real value requires knowing the *transmission result* of the shutdown
-/// U-ITSI DETACH burst. That depends on (a) the deferred MLE-REPORT tx-result
-/// hook and (b) a known MS-side defect where the acknowledged basic-link
-/// outbound queue head-of-line-blocks when the SwMI replies with BL-DATA (the
-/// random-access-transmitted DETACH entry never clears `t_umac_done`, so the
-/// detach may not actually transmit). Until those are fixed MS-side, MM must
-/// **not** synthesise a `TransferResult` — the type is defined per spec but no
-/// emit point asserts a real transfer result yet.
+/// **Emitted by MM during the de-registration drain (cl. 16.6.1).** MM creates a
+/// [`TxReporter`](tetra_core::TxReporter) for the shutdown U-ITSI DETACH and
+/// shares it with the LLC acknowledged-mode outbound entry (cl. 22.3.2.3). The
+/// LLC/MAC drive its state as the burst is actually transmitted (random-access
+/// success), acknowledged, discarded (congestion), or lost (acknowledged
+/// transfer gave up). MM polls the receipt each slot of the detach drain and
+/// emits this indication exactly once with the resolved `TransferResult`:
+/// `TransferSuccessfulDone` when acknowledged/transmitted, `TransferFail` when
+/// discarded or lost. The earlier LLC head-of-line-blocking defect that made the
+/// detach fail to transmit was fixed in the acknowledged-mode uplink wedge fix
+/// (early-ack acceptance in MS mode), so the receipt now carries a real result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Serialize, Deserialize)]
 pub struct TnmmReportIndication {
     /// `Transfer result` — M.

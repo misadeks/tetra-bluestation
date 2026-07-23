@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
-use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, unimplemented_log};
+use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, TxReporter, TxState, unimplemented_log};
 use tetra_saps::lmm::{LmmMleActivateConf, LmmMleIdentitiesReq, LmmMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -162,6 +162,15 @@ pub struct MmMs {
     /// Downlink slots remaining to drain after sending a U-ITSI DETACH at
     /// shutdown, giving the MAC/PHY time to transmit it (cl. 16.6.1).
     detach_countdown: u32,
+    /// Transmit receipt for the shutdown U-ITSI DETACH (cl. 16.6.1), shared with
+    /// the LLC acknowledged-mode outbound entry so MM can observe the real
+    /// on-air transmission result. Polled during the detach drain to emit a
+    /// precise TNMM-REPORT indication (Table 15.4 — "transfer result of the
+    /// U-ITSI DETACH transmission", cl. 15.3.3.6): `TransferSuccessfulDone` once
+    /// the PDU is acknowledged/transmitted, `TransferFail` if the MAC discards it
+    /// or the acknowledged transfer is lost. `None` when no detach is in flight
+    /// (or once the report has been emitted).
+    detach_reporter: Option<TxReporter>,
     /// The cell MM currently believes it is camped on, from the most recent
     /// LMM-ACTIVATE confirm (cl. 17.3.2). Used to distinguish a genuine cell/LA
     /// change from a repeated confirmation for the same cell.
@@ -281,6 +290,7 @@ impl MmMs {
             system_rejection_count: 0,
             left_system: false,
             detach_countdown: 0,
+            detach_reporter: None,
             current_cell: None,
             registered_cell: None,
             pending_cell: None,
@@ -1350,6 +1360,15 @@ impl MmMs {
             sdu.dump_bin()
         );
 
+        // Transmit receipt shared with the LLC acknowledged-mode outbound entry
+        // (cl. 22.3.2.3): MLE passes it through to the LLC, which drives its
+        // Pending -> Transmitted -> Acknowledged/Lost/Discarded transitions as
+        // the MAC/LLC actually send (or fail to send) the burst. MM keeps a clone
+        // to observe the real on-air result and emit a precise TNMM-REPORT
+        // (Table 15.4, cl. 15.3.3.6) instead of a fixed timeout bound.
+        let reporter = TxReporter::new();
+        self.detach_reporter = Some(reporter.clone());
+
         let m = SapMsg {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
@@ -1363,10 +1382,37 @@ impl MmMs {
                 stealing_repeats_flag: false,
                 encryption_flag: false,
                 is_null_pdu: false,
-                tx_reporter: None,
+                tx_reporter: Some(reporter),
             }),
         };
         queue.push_back(m);
+    }
+
+    /// Emit a TNMM-REPORT indication (Table 15.4, cl. 15.3.3.6) reporting the
+    /// transfer result of the U-ITSI DETACH transmission to the user application.
+    fn emit_report(&self, transfer_result: crate::tnmm::TransferResult) {
+        use crate::net_telemetry::TelemetryEvent;
+        use crate::tnmm::TnmmReportIndication;
+        tracing::info!("MM: -> TNMM-REPORT (U-ITSI DETACH transfer result = {:?})", transfer_result);
+        self.emit(TelemetryEvent::TnmmReportIndication(TnmmReportIndication { transfer_result }));
+    }
+
+    /// Resolve the U-ITSI DETACH transmit receipt into a TNMM-REPORT transfer
+    /// result once it reaches a final state (cl. 15.3.3.6 / Table 15.4). Returns
+    /// `None` while the transmission is still in progress (Pending, or on air
+    /// awaiting the acknowledged-basic-link result). An acknowledged transfer
+    /// (cl. 16.6.1 sends the detach over TL-DATA) reports success when the peer
+    /// acknowledges, and failure if the MAC discards it (congestion) or the
+    /// acknowledged transfer is lost after retries (cl. 22.3.2.3).
+    fn detach_transfer_result(reporter: &TxReporter) -> Option<crate::tnmm::TransferResult> {
+        use crate::tnmm::TransferResult;
+        match reporter.get_state() {
+            TxState::Acknowledged => Some(TransferResult::TransferSuccessfulDone),
+            TxState::Discarded | TxState::Lost => Some(TransferResult::TransferFail),
+            // Still queued (Pending) or on air awaiting the ack/loss result
+            // (Transmitted): not a final transfer result yet.
+            TxState::Pending | TxState::Transmitted => None,
+        }
     }
 
     fn rx_lmm_mle_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -2486,13 +2532,42 @@ impl TetraEntityTrait for MmMs {
         // effect for a command-initiated de-registration where the MS keeps
         // running.
         if self.reg_state == RegState::Detaching {
+            // Poll the U-ITSI DETACH transmit receipt (cl. 16.6.1) for a precise
+            // TNMM-REPORT transfer result (Table 15.4, cl. 15.3.3.6). On the first
+            // final result, emit the report exactly once and end the drain early
+            // (the transmission outcome is now known).
+            if let Some(reporter) = &self.detach_reporter {
+                if let Some(result) = Self::detach_transfer_result(reporter) {
+                    self.emit_report(result);
+                    self.detach_reporter = None;
+                    self.detach_countdown = 0;
+                }
+            }
             if self.detach_countdown > 0 {
                 self.detach_countdown = self.detach_countdown.saturating_sub(1);
-                return;
+                if self.detach_countdown > 0 {
+                    return;
+                }
+                // Countdown reached 0 on this tick — fall through to completion
+                // now (the router stops ticking once deregistration_pending()
+                // goes false, so the report must be emitted here).
+            }
+            // Drain elapsed (or ended early): emit a fallback report if none was
+            // emitted yet, based on whether the detach at least reached the air
+            // (best-effort, cl. 16.6.1 — MM proceeds whether the PDU was
+            // successfully or unsuccessfully transmitted). A still-Pending receipt
+            // means it never left the MAC -> TransferFail.
+            if let Some(reporter) = self.detach_reporter.take() {
+                let result = if reporter.is_transmitted() {
+                    crate::tnmm::TransferResult::TransferSuccessfulDone
+                } else {
+                    crate::tnmm::TransferResult::TransferFail
+                };
+                self.emit_report(result);
             }
             tracing::info!(
-                "MM(MS): de-registration drain complete; U-ITSI DETACH is unacknowledged \
-                 (cl. 16.9.3.3), returning to Idle (ready to register again)"
+                "MM(MS): de-registration drain complete; U-ITSI DETACH sent best-effort \
+                 (cl. 16.6.1), returning to Idle (ready to register again)"
             );
             self.reg_state = RegState::Idle;
             return;
@@ -4080,6 +4155,122 @@ attach_groups = []
             TelemetryEvent::TnmmAttachDetachGroupIdentityConfirm(c) => Some(c.clone()),
             _ => None,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // TNMM-REPORT (Table 15.4 / cl. 15.3.3.6): MM shares a transmit receipt with
+    // the shutdown U-ITSI DETACH and emits a precise transfer-result indication
+    // reflecting the real on-air outcome (cl. 16.6.1), not a fixed timeout bound.
+    // -----------------------------------------------------------------------
+
+    /// Pop the queued U-ITSI DETACH and return the transmit receipt MM shares
+    /// with it (a clone of `mm.detach_reporter` — driving it drives MM's copy).
+    fn take_detach_reporter(q: &mut MessageQueue) -> tetra_core::TxReporter {
+        let msg = q.pop_front().expect("U-ITSI DETACH queued");
+        let SapMsgInner::LmmMleUnitdataReq(req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        req.tx_reporter.expect("detach carries a shared tx reporter")
+    }
+
+    /// Collect the transfer results of every TNMM-REPORT indication emitted.
+    fn find_reports(events: &[TelemetryEvent]) -> Vec<crate::tnmm::TransferResult> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                TelemetryEvent::TnmmReportIndication(r) => Some(r.transfer_result),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Acknowledged detach transfer -> exactly one TNMM-REPORT(SuccessfulDone),
+    /// the drain ends early, and no duplicate report is emitted afterwards.
+    #[test]
+    fn test_detach_report_success_on_acknowledged() {
+        use crate::tnmm::TransferResult;
+        let (mut mm, source, _d) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        assert!(mm.begin_deregistration(&mut q));
+        let reporter = take_detach_reporter(&mut q);
+
+        // MAC sends the burst, then the BS acknowledges the acknowledged-mode
+        // basic-link transfer (cl. 16.6.1 / 22.3.2.3).
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(find_reports(&drain(&source)), vec![TransferResult::TransferSuccessfulDone]);
+        assert!(!mm.deregistration_pending(), "drain ended early once the result was known");
+        assert_eq!(mm.reg_state, RegState::Idle);
+
+        // Idempotent: the report is emitted exactly once.
+        mm.tick_start(&mut q, TdmaTime::default());
+        assert!(find_reports(&drain(&source)).is_empty(), "no duplicate TNMM-REPORT");
+    }
+
+    /// The MAC discards the detach (congestion) -> TNMM-REPORT(TransferFail),
+    /// drain ends early.
+    #[test]
+    fn test_detach_report_fail_on_discarded() {
+        use crate::tnmm::TransferResult;
+        let (mut mm, source, _d) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        assert!(mm.begin_deregistration(&mut q));
+        let reporter = take_detach_reporter(&mut q);
+        reporter.mark_discarded();
+
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(find_reports(&drain(&source)), vec![TransferResult::TransferFail]);
+        assert!(!mm.deregistration_pending());
+        assert_eq!(mm.reg_state, RegState::Idle);
+    }
+
+    /// Transmitted on air but the ack never arrives within the drain window:
+    /// best-effort success (cl. 16.6.1 — MM proceeds once the PDU is on air).
+    #[test]
+    fn test_detach_report_success_on_drain_timeout_after_transmit() {
+        use crate::tnmm::TransferResult;
+        let (mut mm, source, _d) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        assert!(mm.begin_deregistration(&mut q));
+        let reporter = take_detach_reporter(&mut q);
+        reporter.mark_transmitted(); // on air, ack withheld for the whole drain
+
+        for _ in 0..DETACH_DRAIN_SLOTS {
+            mm.tick_start(&mut q, TdmaTime::default());
+        }
+
+        assert_eq!(find_reports(&drain(&source)), vec![TransferResult::TransferSuccessfulDone]);
+        assert!(!mm.deregistration_pending(), "drain complete");
+    }
+
+    /// Never transmitted (still Pending at the end of the drain): the detach
+    /// never left the MAC -> TNMM-REPORT(TransferFail).
+    #[test]
+    fn test_detach_report_fail_on_drain_timeout_never_transmitted() {
+        use crate::tnmm::TransferResult;
+        let (mut mm, source, _d) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        assert!(mm.begin_deregistration(&mut q));
+        let _reporter = take_detach_reporter(&mut q); // leave it Pending
+
+        for _ in 0..DETACH_DRAIN_SLOTS {
+            mm.tick_start(&mut q, TdmaTime::default());
+        }
+
+        assert_eq!(find_reports(&drain(&source)), vec![TransferResult::TransferFail]);
+        assert!(!mm.deregistration_pending());
     }
 
     /// G2 (cl. 16.8.2): a standalone group attach/detach requested before the MS
