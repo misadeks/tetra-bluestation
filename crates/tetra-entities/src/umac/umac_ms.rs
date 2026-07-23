@@ -35,6 +35,9 @@ use tetra_pdus::umac::pdus::mac_frag_ul::MacFragUl;
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_pdus::umac::pdus::mac_sync::MacSync;
 use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
+use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
+use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
+use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 
 use crate::umac::subcomp::fillbits;
 use crate::umac::subcomp::ms_defrag::MsDefrag;
@@ -279,16 +282,28 @@ pub struct UmacMs {
     /// SYSINFO broadcast.
     derived_ul_freq: Option<u32>,
 
-    /// Minimal record of which downlink timeslots currently carry an assigned
-    /// traffic channel (indexed by timeslot 1..4). Driven by the per-slot AACH
-    /// downlink-usage marker the MAC already parses (`dl_usage.is_traffic()`,
-    /// cl. 21.4.7.2). Used to gate the U-plane TMD relay: decoded speech is only
-    /// forwarded up on a timeslot the AACH currently marks as traffic, so stray
-    /// or other-timeslot bursts are dropped at the MAC when no call is receiving
-    /// (the definitive U-plane switch gate lives in CC-MS, cl. 14.5.1.4). This
-    /// is the minimal M1 assigned-timeslot bookkeeping; acting on the
-    /// CHANNEL ALLOCATION element is deferred to M2.
-    traffic_slots: [bool; 4],
+    /// Serving cell downlink main carrier number, adopted from SYSINFO
+    /// (`main_carrier`, cl. 21.4.4). Held so a received CHANNEL ALLOCATION
+    /// element (cl. 21.5.2) can be classified as same-carrier (its
+    /// `carrier_num` equals this) versus a different carrier. M2 acts only on
+    /// same-carrier allocations; cross-carrier retune is deferred to M3.
+    serving_carrier_num: Option<u16>,
+
+    /// Which downlink timeslots (indexed by timeslot 1..4) the serving cell has
+    /// assigned to this MS as a traffic channel via a same-carrier CHANNEL
+    /// ALLOCATION element (cl. 21.5.2, carried in the MAC-RESOURCE that also
+    /// carries the D-SETUP / D-CONNECT / D-TX-GRANTED for our call, cl.
+    /// 14.5.1.3). This is the authoritative assigned-timeslot record used to
+    /// gate the U-plane TMD relay: decoded speech is only forwarded up on a
+    /// timeslot the network actually assigned to us, so bursts on other
+    /// (control or other-call) timeslots are dropped at the MAC. The LMAC still
+    /// gates the physical decode on the per-slot AACH traffic marker
+    /// (cl. 21.4.7.2, `cur_burst.is_traffic`), and CC-MS owns the definitive
+    /// U-plane switch gate (is the call actually receiving, cl. 14.5.1.4). The
+    /// assigned slot is followed from the element, never hardcoded to the
+    /// control timeslot (a same-carrier TCH is on some slot other than the
+    /// MCCH's). Cross-carrier / cell-change allocations are deferred to M3.
+    assigned_traffic_slots: [bool; 4],
 }
 
 impl UmacMs {
@@ -326,7 +341,8 @@ impl UmacMs {
             valid_individual_ssi,
             valid_group_ssis,
             derived_ul_freq: None,
-            traffic_slots: [false; 4],
+            serving_carrier_num: None,
+            assigned_traffic_slots: [false; 4],
         }
     }
 
@@ -528,6 +544,12 @@ impl UmacMs {
         if let Some(def) = &pdu.default_access_code {
             self.access_params.update_sysinfo_default_a(def);
         }
+
+        // Record the serving cell's downlink main carrier (cl. 21.4.4) so a
+        // received CHANNEL ALLOCATION element (cl. 21.5.2) can be classified as
+        // same-carrier vs a different carrier. M2 acts only on same-carrier
+        // assignments; cross-carrier retune is deferred to M3.
+        self.serving_carrier_num = Some(pdu.main_carrier);
 
         // Derive the uplink carrier from the cell's broadcast duplex parameters
         // and retune the transmitter if it changed (EN 300 392-2 cl. 18.4.2.2 /
@@ -793,50 +815,62 @@ impl UmacMs {
                 "rx_mac_resource: dropping PDU addressed to {} (not this MS)",
                 pdu.addr.unwrap()
             );
-        } else if pdu.length_ind == 0b111111 {
-            // Fragmentation start, add to defragmenter
-            self.defrag.insert_first(&mut prim.pdu, self.dltime, pdu.addr.unwrap(), None);
-        } else if pdu.length_ind == 0b111110 {
-            tracing::warn!("rx_mac_resource: SECOND HALF SLOT STOLEN IN STCH but not implemented");
         } else {
-            // Pass directly to LLC
-            let sdu = {
-                if pdu.length_ind == 0 {
-                    None // Null PDU
-                } else if prim.pdu.get_len_remaining() == 0 {
-                    None // No more data in this block
-                } else {
-                    // TODO FIXME should not copy here but take ownership
-                    // Copy inner part, without MAC header or fill bits
-                    Some(BitBuffer::from_bitbuffer_pos(&prim.pdu))
-                }
-            };
-            // tracing::debug!("rx_mac_resource: sdu: {:?}", sdu.as_ref().unwrap().dump_bin_full(true));
+            // Act on a CHANNEL ALLOCATION element addressed to us (cl. 21.5.2).
+            // The BS carries it in the MAC-RESOURCE that also carries the
+            // D-SETUP / D-CONNECT / D-TX-GRANTED for our call (cl. 14.5.1.3), so
+            // this is where the MS learns which timeslot its traffic channel is
+            // on. Done before the LLC hand-off so the assigned-slot record is in
+            // place when the U-plane later switches on. Same-carrier only in M2.
+            if let Some(ca) = &pdu.chan_alloc_element {
+                self.act_on_channel_allocation(ca);
+            }
 
-            if sdu.is_some() {
-                // We have an SDU for the LLC, deliver it.
-                let m = SapMsg {
-                    sap: Sap::TmaSap,
-                    src: TetraEntity::Umac,
-                    dest: TetraEntity::Llc,
-                    msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
-                        pdu: sdu,
-                        main_address: pdu.addr.unwrap(),
-                        scrambling_code: prim.scrambling_code,
-                        endpoint_id: 0,        // TODO FIXME
-                        new_endpoint_id: None, // TODO FIXME
-                        css_endpoint_id: None, // TODO FIXME
-                        air_interface_encryption: pdu.encryption_mode as Todo,
-                        chan_change_response_req: false,
-                        chan_change_handle: None,
-                        chan_info: None,
-                    }),
-                };
-                queue.push_back(m);
+            if pdu.length_ind == 0b111111 {
+                // Fragmentation start, add to defragmenter
+                self.defrag.insert_first(&mut prim.pdu, self.dltime, pdu.addr.unwrap(), None);
+            } else if pdu.length_ind == 0b111110 {
+                tracing::warn!("rx_mac_resource: SECOND HALF SLOT STOLEN IN STCH but not implemented");
             } else {
-                // Either this is a null pdu or we are at the end of the block
-                // For now, we don't deliver this. However, important data may need to be signalled upwards
-                tracing::info!("rx_mac_resource: empty PDU not passed to LLC");
+                // Pass directly to LLC
+                let sdu = {
+                    if pdu.length_ind == 0 {
+                        None // Null PDU
+                    } else if prim.pdu.get_len_remaining() == 0 {
+                        None // No more data in this block
+                    } else {
+                        // TODO FIXME should not copy here but take ownership
+                        // Copy inner part, without MAC header or fill bits
+                        Some(BitBuffer::from_bitbuffer_pos(&prim.pdu))
+                    }
+                };
+                // tracing::debug!("rx_mac_resource: sdu: {:?}", sdu.as_ref().unwrap().dump_bin_full(true));
+
+                if sdu.is_some() {
+                    // We have an SDU for the LLC, deliver it.
+                    let m = SapMsg {
+                        sap: Sap::TmaSap,
+                        src: TetraEntity::Umac,
+                        dest: TetraEntity::Llc,
+                        msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+                            pdu: sdu,
+                            main_address: pdu.addr.unwrap(),
+                            scrambling_code: prim.scrambling_code,
+                            endpoint_id: 0,        // TODO FIXME
+                            new_endpoint_id: None, // TODO FIXME
+                            css_endpoint_id: None, // TODO FIXME
+                            air_interface_encryption: pdu.encryption_mode as Todo,
+                            chan_change_response_req: false,
+                            chan_change_handle: None,
+                            chan_info: None,
+                        }),
+                    };
+                    queue.push_back(m);
+                } else {
+                    // Either this is a null pdu or we are at the end of the block
+                    // For now, we don't deliver this. However, important data may need to be signalled upwards
+                    tracing::info!("rx_mac_resource: empty PDU not passed to LLC");
+                }
             }
         }
 
@@ -1063,14 +1097,6 @@ impl UmacMs {
         };
         // This message needs to be processed NOW since it affects the other blocks in this timeslot
         queue.push_prio(m, MessagePrio::Immediate);
-
-        // Record, per timeslot, whether this slot currently carries an assigned
-        // traffic channel (AACH downlink usage, cl. 21.4.7.2). This is the
-        // minimal assigned-timeslot bookkeeping used to gate the U-plane TMD
-        // relay so stray/other-timeslot speech is dropped at the MAC (M1).
-        if (1..=4).contains(&self.dltime.t) {
-            self.traffic_slots[(self.dltime.t - 1) as usize] = is_traffic;
-        }
 
         // Drive the MS random access state machine against this slot's ACCESS-ASSIGN.
         if let Some(aa) = access_assign {
@@ -2331,25 +2357,109 @@ impl UmacMs {
         });
     }
 
+    /// Act on a CHANNEL ALLOCATION element (cl. 21.5.2) received in a
+    /// MAC-RESOURCE addressed to this MS, recording which downlink timeslot(s)
+    /// carry our assigned traffic channel so the U-plane TMD relay follows the
+    /// assigned slot (cl. 14.5.1.3). A same-carrier TCH is on some slot other
+    /// than the control channel, so the slot is taken from the element and never
+    /// hardcoded.
+    ///
+    /// M2 handles same-carrier allocations only. A cross-carrier or cell-change
+    /// allocation (different `carrier_num`, `cell_change_flag`, or extended
+    /// carrier numbering) requires a downlink PHY retune, which is deferred to
+    /// M3 — here it is logged and ignored (no retune, no slot change), so the MS
+    /// keeps decoding its current channel rather than acting half-way on an
+    /// allocation it cannot yet follow.
+    fn act_on_channel_allocation(&mut self, ca: &ChanAllocElement) {
+        // Cross-cell or extended (cross-band) carrier numbering: defer to M3.
+        if ca.ext.is_some() || ca.cell_change_flag {
+            tracing::info!(
+                "rx_mac_resource: cross-cell/extended CHANNEL ALLOCATION (cell_change={}, ext={}) deferred to M3; not following",
+                ca.cell_change_flag,
+                ca.ext.is_some()
+            );
+            return;
+        }
+        // Same-carrier classification (cl. 21.5.2): the allocation carrier must
+        // equal the serving cell's downlink main carrier. A different carrier is
+        // a cross-carrier retune, deferred to M3.
+        match self.serving_carrier_num {
+            Some(serving) if ca.carrier_num == serving => {}
+            Some(serving) => {
+                tracing::info!(
+                    "rx_mac_resource: cross-carrier CHANNEL ALLOCATION (carrier {} != serving {}) deferred to M3; not following",
+                    ca.carrier_num,
+                    serving
+                );
+                return;
+            }
+            None => {
+                // No SYSINFO decoded yet: cannot confirm same-carrier, so do not
+                // act (conservative — avoids following an unclassifiable alloc).
+                tracing::debug!("rx_mac_resource: CHANNEL ALLOCATION received before serving carrier known; ignoring");
+                return;
+            }
+        }
+
+        // Only a downlink-bearing assignment (Dl or Both) carries speech for us
+        // to receive; an uplink-only grant assigns our transmit slot (M4) and
+        // changes no downlink decode.
+        if ca.ul_dl_assigned != UlDlAssignment::Dl && ca.ul_dl_assigned != UlDlAssignment::Both {
+            tracing::debug!(
+                "rx_mac_resource: same-carrier CHANNEL ALLOCATION is {} (no downlink); no traffic-slot change",
+                ca.ul_dl_assigned
+            );
+            return;
+        }
+
+        // Apply the assignment per its type (cl. 21.5.2 / 14.8.17a):
+        //  - Replace / QuitAndGo / ReplaceWithCarrierSignalling: this becomes the
+        //    traffic channel — overwrite the assigned-slot set.
+        //  - Additional: add the assigned slot(s) to the existing set.
+        match ca.alloc_type {
+            ChanAllocType::Additional => {
+                for i in 0..4 {
+                    self.assigned_traffic_slots[i] |= ca.ts_assigned[i];
+                }
+            }
+            ChanAllocType::Replace
+            | ChanAllocType::QuitAndGo
+            | ChanAllocType::ReplaceWithCarrierSignalling => {
+                self.assigned_traffic_slots = ca.ts_assigned;
+            }
+        }
+        tracing::info!(
+            "rx_mac_resource: following same-carrier CHANNEL ALLOCATION {} on carrier {}, assigned traffic slots {:?}",
+            ca.alloc_type,
+            ca.carrier_num,
+            self.assigned_traffic_slots
+        );
+    }
+
     /// Relay decoded downlink circuit-mode (TCH/S) speech up to CMCE.
     ///
     /// The LMAC decodes each downlink traffic burst (TCH/S) and delivers it over
     /// the TMD-SAP (cl. 23) tagged with the timeslot it arrived on. On the MS the
     /// U-plane switch and call state live in CMCE (CC-MS, cl. 14.5.1.4), so the
-    /// MAC simply forwards the frame upward; it performs no audio processing and
-    /// keeps no U-plane gating of its own. As a minimal MAC-level guard it drops
-    /// frames on a timeslot the AACH does not currently mark as traffic (cl.
-    /// 21.4.7.2), so stray or other-timeslot bursts are not relayed when no
-    /// traffic channel is assigned. The definitive U-plane switch gate (is the
-    /// call actually receiving) remains in CC-MS.
+    /// MAC simply forwards the frame upward; it performs no audio processing.
+    ///
+    /// As a MAC-level guard it relays only on a timeslot the network has
+    /// assigned to us as a traffic channel via a same-carrier CHANNEL ALLOCATION
+    /// element (cl. 21.5.2, recorded in `assigned_traffic_slots`). The assigned
+    /// slot is followed from the element — a same-carrier TCH is on some slot
+    /// other than the control channel, so this is never hardcoded to TS1. Bursts
+    /// on control or other-call timeslots are dropped here. The LMAC still gates
+    /// the physical decode on the per-slot AACH traffic marker (cl. 21.4.7.2),
+    /// and the definitive U-plane switch gate (is the call actually receiving)
+    /// remains in CC-MS.
     fn rx_tmd_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tmd_prim");
         match message.msg {
             SapMsgInner::TmdCircuitDataInd(prim) => {
                 let ts = prim.ts;
-                let assigned = (1..=4).contains(&ts) && self.traffic_slots[(ts - 1) as usize];
+                let assigned = (1..=4).contains(&ts) && self.assigned_traffic_slots[(ts - 1) as usize];
                 if !assigned {
-                    tracing::trace!("rx_tmd_prim: no traffic channel assigned on ts={}, dropping speech frame", ts);
+                    tracing::trace!("rx_tmd_prim: ts={} not an assigned traffic timeslot, dropping speech frame", ts);
                     return;
                 }
                 queue.push_back(SapMsg {
@@ -3366,5 +3476,124 @@ attach_groups = []
         umac.maybe_retune_uplink(&mut q, &sysinfo_rf(15, 4095, 7, false));
         assert!(q.iter().all(|m| !matches!(m.msg, SapMsgInner::TmvTxTuneReq(_))));
         assert_eq!(umac.derived_ul_freq, None, "no uplink derived from bad params");
+    }
+
+    /// Build a downlink CHANNEL ALLOCATION element (cl. 21.5.2) for the given
+    /// allocation type, assigned-timeslot bitmap, carrier and UL/DL direction.
+    fn chan_alloc(alloc_type: ChanAllocType, ts: [bool; 4], carrier_num: u16, ul_dl: UlDlAssignment) -> ChanAllocElement {
+        ChanAllocElement {
+            alloc_type,
+            ts_assigned: ts,
+            ul_dl_assigned: ul_dl,
+            clch_permission: false,
+            cell_change_flag: false,
+            carrier_num,
+            ext: None,
+            mon_pattern: 0,
+            frame18_mon_pattern: Some(0),
+        }
+    }
+
+    fn tmd_speech(ts: u8, data: Vec<u8>) -> SapMsg {
+        SapMsg {
+            sap: Sap::TmdSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data }),
+        }
+    }
+
+    /// M2: a same-carrier CHANNEL ALLOCATION assigning a non-control timeslot is
+    /// followed — the assigned slot is recorded from the element (cl. 21.5.2),
+    /// never hardcoded to the control channel — and it gates the U-plane TMD
+    /// relay: speech on the assigned slot relays to CMCE, speech on any other
+    /// timeslot is dropped.
+    #[test]
+    fn test_channel_allocation_same_carrier_follows_assigned_slot() {
+        let mut umac = ms_umac();
+        umac.serving_carrier_num = Some(1593);
+
+        // Traffic assigned on TS3 (a non-control timeslot) on the serving carrier.
+        umac.act_on_channel_allocation(&chan_alloc(
+            ChanAllocType::Replace,
+            [false, false, true, false],
+            1593,
+            UlDlAssignment::Both,
+        ));
+        assert_eq!(umac.assigned_traffic_slots, [false, false, true, false], "follows assigned TS3");
+
+        let mut q = MessageQueue::new();
+        umac.rx_tmd_prim(&mut q, tmd_speech(3, vec![1, 2, 3]));
+        umac.rx_tmd_prim(&mut q, tmd_speech(1, vec![9, 9, 9]));
+        let relayed: Vec<_> = q
+            .iter()
+            .filter(|m| m.dest == TetraEntity::Cmce && matches!(m.msg, SapMsgInner::TmdCircuitDataInd(_)))
+            .collect();
+        assert_eq!(relayed.len(), 1, "only assigned-slot (TS3) speech relayed");
+        let SapMsgInner::TmdCircuitDataInd(ind) = &relayed[0].msg else {
+            unreachable!()
+        };
+        assert_eq!(ind.ts, 3, "assigned timeslot tag preserved");
+        assert_eq!(ind.data, vec![1, 2, 3], "speech payload preserved");
+    }
+
+    /// M2: a CHANNEL ALLOCATION on a different carrier is a cross-carrier retune,
+    /// deferred to M3 — the MS must NOT act on it (no assigned-slot change, no
+    /// retune), so speech on that slot stays gated out.
+    #[test]
+    fn test_channel_allocation_cross_carrier_deferred() {
+        let mut umac = ms_umac();
+        umac.serving_carrier_num = Some(1593);
+
+        umac.act_on_channel_allocation(&chan_alloc(
+            ChanAllocType::Replace,
+            [false, false, true, false],
+            1600, // different carrier
+            UlDlAssignment::Both,
+        ));
+        assert_eq!(umac.assigned_traffic_slots, [false; 4], "cross-carrier allocation not followed");
+
+        let mut q = MessageQueue::new();
+        umac.rx_tmd_prim(&mut q, tmd_speech(3, vec![1, 2, 3]));
+        assert!(
+            q.iter().all(|m| !matches!(m.msg, SapMsgInner::TmdCircuitDataInd(_))),
+            "no speech relayed for a cross-carrier (unfollowed) allocation"
+        );
+    }
+
+    /// M2: an "Additional" allocation adds to the assigned set rather than
+    /// replacing it (cl. 21.5.2 / 14.8.17a), and an uplink-only assignment does
+    /// not change the downlink decode.
+    #[test]
+    fn test_channel_allocation_additional_and_ul_only() {
+        let mut umac = ms_umac();
+        umac.serving_carrier_num = Some(1593);
+
+        umac.act_on_channel_allocation(&chan_alloc(
+            ChanAllocType::Replace,
+            [false, false, true, false],
+            1593,
+            UlDlAssignment::Both,
+        ));
+        umac.act_on_channel_allocation(&chan_alloc(
+            ChanAllocType::Additional,
+            [false, true, false, false],
+            1593,
+            UlDlAssignment::Dl,
+        ));
+        assert_eq!(umac.assigned_traffic_slots, [false, true, true, false], "Additional adds TS2 to TS3");
+
+        // An uplink-only assignment leaves the downlink assigned set untouched.
+        umac.act_on_channel_allocation(&chan_alloc(
+            ChanAllocType::Replace,
+            [true, false, false, false],
+            1593,
+            UlDlAssignment::Ul,
+        ));
+        assert_eq!(
+            umac.assigned_traffic_slots,
+            [false, true, true, false],
+            "uplink-only allocation does not change DL slots"
+        );
     }
 }

@@ -7,10 +7,7 @@ use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use tetra_entities::umac::umac_ms::{FragEndKind, UmacMs};
-use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
-use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
 use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
-use tetra_pdus::umac::pdus::access_assign::{AccessAssign, AccessField};
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
 use tetra_pdus::umac::pdus::mac_end_ul::MacEndUl;
@@ -619,58 +616,26 @@ fn test_uplink_fragmentation_three_slot_roundtrip() {
 }
 
 #[test]
-/// M1: decoded downlink TCH/S speech arriving from the LMAC over the TMD-SAP is
-/// relayed up to CMCE (the MS U-plane owner) unchanged, preserving the timeslot
-/// tag — but only on a timeslot the AACH currently marks as traffic (cl.
-/// 21.4.7.2). Stray/other-timeslot bursts are dropped at the MAC when no traffic
-/// channel is assigned; the definitive U-plane switch gate lives in CC-MS.
-fn test_umac_ms_relays_downlink_speech_to_cmce() {
+/// M2: with no traffic channel assigned (no CHANNEL ALLOCATION acted on), the
+/// MAC drops decoded downlink speech arriving over the TMD-SAP rather than
+/// relaying it to CMCE. This is the default-closed U-plane relay gate — the MS
+/// only follows a timeslot the network has explicitly assigned to it (cl.
+/// 21.5.2); the positive follow path is covered by the UMAC unit tests. The
+/// definitive U-plane switch gate additionally lives in CC-MS (cl. 14.5.1.4).
+fn test_umac_ms_drops_speech_without_channel_allocation() {
     debug::setup_logging_verbose();
     let mut test = ComponentTest::new(StackMode::Ms, None);
-    // Lmac is a sink to absorb the TMV-CONFIGURE the AACH handler emits downward.
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce, TetraEntity::Lmac]);
 
-    // AACH marking the current slot (timeslot 1, the UMAC's default dltime) as
-    // carrying an assigned traffic channel (ACCESS-ASSIGN, cl. 21.4.7.2).
-    let mut aach = BitBuffer::new(14);
-    AccessAssign {
-        dl_usage: AccessAssignDlUsage::Traffic(4),
-        ul_usage: AccessAssignUlUsage::AssignedOnly,
-        f2_af: Some(AccessField { access_code: 0, base_frame_len: 4 }),
-        ..Default::default()
+    // Speech on any timeslot with no prior channel allocation must be dropped.
+    for ts in 1..=4u8 {
+        test.submit_message(SapMsg {
+            sap: Sap::TmdSap,
+            src: TetraEntity::Lmac,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: vec![0u8; 8] }),
+        });
     }
-    .to_bitbuf(&mut aach);
-    aach.seek(0);
-    test.submit_message(SapMsg {
-        sap: Sap::TmvSap,
-        src: TetraEntity::Lmac,
-        dest: TetraEntity::Umac,
-        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
-            pdu: aach,
-            block_num: PhyBlockNum::Both,
-            logical_channel: LogicalChannel::Aach,
-            crc_pass: true,
-            scrambling_code: 0,
-        }),
-    });
-    test.deliver_all_messages();
-    test.dump_sinks(); // discard the downward TMV-CONFIGURE captured on the Lmac sink
-
-    // Speech on the assigned traffic timeslot (1) is relayed up to CMCE.
-    let data = vec![1u8, 0, 1, 1, 0, 0, 1, 0];
-    test.submit_message(SapMsg {
-        sap: Sap::TmdSap,
-        src: TetraEntity::Lmac,
-        dest: TetraEntity::Umac,
-        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: 1, data: data.clone() }),
-    });
-    // Speech on an unassigned timeslot (3) must be dropped at the MAC.
-    test.submit_message(SapMsg {
-        sap: Sap::TmdSap,
-        src: TetraEntity::Lmac,
-        dest: TetraEntity::Umac,
-        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: 3, data: vec![0u8; 8] }),
-    });
     test.deliver_all_messages();
     let cmce_msgs: Vec<_> = test
         .dump_sinks()
@@ -678,13 +643,6 @@ fn test_umac_ms_relays_downlink_speech_to_cmce() {
         .filter(|m| m.dest == TetraEntity::Cmce)
         .collect();
 
-    assert_eq!(cmce_msgs.len(), 1, "only the assigned-timeslot speech frame is relayed to CMCE");
-    let msg = &cmce_msgs[0];
-    assert_eq!(msg.sap, Sap::TmdSap);
-    let SapMsgInner::TmdCircuitDataInd(ind) = &msg.msg else {
-        panic!("expected TmdCircuitDataInd, got {:?}", msg.msg);
-    };
-    assert_eq!(ind.ts, 1, "timeslot tag preserved");
-    assert_eq!(ind.data, data, "speech payload preserved");
+    assert!(cmce_msgs.is_empty(), "no speech relayed to CMCE without a channel allocation");
 }
 
