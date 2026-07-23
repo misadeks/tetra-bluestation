@@ -437,7 +437,7 @@ pub fn decode_aach(buf: BitBuffer, scrambling_code: u32) -> BitBuffer {
 
 #[cfg(test)]
 mod tests {
-    use tetra_core::{BurstType, PhyBlockNum, TrainingSequence, debug::setup_logging_verbose};
+    use tetra_core::{BurstType, PhyBlockNum, TdmaTime, TrainingSequence, debug::setup_logging_verbose};
 
     use super::*;
 
@@ -467,6 +467,7 @@ mod tests {
             block_type: PhyBlockType::SB2,
             block_num: PhyBlockNum::Block2,
             block: type5,
+            time: TdmaTime::default(),
         };
 
         let (type1, crc_ok) = decode_cp(lchan, prim_ind, Some(scramb_code));
@@ -496,6 +497,7 @@ mod tests {
             block_type: PhyBlockType::SB2,
             block_num: PhyBlockNum::Block2,
             block: type5,
+            time: TdmaTime::default(),
         };
 
         let (type1, crc_ok) = decode_cp(lchan, prim_ind, Some(scramb_code));
@@ -569,6 +571,7 @@ mod tests {
             block_type: PhyBlockType::NDB,
             block_num: PhyBlockNum::Both,
             block: type5,
+            time: TdmaTime::default(),
         };
 
         let (type1, crc_ok) = decode_cp(lchan, prim_ind, Some(scramb_code));

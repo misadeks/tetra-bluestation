@@ -614,3 +614,35 @@ fn test_uplink_fragmentation_two_slot_roundtrip() {
 fn test_uplink_fragmentation_three_slot_roundtrip() {
     multislot_roundtrip(800, 3, ReservationRequirement::Req3Slots);
 }
+
+#[test]
+/// M1: decoded downlink TCH/S speech arriving from the LMAC over the TMD-SAP is
+/// relayed up to CMCE (the MS U-plane owner) unchanged, preserving the timeslot
+/// tag. The MAC performs no audio processing and no U-plane gating of its own.
+fn test_umac_ms_relays_downlink_speech_to_cmce() {
+    debug::setup_logging_verbose();
+    let mut test = ComponentTest::new(StackMode::Ms, None);
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    let data = vec![1u8, 0, 1, 1, 0, 0, 1, 0];
+    let m = SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: 3, data: data.clone() }),
+    };
+    test.submit_message(m);
+    test.deliver_all_messages();
+    let mut sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 1, "UMAC should relay exactly one TMD indication to CMCE");
+    let msg = sink_msgs.remove(0);
+    assert_eq!(msg.sap, Sap::TmdSap);
+    assert_eq!(msg.dest, TetraEntity::Cmce);
+    let SapMsgInner::TmdCircuitDataInd(ind) = msg.msg else {
+        panic!("expected TmdCircuitDataInd, got {:?}", msg.msg);
+    };
+    assert_eq!(ind.ts, 3, "timeslot tag preserved");
+    assert_eq!(ind.data, data, "speech payload preserved");
+}
+

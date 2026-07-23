@@ -304,4 +304,34 @@ mod tests {
         }
         assert!(saw_confirm, "TNCC-COMPLETE confirm must be emitted");
     }
+
+    #[test]
+    fn downlink_speech_gated_on_uplane_switch() {
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+
+        // U-plane still switched off: received speech is discarded (cl. 14.5.1.4).
+        cc.rx_downlink_traffic(3, &[1u8; 274]);
+        assert_eq!(cc.call(7).unwrap().rx_speech_frames, 0, "no frames accepted while U-plane off");
+
+        // Grant switches the U-plane on; subsequent speech frames are accepted.
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        assert_eq!(cc.call(7).unwrap().last_uplane.map(|u| u.switch_u_plane), Some(true));
+
+        cc.rx_downlink_traffic(3, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, &[1u8; 274]);
+        assert_eq!(cc.call(7).unwrap().rx_speech_frames, 2, "frames accepted while U-plane on");
+    }
 }

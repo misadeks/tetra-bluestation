@@ -2310,6 +2310,30 @@ impl UmacMs {
             msg: SapMsgInner::TmvTuneReq(TmvTuneReq { carrier_hz }),
         });
     }
+
+    /// Relay decoded downlink circuit-mode (TCH/S) speech up to CMCE.
+    ///
+    /// The LMAC decodes each downlink traffic burst (TCH/S) and delivers it over
+    /// the TMD-SAP (cl. 23) tagged with the timeslot it arrived on. On the MS the
+    /// U-plane switch and call state live in CMCE (CC-MS, cl. 14.5.1.4), so the
+    /// MAC simply forwards the frame upward; it performs no audio processing and
+    /// keeps no U-plane gating of its own.
+    fn rx_tmd_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        tracing::trace!("rx_tmd_prim");
+        match message.msg {
+            SapMsgInner::TmdCircuitDataInd(prim) => {
+                queue.push_back(SapMsg {
+                    sap: Sap::TmdSap,
+                    src: TetraEntity::Umac,
+                    dest: TetraEntity::Cmce,
+                    msg: SapMsgInner::TmdCircuitDataInd(prim),
+                });
+            }
+            _ => {
+                panic!("UMAC-MS: unexpected message on TMD-SAP: {:?}", message.msg);
+            }
+        }
+    }
 }
 
 impl TetraEntityTrait for UmacMs {
@@ -2336,6 +2360,13 @@ impl TetraEntityTrait for UmacMs {
 
             Sap::TlmcSap => {
                 self.rx_tlmc_prim(queue, message);
+            }
+
+            // U-plane: decoded downlink circuit-mode (TCH/S) speech from the LMAC
+            // (cl. 23, TMD-SAP). The MS MAC relays it up to CMCE, which owns the
+            // U-plane switch; the MAC itself performs no audio processing.
+            Sap::TmdSap => {
+                self.rx_tmd_prim(queue, message);
             }
 
             _ => {
