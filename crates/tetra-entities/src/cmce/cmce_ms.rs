@@ -108,9 +108,11 @@ impl CmceMs {
                 Err(detail) => self.tncc_ack(handle, false, Some(detail)),
             },
             ControlCommand::TnccSetupResponse {
-                handle, call_identifier, ..
+                handle,
+                call_identifier,
+                response,
             } => {
-                let accepted = self.cc.handle_tncc_answer(queue, call_identifier);
+                let accepted = self.cc.handle_tncc_setup_response(queue, call_identifier, &response);
                 self.tncc_ack(
                     handle,
                     accepted,
@@ -122,9 +124,11 @@ impl CmceMs {
                 );
             }
             ControlCommand::TnccComplete {
-                handle, call_identifier, ..
+                handle,
+                call_identifier,
+                request,
             } => {
-                let accepted = self.cc.handle_tncc_answer(queue, call_identifier);
+                let accepted = self.cc.handle_tncc_complete(queue, call_identifier, &request);
                 self.tncc_ack(
                     handle,
                     accepted,

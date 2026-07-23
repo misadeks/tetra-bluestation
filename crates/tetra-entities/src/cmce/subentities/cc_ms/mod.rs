@@ -135,4 +135,173 @@ mod tests {
         );
         assert!(matches!(q.pop_front().unwrap().msg, SapMsgInner::LcmcMleConfigureReq(_)));
     }
+
+    // --- MT individual-call answer path (cl. 14.5.1.1.1) ----------------------
+
+    use crate::net_telemetry::channel::telemetry_channel;
+    use tetra_pdus::cmce::enums::cmce_pdu_type_ul::CmcePduTypeUl;
+
+    fn individual_speech() -> BasicServiceInformation {
+        BasicServiceInformation {
+            circuit_mode_type: CircuitModeType::TchS,
+            encryption_flag: false,
+            communication_type: CommunicationType::P2p,
+            slots_per_frame: None,
+            speech_service: Some(0),
+        }
+    }
+
+    /// Minimal D-SETUP for an MT individual call with the given Hook method
+    /// selection IE (cl. 14.8.23).
+    fn d_setup(call_id: u16, hook_on_off: bool) -> DSetup {
+        DSetup {
+            call_identifier: call_id,
+            call_time_out: CallTimeout::Infinite,
+            hook_method_selection: hook_on_off,
+            simplex_duplex_selection: false,
+            basic_service_information: individual_speech(),
+            transmission_grant: TransmissionGrant::Granted,
+            transmission_request_permission: true,
+            call_priority: 0,
+            notification_indicator: None,
+            temporary_address: None,
+            calling_party_address_ssi: Some(101),
+            calling_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+    }
+
+    fn d_connect_ack(call_id: u16) -> DConnectAcknowledge {
+        DConnectAcknowledge {
+            call_identifier: call_id,
+            call_time_out: 1, // T30s (cl. 14.8.16) so T310 actually arms
+            transmission_grant: 0, // Granted
+            transmission_request_permission: true,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        }
+    }
+
+    fn setup_response() -> tncc::TnccSetupResponse {
+        tncc::TnccSetupResponse {
+            access_priority: None,
+            basic_service_information: None,
+            clir_control: None,
+            hook_method_selection: tncc::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+            simplex_duplex_selection: tncc::SimplexDuplexSelection::SimplexOperation,
+            traffic_stealing: None,
+        }
+    }
+
+    fn complete_request() -> tncc::TnccCompleteRequest {
+        tncc::TnccCompleteRequest {
+            access_priority: None,
+            basic_service_information_offered: None,
+            hook_method: tncc::HookMethodSelection::HookOnHookOffSignallingOrCallAcceptanceSignalling,
+            simplex_duplex: tncc::SimplexDuplexSelection::SimplexOperation,
+            traffic_stealing: None,
+        }
+    }
+
+    /// Drain the queue and return the CMCE uplink PDU type of every
+    /// LCMC-MLE-UNITDATA request emitted, in order.
+    fn drain_ul_pdu_types(q: &mut MessageQueue) -> Vec<CmcePduTypeUl> {
+        let mut out = Vec::new();
+        while let Some(m) = q.pop_front() {
+            if let SapMsgInner::LcmcMleUnitdataReq(mut req) = m.msg {
+                req.sdu.seek(0);
+                if let Ok(raw) = req.sdu.read_field(5, "pdu_type") {
+                    if let Ok(t) = CmcePduTypeUl::try_from(raw) {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn on_off_hook_setup_response_sends_only_u_alert() {
+        // cl. 14.5.1.1.1: on/off-hook TNCC-SETUP response → U-ALERT only, stay MT-CALL-SETUP.
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.rx_d_setup(&mut q, d_setup(7, true), route());
+        assert!(cc.call(7).unwrap().hook_on_off, "D-SETUP hook method must be recorded");
+
+        let ok = cc.handle_tncc_setup_response(&mut q, 7, &setup_response());
+        assert!(ok);
+        assert_eq!(drain_ul_pdu_types(&mut q), vec![CmcePduTypeUl::UAlert]);
+        assert_eq!(cc.call(7).unwrap().state, MsCcState::MtCallSetup);
+    }
+
+    #[test]
+    fn on_off_hook_complete_sends_u_connect_and_arms_t301() {
+        // cl. 14.5.1.1.1: on/off-hook TNCC-COMPLETE → U-CONNECT + start T301, stay MT-CALL-SETUP.
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.rx_d_setup(&mut q, d_setup(7, true), route());
+        // Simulate a provisioned/D-INFO Call time-out set-up phase value (cl. 14.8.17)
+        // so T301 arms a real deadline; without one, predefined is not invented.
+        cc.calls.get_mut(&7).unwrap().timers.setup_timeout = Some(CallTimeoutSetupPhase::T5s);
+        let _ = cc.handle_tncc_setup_response(&mut q, 7, &setup_response());
+        assert_eq!(drain_ul_pdu_types(&mut q), vec![CmcePduTypeUl::UAlert]);
+
+        let ok = cc.handle_tncc_complete(&mut q, 7, &complete_request());
+        assert!(ok);
+        assert_eq!(drain_ul_pdu_types(&mut q), vec![CmcePduTypeUl::UConnect]);
+        let call = cc.call(7).unwrap();
+        assert_eq!(call.state, MsCcState::MtCallSetup);
+        assert_eq!(call.timers.setup_timeout, Some(CallTimeoutSetupPhase::T5s));
+        assert!(call.timers.setup_phase_deadline.is_some(), "T301 must be armed");
+    }
+
+    #[test]
+    fn direct_setup_response_sends_u_connect() {
+        // cl. 14.5.1.1.1: direct set-up TNCC-SETUP response → U-CONNECT immediately + start T301.
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.rx_d_setup(&mut q, d_setup(7, false), route());
+        assert!(!cc.call(7).unwrap().hook_on_off);
+
+        let ok = cc.handle_tncc_setup_response(&mut q, 7, &setup_response());
+        assert!(ok);
+        assert_eq!(drain_ul_pdu_types(&mut q), vec![CmcePduTypeUl::UConnect]);
+        let call = cc.call(7).unwrap();
+        assert_eq!(call.state, MsCcState::MtCallSetup);
+        // T301 arm attempted; D-SETUP carried no set-up-phase value so predefined stays uninvented.
+        assert_eq!(call.timers.setup_timeout, Some(CallTimeoutSetupPhase::Predefined));
+    }
+
+    #[test]
+    fn d_connect_ack_activates_and_swaps_timers() {
+        // cl. 14.5.1.1.1: D-CONNECT ACK → CALL-ACTIVE, stop T301, start T310, TNCC-COMPLETE confirm.
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        let mut q = MessageQueue::new();
+        cc.rx_d_setup(&mut q, d_setup(7, true), route());
+        cc.calls.get_mut(&7).unwrap().timers.setup_timeout = Some(CallTimeoutSetupPhase::T5s);
+        let _ = cc.handle_tncc_setup_response(&mut q, 7, &setup_response());
+        let _ = cc.handle_tncc_complete(&mut q, 7, &complete_request());
+        let _ = drain_ul_pdu_types(&mut q);
+        assert!(cc.call(7).unwrap().timers.setup_phase_deadline.is_some(), "T301 running");
+        while source.try_recv().is_some() {} // discard setup-phase telemetry
+
+        cc.rx_d_connect_ack(&mut q, d_connect_ack(7), route());
+        let call = cc.call(7).unwrap();
+        assert_eq!(call.state, MsCcState::CallActive);
+        assert!(call.timers.setup_phase_deadline.is_none(), "T301 stopped");
+        assert!(call.timers.call_deadline.is_some(), "T310 started");
+
+        let mut saw_confirm = false;
+        while let Some(ev) = source.try_recv() {
+            if matches!(ev, TelemetryEvent::TnccCompleteConfirm { .. }) {
+                saw_confirm = true;
+            }
+        }
+        assert!(saw_confirm, "TNCC-COMPLETE confirm must be emitted");
+    }
 }

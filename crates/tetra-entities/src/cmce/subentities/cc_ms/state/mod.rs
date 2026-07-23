@@ -78,6 +78,11 @@ pub struct MsCall {
     pub last_uplane: Option<MsUPlaneState>,
     pub(super) route: CallRoute,
     pub(super) simplex_duplex_selection: bool,
+    /// Signalling mode dictated by the D-SETUP Hook method selection IE
+    /// (cl. 14.8.23, applied per cl. 14.5.1.1.1): `true` = on/off-hook
+    /// signalling (U-ALERT then U-CONNECT), `false` = direct set-up (immediate
+    /// U-CONNECT). Only meaningful for MT individual calls.
+    pub(super) hook_on_off: bool,
     pub(super) pending_tx_request: bool,
     pub(super) uplane_before_wait: Option<MsUPlaneState>,
 }
@@ -120,6 +125,7 @@ impl MsCall {
             last_uplane: None,
             route,
             simplex_duplex_selection,
+            hook_on_off: false,
             pending_tx_request: false,
             uplane_before_wait: None,
         }
