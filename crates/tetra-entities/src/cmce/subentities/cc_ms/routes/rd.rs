@@ -54,7 +54,7 @@ impl CcMsSubentity {
         }
     }
 
-    fn rx_d_setup(&mut self, queue: &mut MessageQueue, pdu: DSetup, route: CallRoute) {
+    pub(in crate::cmce::subentities::cc_ms) fn rx_d_setup(&mut self, queue: &mut MessageQueue, pdu: DSetup, route: CallRoute) {
         let kind = kind_from_basic_service(&pdu.basic_service_information);
         let setup_basic_for_event = pdu.basic_service_information.clone();
         let state = if kind == MsCallKind::Individual {
@@ -72,6 +72,11 @@ impl CcMsSubentity {
             pdu.transmission_request_permission,
         );
         call.current_speaker_ssi = pdu.calling_party_address_ssi;
+        // Record the signalling mode dictated by the D-SETUP Hook method
+        // selection IE (cl. 14.8.23) so the answer path (cl. 14.5.1.1.1) can
+        // choose U-ALERT-then-U-CONNECT (on/off-hook) vs immediate U-CONNECT
+        // (direct set-up).
+        call.hook_on_off = pdu.hook_method_selection;
         call.start_call_timer(self.dltime, pdu.call_time_out);
         self.calls.insert(pdu.call_identifier, call);
         if let Some(basic) = tncc_basic_from_pdu(&setup_basic_for_event) {
@@ -219,7 +224,7 @@ impl CcMsSubentity {
         }
     }
 
-    fn rx_d_connect_ack(&mut self, queue: &mut MessageQueue, pdu: DConnectAcknowledge, route: CallRoute) {
+    pub(in crate::cmce::subentities::cc_ms) fn rx_d_connect_ack(&mut self, queue: &mut MessageQueue, pdu: DConnectAcknowledge, route: CallRoute) {
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.state = MsCcState::CallActive;
             call.route = route;

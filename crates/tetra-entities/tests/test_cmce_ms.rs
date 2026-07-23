@@ -23,6 +23,7 @@ use tetra_pdus::cmce::{
 };
 use tetra_saps::control::enums::{circuit_mode_type::CircuitModeType, communication_type::CommunicationType};
 use tetra_saps::lcmc::{LcmcMleUnitdataInd, LcmcMleUnitdataReq};
+use tetra_saps::tncc;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 #[path = "common/default_stack.rs"]
@@ -125,6 +126,26 @@ fn group_setup(grant: TransmissionGrant) -> DSetup {
     }
 }
 
+fn tncc_setup_response() -> tncc::TnccSetupResponse {
+    tncc::TnccSetupResponse {
+        access_priority: None,
+        basic_service_information: None,
+        clir_control: None,
+        hook_method_selection: tncc::HookMethodSelection::HookOnHookOffSignallingOrCallAcceptanceSignalling,
+        simplex_duplex_selection: tncc::SimplexDuplexSelection::SimplexOperation,
+        traffic_stealing: None,
+    }
+}
+
+fn tncc_complete_request() -> tncc::TnccCompleteRequest {
+    tncc::TnccCompleteRequest {
+        access_priority: None,
+        basic_service_information_offered: None,
+        hook_method: tncc::HookMethodSelection::HookOnHookOffSignallingOrCallAcceptanceSignalling,
+        simplex_duplex: tncc::SimplexDuplexSelection::SimplexOperation,
+        traffic_stealing: None,
+    }
+}
 fn shared_ms_config() -> SharedConfig {
     SharedConfig::from_parts(default_stack::default_test_config_ms(), None)
 }
@@ -275,13 +296,20 @@ fn incoming_individual_answer_and_network_disconnect_pdus_decode() {
     let mut q = MessageQueue::new();
     let mut setup = group_setup(TransmissionGrant::NotGranted);
     setup.basic_service_information = speech_service(CommunicationType::P2p);
+    setup.hook_method_selection = true; // on/off-hook signalling (cl. 14.8.23)
     cc.route_rd_deliver(&mut q, dl_msg(&setup, TetraAddress::new(ISSI, SsiType::Issi)));
     assert_eq!(cc.call(CALL_ID).unwrap().state, MsCcState::MtCallSetup);
 
-    assert!(cc.answer_call(&mut q, CALL_ID, true));
+    // On/off-hook (cl. 14.5.1.1.1): the TNCC-SETUP response only rings the far
+    // end with U-ALERT; the call stays in MT-CALL-SETUP, no U-CONNECT yet.
+    assert!(cc.handle_tncc_setup_response(&mut q, CALL_ID, &tncc_setup_response()));
     let mut prim = pop_unitdata(&mut q);
     let alert = UAlert::from_bitbuf(&mut prim.sdu).unwrap();
     assert_eq!(alert.call_identifier, CALL_ID);
+    assert_eq!(cc.call(CALL_ID).unwrap().state, MsCcState::MtCallSetup);
+
+    // Local pickup: TNCC-COMPLETE sends U-CONNECT to connect the call.
+    assert!(cc.handle_tncc_complete(&mut q, CALL_ID, &tncc_complete_request()));
     let mut prim = pop_unitdata(&mut q);
     let connect = UConnect::from_bitbuf(&mut prim.sdu).unwrap();
     assert_eq!(connect.call_identifier, CALL_ID);

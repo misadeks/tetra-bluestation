@@ -38,9 +38,50 @@ impl CcMsSubentity {
         }
     }
 
-    /// TNCC-SETUP response / TNCC-COMPLETE request adapter (Tables 11.8/11.2).
-    pub fn handle_tncc_answer(&mut self, queue: &mut MessageQueue, call_identifier: u16) -> bool {
-        self.answer_call(queue, call_identifier, false)
+    /// TNCC-SETUP response adapter (Table 11.8, cl. 11.3.3.8) for the MT
+    /// answer, per cl. 14.5.1.1.1. The signalling mode is dictated by the
+    /// D-SETUP Hook method selection IE (cl. 14.8.23) stored on the call:
+    /// on/off-hook → send U-ALERT and remain in MT-CALL-SETUP; direct set-up →
+    /// send U-CONNECT immediately and start T301.
+    pub fn handle_tncc_setup_response(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_identifier: u16,
+        response: &tncc::TnccSetupResponse,
+    ) -> bool {
+        let Some(call) = self.calls.get(&call_identifier) else {
+            return false;
+        };
+        if call.hook_on_off {
+            self.send_u_alert(queue, call_identifier, response)
+        } else {
+            let basic_service = response
+                .basic_service_information
+                .as_ref()
+                .and_then(|b| pdu_basic_from_tncc(b).ok())
+                .unwrap_or_else(|| call.basic_service.clone());
+            self.connect_call(queue, call_identifier, response.simplex_duplex_selection.as_bool(), basic_service)
+        }
+    }
+
+    /// TNCC-COMPLETE request adapter (Table 11.2, cl. 11.3.3.2): the on/off-hook
+    /// called user has answered, so CC sends U-CONNECT and starts T301
+    /// (cl. 14.5.1.1.1), remaining in MT-CALL-SETUP.
+    pub fn handle_tncc_complete(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_identifier: u16,
+        request: &tncc::TnccCompleteRequest,
+    ) -> bool {
+        let Some(call) = self.calls.get(&call_identifier) else {
+            return false;
+        };
+        let basic_service = request
+            .basic_service_information_offered
+            .as_ref()
+            .and_then(|b| pdu_basic_from_tncc(b).ok())
+            .unwrap_or_else(|| call.basic_service.clone());
+        self.connect_call(queue, call_identifier, request.simplex_duplex.as_bool(), basic_service)
     }
 
     /// TNCC-TX request adapter (Table 11.9).
