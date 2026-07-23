@@ -1,6 +1,14 @@
 use super::*;
 
 impl CcMsSubentity {
+    /// LCMC-SAP (lower boundary) air-interface ingress route.
+    ///
+    /// Downlink CMCE call-control PDUs are delivered up from MLE as
+    /// `LcmcMleUnitdataInd`; the CMCE protocol control (`cmce_ms`) has already
+    /// demultiplexed by message type (cl. 14.8.28) and routed the CC-owned PDU
+    /// set here. This peeks the 5-bit PDU type, parses, and dispatches to the
+    /// per-PDU `rx_d_*` handlers — mirroring cc_bs's `route_rd_deliver`
+    /// (`rx_u_*` on the BS, which receives the uplink instead).
     pub fn route_rd_deliver(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
             panic!()

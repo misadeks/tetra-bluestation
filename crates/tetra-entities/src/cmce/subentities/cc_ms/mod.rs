@@ -35,7 +35,6 @@ mod procedures;
 mod routes;
 mod state;
 mod timers;
-mod tncc_adapters;
 mod uplane;
 
 // Re-export the CC-MS shared vocabulary so the `use super::*;` chain in every

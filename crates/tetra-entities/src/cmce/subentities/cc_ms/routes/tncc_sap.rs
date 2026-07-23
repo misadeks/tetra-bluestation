@@ -1,5 +1,14 @@
 use super::*;
 
+// TNCC-SAP (upper boundary) ingress route for CC-MS.
+//
+// The user application drives MS call control across the TNCC-SAP
+// (TS 100 392-2 cl. 11.3.3): TNCC-SETUP / -TX / -RELEASE requests and the
+// TNCC-SETUP response / TNCC-COMPLETE answer. These adapters translate each
+// TNCC primitive into the Phase-1 CC engine's origination/answer/floor/release
+// procedures; no call-control behaviour is duplicated here. This mirrors the
+// cc_bs `routes/ra.rs` application-ingress route (the BS's network-side call
+// control), keeping every CC ingress SAP under `routes/`.
 impl CcMsSubentity {
     /// TNCC-SETUP request (Table 11.8, cl. 11.3.3.8) adapter: build U-SETUP
     /// through the Phase-1 CC engine; no call-control behaviour is duplicated.
