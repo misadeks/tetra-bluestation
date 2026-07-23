@@ -11,6 +11,7 @@ use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
 use tetra_pdus::umac::pdus::mac_end_ul::MacEndUl;
+use tetra_pdus::umac::pdus::mac_frag_ul::MacFragUl;
 
 use crate::common::ComponentTest;
 
@@ -522,16 +523,94 @@ fn test_uplink_fragmentation_full_slot_roundtrip() {
     assert_eq!(reassembled, expected, "reassembled SDU equals the original");
 }
 
-/// A TM-SDU whose remainder exceeds even one full slot (~254 bits) cannot be
-/// sent with the implemented two-fragment scheme (that would need multi-slot
-/// MAC-FRAG-UL continuations), so `build_mac_access_frag_start` returns `None`.
+/// A TM-SDU whose remainder needs more than `MAX_UL_FRAG_SLOTS` full slots
+/// (the multi-slot MAC-FRAG-UL cap) is rejected by `build_mac_access_frag_start`
+/// (`None`); no realistic MM/CMCE signalling SDU is that large.
 #[test]
-fn test_frag_start_rejects_over_two_fragments() {
+fn test_frag_start_rejects_beyond_max_slots() {
     let issi: u32 = 0x0000_0001;
-    // 56-bit first fragment + a remainder over the ~254-bit MAC-END-UL limit.
-    let mut sdu = BitBuffer::from_bitstr(&"1".repeat(56 + 255));
+    // Remainder needs 7 full slots: MAC-END-UL(254) + 6*MAC-FRAG-UL(264) + 1.
+    let remainder = 254 + 264 * 6 + 1;
+    let mut sdu = BitBuffer::from_bitstr(&"1".repeat(56 + remainder));
     assert!(
         UmacMs::build_mac_access_frag_start(issi, &mut sdu).is_none(),
-        "an SDU whose remainder exceeds one full slot must be rejected"
+        "an SDU whose remainder exceeds the multi-slot cap must be rejected"
     );
+}
+
+/// End-to-end multi-slot uplink fragmentation (ETSI TS 100 392-2 cl. 23.4.2.1.2):
+/// an oversized TM-SDU is split into a MAC-ACCESS frag-start (56 SDU bits +
+/// N-slot capacity request) followed by `N-1` MAC-FRAG-UL continuations (264 SDU
+/// bits each) and a terminating MAC-END-UL, and the pieces reassemble to exactly
+/// the original TM-SDU when decoded with the BS's own parsers.
+fn multislot_roundtrip(sdu_len: usize, expected_slots: usize, expected_req: ReservationRequirement) {
+    let issi: u32 = 0x0012_D687;
+    let sdu_bits = bitstr(sdu_len);
+    let expected: Vec<u8> = sdu_bits.chars().map(|c| (c == '1') as u8).collect();
+    let mut sdu = BitBuffer::from_bitstr(&sdu_bits);
+
+    let (mut frag_block, mut remainder, end_kind) =
+        UmacMs::build_mac_access_frag_start(issi, &mut sdu).expect("oversized SDU fragments");
+    assert_eq!(
+        end_kind,
+        FragEndKind::MacFragUl { total_slots: expected_slots },
+        "remainder needs {} full slots",
+        expected_slots
+    );
+    assert_eq!(remainder.get_len(), sdu_len - 56, "remainder = SDU - 56 first-fragment bits");
+
+    // Frag-start MAC-ACCESS decodes with the BS parser and requests N slots.
+    let frag_pdu = MacAccess::from_bitbuf(&mut frag_block).expect("frag-start decodes");
+    assert_eq!(frag_pdu.addr.expect("addressed").ssi, issi);
+    assert_eq!(frag_pdu.frag_flag, Some(true), "start-of-fragmentation flag set");
+    assert_eq!(frag_pdu.reservation_req, Some(expected_req), "capacity request = N slots");
+    assert_eq!(frag_pdu.length_ind, None, "frag-start carries no length indication");
+    assert_eq!(frag_block.get_pos(), 36, "frag-start header is 36 bits");
+    let mut reassembled = vec![0u8; 56];
+    frag_block.to_bitarr(&mut reassembled);
+    assert_eq!(reassembled, expected[..56], "first fragment carries the first 56 SDU bits");
+
+    // Split the remainder into the N full-slot blocks and decode each with the
+    // BS's own parsers, reassembling the TM-SDU.
+    let blocks = UmacMs::build_ul_frag_blocks(&mut remainder, expected_slots)
+        .expect("remainder splits into N full slots");
+    assert_eq!(blocks.len(), expected_slots, "N full-slot blocks");
+    let mut consumed = 56usize;
+    for (i, mut block) in blocks.into_iter().enumerate() {
+        assert_eq!(block.get_len(), 268, "each block is a 268-bit SCH/F type-1 block");
+        let is_last = i + 1 == expected_slots;
+        if is_last {
+            let end_pdu = MacEndUl::from_bitbuf(&mut block).expect("MAC-END-UL decodes");
+            assert_eq!(block.get_pos(), 10, "MAC-END-UL header is 10 bits");
+            assert!(end_pdu.length_ind.is_some(), "terminating PDU carries the length");
+            let tail = sdu_len - consumed;
+            let mut rest = vec![0u8; tail];
+            block.to_bitarr(&mut rest);
+            assert_eq!(rest, expected[consumed..], "MAC-END-UL carries the final SDU bits");
+            consumed += tail;
+        } else {
+            let frag = MacFragUl::from_bitbuf(&mut block).expect("MAC-FRAG-UL decodes");
+            assert!(!frag.fill_bits, "continuation fills the slot, no fill bits");
+            assert_eq!(block.get_pos(), 4, "MAC-FRAG-UL header is 4 bits");
+            let mut chunk = vec![0u8; 264];
+            block.to_bitarr(&mut chunk);
+            assert_eq!(chunk, expected[consumed..consumed + 264], "continuation carries 264 SDU bits");
+            consumed += 264;
+        }
+    }
+    assert_eq!(consumed, sdu_len, "all SDU bits reassembled");
+}
+
+/// ~500-bit SDU: frag-start (56) + one MAC-FRAG-UL (264) + MAC-END-UL (180)
+/// across two reserved full slots.
+#[test]
+fn test_uplink_fragmentation_two_slot_roundtrip() {
+    multislot_roundtrip(500, 2, ReservationRequirement::Req2Slots);
+}
+
+/// ~800-bit SDU: frag-start (56) + two MAC-FRAG-UL (264 each) + MAC-END-UL (216)
+/// across three reserved full slots.
+#[test]
+fn test_uplink_fragmentation_three_slot_roundtrip() {
+    multislot_roundtrip(800, 3, ReservationRequirement::Req3Slots);
 }

@@ -31,6 +31,7 @@ use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
 use tetra_pdus::umac::pdus::mac_end_ul::MacEndUl;
 use tetra_pdus::umac::pdus::mac_frag_dl::MacFragDl;
+use tetra_pdus::umac::pdus::mac_frag_ul::MacFragUl;
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_pdus::umac::pdus::mac_sync::MacSync;
 use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
@@ -62,6 +63,20 @@ const SCH_F_TYPE1_BITS: usize = 268;
 /// PDU type (2) + PDU subtype (1) + fill-bit indication (1) + length-indication-
 /// or-capacity-request (6).
 const MAC_END_UL_HEADER_BITS: usize = 10;
+
+/// MAC-FRAG-UL fixed header length in bits (ETSI TS 100 392-2 cl. 21.4.2.4):
+/// MAC PDU type (2) + PDU subtype (1) + fill-bit indication (1). Each MAC-FRAG-UL
+/// continuation carries a full SCH/F slot of TM-SDU (no length indication — the
+/// terminating MAC-END-UL carries it) so the whole 268-bit block minus this
+/// header is TM-SDU.
+const MAC_FRAG_UL_HEADER_BITS: usize = 4;
+
+/// Maximum number of full SCH/F slots a single fragmented uplink transfer may
+/// reserve (one MAC-ACCESS frag-start plus this many full slots of
+/// MAC-FRAG-UL/MAC-END-UL). No realistic MM/CMCE signalling TM-SDU needs more
+/// than a couple of full slots; larger transfers are rejected at frag-start so
+/// the reserved-slot bookkeeping stays bounded (ETSI TS 100 392-2 cl. 23.5.2).
+const MAX_UL_FRAG_SLOTS: usize = 6;
 
 /// TETRA broadcast identity: the 24-bit SSI with all bits set (ETSI TS 100
 /// 392-2 addressing). MAC PDUs addressed to it are processed by every MS.
@@ -113,6 +128,12 @@ pub enum FragEndKind {
     /// MAC-END-UL on a granted SCH/F full slot (Normal Uplink Burst). Requested
     /// with `Req1Slot`; the remainder fits ~254 TM-SDU bits.
     MacEndUl,
+    /// Multi-slot transfer: `total_slots` full SCH/F slots carrying
+    /// `total_slots - 1` MAC-FRAG-UL continuations (264 TM-SDU bits each)
+    /// followed by a terminating MAC-END-UL (ETSI TS 100 392-2 cl. 23.4.2.1.2).
+    /// Requested with `Req{N}Slots` (cl. 23.5.2); used when the remainder is
+    /// larger than one full slot can carry.
+    MacFragUl { total_slots: usize },
 }
 
 /// The remaining TM-SDU of an uplink transfer that did not fit a single
@@ -137,6 +158,32 @@ pub struct UplinkFragment {
     /// remainder cannot be sent (no grant / mismatched allocation), so the LLC
     /// retransmits the whole transfer.
     pub tx_reporter: Option<TxReporter>,
+}
+
+/// An in-flight multi-slot reserved uplink transfer (ETSI TS 100 392-2
+/// cl. 23.4.2.1.2 / 23.5.2). When the BS grants N full slots in response to a
+/// frag-start capacity request, the remainder is pre-built into N full-slot
+/// blocks — `N-1` MAC-FRAG-UL continuations followed by a terminating
+/// MAC-END-UL — and this plan drives them out **one block per reserved slot**.
+///
+/// The MS PHY (`phy_ms`) can only physically transmit at "current downlink slot
+/// + 2", so all N blocks cannot be emitted at once: [`UmacMs::drive_reserved_tx`]
+/// emits the front block only when its reserved slot's uplink time (`dltime + 2`)
+/// is reached, popping `blocks`/`slots` in lockstep. The reserved-slot sequence
+/// mirrors the BS `ul_find_grant_opportunity` "next opportunity" stepping
+/// (same timeslot every TDMA frame, skipping the mandatory CLCH slot).
+#[derive(Debug, Clone)]
+struct ReservedTxPlan {
+    /// The pre-built full-slot MAC blocks, front = next to transmit. All but the
+    /// last are MAC-FRAG-UL; the last is the terminating MAC-END-UL.
+    blocks: VecDeque<BitBuffer>,
+    /// The reserved uplink slot for each block (same length/order as `blocks`).
+    slots: VecDeque<TdmaTime>,
+    scrambling_code: u32,
+    /// Transmit receipt for the whole fragmented TM-SDU (see
+    /// [`PendingUplink::tx_reporter`]); marked *transmitted* only when the final
+    /// MAC-END-UL block is emitted, *discarded* if a reserved slot is missed.
+    tx_reporter: Option<TxReporter>,
 }
 
 /// A complete uplink transfer waiting behind the one currently in flight.
@@ -205,6 +252,15 @@ pub struct UmacMs {
     /// a MAC-END-HU once the BS grants an uplink subslot (cl. 23.5.2).
     pending_fragment: Option<UplinkFragment>,
 
+    /// An in-flight multi-slot reserved uplink transfer (cl. 23.4.2.1.2 /
+    /// 23.5.2). When `Some`, the BS has granted the reserved capacity for a
+    /// remainder too large for one full slot, and this holds the pre-built
+    /// MAC-FRAG-UL/MAC-END-UL blocks plus their reserved uplink slots; one block
+    /// is emitted per slot by `drive_reserved_tx` (called each downlink tick).
+    /// While it is set no new uplink transfer may start (the in-flight guard),
+    /// so its transmit receipt is never orphaned.
+    reserved_tx: Option<ReservedTxPlan>,
+
     /// Runtime downlink address-filter set (cl. 23.4.1.2.1). Seeded from
     /// `[ms].issi` / `[ms].attach_groups` at construction and updated at runtime
     /// via TL-CONFIGURE (from the MLE-IDENTITIES chain, cl. 17.3.2) so that
@@ -255,6 +311,7 @@ impl UmacMs {
             access_params: AccessParamStore::new(),
             random_access: MsRandomAccess::new(),
             pending_fragment: None,
+            reserved_tx: None,
             valid_individual_ssi,
             valid_group_ssis,
             derived_ul_freq: None,
@@ -1152,7 +1209,11 @@ impl UmacMs {
     /// - `Req1Subslot` -> `FirstSubslotGranted` -> MAC-END-HU on SCH/HU (Control
     ///   Uplink Burst) — remainder up to ~81 TM-SDU bits;
     /// - `Req1Slot` -> `Grant1Slot` -> MAC-END-UL on SCH/F (Normal Uplink Burst)
-    ///   — remainder up to ~254 TM-SDU bits.
+    ///   — remainder up to ~254 TM-SDU bits;
+    /// - `Req{N}Slots` -> `Grant{N}Slots` -> `N-1` MAC-FRAG-UL continuations plus
+    ///   a terminating MAC-END-UL across N reserved SCH/F full slots (true
+    ///   multi-slot fragmentation) — driven out one block per slot by
+    ///   [`Self::drive_reserved_tx`].
     ///
     /// Only the "next opportunity" granting delay (cl. 23.5.2.2.2) is handled;
     /// any other capacity allocation / granting delay, or a grant that does not
@@ -1162,11 +1223,6 @@ impl UmacMs {
     /// in the same TDMA frame as the downlink slot carrying the grant; since the
     /// uplink frame is a fixed 2-timeslot delay from the downlink (cl. 9.3.9
     /// Frame alignment), that is `dltime + 2`.
-    ///
-    /// Remainders larger than one full slot would need true multi-slot
-    /// fragmentation (MAC-FRAG-UL continuations across consecutive reserved
-    /// slots); those are rejected earlier in `build_mac_access_frag_start` and
-    /// never reach here.
     fn emit_fragment_end(&mut self, queue: &mut MessageQueue, grant: Option<&BasicSlotgrant>) {
         let Some(mut frag) = self.pending_fragment.take() else {
             return;
@@ -1182,8 +1238,8 @@ impl UmacMs {
             return;
         };
 
-        // Only the "next opportunity" granting delay is used for a two-fragment
-        // transfer (cl. 23.5.2.2.2).
+        // Only the "next opportunity" granting delay is used for a reserved
+        // fragment transfer (cl. 23.5.2.2.2).
         match grant.granting_delay {
             BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity => {}
             other => {
@@ -1194,6 +1250,67 @@ impl UmacMs {
                 Self::discard_fragment(&frag);
                 return;
             }
+        }
+
+        // Multi-slot transfer (cl. 23.4.2.1.2): build the (N-1) MAC-FRAG-UL
+        // continuations + terminating MAC-END-UL and set up a reserved
+        // transmission plan driven one block per reserved slot. The PHY can only
+        // transmit at `dltime + 2`, so the blocks cannot all be emitted at once.
+        if let FragEndKind::MacFragUl { total_slots } = frag.end_kind {
+            // The grant must reserve at least the N full slots we requested
+            // (cl. 23.5.2). Subslot grants (which have no whole-slot count) never
+            // match a multi-slot request.
+            let granted_slots = match grant.capacity_allocation {
+                BasicSlotgrantCapAlloc::FirstSubslotGranted
+                | BasicSlotgrantCapAlloc::SecondSubslotGranted => 0,
+                other => other.to_req_slotcount(),
+            };
+            if granted_slots < total_slots {
+                unimplemented_log!(
+                    "uplink fragmentation: grant {:?} ({} slot(s)) smaller than requested {} slots; \
+                     dropping fragment end (LLC/MM will retransmit)",
+                    grant.capacity_allocation,
+                    granted_slots,
+                    total_slots
+                );
+                Self::discard_fragment(&frag);
+                return;
+            }
+            let Some(blocks) = Self::build_ul_frag_blocks(&mut frag.remainder, total_slots) else {
+                tracing::warn!(
+                    "uplink fragmentation: could not split {}-bit remainder into {} full slots; \
+                     dropping (LLC/MM will retransmit)",
+                    rem_len,
+                    total_slots
+                );
+                Self::discard_fragment(&frag);
+                return;
+            };
+            // First reserved slot = dltime + 2 (cl. 9.3.9 / 23.5.2.2.2); the rest
+            // step one TDMA frame at a time, skipping the mandatory CLCH slot,
+            // mirroring the BS grant-opportunity walk.
+            let first = self.dltime.add_timeslots(2);
+            let slots = Self::reserved_slot_sequence(first, total_slots);
+            debug_assert_eq!(blocks.len(), slots.len());
+            tracing::info!(
+                "uplink fragmentation: BS granted {:?}; scheduling {}-block multi-slot transfer \
+                 ({} SDU bits) starting UL {:?}",
+                grant.capacity_allocation,
+                total_slots,
+                rem_len,
+                first
+            );
+            self.reserved_tx = Some(ReservedTxPlan {
+                blocks: blocks.into_iter().collect(),
+                slots,
+                scrambling_code: frag.scrambling_code,
+                tx_reporter: frag.tx_reporter.take(),
+            });
+            // Emit the first block now if its reserved slot is this uplink slot
+            // (dltime + 2). If dltime + 2 was a CLCH slot, slot[0] is later and
+            // this correctly does nothing until that slot arrives.
+            self.drive_reserved_tx(queue);
+            return;
         }
 
         // The grant's capacity allocation must match the capacity we requested
@@ -1296,6 +1413,104 @@ impl UmacMs {
         // (cl. 22.3.2.3); panic-safe against a re-presented retransmission.
         if let Some(tx_reporter) = frag.tx_reporter.as_ref() {
             tx_reporter.try_mark_transmitted();
+        }
+    }
+
+    /// Drive an in-flight multi-slot reserved uplink transfer (ETSI TS 100 392-2
+    /// cl. 23.4.2.1.2 / 23.5.2). Called each downlink slot (from `tick_start`,
+    /// and once from `emit_fragment_end` when the plan is created): when the
+    /// front reserved slot's uplink time (`dltime + 2`) is reached, the next
+    /// prebuilt full-slot block (a MAC-FRAG-UL continuation, or the final
+    /// MAC-END-UL) is emitted to LMAC as a reserved-access burst that the PHY
+    /// transmits at exactly that slot.
+    ///
+    /// The reserved slots are spaced one TDMA frame apart (>= 4 timeslots) and
+    /// the downlink clock advances one slot per tick, so at most one block is
+    /// ever due in a given tick. If a reserved slot is missed (we advanced past
+    /// it without transmitting — e.g. the downlink clock was re-seeded by a SYNC
+    /// burst), the whole plan is abandoned and its transmit receipt discarded so
+    /// the LLC/MM retransmit the whole transfer.
+    fn drive_reserved_tx(&mut self, queue: &mut MessageQueue) {
+        let Some(mut plan) = self.reserved_tx.take() else {
+            return;
+        };
+        // The uplink slot paired with the current downlink slot (cl. 9.3.9).
+        let ul = self.dltime.add_timeslots(2);
+        let Some(&slot) = plan.slots.front() else {
+            // An empty plan should never persist; drop it defensively.
+            return;
+        };
+
+        // slot - ul, via ul.diff(slot) = ul - slot: >0 => ul past slot (missed);
+        // 0 => this slot; <0 => still in the future.
+        let delta = ul.diff(slot);
+        if delta < 0 {
+            // Reserved slot not reached yet; keep waiting.
+            self.reserved_tx = Some(plan);
+            return;
+        }
+        if delta > 0 {
+            tracing::warn!(
+                "uplink fragmentation: missed reserved slot {:?} (now UL {:?}); abandoning \
+                 multi-slot transfer ({} block(s) unsent), LLC/MM will retransmit",
+                slot,
+                ul,
+                plan.blocks.len()
+            );
+            if let Some(tx_reporter) = plan.tx_reporter.as_ref() {
+                tx_reporter.try_mark_discarded();
+            }
+            // Plan dropped (taken, not restored).
+            return;
+        }
+
+        // delta == 0: transmit the next block in its reserved slot.
+        let block = plan
+            .blocks
+            .pop_front()
+            .expect("blocks and slots kept in lockstep");
+        plan.slots.pop_front();
+        let is_last = plan.blocks.is_empty();
+        tracing::info!(
+            "uplink fragmentation: transmitting reserved {} at UL {:?} on SchF ({} block(s) left)",
+            if is_last { "MAC-END-UL" } else { "MAC-FRAG-UL" },
+            slot,
+            plan.blocks.len()
+        );
+
+        let blk = TmvUnitdataReq {
+            mac_block: block,
+            logical_channel: LogicalChannel::SchF,
+            scrambling_code: plan.scrambling_code,
+        };
+        let m = SapMsg {
+            sap: Sap::TmvSap,
+            src: self.self_component,
+            dest: TetraEntity::Lmac,
+            msg: SapMsgInner::TmvUnitdataReq(TmvUnitdataReqSlot {
+                ts: slot,
+                ul_phy_chan: PhysicalChannel::Cp,
+                blk1: Some(blk),
+                blk2: None,
+                bbk: None,
+                // Reserved-access burst: the BS reserved this exact slot
+                // (cl. 23.5.2). The PHY must transmit it at exactly `slot` or
+                // drop it -- it may not be frame-advanced to a later slot.
+                reserved_access: true,
+            }),
+        };
+        queue.push_back(m);
+
+        if is_last {
+            // The whole fragmented TM-SDU is now handed to the PHY. Mark the LLC
+            // transmit receipt so the acknowledged basic link starts its
+            // ack-wait / retransmit timer (cl. 22.3.2.3); panic-safe against a
+            // re-presented retransmission. Plan complete (not restored).
+            if let Some(tx_reporter) = plan.tx_reporter.as_ref() {
+                tx_reporter.try_mark_transmitted();
+            }
+        } else {
+            self.reserved_tx = Some(plan);
         }
     }
 
@@ -1453,10 +1668,10 @@ impl UmacMs {
                     }
                     None => {
                         tracing::warn!(
-                            "rx_tma_prim: TM-SDU ({} bits) exceeds two-fragment (MAC-ACCESS + \
-                             MAC-END-UL full slot) capacity; multi-slot uplink fragmentation not \
-                             implemented, dropping",
-                            sdu_len
+                            "rx_tma_prim: TM-SDU ({} bits) exceeds the maximum multi-slot uplink \
+                             fragment capacity ({} full slots); dropping (LLC/MM will retransmit)",
+                            sdu_len,
+                            MAX_UL_FRAG_SLOTS
                         );
                         return;
                     }
@@ -1474,10 +1689,7 @@ impl UmacMs {
         // (observed as endless "still blocked" when an LLC BL-ACK auto-ack
         // interleaved with a group-attach). Queue the new transfer instead and
         // let `promote_next_uplink` start it once the current one completes.
-        if self.pending_uplink.is_some()
-            || self.pending_fragment.is_some()
-            || self.random_access.is_active()
-        {
+        if self.uplink_in_flight() {
             if self.uplink_queue.len() >= MAX_UPLINK_QUEUE {
                 if let Some(dropped) = self.uplink_queue.pop_front() {
                     tracing::warn!(
@@ -1531,6 +1743,21 @@ impl UmacMs {
         }
     }
 
+    /// Whether an uplink transfer is currently occupying the single random-access
+    /// / reserved-transmission slot the MS-MAC allows (cl. 23.5.1.4 / 23.4.2.1.2).
+    /// A new transfer must not start (or overwrite) while any of these hold, or
+    /// its `tx_reporter` would be orphaned and the acknowledged basic link would
+    /// wedge. Covers a queued/contending MAC-ACCESS (`pending_uplink`), an
+    /// outstanding fragment remainder awaiting its grant (`pending_fragment`), an
+    /// active random-access attempt, and an in-flight multi-slot reserved transfer
+    /// (`reserved_tx`).
+    fn uplink_in_flight(&self) -> bool {
+        self.pending_uplink.is_some()
+            || self.pending_fragment.is_some()
+            || self.random_access.is_active()
+            || self.reserved_tx.is_some()
+    }
+
     /// Promote the next queued uplink transfer (if any) into the active
     /// `pending_uplink`/`pending_fragment` slots, but only when nothing is
     /// currently contending for random access. Called each downlink slot from
@@ -1538,10 +1765,7 @@ impl UmacMs {
     /// (e.g. a group-attach behind an LLC BL-ACK) start once the earlier one has
     /// been acknowledged or abandoned.
     fn promote_next_uplink(&mut self) {
-        if self.pending_uplink.is_some()
-            || self.pending_fragment.is_some()
-            || self.random_access.is_active()
-        {
+        if self.uplink_in_flight() {
             return;
         }
         if let Some(next) = self.uplink_queue.pop_front() {
@@ -1636,6 +1860,100 @@ impl UmacMs {
         (SCH_F_TYPE1_BITS / 8) * 8 - MAC_END_UL_HEADER_BITS
     }
 
+    /// TM-SDU bits carried by a single MAC-FRAG-UL continuation: the whole
+    /// 268-bit SCH/F block minus the 4-bit header (cl. 21.4.2.4). A continuation
+    /// fills its slot exactly (no fill bits, no length indication — the length
+    /// is carried by the terminating MAC-END-UL).
+    const fn max_frag_ul_sdu_bits() -> usize {
+        SCH_F_TYPE1_BITS - MAC_FRAG_UL_HEADER_BITS
+    }
+
+    /// Number of full SCH/F slots a multi-slot uplink fragment remainder needs:
+    /// `total_slots - 1` MAC-FRAG-UL continuations of [`Self::max_frag_ul_sdu_bits`]
+    /// bits each plus a terminating MAC-END-UL of at most
+    /// [`Self::max_end_ul_sdu_bits`] bits (ETSI TS 100 392-2 cl. 23.4.2.1.2).
+    /// Returns `None` if the remainder needs more than [`MAX_UL_FRAG_SLOTS`]
+    /// slots. The caller only reaches this for a remainder that does not fit a
+    /// single MAC-END-UL, so `total_slots >= 2`.
+    fn compute_ul_frag_slots(remainder_len: usize) -> Option<usize> {
+        let frag = Self::max_frag_ul_sdu_bits();
+        let end = Self::max_end_ul_sdu_bits();
+        debug_assert!(remainder_len > end, "single MAC-END-UL should have been chosen");
+        // ceil((remainder - end) / frag) continuations, each of `frag` bits,
+        // leave a tail of at most `end` bits for the MAC-END-UL.
+        let k = (remainder_len - end).div_ceil(frag);
+        let total_slots = k + 1;
+        if total_slots > MAX_UL_FRAG_SLOTS {
+            None
+        } else {
+            Some(total_slots)
+        }
+    }
+
+    /// Build one MAC-FRAG-UL continuation block (ETSI TS 100 392-2 cl. 21.4.2.4)
+    /// on a reserved SCH/F full slot: the 4-bit header followed by exactly
+    /// [`Self::max_frag_ul_sdu_bits`] TM-SDU bits, filling the 268-bit block with
+    /// no fill bits and no length indication (the terminating MAC-END-UL carries
+    /// the overall length). `sdu_chunk` must hold exactly that many bits.
+    pub fn build_mac_frag_ul_block(sdu_chunk: &mut BitBuffer) -> BitBuffer {
+        debug_assert_eq!(sdu_chunk.get_len(), Self::max_frag_ul_sdu_bits());
+        let pdu = MacFragUl { fill_bits: false };
+        let mut block = BitBuffer::new(SCH_F_TYPE1_BITS);
+        pdu.to_bitbuf(&mut block);
+        sdu_chunk.seek(0);
+        block.copy_bits(sdu_chunk, sdu_chunk.get_len());
+        block.seek(0);
+        block
+    }
+
+    /// Split a multi-slot fragment `remainder` into `total_slots` full-slot
+    /// blocks: `total_slots - 1` MAC-FRAG-UL continuations followed by a
+    /// terminating MAC-END-UL (ETSI TS 100 392-2 cl. 23.4.2.1.2). Returns the
+    /// blocks in transmission order, or `None` if the sizing is inconsistent
+    /// (should not happen for a `total_slots` from [`Self::compute_ul_frag_slots`]).
+    pub fn build_ul_frag_blocks(remainder: &mut BitBuffer, total_slots: usize) -> Option<Vec<BitBuffer>> {
+        let frag = Self::max_frag_ul_sdu_bits();
+        let k = total_slots.checked_sub(1)?; // MAC-FRAG-UL continuations
+        let r = remainder.get_len();
+        if r < k * frag {
+            return None;
+        }
+        let tail = r - k * frag;
+        if tail == 0 || tail > Self::max_end_ul_sdu_bits() {
+            return None;
+        }
+        remainder.seek(0);
+        let mut blocks = Vec::with_capacity(total_slots);
+        for _ in 0..k {
+            let mut chunk = BitBuffer::new(frag);
+            chunk.copy_bits(remainder, frag);
+            blocks.push(Self::build_mac_frag_ul_block(&mut chunk));
+        }
+        let mut tail_buf = BitBuffer::new(tail);
+        tail_buf.copy_bits(remainder, tail);
+        blocks.push(Self::build_mac_end_ul_block(&mut tail_buf)?);
+        Some(blocks)
+    }
+
+    /// The sequence of reserved uplink slots for a multi-slot transfer, starting
+    /// at `first` (the `dltime + 2` uplink slot paired with the downlink slot
+    /// carrying the grant, cl. 9.3.9 / 23.5.2.2.2). Subsequent slots are the
+    /// same-numbered timeslot in each following TDMA frame (step +4 timeslots),
+    /// skipping any mandatory CLCH slot — mirroring the BS
+    /// `ul_find_grant_opportunity` "capacity allocation at next opportunity"
+    /// stepping so the MS reproduces the BS's reserved set exactly.
+    fn reserved_slot_sequence(first: TdmaTime, total_slots: usize) -> VecDeque<TdmaTime> {
+        let mut slots = VecDeque::with_capacity(total_slots);
+        let mut cand = first;
+        while slots.len() < total_slots {
+            if !cand.is_mandatory_clch() {
+                slots.push_back(cand);
+            }
+            cand = cand.add_timeslots(4);
+        }
+        slots
+    }
+
     /// Build the first fragment of an oversized uplink TM-SDU: a MAC-ACCESS
     /// "start of fragmentation" block (ETSI TS 100 392-2 cl. 21.4.2.1,
     /// cl. 23.4.2.1.2). The block is addressed with the MS's own ISSI and
@@ -1651,9 +1969,9 @@ impl UmacMs {
     /// TM-SDU bits, and the [`FragEndKind`] the remainder must be completed
     /// with. Returns `None` if the SDU is not actually larger than one fragment
     /// (caller should use the self-contained [`Self::build_mac_access_block`]
-    /// path instead), or if the remainder is larger than a single full slot can
-    /// carry (true multi-slot fragmentation with MAC-FRAG-UL continuations is
-    /// not implemented).
+    /// path instead), or if the remainder is larger than
+    /// [`MAX_UL_FRAG_SLOTS`] full slots can carry (no realistic signalling SDU
+    /// is that large).
     pub fn build_mac_access_frag_start(
         issi: u32,
         sdu: &mut BitBuffer,
@@ -1698,15 +2016,24 @@ impl UmacMs {
         // Choose the fragment-end PDU and matching capacity request from the
         // remainder size (cl. 23.4.2.1.2 / 23.5.2): a small remainder fits a
         // MAC-END-HU on one granted subslot; a larger one needs a MAC-END-UL on
-        // a granted SCH/F full slot. A remainder larger than one full slot would
-        // need true multi-slot fragmentation (MAC-FRAG-UL continuations across
-        // consecutive reserved slots), which is not implemented.
+        // a granted SCH/F full slot; a still larger one is split across several
+        // reserved full slots as MAC-FRAG-UL continuations terminated by a
+        // MAC-END-UL (true multi-slot fragmentation), requesting the matching
+        // N-slot reserved capacity (cl. 23.5.2 basic slot granting).
         let (reservation_req, end_kind) = if remainder_len <= Self::max_end_hu_sdu_bits() {
             (ReservationRequirement::Req1Subslot, FragEndKind::MacEndHu)
         } else if remainder_len <= Self::max_end_ul_sdu_bits() {
             (ReservationRequirement::Req1Slot, FragEndKind::MacEndUl)
         } else {
-            return None;
+            // Needs (N-1) MAC-FRAG-UL continuations (264 SDU bits each) plus a
+            // terminating MAC-END-UL. `compute_ul_frag_slots` sizes N and caps
+            // it at `MAX_UL_FRAG_SLOTS`; beyond that the transfer is rejected
+            // (returns None) — no realistic MM/CMCE signalling SDU is that large.
+            let n = Self::compute_ul_frag_slots(remainder_len)?;
+            (
+                ReservationRequirement::from_req_slotcount(n),
+                FragEndKind::MacFragUl { total_slots: n },
+            )
         };
         pdu.reservation_req = Some(reservation_req);
 
@@ -2017,13 +2344,18 @@ impl TetraEntityTrait for UmacMs {
         }
     }
 
-    fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {
+    fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
         // The MS free-runs the absolute downlink time between SYNC bursts,
         // advancing one timeslot per received slot. It is re-seeded from each
         // BSCH in `rx_tmv_bsch` (ETSI TS 100 392-2 cl. 7 / 21.4.4.2). The
         // router's `ts` is a relative pacing clock in MS mode, so it is
         // intentionally not used here.
         self.dltime = self.dltime.add_timeslots(1);
+
+        // Drive any in-flight multi-slot reserved uplink transfer: emit the next
+        // MAC-FRAG-UL/MAC-END-UL block when its reserved slot (dltime + 2) is
+        // reached (cl. 23.4.2.1.2 / 23.5.2). No-op when nothing is reserved.
+        self.drive_reserved_tx(queue);
     }
 }
 
@@ -2393,6 +2725,165 @@ attach_groups = []
         assert!(q.pop_front().is_none(), "no uplink without a grant");
         assert!(umac.pending_fragment.is_none(), "fragment consumed even without a grant");
         assert!(reporter.is_discarded(), "no-grant drop marks the receipt discarded");
+    }
+
+    // --- Multi-slot uplink fragmentation (cl. 23.4.2.1.2 / 23.5.2) ---
+
+    /// A remainder too large for one full slot is split into MAC-FRAG-UL
+    /// continuations plus a terminating MAC-END-UL across the N reserved full
+    /// slots the BS granted. Emission is discontinuous: exactly one block is put
+    /// on air per reserved slot (the PHY can only transmit at `dltime + 2`), so
+    /// the first block goes out when the grant is processed and the rest as each
+    /// reserved slot is reached on later downlink ticks.
+    #[test]
+    fn test_multislot_grant_schedules_and_drives() {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let reporter = TxReporter::new();
+        // 400-bit remainder => 1 MAC-FRAG-UL (264 SDU bits) + MAC-END-UL (136),
+        // i.e. total_slots = 2.
+        umac.pending_fragment = Some(UplinkFragment {
+            remainder: BitBuffer::from_bitstr(&"1".repeat(400)),
+            scrambling_code: 0xFEED_BEEF,
+            end_kind: FragEndKind::MacFragUl { total_slots: 2 },
+            tx_reporter: Some(reporter.clone()),
+        });
+        let mut q = MessageQueue::new();
+
+        let grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::Grant2Slots,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        };
+        let slot0 = umac.dltime.add_timeslots(2);
+        umac.emit_fragment_end(&mut q, Some(&grant));
+
+        // First reserved slot (dltime + 2) is due this tick: exactly one
+        // MAC-FRAG-UL emitted; the plan retains the MAC-END-UL.
+        let msg = q.pop_front().expect("first MAC-FRAG-UL emitted");
+        assert!(q.pop_front().is_none(), "only one block per slot");
+        let SapMsgInner::TmvUnitdataReq(slot) = msg.msg else {
+            panic!("expected TmvUnitdataReq");
+        };
+        assert_eq!(slot.ts, slot0, "first block at DL + 2 timeslots");
+        assert!(slot.reserved_access, "reserved-access burst");
+        let mut blk0 = slot.blk1.expect("blk1").mac_block;
+        assert_eq!(blk0.get_len(), SCH_F_TYPE1_BITS, "full-slot SCH/F block");
+        let frag_pdu = MacFragUl::from_bitbuf(&mut blk0).expect("MAC-FRAG-UL decodes");
+        assert!(!frag_pdu.fill_bits, "continuation fills the slot, no fill bits");
+        assert!(umac.pending_fragment.is_none(), "fragment consumed");
+        assert!(umac.reserved_tx.is_some(), "plan still holds the MAC-END-UL");
+        assert!(!reporter.is_transmitted(), "receipt not marked until the last block");
+
+        // Advance downlink ticks until the second reserved slot (slot0 + 4) is
+        // reached; the MAC-END-UL is emitted then and the receipt marked.
+        let mut emitted_end = None;
+        for _ in 0..4 {
+            umac.tick_start(&mut q, TdmaTime::default());
+            if let Some(m) = q.pop_front() {
+                emitted_end = Some(m);
+            }
+            assert!(q.pop_front().is_none(), "at most one block per tick");
+        }
+        let msg = emitted_end.expect("MAC-END-UL emitted on its reserved slot");
+        let SapMsgInner::TmvUnitdataReq(slot) = msg.msg else {
+            panic!("expected TmvUnitdataReq");
+        };
+        assert_eq!(slot.ts, slot0.add_timeslots(4), "second block one TDMA frame later");
+        assert!(slot.reserved_access);
+        let mut blk1 = slot.blk1.expect("blk1").mac_block;
+        assert_eq!(blk1.get_len(), SCH_F_TYPE1_BITS);
+        let end_pdu = MacEndUl::from_bitbuf(&mut blk1).expect("MAC-END-UL decodes");
+        assert!(end_pdu.length_ind.is_some(), "terminating PDU carries the length");
+        assert!(umac.reserved_tx.is_none(), "plan complete");
+        assert!(reporter.is_transmitted(), "last block marks the receipt transmitted");
+    }
+
+    /// A grant smaller than the requested number of full slots cannot carry the
+    /// multi-slot transfer: nothing is transmitted, the fragment is dropped and
+    /// its receipt marked discarded so the LLC retransmits (cl. 23.5.2).
+    #[test]
+    fn test_multislot_grant_too_small_drops() {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        let reporter = TxReporter::new();
+        umac.pending_fragment = Some(UplinkFragment {
+            remainder: BitBuffer::from_bitstr(&"1".repeat(700)),
+            scrambling_code: 0,
+            end_kind: FragEndKind::MacFragUl { total_slots: 3 },
+            tx_reporter: Some(reporter.clone()),
+        });
+        let mut q = MessageQueue::new();
+
+        let grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::Grant2Slots,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        };
+        umac.emit_fragment_end(&mut q, Some(&grant));
+
+        assert!(q.pop_front().is_none(), "no uplink on an undersized grant");
+        assert!(umac.pending_fragment.is_none(), "fragment consumed");
+        assert!(umac.reserved_tx.is_none(), "no plan installed");
+        assert!(reporter.is_discarded(), "undersized grant marks the receipt discarded");
+    }
+
+    /// The reserved-slot walk steps one TDMA frame at a time (same timeslot,
+    /// +4 timeslots) and skips the mandatory CLCH slot, mirroring the BS
+    /// grant-opportunity stepping (cl. 23.5.2.2.2).
+    #[test]
+    fn test_reserved_slot_sequence_skips_clch() {
+        // At m=1, the CLCH is f=18, t=2 (is_mandatory_clch). Starting the walk
+        // at t=2, f=15, m=1 makes the f=18 candidate a CLCH that must be skipped.
+        let first = TdmaTime { t: 2, f: 15, m: 1, h: 0 };
+        assert!(TdmaTime { t: 2, f: 18, m: 1, h: 0 }.is_mandatory_clch());
+        let slots = UmacMs::reserved_slot_sequence(first, 4);
+        assert_eq!(slots.len(), 4);
+        let fs: Vec<u8> = slots.iter().map(|s| s.f).collect();
+        // f=18 (CLCH) is skipped; the walk continues into the next multiframe.
+        assert_eq!(fs, vec![15, 16, 17, 1], "CLCH frame 18 skipped");
+        assert!(slots.iter().all(|s| !s.is_mandatory_clch()), "no reserved slot is CLCH");
+    }
+
+    /// `compute_ul_frag_slots` sizes N = (continuations) + 1 and rejects a
+    /// remainder needing more than `MAX_UL_FRAG_SLOTS` full slots.
+    #[test]
+    fn test_compute_ul_frag_slots() {
+        let end = UmacMs::max_end_ul_sdu_bits(); // 254
+        let frag = UmacMs::max_frag_ul_sdu_bits(); // 264
+        assert_eq!(UmacMs::compute_ul_frag_slots(end + 1), Some(2), "just over one slot => 2 slots");
+        assert_eq!(UmacMs::compute_ul_frag_slots(end + frag), Some(2));
+        assert_eq!(UmacMs::compute_ul_frag_slots(end + frag + 1), Some(3));
+        // Beyond MAX_UL_FRAG_SLOTS the transfer is rejected.
+        let too_big = end + frag * MAX_UL_FRAG_SLOTS;
+        assert_eq!(UmacMs::compute_ul_frag_slots(too_big), None);
+    }
+
+    /// If a reserved slot is missed (the downlink clock advanced past it without
+    /// transmitting), the whole multi-slot plan is abandoned and its receipt
+    /// discarded so the LLC/MM retransmit (cl. 23.5.2 / 22.3.2.3).
+    #[test]
+    fn test_missed_reserved_slot_abandons() {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 5, m: 1, h: 0 };
+        let reporter = TxReporter::new();
+        // Front reserved slot equals the current downlink slot, i.e. dltime + 2
+        // (the uplink slot) is already 2 timeslots past it => missed.
+        let mut blocks = VecDeque::new();
+        blocks.push_back(BitBuffer::new(SCH_F_TYPE1_BITS));
+        let mut slots = VecDeque::new();
+        slots.push_back(umac.dltime);
+        umac.reserved_tx = Some(ReservedTxPlan {
+            blocks,
+            slots,
+            scrambling_code: 0,
+            tx_reporter: Some(reporter.clone()),
+        });
+        let mut q = MessageQueue::new();
+
+        umac.drive_reserved_tx(&mut q);
+
+        assert!(q.pop_front().is_none(), "missed slot emits nothing");
+        assert!(umac.reserved_tx.is_none(), "plan abandoned");
+        assert!(reporter.is_discarded(), "missed slot marks the receipt discarded");
     }
 
     // --- Uplink transfer queueing (cl. 23.5.1.4: one transfer at a time) ---
