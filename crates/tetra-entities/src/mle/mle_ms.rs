@@ -258,7 +258,7 @@ impl MleMs {
         // Dispatch to appropriate component (or to self if for MLE)
         match pdu_type {
             MleProtocolDiscriminator::Mm => {
-                tracing::warn!("TM-UNITDATA for MM?"); // todo fixme find if ever used
+                tracing::debug!("MLE-MS: TM-UNITDATA (MLE-SDU) routed to MM"); // MM-addressed L3 PDU on the assigned/traffic channel (cl. 18.3.3)
                 let m = LmmMleUnitdataInd {
                     sdu,
                     handle: 0,
@@ -273,7 +273,7 @@ impl MleMs {
                 queue.push_back(msg);
             }
             MleProtocolDiscriminator::Cmce => {
-                tracing::warn!("TM-UNITDATA for CMCE?"); // todo fixme find if ever used
+                tracing::debug!("MLE-MS: TM-UNITDATA (MLE-SDU) routed to CMCE"); // CMCE-addressed L3 PDU on the assigned/traffic channel (cl. 18.3.3)
                 let m = LcmcMleUnitdataInd {
                     sdu,
                     handle: 0,
