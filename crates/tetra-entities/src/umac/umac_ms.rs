@@ -87,6 +87,17 @@ pub struct PendingUplink {
     /// wedge the basic link forever. `None` for the frag-start of a fragmented
     /// transfer (the receipt travels with the completing MAC-END-HU instead).
     pub tx_reporter: Option<TxReporter>,
+    /// L3-specified PDU priority for the random-access gate (ETSI TS 100 392-2
+    /// cl. 23.5.1.4.4): the access attempt is only permitted when this priority
+    /// is at least the access code's advertised minimum. `None` → the MAC uses
+    /// the access-code minimum (unspecified/LLC-internal traffic always passes,
+    /// preserving prior behaviour). Set from the L3 `TMA-UNITDATA-REQ`.
+    pub pdu_priority: Option<u8>,
+    /// L3 emergency flag (cl. 23.5.1.4.4): an emergency transfer on access code A
+    /// bypasses the priority gate and doubles the maximum transmission count.
+    /// Always `false` for MM signalling (emergency is CMCE-only); plumbed for a
+    /// future CMCE MS.
+    pub is_emergency: bool,
 }
 
 /// How the remainder of a fragmented uplink transfer is completed, chosen from
@@ -1020,13 +1031,20 @@ impl UmacMs {
             if self.pending_uplink.is_none() {
                 return;
             }
-            // PDU priority is not yet carried by TMA-UNITDATA-REQ, so use the
-            // code's minimum so the priority gate passes. TODO: plumb the L3
-            // PDU priority and emergency flag through the LLC/MAC primitives.
-            let pdu_prio = params.min_pdu_prio;
+            // The L3-specified PDU priority + emergency flag feed the random-
+            // access permission gate (cl. 23.5.1.4.4). They travel on the queued
+            // `PendingUplink` (set from the TMA-UNITDATA-REQ in `rx_tma_prim`).
+            // `None` → use the access code's minimum so the gate passes
+            // (unspecified/LLC-internal traffic, preserving prior behaviour).
+            let pu = self
+                .pending_uplink
+                .as_ref()
+                .expect("pending_uplink checked Some above");
+            let pdu_prio = pu.pdu_priority.unwrap_or(params.min_pdu_prio);
+            let is_emergency = pu.is_emergency;
             if let Err(e) = self
                 .random_access
-                .initiate(self.dltime, code, &params, pdu_prio, false)
+                .initiate(self.dltime, code, &params, pdu_prio, is_emergency)
             {
                 tracing::warn!("drive_random_access: random access not initiated: {:?}; dropping uplink SDU", e);
                 self.pending_uplink = None;
@@ -1361,6 +1379,10 @@ impl UmacMs {
         // entry (cl. 22.3.2.3). Marking it drives the LLC retransmit/give-up
         // logic; see PendingUplink::tx_reporter.
         let tx_reporter = prim.tx_reporter.take();
+        // L3-specified PDU priority + emergency flag for the random-access gate
+        // (cl. 23.5.1.4.4). Read before `prim.pdu` is consumed below.
+        let pdu_priority = prim.pdu_priority;
+        let is_emergency = prim.is_emergency;
         // Build a MAC-ACCESS carrying the TM-SDU for random access on SCH/HU
         // (Control Uplink Burst). ETSI TS 100 392-2 cl. 21.4.2.1, cl. 23.5.1.
         // If the TM-SDU is too large for a single access burst (> ~62 bits on a
@@ -1385,6 +1407,8 @@ impl UmacMs {
                         logical_channel: LogicalChannel::SchHu,
                         scrambling_code,
                         tx_reporter,
+                        pdu_priority,
+                        is_emergency,
                     },
                     None,
                 )
@@ -1416,6 +1440,8 @@ impl UmacMs {
                                 logical_channel: LogicalChannel::SchHu,
                                 scrambling_code,
                                 tx_reporter: None,
+                                pdu_priority,
+                                is_emergency,
                             },
                             Some(UplinkFragment {
                                 remainder,
@@ -2114,6 +2140,8 @@ attach_groups = []
             logical_channel: LogicalChannel::SchHu,
             scrambling_code: 0x1234_5678,
             tx_reporter: None,
+            pdu_priority: None,
+            is_emergency: false,
         });
 
         let p = umac.access_params.params_for(AccessCode::A).expect("params present").clone();
@@ -2122,6 +2150,64 @@ attach_groups = []
             .expect("initiate succeeds");
         assert!(umac.random_access.is_active());
         umac
+    }
+
+    /// Set up a UMAC camped with access params (advertising a minimum PDU
+    /// priority) and a queued uplink of the given L3 priority/emergency, but with
+    /// random access NOT yet initiated — so `drive_random_access` runs the
+    /// cl. 23.5.1.4.4 permission gate against the queued priority.
+    fn umac_with_queued_priority(min_pdu_prio: u8, pdu_priority: Option<u8>, is_emergency: bool) -> UmacMs {
+        let mut umac = ms_umac();
+        umac.dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.access_params.update_sysinfo_default_a(&SysinfoDefaultDefForAccessCodeA {
+            imm: 15,
+            wt: 6,
+            nu: 4,
+            fl_factor: false,
+            ts_ptr: 0,
+            min_pdu_prio,
+        });
+        let mut sdu = BitBuffer::from_bitstr("0110100100011110001011010010");
+        let mac_block = UmacMs::build_mac_access_block(umac.own_issi(), &mut sdu).expect("SDU fits");
+        umac.pending_uplink = Some(PendingUplink {
+            mac_block,
+            logical_channel: LogicalChannel::SchHu,
+            scrambling_code: 0x1234_5678,
+            tx_reporter: None,
+            pdu_priority,
+            is_emergency,
+        });
+        umac
+    }
+
+    /// Feature 2: `drive_random_access` feeds the queued L3 PDU priority to the
+    /// permission gate (cl. 23.5.1.4.4). A non-emergency uplink whose priority is
+    /// below the access code's advertised minimum is not permitted, so the
+    /// attempt is not started and the block is dropped (the LLC retransmits).
+    #[test]
+    fn test_below_min_priority_uplink_rejected() {
+        let mut umac = umac_with_queued_priority(5, Some(3), false);
+        let mut q = MessageQueue::new();
+
+        umac.drive_random_access(&mut q, &ongoing_a_assign());
+
+        assert!(!umac.random_access.is_active(), "gate must reject below-min priority");
+        assert!(umac.pending_uplink.is_none(), "rejected uplink is dropped");
+        assert!(q.pop_front().is_none(), "no uplink emitted");
+    }
+
+    /// Feature 2: an emergency uplink on access code A bypasses the priority gate
+    /// (cl. 23.5.1.4.4), so even a below-minimum priority starts the attempt.
+    #[test]
+    fn test_emergency_uplink_bypasses_priority_gate() {
+        let mut umac = umac_with_queued_priority(5, Some(3), true);
+        let mut q = MessageQueue::new();
+
+        umac.drive_random_access(&mut q, &ongoing_a_assign());
+
+        assert!(umac.random_access.is_active(), "emergency access on code A bypasses the gate");
+        assert!(umac.pending_uplink.is_some(), "block retained for transmission");
     }
 
     /// 3C-d: on a granting ACCESS-ASSIGN, the UMAC emits the queued MAC-ACCESS
@@ -2324,6 +2410,8 @@ attach_groups = []
                 main_address: TetraAddress::issi(1000001),
                 link_id: 0,
                 endpoint_id: 0,
+                pdu_priority: None,
+                is_emergency: false,
                 stealing_permission: false,
                 subscriber_class: 0,
                 air_interface_encryption: None,

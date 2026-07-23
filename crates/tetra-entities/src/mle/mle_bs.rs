@@ -207,6 +207,8 @@ impl MleBs {
                 link_id: 0,
                 endpoint_id: 0,
                 tl_sdu: pdu,
+                pdu_priority: None,
+                is_emergency: false,
                 stealing_permission: false,
                 subscriber_class: 0, // TODO fixme
                 fcs_flag: false,
@@ -296,6 +298,8 @@ impl MleBs {
                     link_id: prim.link_id,
                     endpoint_id: prim.endpoint_id,
                     tl_sdu: pdu,
+                    pdu_priority: None,
+                    is_emergency: false,
                     stealing_permission: prim.stealing_permission,
                     subscriber_class: 0, // TODO fixme
                     fcs_flag: false,

@@ -289,6 +289,10 @@ impl Llc {
                 main_address: prim.main_address,
                 link_id: prim.link_id,
                 endpoint_id: prim.endpoint_id,
+                // Unacknowledged BL-UDATA: TlaTlUnitdataReqBl carries no L3 PDU
+                // priority, so the MAC uses the access-code minimum.
+                pdu_priority: None,
+                is_emergency: false,
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: prim.subscriber_class,
                 air_interface_encryption: prim.air_interface_encryption,
@@ -349,6 +353,8 @@ impl Llc {
                         main_address: prim.main_address,
                         link_id: prim.link_id,
                         endpoint_id: prim.endpoint_id,
+                        pdu_priority: prim.pdu_priority,
+                        is_emergency: prim.is_emergency,
                         stealing_permission: prim.stealing_permission,
                         subscriber_class: prim.subscriber_class,
                         air_interface_encryption: prim.air_interface_encryption,
@@ -385,6 +391,8 @@ impl Llc {
                     main_address: prim.main_address,
                     link_id: 0,
                     endpoint_id: prim.endpoint_id,
+                    pdu_priority: prim.pdu_priority,
+                    is_emergency: prim.is_emergency,
                     stealing_permission: prim.stealing_permission,
                     subscriber_class: prim.subscriber_class,
                     air_interface_encryption: prim.air_interface_encryption,
@@ -448,6 +456,8 @@ impl Llc {
                 main_address: prim.main_address,
                 link_id: prim.link_id,
                 endpoint_id: prim.endpoint_id,
+                pdu_priority: prim.pdu_priority,
+                is_emergency: prim.is_emergency,
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: prim.subscriber_class,
                 air_interface_encryption: prim.air_interface_encryption,
@@ -890,6 +900,10 @@ impl Llc {
                     pdu: pdu_buf,
                     main_address: ack.addr,
                     endpoint_id: 0, // todo fixme
+                    // LLC-internal BL-ACK: no L3 PDU priority (MAC uses the
+                    // access-code minimum).
+                    pdu_priority: None,
+                    is_emergency: false,
                     stealing_permission: steal,
                     subscriber_class: 0,            // TODO FIXME
                     air_interface_encryption: None, // TODO FIXME
@@ -1106,6 +1120,8 @@ attach_groups = []
                 link_id: 0,
                 endpoint_id: 0,
                 tl_sdu: sdu,
+                pdu_priority: None,
+                is_emergency: false,
                 stealing_permission: false,
                 subscriber_class: 0,
                 fcs_flag: false,
@@ -1172,6 +1188,8 @@ attach_groups = []
                 link_id: 0,
                 endpoint_id: 0,
                 tl_sdu: sdu,
+                pdu_priority: None,
+                is_emergency: false,
                 stealing_permission: false,
                 subscriber_class: 0,
                 fcs_flag: false,

@@ -100,7 +100,14 @@ pub struct TlaTlDataReqBl {
     pub endpoint_id: EndpointId,
     pub tl_sdu: BitBuffer,
     // pub scrambling_code: u32, // TODO FIXME: according to the spec, should be there, but why do we need to provide this?
-    // pub pdu_prio: Todo, // Optional feature
+    /// L3-assigned PDU priority (ETSI TS 100 392-2 cl. 20.2.4.52). `None` = no
+    /// explicit priority (MAC uses the access-code minimum); `Some(p)` carries
+    /// the priority set by the originating L3 entity (forwarded from the
+    /// MLE-UNITDATA request), used for the MS random-access gate (cl. 23.5.1.4.4).
+    pub pdu_priority: Option<u8>,
+    /// Emergency indication (cl. 14.5.6 / 23.5.1.4.4), forwarded from the
+    /// MLE-UNITDATA request.
+    pub is_emergency: bool,
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
     pub fcs_flag: bool,

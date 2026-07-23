@@ -1067,6 +1067,24 @@ impl MmMs {
     /// to MLE. MLE prepends its protocol discriminator and forwards it to LLC,
     /// from where it reaches the MAC and is transmitted on the uplink via random
     /// access (cl. 23.5.1.4).
+    /// PDU priority for a U-LOCATION-UPDATE-DEMAND, keyed to the location update
+    /// type (ETSI TS 100 392-2 cl. 20.2.4.52, values per cl. 16.4.3):
+    /// ITSI attach / demand / disabled-MS updating = 6 (cl. 17340/16949 wording);
+    /// service-restoration roaming/migrating = 5 (cl. 16888/16924); routine
+    /// roaming/migrating/periodic location updating = 3 (cl. 16887/16923/16976).
+    fn lu_pdu_priority(lu_type: LocationUpdateType) -> u8 {
+        match lu_type {
+            LocationUpdateType::RoamingLocationUpdating
+            | LocationUpdateType::MigratingLocationUpdating
+            | LocationUpdateType::PeriodicLocationUpdating => 3,
+            LocationUpdateType::ServiceRestorationRoamingLocationUpdating
+            | LocationUpdateType::ServiceRestorationMigratingLocationUpdating => 5,
+            LocationUpdateType::ItsiAttach
+            | LocationUpdateType::DemandLocationUpdating
+            | LocationUpdateType::DisabledMsUpdating => 6,
+        }
+    }
+
     fn send_location_update_demand(&mut self, queue: &mut MessageQueue, lu_type: LocationUpdateType) {
         let issi = self.own_issi();
         // Remember the type in flight so a T351 resend repeats the same request
@@ -1126,6 +1144,8 @@ impl MmMs {
                 handle: 0,
                 address: TetraAddress::issi(issi),
                 layer2service: Layer2Service::Acknowledged,
+                pdu_priority: Some(Self::lu_pdu_priority(lu_type)),
+                is_emergency: false,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
@@ -1300,11 +1320,11 @@ impl MmMs {
             sdu.dump_bin()
         );
 
-        // NOTE: cl. 16.4.3 assigns this PDU priority 6 (or 3 when a group report
-        // response is included). The LMM-UNITDATA request primitive carries no
-        // PDU-priority parameter in this stack, so the priority cannot be
-        // signalled to lower layers — a documented limitation, not an on-air
-        // deviation of the PDU contents.
+        // PDU priority per cl. 16.4.3: 6 for a demand location update, or 3 when
+        // a group report response is included in the PDU. This is now signalled
+        // to the lower layers via the LMM-UNITDATA request pdu_priority parameter
+        // (used by the MS-MAC random-access priority gate, cl. 23.5.1.4.4).
+        let pdu_priority = Some(if group_report_requested { 3u8 } else { 6u8 });
         let m = SapMsg {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
@@ -1314,6 +1334,8 @@ impl MmMs {
                 handle: 0,
                 address: TetraAddress::issi(issi),
                 layer2service: Layer2Service::Acknowledged,
+                pdu_priority,
+                is_emergency: false,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
@@ -1378,6 +1400,9 @@ impl MmMs {
                 handle: 0,
                 address: TetraAddress::issi(issi),
                 layer2service: Layer2Service::Acknowledged,
+                // U-ITSI DETACH PDU priority 3 (cl. 16.6.1, spec line 17910).
+                pdu_priority: Some(3),
+                is_emergency: false,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
@@ -2086,8 +2111,8 @@ impl MmMs {
     /// 16.9.3.1) over the LMM SAP (MLE-UNITDATA request, acknowledged basic
     /// link, addressed by the MS's own ISSI). Per cl. 16.8.2 the group identity
     /// report is set to "not report request" and the group report response
-    /// element is omitted. PDU priority 3 (cl. 16.8.2) is not plumbable through
-    /// the LMM-UNITDATA primitive here and is therefore documented, not carried.
+    /// element is omitted. PDU priority 3 (cl. 16.8.2, spec lines 18365/18433)
+    /// is carried down via the LMM-UNITDATA request pdu_priority parameter.
     fn send_attach_detach_group_identity(
         &mut self,
         queue: &mut MessageQueue,
@@ -2122,6 +2147,9 @@ impl MmMs {
                 handle: 0,
                 address: TetraAddress::issi(issi),
                 layer2service: Layer2Service::Acknowledged,
+                // U-ATTACH/DETACH GROUP IDENTITY PDU priority 3 (cl. 16.8.2).
+                pdu_priority: Some(3),
+                is_emergency: false,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
                 encryption_flag: false,
@@ -2908,8 +2936,67 @@ attach_groups = []
         assert_eq!(req.sdu.get_len_remaining(), 0, "demand fully consumed");
     }
 
-    /// After a registration is accepted, all configured groups are affiliated in
-    /// a single standalone U-ATTACH/DETACH GROUP IDENTITY PDU (cl. 16.8.2,
+    /// Feature 2 (L3 PDU priority plumbing): the ITSI-attach registration demand
+    /// must be handed to the MAC with PDU priority 6 (new-ITSI attach,
+    /// ETSI TS 100 392-2 cl. 16, registration) and no emergency flag, so the
+    /// random-access permission gate (cl. 23.5.1.4.4) sees the real L3 priority.
+    #[test]
+    fn test_registration_demand_carries_priority_six() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+
+        let msg = q.pop_front().expect("a demand must be emitted");
+        let SapMsgInner::LmmMleUnitdataReq(req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        assert_eq!(req.pdu_priority, Some(6), "ITSI-attach registration is priority 6");
+        assert!(!req.is_emergency, "MM signalling is never emergency");
+    }
+
+    /// Feature 2: the U-ITSI DETACH sent on de-registration carries PDU priority 3
+    /// (cl. 16.6.1) and no emergency flag.
+    #[test]
+    fn test_detach_carries_priority_three() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        drain_mle_identities(&mut q);
+
+        assert!(mm.begin_deregistration(&mut q));
+        let msg = q.pop_front().expect("a U-ITSI DETACH must be emitted");
+        let SapMsgInner::LmmMleUnitdataReq(req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        assert_eq!(req.pdu_priority, Some(3), "U-ITSI DETACH is priority 3");
+        assert!(!req.is_emergency);
+    }
+
+    /// Feature 2: a standalone U-ATTACH/DETACH GROUP IDENTITY carries PDU
+    /// priority 3 (cl. 16.8.2) and no emergency flag.
+    #[test]
+    fn test_group_attach_carries_priority_three() {
+        let mut mm = ms_mm_with_groups(&[91, 220]);
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        let _ = q.pop_front();
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        drain_mle_identities(&mut q);
+
+        let msg = q.pop_front().expect("a standalone group attach must be emitted");
+        let SapMsgInner::LmmMleUnitdataReq(req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        assert_eq!(req.pdu_priority, Some(3), "group attach is priority 3");
+        assert!(!req.is_emergency);
+    }
     /// amendment mode) whose group identity uplink element repeats once per
     /// group (cl. 16.10.27). One acknowledgement completes the whole set.
     #[test]

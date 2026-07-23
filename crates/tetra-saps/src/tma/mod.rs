@@ -57,7 +57,18 @@ pub struct TmaUnitdataReq {
     pub link_id: LinkId,
     // pub scrambling_code: u32, // TODO FIXME : according to the spec, should be there, but why do we need to provide this?
     pub endpoint_id: EndpointId,
-    // pub pdu_prio: Todo, // optional feature
+    /// L3-assigned PDU priority (ETSI TS 100 392-2 cl. 20.2.4.52). `None` means
+    /// no explicit L3 priority was supplied, in which case the MS-MAC uses the
+    /// access code's minimum permitted priority so the random-access priority
+    /// gate (cl. 23.5.1.4.4) always passes (the pre-plumbing behaviour, used for
+    /// LLC-internal acks). `Some(p)` carries the priority (0..=7) the originating
+    /// L3 entity assigned to the PDU (e.g. MM registration = 6, cl. 16.4.3).
+    pub pdu_priority: Option<u8>,
+    /// Emergency indication (cl. 14.5.6 / 23.5.1.4.4). When set, the MS-MAC may
+    /// use access code A even below its minimum priority and doubles the maximum
+    /// number of random-access transmissions (cl. 23.5.1.4.9). Only set by
+    /// emergency CMCE traffic; MM signalling never sets it.
+    pub is_emergency: bool,
     pub stealing_permission: bool,
     pub subscriber_class: Todo,
     pub air_interface_encryption: Option<Todo>,

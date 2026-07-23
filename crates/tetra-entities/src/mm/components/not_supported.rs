@@ -32,6 +32,8 @@ pub fn make_ul_mm_pdu_function_not_supported(
             handle,
             address: ssi,
             layer2service: Layer2Service::Todo,
+            pdu_priority: None,
+            is_emergency: false,
             stealing_permission: false,
             stealing_repeats_flag: false,
             encryption_flag: false,

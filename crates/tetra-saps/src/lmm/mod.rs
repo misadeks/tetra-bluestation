@@ -200,7 +200,14 @@ pub struct LmmMleUnitdataReq {
     // pub address_type: Todo,
     pub address: TetraAddress,
     pub layer2service: Layer2Service,
-    // pub pdu_prio: Todo, // Optional feature
+    /// L3-assigned PDU priority (ETSI TS 100 392-2 cl. 20.2.4.52). `None` = no
+    /// explicit priority (MAC uses the access-code minimum); `Some(p)` = the
+    /// priority the MM/CMCE entity assigned to this PDU (e.g. registration = 6,
+    /// U-ITSI DETACH = 3, group attach/detach = 3, cl. 16.4.3 / 16.6.1 / 16.8.2).
+    pub pdu_priority: Option<u8>,
+    /// Emergency indication (cl. 14.5.6 / 23.5.1.4.4). MM signalling never sets
+    /// this; reserved for emergency CMCE traffic.
+    pub is_emergency: bool,
     pub stealing_permission: bool,
     pub stealing_repeats_flag: bool,
     pub encryption_flag: bool,

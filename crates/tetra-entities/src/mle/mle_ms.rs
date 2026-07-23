@@ -876,6 +876,10 @@ impl MleMs {
                 link_id: 0,
                 endpoint_id: 0,
                 tl_sdu: pdu,
+                // Forward the L3 PDU priority / emergency flag from the
+                // MLE-UNITDATA request down to the LLC (cl. 23.5.1.4.4).
+                pdu_priority: prim.pdu_priority,
+                is_emergency: prim.is_emergency,
                 stealing_permission: false,
                 subscriber_class: 0, // TODO fixme
                 fcs_flag: false,
@@ -973,6 +977,11 @@ impl MleMs {
                 link_id: prim.link_id,
                 endpoint_id: prim.endpoint_id,
                 tl_sdu: pdu,
+                // CMCE PDU priority / emergency plumbing is deferred (CMCE MS is
+                // stubbed and does not originate uplinks yet); default to no
+                // explicit L3 priority so the MAC uses the access-code minimum.
+                pdu_priority: None,
+                is_emergency: false,
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: 0, // TODO fixme
                 fcs_flag: false,

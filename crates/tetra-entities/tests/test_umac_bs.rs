@@ -267,6 +267,8 @@ fn test_out_fragmented_resource() {
             ssi: 30128,
         },
         layer2service: Layer2Service::Acknowledged,
+        pdu_priority: None,
+        is_emergency: false,
         stealing_permission: false,
         stealing_repeats_flag: false,
         encryption_flag: false,
