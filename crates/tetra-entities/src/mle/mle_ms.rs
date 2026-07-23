@@ -1003,6 +1003,14 @@ impl MleMs {
             SapMsgInner::LcmcMleUnitdataReq(_) => {
                 self.rx_lcmc_mle_unitdata_req(queue, message);
             }
+            SapMsgInner::LcmcMleConfigureReq(prim) => {
+                // CMCE-MS Phase 1 C-plane seam. ETSI TS 100 392-2 cl. 17.3.3
+                // defines MLE-CONFIGURE and cl. 14.5.1.4 requires CC to issue
+                // it for U-plane switching / Tx grant changes. The MS traffic
+                // path (TMD/TCH speech) is intentionally not implemented in
+                // Phase 1, so MLE records the request as a no-op handoff point.
+                tracing::info!("MLE-MS: CMCE configure request (U-plane stub): {:?}", prim);
+            }
             _ => panic!(),
         }
     }

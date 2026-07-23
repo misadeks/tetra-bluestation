@@ -1,5 +1,7 @@
-use tetra_core::unimplemented_log;
-use tetra_pdus::cmce::{enums::cmce_pdu_type_dl::CmcePduTypeDl, pdus::d_sds_data::DSdsData};
+use tetra_pdus::cmce::{
+    enums::cmce_pdu_type_dl::CmcePduTypeDl,
+    pdus::{d_sds_data::DSdsData, d_status::DStatus},
+};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::MessageQueue;
@@ -19,7 +21,7 @@ impl SdsMsSubentity {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
             panic!();
         };
-        let _pdu = match DSdsData::from_bitbuf(&mut prim.sdu) {
+        let pdu = match DSdsData::from_bitbuf(&mut prim.sdu) {
             Ok(pdu) => {
                 tracing::debug!("Received DSdsData: {:?}", pdu);
                 pdu
@@ -30,7 +32,39 @@ impl SdsMsSubentity {
             }
         };
 
-        unimplemented_log!("rx_sds_data not implemented");
+        // ETSI TS 100 392-2 cl. 14.7.1.10 delivers CMCE SDS user data to the
+        // MS. Phase 1 has no TNSDS/UI SAP, so the handoff is intentionally the
+        // internal log/state seam; Phase 3 will expose it without changing the
+        // wire decode path. SDS-TL interpretation, when user data is Type 4, is
+        // defined in cl. 29 and remains above this CMCE receive decode.
+        tracing::info!(
+            calling_party = ?pdu.calling_party_address_ssi,
+            data = ?pdu.user_defined_data,
+            "CMCE-MS: received D-SDS-DATA"
+        );
+    }
+
+    pub fn rx_status(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_status");
+
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
+            panic!();
+        };
+        let pdu = match DStatus::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => pdu,
+            Err(e) => {
+                tracing::warn!("Failed parsing DStatus: {:?} {}", e, prim.sdu.dump_bin());
+                return;
+            }
+        };
+
+        // ETSI TS 100 392-2 cl. 14.7.1.11 / cl. 14.8.34. Full TNSDS exposure is
+        // Phase 3; Phase 1 decodes and records the receive event internally.
+        tracing::info!(
+            calling_party = ?pdu.calling_party_address_ssi,
+            status = ?pdu.pre_coded_status,
+            "CMCE-MS: received D-STATUS"
+        );
     }
 
     /// Poor man's rx_prim, as this is a subcomponent and not governed by the MessageRouter
@@ -58,7 +92,7 @@ impl SdsMsSubentity {
                 self.rx_sds_data(queue, message);
             }
             CmcePduTypeDl::DStatus => {
-                unimplemented_log!("rx_prim not implemented for SDS DStatus PDU");
+                self.rx_status(queue, message);
             }
             _ => {
                 panic!();

@@ -112,6 +112,9 @@ pub enum SapMsgInner {
     // LCMC-SAP (MLE-CMCE)
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),
     LcmcMleUnitdataReq(LcmcMleUnitdataReq),
+    /// CMCE -> MLE lower-layer circuit-mode configuration (cl. 17.3.3);
+    /// CC-MS uses this for U-plane switching per cl. 14.5.1.4.
+    LcmcMleConfigureReq(LcmcMleConfigureReq),
     /// MLE -> CMCE break indication (cl. 17.3.3): communication resources are
     /// temporarily unavailable (serving-cell radio link failure).
     LcmcMleBreakInd(LcmcMleBreakInd),
@@ -168,6 +171,7 @@ impl Display for SapMsgInner {
             // LCMC-SAP
             SapMsgInner::LcmcMleBreakInd(_) => write!(f, "LcmcMleBreakInd"),
             SapMsgInner::LcmcMleReopenInd(_) => write!(f, "LcmcMleReopenInd"),
+            SapMsgInner::LcmcMleConfigureReq(_) => write!(f, "LcmcMleConfigureReq"),
 
             // LMM-SAP
             SapMsgInner::LmmMleIdentitiesReq(_) => write!(f, "LmmMleIdentitiesReq"),

@@ -1,7 +1,7 @@
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
-use tetra_core::Sap;
 use tetra_core::tetra_entities::TetraEntity;
+use tetra_core::{Sap, TdmaTime};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
@@ -21,9 +21,9 @@ pub struct CmceMs {
 impl CmceMs {
     pub fn new(config: SharedConfig) -> Self {
         Self {
-            config,
+            config: config.clone(),
             sds: SdsMsSubentity::new(),
-            cc: CcMsSubentity::new(),
+            cc: CcMsSubentity::new_with_config(config.clone()),
             ss: SsMsSubentity::new(),
         }
     }
@@ -80,7 +80,12 @@ impl TetraEntityTrait for CmceMs {
     }
 
     fn set_config(&mut self, config: SharedConfig) {
+        self.cc.set_config(config.clone());
         self.config = config;
+    }
+
+    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        self.cc.tick_start(queue, ts);
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -96,15 +101,16 @@ impl TetraEntityTrait for CmceMs {
             }
             SapMsgInner::LcmcMleBreakInd(_) => {
                 // MLE-BREAK (cl. 17.3.3): communication resources temporarily
-                // unavailable (serving-cell radio link failure). MS call control
-                // is not yet implemented, so there is no active call to suspend;
-                // record the loss of service.
+                // unavailable. CC-MS switches U-plane off and enters restoration
+                // handling per cl. 14.5.1.4.2 e / cl. 14.5.2.2.4.
                 tracing::warn!("CMCE: MLE-BREAK — communication resources unavailable");
+                self.cc.handle_break(queue);
             }
             SapMsgInner::LcmcMleReopenInd(_) => {
-                // MLE-REOPEN (cl. 17.3.3): communication resources available
-                // again (serving-cell downlink recovered).
+                // MLE-REOPEN (cl. 17.3.3): cl. 14.5.2.2.4 treats this as
+                // unsuccessful call restoration for active group calls.
                 tracing::info!("CMCE: MLE-REOPEN — communication resources available");
+                self.cc.handle_reopen(queue);
             }
             _ => {
                 panic!();
