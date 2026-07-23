@@ -7,7 +7,10 @@ use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use tetra_entities::umac::umac_ms::{FragEndKind, UmacMs};
+use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
+use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
 use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+use tetra_pdus::umac::pdus::access_assign::{AccessAssign, AccessField};
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
 use tetra_pdus::umac::pdus::mac_end_ul::MacEndUl;
@@ -618,31 +621,70 @@ fn test_uplink_fragmentation_three_slot_roundtrip() {
 #[test]
 /// M1: decoded downlink TCH/S speech arriving from the LMAC over the TMD-SAP is
 /// relayed up to CMCE (the MS U-plane owner) unchanged, preserving the timeslot
-/// tag. The MAC performs no audio processing and no U-plane gating of its own.
+/// tag — but only on a timeslot the AACH currently marks as traffic (cl.
+/// 21.4.7.2). Stray/other-timeslot bursts are dropped at the MAC when no traffic
+/// channel is assigned; the definitive U-plane switch gate lives in CC-MS.
 fn test_umac_ms_relays_downlink_speech_to_cmce() {
     debug::setup_logging_verbose();
     let mut test = ComponentTest::new(StackMode::Ms, None);
-    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+    // Lmac is a sink to absorb the TMV-CONFIGURE the AACH handler emits downward.
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce, TetraEntity::Lmac]);
 
+    // AACH marking the current slot (timeslot 1, the UMAC's default dltime) as
+    // carrying an assigned traffic channel (ACCESS-ASSIGN, cl. 21.4.7.2).
+    let mut aach = BitBuffer::new(14);
+    AccessAssign {
+        dl_usage: AccessAssignDlUsage::Traffic(4),
+        ul_usage: AccessAssignUlUsage::AssignedOnly,
+        f2_af: Some(AccessField { access_code: 0, base_frame_len: 4 }),
+        ..Default::default()
+    }
+    .to_bitbuf(&mut aach);
+    aach.seek(0);
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: aach,
+            block_num: PhyBlockNum::Both,
+            logical_channel: LogicalChannel::Aach,
+            crc_pass: true,
+            scrambling_code: 0,
+        }),
+    });
+    test.deliver_all_messages();
+    test.dump_sinks(); // discard the downward TMV-CONFIGURE captured on the Lmac sink
+
+    // Speech on the assigned traffic timeslot (1) is relayed up to CMCE.
     let data = vec![1u8, 0, 1, 1, 0, 0, 1, 0];
-    let m = SapMsg {
+    test.submit_message(SapMsg {
         sap: Sap::TmdSap,
         src: TetraEntity::Lmac,
         dest: TetraEntity::Umac,
-        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: 3, data: data.clone() }),
-    };
-    test.submit_message(m);
+        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: 1, data: data.clone() }),
+    });
+    // Speech on an unassigned timeslot (3) must be dropped at the MAC.
+    test.submit_message(SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: 3, data: vec![0u8; 8] }),
+    });
     test.deliver_all_messages();
-    let mut sink_msgs = test.dump_sinks();
+    let cmce_msgs: Vec<_> = test
+        .dump_sinks()
+        .into_iter()
+        .filter(|m| m.dest == TetraEntity::Cmce)
+        .collect();
 
-    assert_eq!(sink_msgs.len(), 1, "UMAC should relay exactly one TMD indication to CMCE");
-    let msg = sink_msgs.remove(0);
+    assert_eq!(cmce_msgs.len(), 1, "only the assigned-timeslot speech frame is relayed to CMCE");
+    let msg = &cmce_msgs[0];
     assert_eq!(msg.sap, Sap::TmdSap);
-    assert_eq!(msg.dest, TetraEntity::Cmce);
-    let SapMsgInner::TmdCircuitDataInd(ind) = msg.msg else {
+    let SapMsgInner::TmdCircuitDataInd(ind) = &msg.msg else {
         panic!("expected TmdCircuitDataInd, got {:?}", msg.msg);
     };
-    assert_eq!(ind.ts, 3, "timeslot tag preserved");
+    assert_eq!(ind.ts, 1, "timeslot tag preserved");
     assert_eq!(ind.data, data, "speech payload preserved");
 }
 

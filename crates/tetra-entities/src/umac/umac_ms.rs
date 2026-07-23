@@ -278,6 +278,17 @@ pub struct UmacMs {
     /// the retune is issued once per (re)selected cell rather than on every
     /// SYSINFO broadcast.
     derived_ul_freq: Option<u32>,
+
+    /// Minimal record of which downlink timeslots currently carry an assigned
+    /// traffic channel (indexed by timeslot 1..4). Driven by the per-slot AACH
+    /// downlink-usage marker the MAC already parses (`dl_usage.is_traffic()`,
+    /// cl. 21.4.7.2). Used to gate the U-plane TMD relay: decoded speech is only
+    /// forwarded up on a timeslot the AACH currently marks as traffic, so stray
+    /// or other-timeslot bursts are dropped at the MAC when no call is receiving
+    /// (the definitive U-plane switch gate lives in CC-MS, cl. 14.5.1.4). This
+    /// is the minimal M1 assigned-timeslot bookkeeping; acting on the
+    /// CHANNEL ALLOCATION element is deferred to M2.
+    traffic_slots: [bool; 4],
 }
 
 impl UmacMs {
@@ -315,6 +326,7 @@ impl UmacMs {
             valid_individual_ssi,
             valid_group_ssis,
             derived_ul_freq: None,
+            traffic_slots: [false; 4],
         }
     }
 
@@ -1051,6 +1063,14 @@ impl UmacMs {
         };
         // This message needs to be processed NOW since it affects the other blocks in this timeslot
         queue.push_prio(m, MessagePrio::Immediate);
+
+        // Record, per timeslot, whether this slot currently carries an assigned
+        // traffic channel (AACH downlink usage, cl. 21.4.7.2). This is the
+        // minimal assigned-timeslot bookkeeping used to gate the U-plane TMD
+        // relay so stray/other-timeslot speech is dropped at the MAC (M1).
+        if (1..=4).contains(&self.dltime.t) {
+            self.traffic_slots[(self.dltime.t - 1) as usize] = is_traffic;
+        }
 
         // Drive the MS random access state machine against this slot's ACCESS-ASSIGN.
         if let Some(aa) = access_assign {
@@ -2317,11 +2337,21 @@ impl UmacMs {
     /// the TMD-SAP (cl. 23) tagged with the timeslot it arrived on. On the MS the
     /// U-plane switch and call state live in CMCE (CC-MS, cl. 14.5.1.4), so the
     /// MAC simply forwards the frame upward; it performs no audio processing and
-    /// keeps no U-plane gating of its own.
+    /// keeps no U-plane gating of its own. As a minimal MAC-level guard it drops
+    /// frames on a timeslot the AACH does not currently mark as traffic (cl.
+    /// 21.4.7.2), so stray or other-timeslot bursts are not relayed when no
+    /// traffic channel is assigned. The definitive U-plane switch gate (is the
+    /// call actually receiving) remains in CC-MS.
     fn rx_tmd_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tmd_prim");
         match message.msg {
             SapMsgInner::TmdCircuitDataInd(prim) => {
+                let ts = prim.ts;
+                let assigned = (1..=4).contains(&ts) && self.traffic_slots[(ts - 1) as usize];
+                if !assigned {
+                    tracing::trace!("rx_tmd_prim: no traffic channel assigned on ts={}, dropping speech frame", ts);
+                    return;
+                }
                 queue.push_back(SapMsg {
                     sap: Sap::TmdSap,
                     src: TetraEntity::Umac,
