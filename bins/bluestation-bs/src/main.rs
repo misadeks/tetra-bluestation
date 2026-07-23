@@ -256,7 +256,7 @@ fn build_ms_stack(
         mm
     };
     let sndcp = Sndcp::new(cfg.clone());
-    let cmce = CmceMs::new(cfg.clone());
+    let cmce = CmceMs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
     router.register_entity(Box::new(lmac));
     router.register_entity(Box::new(umac));
     router.register_entity(Box::new(llc));

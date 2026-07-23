@@ -239,7 +239,7 @@ mod tests {
     /// against (schema `bluestation-ms-interface-2`).
     #[test]
     fn test_json_schema_freeze_golden_wire_format() {
-        use crate::management::{ManagementCommand, ManagementResponse, MS_INTERFACE_SCHEMA_VERSION};
+        use crate::management::{MS_INTERFACE_SCHEMA_VERSION, ManagementCommand, ManagementResponse};
         let codec = ControlCodecJson;
         let enc_cmd = |c: &ControlCommand| String::from_utf8(codec.encode_command(c)).unwrap();
         let enc_resp = |r: &ControlResponse| String::from_utf8(codec.encode_response(r)).unwrap();
@@ -313,6 +313,145 @@ mod tests {
                 detail: None,
             }),
             r#"{"TnmmAck":{"handle":6,"accepted":true,"detail":null}}"#
+        );
+    }
+
+    fn sample_tncc_basic() -> tetra_saps::tncc::TnccBasicServiceInformation {
+        use tetra_saps::tncc as t;
+        t::TnccBasicServiceInformation {
+            circuit_mode_service: t::CircuitModeService::SpeechService,
+            communication_type: t::CommunicationType::PointToMultipoint,
+            data_service: None,
+            data_call_capacity: None,
+            encryption_flag: t::EncryptionFlag::ClearEndToEndTransmission,
+            speech_service: Some(t::SpeechService::TetraEncodedOneTimeslotSpeech),
+        }
+    }
+
+    fn sample_tncc_setup_request() -> tetra_saps::tncc::TnccSetupRequest {
+        use tetra_saps::tncc as t;
+        t::TnccSetupRequest {
+            access_priority: Some(t::AccessPriority::LowPriority),
+            area_selection: Some(t::AreaSelection::AreaNotDefined),
+            basic_service_information: sample_tncc_basic(),
+            call_priority: t::CallPriority::PriorityNotDefined,
+            called_party_type_identifier: t::CalledPartyTypeIdentifier::Ssi,
+            called_party_sna: None,
+            called_party_ssi: Some(91),
+            called_party_extension: None,
+            external_subscriber_number_called: None,
+            clir_control: Some(t::ClirControl::NotImplementedOrUseDefaultMode),
+            hook_method_selection: t::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+            request_to_transmit_send_data: t::RequestToTransmitSendData::RequestToTransmitSendData,
+            simplex_duplex_selection: t::SimplexDuplexSelection::SimplexOperation,
+            traffic_stealing: Some(t::TrafficStealing::DoNotStealTraffic),
+        }
+    }
+
+    fn sample_tncc_commands() -> Vec<ControlCommand> {
+        use tetra_saps::tncc as t;
+        vec![
+            ControlCommand::TnccSetup {
+                handle: 1,
+                request: Box::new(sample_tncc_setup_request()),
+            },
+            ControlCommand::TnccSetupResponse {
+                handle: 2,
+                call_identifier: 7,
+                response: t::TnccSetupResponse {
+                    access_priority: None,
+                    basic_service_information: Some(sample_tncc_basic()),
+                    clir_control: None,
+                    hook_method_selection: t::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+                    simplex_duplex_selection: t::SimplexDuplexSelection::SimplexOperation,
+                    traffic_stealing: None,
+                },
+            },
+            ControlCommand::TnccComplete {
+                handle: 3,
+                call_identifier: 7,
+                request: t::TnccCompleteRequest {
+                    access_priority: None,
+                    basic_service_information_offered: Some(sample_tncc_basic()),
+                    hook_method: t::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+                    simplex_duplex: t::SimplexDuplexSelection::SimplexOperation,
+                    traffic_stealing: None,
+                },
+            },
+            ControlCommand::TnccTx {
+                handle: 4,
+                call_identifier: 7,
+                request: t::TnccTxRequest {
+                    access_priority: None,
+                    encryption_flag: t::EncryptionFlag::ClearEndToEndTransmission,
+                    traffic_stealing: None,
+                    transmission_condition: t::TransmissionCondition::RequestToTransmit,
+                    tx_demand_priority: t::TxDemandPriority::LowPriority,
+                },
+            },
+            ControlCommand::TnccRelease {
+                handle: 5,
+                call_identifier: 7,
+                request: t::TnccReleaseRequest {
+                    access_priority: None,
+                    disconnect_cause: t::DisconnectCause::UserRequestedDisconnection,
+                    disconnect_type: t::DisconnectType::DisconnectCall,
+                    traffic_stealing: None,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn test_roundtrip_json_and_bitcode_all_tncc_commands() {
+        let json = ControlCodecJson;
+        let bitcode = ControlCodecBitcode;
+        for cmd in sample_tncc_commands() {
+            let json_decoded = json.decode_command(&json.encode_command(&cmd)).unwrap();
+            assert_eq!(serde_json::to_string(&json_decoded).unwrap(), serde_json::to_string(&cmd).unwrap());
+            let bitcode_decoded = bitcode.decode_command(&bitcode.encode_command(&cmd)).unwrap();
+            assert_eq!(
+                serde_json::to_string(&bitcode_decoded).unwrap(),
+                serde_json::to_string(&cmd).unwrap()
+            );
+        }
+        let resp = ControlResponse::TnccAck {
+            handle: 6,
+            accepted: true,
+            detail: None,
+        };
+        let json_decoded = json.decode_response(&json.encode_response(&resp)).unwrap();
+        assert_eq!(serde_json::to_string(&json_decoded).unwrap(), serde_json::to_string(&resp).unwrap());
+        let bitcode_decoded = bitcode.decode_response(&bitcode.encode_response(&resp)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&bitcode_decoded).unwrap(),
+            serde_json::to_string(&resp).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_json_schema_freeze_golden_wire_format_tncc() {
+        let codec = ControlCodecJson;
+        let enc_cmd = |c: &ControlCommand| String::from_utf8(codec.encode_command(c)).unwrap();
+        let enc_resp = |r: &ControlResponse| String::from_utf8(codec.encode_response(r)).unwrap();
+        let commands = sample_tncc_commands();
+        let expected = vec![
+            r#"{"TnccSetup":{"handle":1,"request":{"access_priority":"LowPriority","area_selection":"AreaNotDefined","basic_service_information":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"call_priority":"PriorityNotDefined","called_party_type_identifier":"Ssi","called_party_sna":null,"called_party_ssi":91,"called_party_extension":null,"external_subscriber_number_called":null,"clir_control":"NotImplementedOrUseDefaultMode","hook_method_selection":"NoHookSignallingDirectThroughConnect","request_to_transmit_send_data":"RequestToTransmitSendData","simplex_duplex_selection":"SimplexOperation","traffic_stealing":"DoNotStealTraffic"}}}"#,
+            r#"{"TnccSetupResponse":{"handle":2,"call_identifier":7,"response":{"access_priority":null,"basic_service_information":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"clir_control":null,"hook_method_selection":"NoHookSignallingDirectThroughConnect","simplex_duplex_selection":"SimplexOperation","traffic_stealing":null}}}"#,
+            r#"{"TnccComplete":{"handle":3,"call_identifier":7,"request":{"access_priority":null,"basic_service_information_offered":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"hook_method":"NoHookSignallingDirectThroughConnect","simplex_duplex":"SimplexOperation","traffic_stealing":null}}}"#,
+            r#"{"TnccTx":{"handle":4,"call_identifier":7,"request":{"access_priority":null,"encryption_flag":"ClearEndToEndTransmission","traffic_stealing":null,"transmission_condition":"RequestToTransmit","tx_demand_priority":"LowPriority"}}}"#,
+            r#"{"TnccRelease":{"handle":5,"call_identifier":7,"request":{"access_priority":null,"disconnect_cause":"UserRequestedDisconnection","disconnect_type":"DisconnectCall","traffic_stealing":null}}}"#,
+        ];
+        for (cmd, expected_json) in commands.iter().zip(expected) {
+            assert_eq!(enc_cmd(cmd), expected_json);
+        }
+        assert_eq!(
+            enc_resp(&ControlResponse::TnccAck {
+                handle: 6,
+                accepted: true,
+                detail: None
+            }),
+            r#"{"TnccAck":{"handle":6,"accepted":true,"detail":null}}"#
         );
     }
 }

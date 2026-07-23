@@ -122,6 +122,12 @@ impl<T: NetworkTransport> ControlWorker<T> {
             | ControlCommand::TnmmAttachDetachGroupIdentity { .. }
             | ControlCommand::TnmmStatus { .. }
             | ControlCommand::TnmmEnergySaving { .. } => TetraEntity::Mm,
+            // TNCC-SAP requests (cl. 11.3) are handled by CMCE call control.
+            ControlCommand::TnccSetup { .. }
+            | ControlCommand::TnccSetupResponse { .. }
+            | ControlCommand::TnccComplete { .. }
+            | ControlCommand::TnccTx { .. }
+            | ControlCommand::TnccRelease { .. } => TetraEntity::Cmce,
             // Management / provisioning (Plane B, non-standard) is served by MM,
             // the single writer of MS runtime state and config-apply.
             ControlCommand::Management(_) => TetraEntity::Mm,
@@ -201,8 +207,7 @@ mod tests {
     #[test]
     fn test_route_tnmm_requests_to_mm() {
         use crate::tnmm::{
-            RegistrationType, TnmmDeregistrationRequest, TnmmEnergySavingRequest, TnmmRegistrationRequest,
-            TnmmStatusRequest,
+            RegistrationType, TnmmDeregistrationRequest, TnmmEnergySavingRequest, TnmmRegistrationRequest, TnmmStatusRequest,
         };
         let reg = ControlCommand::TnmmRegistration {
             handle: 1,
@@ -225,13 +230,21 @@ mod tests {
 
         let dereg = ControlCommand::TnmmDeregistration {
             handle: 2,
-            request: TnmmDeregistrationRequest { issi: None, mcc: None, mnc: None },
+            request: TnmmDeregistrationRequest {
+                issi: None,
+                mcc: None,
+                mnc: None,
+            },
         };
         assert_eq!(ControlWorker::<MockTransport>::route_control_command(&dereg), TetraEntity::Mm);
 
         let status = ControlCommand::TnmmStatus {
             handle: 3,
-            request: TnmmStatusRequest { direct_mode: None, dual_watch: None, energy_economy_mode: None },
+            request: TnmmStatusRequest {
+                direct_mode: None,
+                dual_watch: None,
+                energy_economy_mode: None,
+            },
         };
         assert_eq!(ControlWorker::<MockTransport>::route_control_command(&status), TetraEntity::Mm);
 
@@ -242,6 +255,39 @@ mod tests {
             },
         };
         assert_eq!(ControlWorker::<MockTransport>::route_control_command(&energy), TetraEntity::Mm);
+    }
+
+    #[test]
+    fn test_route_tncc_requests_to_cmce() {
+        use tetra_saps::tncc as t;
+        let basic = t::TnccBasicServiceInformation {
+            circuit_mode_service: t::CircuitModeService::SpeechService,
+            communication_type: t::CommunicationType::PointToMultipoint,
+            data_service: None,
+            data_call_capacity: None,
+            encryption_flag: t::EncryptionFlag::ClearEndToEndTransmission,
+            speech_service: Some(t::SpeechService::TetraEncodedOneTimeslotSpeech),
+        };
+        let setup = ControlCommand::TnccSetup {
+            handle: 1,
+            request: Box::new(t::TnccSetupRequest {
+                access_priority: None,
+                area_selection: None,
+                basic_service_information: basic,
+                call_priority: t::CallPriority::PriorityNotDefined,
+                called_party_type_identifier: t::CalledPartyTypeIdentifier::Ssi,
+                called_party_sna: None,
+                called_party_ssi: Some(91),
+                called_party_extension: None,
+                external_subscriber_number_called: None,
+                clir_control: None,
+                hook_method_selection: t::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+                request_to_transmit_send_data: t::RequestToTransmitSendData::RequestToTransmitSendData,
+                simplex_duplex_selection: t::SimplexDuplexSelection::SimplexOperation,
+                traffic_stealing: None,
+            }),
+        };
+        assert_eq!(ControlWorker::<MockTransport>::route_control_command(&setup), TetraEntity::Cmce);
     }
 
     /// Management commands (Plane B, non-standard) are routed to Mobility

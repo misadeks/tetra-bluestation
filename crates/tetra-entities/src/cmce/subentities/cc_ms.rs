@@ -21,9 +21,13 @@ use tetra_saps::{
     SapMsg, SapMsgInner,
     control::enums::{circuit_mode_type::CircuitModeType, communication_type::CommunicationType},
     lcmc::{LcmcMleConfigureReq, LcmcMleUnitdataReq},
+    tncc,
 };
 
-use crate::MessageQueue;
+use crate::{
+    MessageQueue,
+    net_telemetry::{TelemetryEvent, channel::TelemetrySink},
+};
 
 const TIMESLOT_DURATION_MS: f64 = 170.0 / 12.0;
 
@@ -130,22 +134,34 @@ pub struct CcMsSubentity {
     dltime: TdmaTime,
     calls: HashMap<u16, MsCall>,
     pending_originations: Vec<PendingOrigination>,
+    telemetry: Option<TelemetrySink>,
 }
 
 impl CcMsSubentity {
-    pub fn new() -> Self {
+    pub fn new(telemetry: Option<TelemetrySink>) -> Self {
         Self {
             own_issi: None,
             dltime: TdmaTime::default(),
             calls: HashMap::new(),
             pending_originations: Vec::new(),
+            telemetry,
         }
     }
 
-    pub fn new_with_config(config: SharedConfig) -> Self {
-        let mut s = Self::new();
+    pub fn new_with_config(config: SharedConfig, telemetry: Option<TelemetrySink>) -> Self {
+        let mut s = Self::new(telemetry);
         s.set_config(config);
         s
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: Option<TelemetrySink>) {
+        self.telemetry = telemetry;
+    }
+
+    fn emit(&self, event: TelemetryEvent) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(event);
+        }
     }
 
     pub fn set_config(&mut self, config: SharedConfig) {
@@ -162,6 +178,70 @@ impl CcMsSubentity {
 
     pub fn pending_origination_count(&self) -> usize {
         self.pending_originations.len()
+    }
+
+    /// TNCC-SETUP request (Table 11.8, cl. 11.3.3.8) adapter: build U-SETUP
+    /// through the Phase-1 CC engine; no call-control behaviour is duplicated.
+    pub fn handle_tncc_setup_request(&mut self, queue: &mut MessageQueue, request: &tncc::TnccSetupRequest) -> Result<(), String> {
+        let Some(called_party_ssi) = request.called_party_ssi else {
+            return Err("TNCC-SETUP request without called party SSI is not supported by this MS CC engine".to_string());
+        };
+        let basic = pdu_basic_from_tncc(&request.basic_service_information)?;
+        match request.called_party_type_identifier {
+            tncc::CalledPartyTypeIdentifier::Ssi => {
+                if request.basic_service_information.communication_type == tncc::CommunicationType::PointToPoint {
+                    self.originate_individual_call(
+                        queue,
+                        called_party_ssi,
+                        basic,
+                        request.simplex_duplex_selection.as_bool(),
+                        request.request_to_transmit_send_data.as_bool(),
+                    );
+                } else {
+                    self.originate_group_call(queue, called_party_ssi, basic, request.request_to_transmit_send_data.as_bool());
+                }
+                Ok(())
+            }
+            tncc::CalledPartyTypeIdentifier::Sna | tncc::CalledPartyTypeIdentifier::Tsi => {
+                Err("TNCC-SETUP SNA/TSI called-party addressing is not implemented by the Phase-1 engine".to_string())
+            }
+        }
+    }
+
+    /// TNCC-SETUP response / TNCC-COMPLETE request adapter (Tables 11.8/11.2).
+    pub fn handle_tncc_answer(&mut self, queue: &mut MessageQueue, call_identifier: u16) -> bool {
+        self.answer_call(queue, call_identifier, false)
+    }
+
+    /// TNCC-TX request adapter (Table 11.9).
+    pub fn handle_tncc_tx_request(&mut self, queue: &mut MessageQueue, call_identifier: u16, request: tncc::TnccTxRequest) -> bool {
+        match request.transmission_condition {
+            tncc::TransmissionCondition::RequestToTransmit => {
+                self.request_tx(queue, call_identifier, request.tx_demand_priority.into_raw())
+            }
+            tncc::TransmissionCondition::TransmissionCeased => self.cease_tx(queue, call_identifier),
+        }
+    }
+
+    /// TNCC-RELEASE request adapter (Table 11.7).
+    pub fn handle_tncc_release_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_identifier: u16,
+        request: tncc::TnccReleaseRequest,
+    ) -> Result<(), String> {
+        let cause = pdu_disconnect_cause_from_tncc(request.disconnect_cause)?;
+        let acted = match request.disconnect_type {
+            tncc::DisconnectType::DisconnectCall => self.disconnect_call(queue, call_identifier, cause),
+            tncc::DisconnectType::LeaveCallWithoutDisconnection | tncc::DisconnectType::LeaveCallTemporarily => {
+                self.release_call(queue, call_identifier, cause)
+            }
+        };
+        if acted {
+            Ok(())
+        } else {
+            Err("unknown call identifier".to_string())
+        }
     }
 
     /// U-SETUP for MO group call (cl. 14.5.2.1.2; PDU cl. 14.7.2.10).
@@ -471,6 +551,7 @@ impl CcMsSubentity {
 
     fn rx_d_setup(&mut self, queue: &mut MessageQueue, pdu: DSetup, route: CallRoute) {
         let kind = kind_from_basic_service(&pdu.basic_service_information);
+        let setup_basic_for_event = pdu.basic_service_information.clone();
         let state = if kind == MsCallKind::Individual {
             MsCcState::MtCallSetup
         } else {
@@ -488,6 +569,32 @@ impl CcMsSubentity {
         call.current_speaker_ssi = pdu.calling_party_address_ssi;
         call.start_call_timer(self.dltime, pdu.call_time_out);
         self.calls.insert(pdu.call_identifier, call);
+        if let Some(basic) = tncc_basic_from_pdu(&setup_basic_for_event) {
+            self.emit(TelemetryEvent::TnccSetupIndication {
+                call_identifier: pdu.call_identifier,
+                indication: Box::new(tncc::TnccSetupIndication {
+                    basic_service_information: basic,
+                    call_priority: tncc::CallPriority::from_raw(pdu.call_priority).unwrap_or(tncc::CallPriority::PriorityNotDefined),
+                    call_time_out: tncc_call_timeout(pdu.call_time_out),
+                    called_party_ssi: route.main_address.ssi,
+                    called_party_extension: None,
+                    calling_party_ssi: pdu.calling_party_address_ssi,
+                    calling_party_extension: pdu.calling_party_extension,
+                    external_subscriber_number_calling: None,
+                    clir_control: None,
+                    hook_method_selection: tncc::HookMethodSelection::from_bool(pdu.hook_method_selection),
+                    notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                    simplex_duplex_selection: tncc::SimplexDuplexSelection::from_bool(pdu.simplex_duplex_selection),
+                    transmission_grant: tncc_transmission_grant(pdu.transmission_grant),
+                    transmission_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                }),
+            });
+        } else {
+            tracing::warn!(
+                call_identifier = pdu.call_identifier,
+                "CMCE-MS: unsupported TNCC basic service value; suppressing TNCC-SETUP indication"
+            );
+        }
         if kind != MsCallKind::Individual {
             self.apply_transmission_grant(queue, pdu.call_identifier, pdu.transmission_grant, pdu.calling_party_address_ssi);
         }
@@ -497,6 +604,7 @@ impl CcMsSubentity {
         let pending = self.pending_originations.pop();
         let basic = pdu
             .basic_service_information
+            .clone()
             .or_else(|| pending.as_ref().map(|p| p.basic_service.clone()))
             .unwrap_or_else(default_speech_basic_service);
         let simplex = pending
@@ -511,24 +619,51 @@ impl CcMsSubentity {
         call.state = MsCcState::MoCallSetup;
         call.route = route;
         call.start_setup_timer(self.dltime, pdu.call_time_out_set_up_phase);
+        self.emit(TelemetryEvent::TnccProceedIndication {
+            call_identifier: pdu.call_identifier,
+            indication: tncc::TnccProceedIndication {
+                basic_service_information_offered: pdu.basic_service_information.as_ref().and_then(tncc_basic_from_pdu),
+                call_status: pdu.call_status.and_then(tncc_call_status),
+                hook_method: Some(tncc::HookMethodSelection::from_bool(pdu.hook_method_selection)),
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                simplex_duplex: Some(tncc::SimplexDuplexSelection::from_bool(pdu.simplex_duplex_selection)),
+            },
+        });
     }
 
     fn rx_d_alert(&mut self, _queue: &mut MessageQueue, pdu: DAlert, route: CallRoute) {
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
-            if let Some(basic) = pdu.basic_service_information {
-                call.basic_service = basic;
+            if let Some(basic) = &pdu.basic_service_information {
+                call.basic_service = basic.clone();
             }
             if let Ok(timeout) = CallTimeoutSetupPhase::try_from(pdu.call_time_out_set_up_phase as u64) {
                 call.start_setup_timer(self.dltime, timeout);
             }
         }
+        self.emit(TelemetryEvent::TnccAlertIndication {
+            call_identifier: pdu.call_identifier,
+            indication: tncc::TnccAlertIndication {
+                basic_service_information_offered: pdu.basic_service_information.as_ref().and_then(tncc_basic_from_pdu),
+                call_queued: Some(if pdu.call_queued {
+                    tncc::CallQueued::CallIsQueued
+                } else {
+                    tncc::CallQueued::CallIsNotQueued
+                }),
+                call_time_out_set_up_phase: tncc_setup_timeout(
+                    CallTimeoutSetupPhase::try_from(pdu.call_time_out_set_up_phase as u64).unwrap_or(CallTimeoutSetupPhase::Predefined),
+                ),
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                simplex_duplex: tncc::SimplexDuplexSelection::from_bool(pdu.simplex_duplex_selection),
+            },
+        });
     }
 
     fn rx_d_connect(&mut self, queue: &mut MessageQueue, pdu: DConnect, route: CallRoute) {
         let pending = self.pending_originations.pop();
         let basic = pdu
             .basic_service_information
+            .clone()
             .or_else(|| pending.as_ref().map(|p| p.basic_service.clone()))
             .unwrap_or_else(default_speech_basic_service);
         let simplex = pending
@@ -553,7 +688,30 @@ impl CcMsSubentity {
         call.simplex_duplex_selection = pdu.simplex_duplex_selection;
         call.start_call_timer(self.dltime, pdu.call_time_out);
         call.timers.setup_phase_deadline = None;
+        let confirm_basic = call.basic_service.clone();
+        let _ = call;
         self.apply_transmission_grant(queue, pdu.call_identifier, pdu.transmission_grant, None);
+        if let Some(basic) = tncc_basic_from_pdu(&confirm_basic) {
+            self.emit(TelemetryEvent::TnccSetupConfirm {
+                call_identifier: pdu.call_identifier,
+                confirm: Box::new(tncc::TnccSetupConfirm {
+                    basic_service_information: basic,
+                    call_priority: pdu.call_priority.and_then(|v| tncc::CallPriority::from_raw(v as u8)),
+                    call_ownership: if pdu.call_ownership {
+                        tncc::CallOwnership::ACallOwner
+                    } else {
+                        tncc::CallOwnership::NotACallOwner
+                    },
+                    call_amalgamation: tncc::CallAmalgamation::CallNotAmalgamated,
+                    call_time_out: tncc_call_timeout(pdu.call_time_out),
+                    hook_method_selection: tncc::HookMethodSelection::from_bool(pdu.hook_method_selection),
+                    notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                    simplex_duplex_selection: tncc::SimplexDuplexSelection::from_bool(pdu.simplex_duplex_selection),
+                    transmission_grant: tncc_transmission_grant(pdu.transmission_grant),
+                    transmission_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                }),
+            });
+        }
     }
 
     fn rx_d_connect_ack(&mut self, queue: &mut MessageQueue, pdu: DConnectAcknowledge, route: CallRoute) {
@@ -568,10 +726,25 @@ impl CcMsSubentity {
         }
         if let Ok(grant) = TransmissionGrant::try_from(pdu.transmission_grant as u64) {
             self.apply_transmission_grant(queue, pdu.call_identifier, grant, None);
+            if let Some(call) = self.calls.get(&pdu.call_identifier) {
+                self.emit(TelemetryEvent::TnccCompleteConfirm {
+                    call_identifier: pdu.call_identifier,
+                    confirm: tncc::TnccCompleteConfirm {
+                        call_time_out: tncc_call_timeout(call.timers.call_timeout),
+                        notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                        transmission_grant: tncc_transmission_grant(grant),
+                        transmission_request_permission: tncc::TransmissionRequestPermission::from_bool(
+                            pdu.transmission_request_permission,
+                        ),
+                        transmission_status: tncc_transmission_status_from_grant(grant),
+                    },
+                });
+            }
         }
     }
 
     fn rx_d_tx_granted(&mut self, queue: &mut MessageQueue, pdu: DTxGranted, route: CallRoute) {
+        let pending_before = self.calls.get(&pdu.call_identifier).map(|c| c.pending_tx_request).unwrap_or(false);
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::CallActive;
@@ -585,6 +758,35 @@ impl CcMsSubentity {
                 return;
             }
             self.apply_transmission_grant(queue, pdu.call_identifier, grant, speaker);
+            if let Some(call) = self.calls.get(&pdu.call_identifier) {
+                if pending_before && grant == TransmissionGrant::Granted {
+                    self.emit(TelemetryEvent::TnccTxConfirm {
+                        call_identifier: pdu.call_identifier,
+                        confirm: tncc::TnccTxConfirm {
+                            encryption_flag: tncc::EncryptionFlag::from_bool(pdu.encryption_control),
+                            transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(
+                                pdu.transmission_request_permission,
+                            ),
+                            transmission_status: tncc_transmission_status_from_grant(grant),
+                        },
+                    });
+                } else {
+                    self.emit(TelemetryEvent::TnccTxIndication {
+                        call_identifier: pdu.call_identifier,
+                        indication: tncc::TnccTxIndication {
+                            encryption_flag: tncc::EncryptionFlag::from_bool(pdu.encryption_control),
+                            notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                            transmitting_party_ssi: pdu.transmitting_party_address_ssi.map(|v| v as u32).or(call.current_speaker_ssi),
+                            transmitting_party_extension: pdu.transmitting_party_extension.map(|v| v as u32),
+                            external_subscriber_number: None,
+                            transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(
+                                pdu.transmission_request_permission,
+                            ),
+                            transmission_status: tncc_transmission_status_from_grant(grant),
+                        },
+                    });
+                }
+            }
         }
     }
 
@@ -603,6 +805,18 @@ impl CcMsSubentity {
         if let Some(simplex_duplex) = simplex_duplex {
             self.configure_uplane(queue, pdu.call_identifier, false, false, simplex_duplex);
         }
+        self.emit(TelemetryEvent::TnccTxIndication {
+            call_identifier: pdu.call_identifier,
+            indication: tncc::TnccTxIndication {
+                encryption_flag: tncc::EncryptionFlag::ClearEndToEndTransmission,
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                transmitting_party_ssi: None,
+                transmitting_party_extension: None,
+                external_subscriber_number: None,
+                transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                transmission_status: tncc::TransmissionStatus::TransmissionCeased,
+            },
+        });
     }
 
     fn rx_d_tx_wait(&mut self, queue: &mut MessageQueue, pdu: DTxWait, route: CallRoute) {
@@ -619,6 +833,18 @@ impl CcMsSubentity {
         if let Some(simplex_duplex) = simplex_duplex {
             self.configure_uplane(queue, pdu.call_identifier, false, false, simplex_duplex);
         }
+        self.emit(TelemetryEvent::TnccTxIndication {
+            call_identifier: pdu.call_identifier,
+            indication: tncc::TnccTxIndication {
+                encryption_flag: tncc::EncryptionFlag::ClearEndToEndTransmission,
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                transmitting_party_ssi: None,
+                transmitting_party_extension: None,
+                external_subscriber_number: None,
+                transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                transmission_status: tncc::TransmissionStatus::TransmissionWait,
+            },
+        });
     }
 
     fn rx_d_tx_continue(&mut self, queue: &mut MessageQueue, pdu: DTxContinue, route: CallRoute) {
@@ -644,6 +870,22 @@ impl CcMsSubentity {
                 };
             }
         }
+        self.emit(TelemetryEvent::TnccTxIndication {
+            call_identifier: pdu.call_identifier,
+            indication: tncc::TnccTxIndication {
+                encryption_flag: tncc::EncryptionFlag::ClearEndToEndTransmission,
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                transmitting_party_ssi: None,
+                transmitting_party_extension: None,
+                external_subscriber_number: None,
+                transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                transmission_status: if pdu.do_continue {
+                    tncc::TransmissionStatus::TransmissionGranted
+                } else {
+                    tncc::TransmissionStatus::TransmissionCeased
+                },
+            },
+        });
     }
 
     fn rx_d_tx_interrupt(&mut self, queue: &mut MessageQueue, pdu: DTxInterrupt, route: CallRoute) {
@@ -668,9 +910,28 @@ impl CcMsSubentity {
                 self.configure_uplane(queue, pdu.call_identifier, false, false, simplex_duplex);
             }
         }
+        self.emit(TelemetryEvent::TnccTxIndication {
+            call_identifier: pdu.call_identifier,
+            indication: tncc::TnccTxIndication {
+                encryption_flag: tncc::EncryptionFlag::ClearEndToEndTransmission,
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                transmitting_party_ssi: pdu.transmitting_party_address_ssi.map(|v| v as u32),
+                transmitting_party_extension: pdu.transmitting_party_extension.map(|v| v as u32),
+                external_subscriber_number: None,
+                transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                transmission_status: tncc::TransmissionStatus::TransmissionInterrupt,
+            },
+        });
     }
 
     fn rx_d_disconnect(&mut self, queue: &mut MessageQueue, pdu: DDisconnect, route: CallRoute) {
+        self.emit(TelemetryEvent::TnccReleaseIndication {
+            call_identifier: pdu.call_identifier,
+            indication: tncc::TnccReleaseIndication {
+                disconnect_cause: tncc_disconnect_cause(pdu.disconnect_cause),
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+            },
+        });
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::Disconnect;
@@ -680,6 +941,11 @@ impl CcMsSubentity {
     }
 
     fn rx_d_release(&mut self, queue: &mut MessageQueue, pdu: DRelease, route: CallRoute) {
+        let was_local_disconnect = self
+            .calls
+            .get(&pdu.call_identifier)
+            .map(|c| c.state == MsCcState::Disconnect || c.state == MsCcState::Release)
+            .unwrap_or(false);
         let simplex_duplex = if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::Release;
@@ -690,6 +956,24 @@ impl CcMsSubentity {
         };
         if let Some(simplex_duplex) = simplex_duplex {
             self.configure_uplane(queue, pdu.call_identifier, false, false, simplex_duplex);
+        }
+        if was_local_disconnect {
+            self.emit(TelemetryEvent::TnccReleaseConfirm {
+                call_identifier: pdu.call_identifier,
+                confirm: tncc::TnccReleaseConfirm {
+                    disconnect_cause: tncc_disconnect_cause(pdu.disconnect_cause),
+                    disconnect_status: tncc::DisconnectStatus::DisconnectionSuccessful,
+                    notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                },
+            });
+        } else {
+            self.emit(TelemetryEvent::TnccReleaseIndication {
+                call_identifier: pdu.call_identifier,
+                indication: tncc::TnccReleaseIndication {
+                    disconnect_cause: tncc_disconnect_cause(pdu.disconnect_cause),
+                    notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                },
+            });
         }
         self.calls.remove(&pdu.call_identifier);
     }
@@ -721,6 +1005,29 @@ impl CcMsSubentity {
                 self.calls.insert(id, call);
             }
         }
+        self.emit(TelemetryEvent::TnccNotifyIndication {
+            call_identifier: new_key.unwrap_or(pdu.call_identifier),
+            indication: tncc::TnccNotifyIndication {
+                call_status: pdu.call_status.and_then(|v| tncc_call_status_raw(v as u8)),
+                call_time_out_in_set_up_phase: pdu
+                    .call_time_out_set_up_phase_t301_t302_
+                    .and_then(|v| CallTimeoutSetupPhase::try_from(v).ok())
+                    .map(tncc_setup_timeout),
+                call_time_out: pdu.call_time_out.and_then(|v| CallTimeout::try_from(v).ok()).map(tncc_call_timeout),
+                call_ownership: pdu.call_ownership.map(|v| {
+                    if v == 0 {
+                        tncc::CallOwnership::NotACallOwner
+                    } else {
+                        tncc::CallOwnership::ACallOwner
+                    }
+                }),
+                notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                poll_response_percentage: pdu.poll_response_percentage.map(|v| v as u8),
+                poll_response_number: pdu.poll_response_number.map(|v| v as u8),
+                poll_response_addresses: None,
+                poll_request: Some(pdu.poll_request),
+            },
+        });
     }
 
     fn rx_d_call_restore(&mut self, queue: &mut MessageQueue, pdu: DCallRestore, route: CallRoute) {
@@ -950,6 +1257,245 @@ fn default_speech_basic_service() -> BasicServiceInformation {
     }
 }
 
+fn tncc_basic_from_pdu(basic: &BasicServiceInformation) -> Option<tncc::TnccBasicServiceInformation> {
+    let communication_type = match basic.communication_type {
+        CommunicationType::P2p => tncc::CommunicationType::PointToPoint,
+        CommunicationType::P2Mp => tncc::CommunicationType::PointToMultipoint,
+        CommunicationType::P2MpAcked => tncc::CommunicationType::PointToMultipointAcknowledged,
+        CommunicationType::Broadcast => tncc::CommunicationType::Broadcast,
+    };
+    let encryption_flag = tncc::EncryptionFlag::from_bool(basic.encryption_flag);
+    if basic.circuit_mode_type == CircuitModeType::TchS {
+        let speech_service = match basic.speech_service? {
+            0 => tncc::SpeechService::TetraEncodedOneTimeslotSpeech,
+            3 => tncc::SpeechService::ProprietaryEncodedOneTimeslotSpeech,
+            _ => return None,
+        };
+        Some(tncc::TnccBasicServiceInformation {
+            circuit_mode_service: tncc::CircuitModeService::SpeechService,
+            communication_type,
+            data_service: None,
+            data_call_capacity: None,
+            encryption_flag,
+            speech_service: Some(speech_service),
+        })
+    } else {
+        let data_service = match basic.circuit_mode_type {
+            CircuitModeType::Tch72 => tncc::DataService::Unprotected72KbitsNoInterleaving,
+            CircuitModeType::Tch48n1 => tncc::DataService::LowProtection48KbitsShortInterleavingDepth1,
+            CircuitModeType::Tch48n4 => tncc::DataService::LowProtection48KbitsMediumInterleavingDepth4,
+            CircuitModeType::Tch48n8 => tncc::DataService::LowProtection48KbitsLongInterleavingDepth8,
+            CircuitModeType::Tch24n1 => tncc::DataService::HighProtection24KbitsShortInterleavingDepth1,
+            CircuitModeType::Tch24n4 => tncc::DataService::HighProtection24KbitsMediumInterleavingDepth4,
+            CircuitModeType::Tch24n8 => tncc::DataService::HighProtection24KbitsLongInterleavingDepth8,
+            CircuitModeType::TchS => return None,
+        };
+        let data_call_capacity = match basic.slots_per_frame? {
+            0 => tncc::DataCallCapacity::OneTimeSlot,
+            1 => tncc::DataCallCapacity::TwoTimeSlots,
+            2 => tncc::DataCallCapacity::ThreeTimeSlots,
+            3 => tncc::DataCallCapacity::FourTimeSlots,
+            _ => return None,
+        };
+        Some(tncc::TnccBasicServiceInformation {
+            circuit_mode_service: tncc::CircuitModeService::DataService,
+            communication_type,
+            data_service: Some(data_service),
+            data_call_capacity: Some(data_call_capacity),
+            encryption_flag,
+            speech_service: None,
+        })
+    }
+}
+
+fn pdu_basic_from_tncc(basic: &tncc::TnccBasicServiceInformation) -> Result<BasicServiceInformation, String> {
+    let communication_type = match basic.communication_type {
+        tncc::CommunicationType::PointToPoint => CommunicationType::P2p,
+        tncc::CommunicationType::PointToMultipoint => CommunicationType::P2Mp,
+        tncc::CommunicationType::PointToMultipointAcknowledged => CommunicationType::P2MpAcked,
+        tncc::CommunicationType::Broadcast => CommunicationType::Broadcast,
+    };
+    match basic.circuit_mode_service {
+        tncc::CircuitModeService::SpeechService => {
+            let speech_service = match basic
+                .speech_service
+                .ok_or("speech_service is required for TNCC speech basic service")?
+            {
+                tncc::SpeechService::TetraEncodedOneTimeslotSpeech => 0,
+                tncc::SpeechService::ProprietaryEncodedOneTimeslotSpeech => 3,
+            };
+            Ok(BasicServiceInformation {
+                circuit_mode_type: CircuitModeType::TchS,
+                encryption_flag: basic.encryption_flag.as_bool(),
+                communication_type,
+                slots_per_frame: None,
+                speech_service: Some(speech_service),
+            })
+        }
+        tncc::CircuitModeService::DataService => {
+            let circuit_mode_type = match basic.data_service.ok_or("data_service is required for TNCC data basic service")? {
+                tncc::DataService::Unprotected72KbitsNoInterleaving => CircuitModeType::Tch72,
+                tncc::DataService::LowProtection48KbitsShortInterleavingDepth1 => CircuitModeType::Tch48n1,
+                tncc::DataService::LowProtection48KbitsMediumInterleavingDepth4 => CircuitModeType::Tch48n4,
+                tncc::DataService::LowProtection48KbitsLongInterleavingDepth8 => CircuitModeType::Tch48n8,
+                tncc::DataService::HighProtection24KbitsShortInterleavingDepth1 => CircuitModeType::Tch24n1,
+                tncc::DataService::HighProtection24KbitsMediumInterleavingDepth4 => CircuitModeType::Tch24n4,
+                tncc::DataService::HighProtection24KbitsLongInterleavingDepth8 => CircuitModeType::Tch24n8,
+            };
+            let slots_per_frame = match basic
+                .data_call_capacity
+                .ok_or("data_call_capacity is required for TNCC data basic service")?
+            {
+                tncc::DataCallCapacity::OneTimeSlot => 0,
+                tncc::DataCallCapacity::TwoTimeSlots => 1,
+                tncc::DataCallCapacity::ThreeTimeSlots => 2,
+                tncc::DataCallCapacity::FourTimeSlots => 3,
+            };
+            Ok(BasicServiceInformation {
+                circuit_mode_type,
+                encryption_flag: basic.encryption_flag.as_bool(),
+                communication_type,
+                slots_per_frame: Some(slots_per_frame),
+                speech_service: None,
+            })
+        }
+    }
+}
+
+fn tncc_call_timeout(timeout: CallTimeout) -> tncc::CallTimeout {
+    match timeout {
+        CallTimeout::Infinite => tncc::CallTimeout::Infinite,
+        CallTimeout::T30s => tncc::CallTimeout::Value1,
+        CallTimeout::T45s => tncc::CallTimeout::Value2,
+        CallTimeout::T60s => tncc::CallTimeout::Value3,
+        CallTimeout::T2m => tncc::CallTimeout::Value4,
+        CallTimeout::T3m => tncc::CallTimeout::Value5,
+        CallTimeout::T4m => tncc::CallTimeout::Value6,
+        CallTimeout::T5m => tncc::CallTimeout::Value7,
+        CallTimeout::T6m => tncc::CallTimeout::Value8,
+        CallTimeout::T8m => tncc::CallTimeout::Value9,
+        CallTimeout::T10m => tncc::CallTimeout::Value10,
+        CallTimeout::T12m => tncc::CallTimeout::Value11,
+        CallTimeout::T15m => tncc::CallTimeout::Value12,
+        CallTimeout::T20m => tncc::CallTimeout::Value13,
+        CallTimeout::T30m => tncc::CallTimeout::Value14,
+        CallTimeout::Reserved => tncc::CallTimeout::Value15,
+    }
+}
+
+fn tncc_setup_timeout(timeout: CallTimeoutSetupPhase) -> tncc::CallTimeoutSetupPhase {
+    match timeout {
+        CallTimeoutSetupPhase::Predefined => tncc::CallTimeoutSetupPhase::PreDefined,
+        CallTimeoutSetupPhase::T1s => tncc::CallTimeoutSetupPhase::Value1,
+        CallTimeoutSetupPhase::T2s => tncc::CallTimeoutSetupPhase::Value2,
+        CallTimeoutSetupPhase::T5s => tncc::CallTimeoutSetupPhase::Value3,
+        CallTimeoutSetupPhase::T10s => tncc::CallTimeoutSetupPhase::Value4,
+        CallTimeoutSetupPhase::T20s => tncc::CallTimeoutSetupPhase::Value5,
+        CallTimeoutSetupPhase::T30s => tncc::CallTimeoutSetupPhase::Value6,
+        CallTimeoutSetupPhase::T60s => tncc::CallTimeoutSetupPhase::Value7,
+    }
+}
+
+fn tncc_transmission_grant(grant: TransmissionGrant) -> tncc::TransmissionGrant {
+    match grant {
+        TransmissionGrant::Granted => tncc::TransmissionGrant::TransmissionGranted,
+        TransmissionGrant::NotGranted => tncc::TransmissionGrant::TransmissionNotGranted,
+        TransmissionGrant::RequestQueued => tncc::TransmissionGrant::TransmissionRequestQueued,
+        TransmissionGrant::GrantedToOtherUser => tncc::TransmissionGrant::TransmissionGrantedToAnotherUser,
+    }
+}
+
+fn tncc_transmission_status_from_grant(grant: TransmissionGrant) -> tncc::TransmissionStatus {
+    match grant {
+        TransmissionGrant::Granted => tncc::TransmissionStatus::TransmissionGranted,
+        TransmissionGrant::NotGranted => tncc::TransmissionStatus::TransmissionNotGranted,
+        TransmissionGrant::RequestQueued => tncc::TransmissionStatus::TransmissionRequestQueued,
+        TransmissionGrant::GrantedToOtherUser => tncc::TransmissionStatus::TransmissionGrantedToAnotherUser,
+    }
+}
+
+fn tncc_call_status(status: tetra_pdus::cmce::enums::call_status::CallStatus) -> Option<tncc::CallStatus> {
+    Some(match status {
+        tetra_pdus::cmce::enums::call_status::CallStatus::Callproceeding => tncc::CallStatus::CallIsProgressing,
+        tetra_pdus::cmce::enums::call_status::CallStatus::Callqueued => tncc::CallStatus::CallIsQueued,
+        tetra_pdus::cmce::enums::call_status::CallStatus::Requestedsubscriberpaged => tncc::CallStatus::RequestedSubscriberIsPaged,
+        tetra_pdus::cmce::enums::call_status::CallStatus::Callcontinue => tncc::CallStatus::CallContinue,
+        tetra_pdus::cmce::enums::call_status::CallStatus::Hangtimeexpired => tncc::CallStatus::HangTimerHasExpired,
+    })
+}
+
+fn tncc_call_status_raw(status: u8) -> Option<tncc::CallStatus> {
+    Some(match status {
+        0 => tncc::CallStatus::CallIsProgressing,
+        1 => tncc::CallStatus::CallIsQueued,
+        2 => tncc::CallStatus::RequestedSubscriberIsPaged,
+        3 => tncc::CallStatus::CallContinue,
+        4 => tncc::CallStatus::HangTimerHasExpired,
+        _ => return None,
+    })
+}
+
+fn tncc_disconnect_cause(cause: DisconnectCause) -> tncc::DisconnectCause {
+    match cause {
+        DisconnectCause::CauseNotDefinedOrUnknown => tncc::DisconnectCause::CauseNotDefinedOrUnknown,
+        DisconnectCause::UserRequestedDisconnection => tncc::DisconnectCause::UserRequestedDisconnection,
+        DisconnectCause::NonCallOwnerRequestedDisconnection => tncc::DisconnectCause::NonCallOwnerRequestedDisconnection,
+        DisconnectCause::CalledPartyBusy => tncc::DisconnectCause::CalledPartyBusy,
+        DisconnectCause::CalledPartyNotReachable => tncc::DisconnectCause::CalledPartyNotReachable,
+        DisconnectCause::CalledPartyDoesNotSupportEncryption => tncc::DisconnectCause::CalledPartyDoesNotSupportEncryption,
+        DisconnectCause::CongestionInInfrastructure => tncc::DisconnectCause::CongestionInInfrastructure,
+        DisconnectCause::NotAllowedTrafficCase => tncc::DisconnectCause::NotAllowedTrafficCase,
+        DisconnectCause::IncompatibleTrafficCase => tncc::DisconnectCause::IncompatibleTrafficCase,
+        DisconnectCause::RequestedServiceNotAvailable => tncc::DisconnectCause::RequestedServiceNotAvailable,
+        DisconnectCause::PreEmptiveUseOfResource => tncc::DisconnectCause::PreEmptiveUseOfResource,
+        DisconnectCause::InvalidCallIdentifier => tncc::DisconnectCause::InvalidCallIdentifier,
+        DisconnectCause::CallRejectedByTheCalledParty => tncc::DisconnectCause::CallRejectedByTheCalledParty,
+        DisconnectCause::NoIdleCcEntity => tncc::DisconnectCause::NoIdleCcEntity,
+        DisconnectCause::ExpiryOfTimer => tncc::DisconnectCause::ExpiryOfTimer,
+        DisconnectCause::SwmiRequestedDisconnection => tncc::DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::AcknowledgedServiceNotComplete => tncc::DisconnectCause::AcknowledgedServiceNotCompleted,
+        DisconnectCause::CalledPartyRequiresEncryption => tncc::DisconnectCause::CalledPartyRequiresEncryption,
+        DisconnectCause::ConcurrentSetUpNotSupported => tncc::DisconnectCause::ConcurrentSetUpNotSupported,
+        DisconnectCause::CalledPartyIsUnderTheSameDmGateOfTheCallingParty => {
+            tncc::DisconnectCause::CalledPartyIsUnderTheSameDmGateOfTheCallingParty
+        }
+        DisconnectCause::UnknownTetraIdentity
+        | DisconnectCause::SsSpecificDisconnection
+        | DisconnectCause::UnknownExternalSubscriberIdentity
+        | DisconnectCause::CallRestorationOfTheOtherUserFailed => tncc::DisconnectCause::CauseNotDefinedOrUnknown,
+    }
+}
+
+fn pdu_disconnect_cause_from_tncc(cause: tncc::DisconnectCause) -> Result<DisconnectCause, String> {
+    Ok(match cause {
+        tncc::DisconnectCause::CauseNotDefinedOrUnknown => DisconnectCause::CauseNotDefinedOrUnknown,
+        tncc::DisconnectCause::UserRequestedDisconnection => DisconnectCause::UserRequestedDisconnection,
+        tncc::DisconnectCause::NonCallOwnerRequestedDisconnection => DisconnectCause::NonCallOwnerRequestedDisconnection,
+        tncc::DisconnectCause::CalledPartyBusy => DisconnectCause::CalledPartyBusy,
+        tncc::DisconnectCause::CalledPartyNotReachable => DisconnectCause::CalledPartyNotReachable,
+        tncc::DisconnectCause::CalledPartyDoesNotSupportEncryption => DisconnectCause::CalledPartyDoesNotSupportEncryption,
+        tncc::DisconnectCause::CongestionInInfrastructure => DisconnectCause::CongestionInInfrastructure,
+        tncc::DisconnectCause::NotAllowedTrafficCase => DisconnectCause::NotAllowedTrafficCase,
+        tncc::DisconnectCause::IncompatibleTrafficCase => DisconnectCause::IncompatibleTrafficCase,
+        tncc::DisconnectCause::RequestedServiceNotAvailable => DisconnectCause::RequestedServiceNotAvailable,
+        tncc::DisconnectCause::PreEmptiveUseOfResource => DisconnectCause::PreEmptiveUseOfResource,
+        tncc::DisconnectCause::InvalidCallIdentifier => DisconnectCause::InvalidCallIdentifier,
+        tncc::DisconnectCause::CallRejectedByTheCalledParty => DisconnectCause::CallRejectedByTheCalledParty,
+        tncc::DisconnectCause::NoIdleCcEntity => DisconnectCause::NoIdleCcEntity,
+        tncc::DisconnectCause::ExpiryOfTimer => DisconnectCause::ExpiryOfTimer,
+        tncc::DisconnectCause::SwmiRequestedDisconnection => DisconnectCause::SwmiRequestedDisconnection,
+        tncc::DisconnectCause::AcknowledgedServiceNotCompleted => DisconnectCause::AcknowledgedServiceNotComplete,
+        tncc::DisconnectCause::CalledPartyRequiresEncryption => DisconnectCause::CalledPartyRequiresEncryption,
+        tncc::DisconnectCause::ConcurrentSetUpNotSupported => DisconnectCause::ConcurrentSetUpNotSupported,
+        tncc::DisconnectCause::CalledPartyIsUnderTheSameDmGateOfTheCallingParty => {
+            DisconnectCause::CalledPartyIsUnderTheSameDmGateOfTheCallingParty
+        }
+        tncc::DisconnectCause::LossOfResources | tncc::DisconnectCause::UsageMarkerFailure => {
+            return Err("TNCC disconnect cause has no Phase-1 U-RELEASE/U-DISCONNECT mapping".to_string());
+        }
+    })
+}
+
 #[inline]
 fn seconds_to_timeslots(seconds: i32) -> i32 {
     (f64::from(seconds) * 1_000.0 / TIMESLOT_DURATION_MS) as i32
@@ -1045,7 +1591,7 @@ mod tests {
 
     #[test]
     fn grant_self_switches_uplane_tx() {
-        let mut cc = CcMsSubentity::new();
+        let mut cc = CcMsSubentity::new(None);
         let mut q = MessageQueue::new();
         cc.calls.insert(
             7,

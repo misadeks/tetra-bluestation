@@ -1526,6 +1526,9 @@ dependencies = [
 name = "tetra-saps"
 version = "0.5.9"
 dependencies = [
+ "bitcode",
+ "serde",
+ "serde_json",
  "tetra-core",
  "tracing",
  "uuid",

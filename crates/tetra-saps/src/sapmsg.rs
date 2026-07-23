@@ -8,6 +8,7 @@ use crate::control::call_control::CallControl;
 use crate::control::sds::CmceSdsData;
 use crate::tmd::TmdCircuitDataInd;
 use crate::tmd::TmdCircuitDataReq;
+use crate::tncc::*;
 use crate::tnmm::TnmmTestDemand;
 use crate::tnmm::TnmmTestResponse;
 
@@ -137,6 +138,28 @@ pub enum SapMsgInner {
     // TNMM-SAP (MM-User)
     TnmmTestDemand(TnmmTestDemand),
     TnmmTestResponse(TnmmTestResponse),
+
+    // TNCC-SAP (CMCE/CC-User), ETSI TS 100 392-2 v3.10.1 cl. 11.3.3.
+    TnccAlertIndication(TnccAlertIndication),
+    TnccCompleteRequest(TnccCompleteRequest),
+    TnccCompleteIndication(TnccCompleteIndication),
+    TnccCompleteConfirm(TnccCompleteConfirm),
+    TnccDtmfRequest(TnccDtmfRequest),
+    TnccDtmfIndication(TnccDtmfIndication),
+    TnccModifyRequest(TnccModifyRequest),
+    TnccModifyIndication(TnccModifyIndication),
+    TnccNotifyIndication(TnccNotifyIndication),
+    TnccProceedIndication(TnccProceedIndication),
+    TnccReleaseRequest(TnccReleaseRequest),
+    TnccReleaseIndication(TnccReleaseIndication),
+    TnccReleaseConfirm(TnccReleaseConfirm),
+    TnccSetupRequest(TnccSetupRequest),
+    TnccSetupIndication(TnccSetupIndication),
+    TnccSetupResponse(TnccSetupResponse),
+    TnccSetupConfirm(TnccSetupConfirm),
+    TnccTxRequest(TnccTxRequest),
+    TnccTxIndication(TnccTxIndication),
+    TnccTxConfirm(TnccTxConfirm),
 }
 
 impl Display for SapMsgInner {

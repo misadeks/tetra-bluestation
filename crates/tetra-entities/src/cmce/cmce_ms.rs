@@ -1,3 +1,5 @@
+use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
+use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
@@ -16,15 +18,19 @@ pub struct CmceMs {
     sds: SdsMsSubentity,
     cc: CcMsSubentity,
     ss: SsMsSubentity,
+    telemetry: Option<TelemetrySink>,
+    control: Option<ControlEndpoint>,
 }
 
 impl CmceMs {
-    pub fn new(config: SharedConfig) -> Self {
+    pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         Self {
             config: config.clone(),
             sds: SdsMsSubentity::new(),
-            cc: CcMsSubentity::new_with_config(config.clone()),
+            cc: CcMsSubentity::new_with_config(config.clone(), telemetry.clone()),
             ss: SsMsSubentity::new(),
+            telemetry,
+            control,
         }
     }
 
@@ -72,6 +78,90 @@ impl CmceMs {
             }
         }
     }
+
+    fn poll_control(&mut self, queue: &mut MessageQueue) {
+        let mut commands = Vec::new();
+        if let Some(cep) = &self.control {
+            while let Some(cmd) = cep.try_recv() {
+                commands.push(cmd);
+            }
+        }
+        for cmd in commands {
+            self.handle_control_command(queue, cmd);
+        }
+    }
+
+    fn respond(&self, response: ControlResponse) {
+        if let Some(cep) = &self.control {
+            cep.respond(response);
+        }
+    }
+
+    fn tncc_ack(&self, handle: u32, accepted: bool, detail: Option<String>) {
+        self.respond(ControlResponse::TnccAck { handle, accepted, detail });
+    }
+
+    fn handle_control_command(&mut self, queue: &mut MessageQueue, cmd: ControlCommand) {
+        match cmd {
+            ControlCommand::TnccSetup { handle, request } => match self.cc.handle_tncc_setup_request(queue, &request) {
+                Ok(()) => self.tncc_ack(handle, true, None),
+                Err(detail) => self.tncc_ack(handle, false, Some(detail)),
+            },
+            ControlCommand::TnccSetupResponse {
+                handle, call_identifier, ..
+            } => {
+                let accepted = self.cc.handle_tncc_answer(queue, call_identifier);
+                self.tncc_ack(
+                    handle,
+                    accepted,
+                    if accepted {
+                        None
+                    } else {
+                        Some("unknown call identifier".to_string())
+                    },
+                );
+            }
+            ControlCommand::TnccComplete {
+                handle, call_identifier, ..
+            } => {
+                let accepted = self.cc.handle_tncc_answer(queue, call_identifier);
+                self.tncc_ack(
+                    handle,
+                    accepted,
+                    if accepted {
+                        None
+                    } else {
+                        Some("unknown call identifier".to_string())
+                    },
+                );
+            }
+            ControlCommand::TnccTx {
+                handle,
+                call_identifier,
+                request,
+            } => {
+                let accepted = self.cc.handle_tncc_tx_request(queue, call_identifier, request);
+                self.tncc_ack(
+                    handle,
+                    accepted,
+                    if accepted {
+                        None
+                    } else {
+                        Some("TX request rejected by CC state".to_string())
+                    },
+                );
+            }
+            ControlCommand::TnccRelease {
+                handle,
+                call_identifier,
+                request,
+            } => match self.cc.handle_tncc_release_request(queue, call_identifier, request) {
+                Ok(()) => self.tncc_ack(handle, true, None),
+                Err(detail) => self.tncc_ack(handle, false, Some(detail)),
+            },
+            other => tracing::warn!("CMCE(MS): received non-TNCC control command, dropping: {:?}", other),
+        }
+    }
 }
 
 impl TetraEntityTrait for CmceMs {
@@ -85,6 +175,7 @@ impl TetraEntityTrait for CmceMs {
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        self.poll_control(queue);
         self.cc.tick_start(queue, ts);
     }
 

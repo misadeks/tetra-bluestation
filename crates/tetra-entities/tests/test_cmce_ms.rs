@@ -1,7 +1,14 @@
+use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, SsiType, TetraAddress};
+use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress};
 use tetra_entities::MessageQueue;
+use tetra_entities::TetraEntityTrait;
+use tetra_entities::cmce::cmce_ms::CmceMs;
 use tetra_entities::cmce::subentities::cc_ms::{CcMsSubentity, MsCcState, MsTxGrantState};
+use tetra_entities::net_control::ControlCommand;
+use tetra_entities::net_control::channel::make_control_link;
+use tetra_entities::net_telemetry::channel::telemetry_channel;
+use tetra_entities::net_telemetry::events::TelemetryEvent;
 use tetra_pdus::cmce::{
     enums::{
         call_timeout::CallTimeout, disconnect_cause::DisconnectCause, party_type_identifier::PartyTypeIdentifier,
@@ -17,6 +24,9 @@ use tetra_pdus::cmce::{
 use tetra_saps::control::enums::{circuit_mode_type::CircuitModeType, communication_type::CommunicationType};
 use tetra_saps::lcmc::{LcmcMleUnitdataInd, LcmcMleUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
+
+#[path = "common/default_stack.rs"]
+mod default_stack;
 
 const CALL_ID: u16 = 77;
 const GSSI: u32 = 91;
@@ -115,9 +125,99 @@ fn group_setup(grant: TransmissionGrant) -> DSetup {
     }
 }
 
+fn shared_ms_config() -> SharedConfig {
+    SharedConfig::from_parts(default_stack::default_test_config_ms(), None)
+}
+
+fn tncc_basic() -> tetra_saps::tncc::TnccBasicServiceInformation {
+    use tetra_saps::tncc as t;
+    t::TnccBasicServiceInformation {
+        circuit_mode_service: t::CircuitModeService::SpeechService,
+        communication_type: t::CommunicationType::PointToMultipoint,
+        data_service: None,
+        data_call_capacity: None,
+        encryption_flag: t::EncryptionFlag::ClearEndToEndTransmission,
+        speech_service: Some(t::SpeechService::TetraEncodedOneTimeslotSpeech),
+    }
+}
+
+fn tncc_setup_request() -> tetra_saps::tncc::TnccSetupRequest {
+    use tetra_saps::tncc as t;
+    t::TnccSetupRequest {
+        access_priority: None,
+        area_selection: None,
+        basic_service_information: tncc_basic(),
+        call_priority: t::CallPriority::PriorityNotDefined,
+        called_party_type_identifier: t::CalledPartyTypeIdentifier::Ssi,
+        called_party_sna: None,
+        called_party_ssi: Some(GSSI),
+        called_party_extension: None,
+        external_subscriber_number_called: None,
+        clir_control: None,
+        hook_method_selection: t::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+        request_to_transmit_send_data: t::RequestToTransmitSendData::RequestToTransmitSendData,
+        simplex_duplex_selection: t::SimplexDuplexSelection::SimplexOperation,
+        traffic_stealing: None,
+    }
+}
+
+#[test]
+fn cmce_ms_tncc_setup_command_emits_decodable_u_setup() {
+    let (dispatcher, endpoint) = make_control_link();
+    let mut cmce = CmceMs::new(shared_ms_config(), None, Some(endpoint));
+    let mut q = MessageQueue::new();
+
+    dispatcher.send(ControlCommand::TnccSetup {
+        handle: 44,
+        request: Box::new(tncc_setup_request()),
+    });
+    cmce.tick_start(&mut q, TdmaTime::default());
+
+    let ack = dispatcher.try_recv_response().expect("TNCC ack");
+    assert!(matches!(
+        ack,
+        tetra_entities::net_control::ControlResponse::TnccAck {
+            handle: 44,
+            accepted: true,
+            ..
+        }
+    ));
+    let mut prim = pop_unitdata(&mut q);
+    let pdu = USetup::from_bitbuf(&mut prim.sdu).unwrap();
+    assert_eq!(pdu.called_party_ssi, Some(GSSI as u64));
+    assert!(pdu.request_to_transmit_send_data);
+    assert_eq!(pdu.basic_service_information.communication_type, CommunicationType::P2Mp);
+}
+
+#[test]
+fn cmce_ms_downlink_setup_emits_tncc_setup_indication() {
+    let (sink, source) = telemetry_channel();
+    let mut cmce = CmceMs::new(shared_ms_config(), Some(sink), None);
+    let mut q = MessageQueue::new();
+
+    cmce.rx_prim(
+        &mut q,
+        dl_msg(
+            &group_setup(TransmissionGrant::GrantedToOtherUser),
+            TetraAddress::new(GSSI, SsiType::Gssi),
+        ),
+    );
+
+    let event = source.try_recv().expect("TNCC telemetry");
+    let TelemetryEvent::TnccSetupIndication {
+        call_identifier,
+        indication,
+    } = event
+    else {
+        panic!("expected TNCC setup indication");
+    };
+    assert_eq!(call_identifier, CALL_ID);
+    assert_eq!(indication.called_party_ssi, GSSI);
+    assert_eq!(indication.calling_party_ssi, Some(ISSI));
+}
 #[test]
 fn ms_originated_setup_pdus_decode_with_tetra_pdus() {
-    let mut cc = CcMsSubentity::new();
+    let mut cc = CcMsSubentity::new(None);
     let mut q = MessageQueue::new();
 
     cc.originate_group_call(&mut q, GSSI, speech_service(CommunicationType::P2Mp), false);
@@ -139,7 +239,7 @@ fn ms_originated_setup_pdus_decode_with_tetra_pdus() {
 
 #[test]
 fn active_group_tx_demand_ceased_and_disconnect_pdus_decode() {
-    let mut cc = CcMsSubentity::new();
+    let mut cc = CcMsSubentity::new(None);
     let mut q = MessageQueue::new();
     cc.route_rd_deliver(
         &mut q,
@@ -171,7 +271,7 @@ fn active_group_tx_demand_ceased_and_disconnect_pdus_decode() {
 
 #[test]
 fn incoming_individual_answer_and_network_disconnect_pdus_decode() {
-    let mut cc = CcMsSubentity::new();
+    let mut cc = CcMsSubentity::new(None);
     let mut q = MessageQueue::new();
     let mut setup = group_setup(TransmissionGrant::NotGranted);
     setup.basic_service_information = speech_service(CommunicationType::P2p);
@@ -203,7 +303,7 @@ fn incoming_individual_answer_and_network_disconnect_pdus_decode() {
 
 #[test]
 fn downlink_grant_wait_continue_and_release_update_ms_state() {
-    let mut cc = CcMsSubentity::new();
+    let mut cc = CcMsSubentity::new(None);
     let mut q = MessageQueue::new();
     cc.route_rd_deliver(
         &mut q,

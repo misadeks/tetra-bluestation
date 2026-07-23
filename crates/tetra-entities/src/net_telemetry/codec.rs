@@ -82,9 +82,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::tnmm::{
-        CellType, ClassOfUsage, DisableStatus, GroupIdentity, GroupIdentityAttachDetachTypeIdentifier,
-        GroupIdentityLifetime, RegistrationRejectCause, RegistrationStatus, ServiceStatus,
-        TnmmAttachDetachGroupIdentityIndication, TnmmRegistrationIndication, TnmmServiceIndication,
+        CellType, ClassOfUsage, DisableStatus, GroupIdentity, GroupIdentityAttachDetachTypeIdentifier, GroupIdentityLifetime,
+        RegistrationRejectCause, RegistrationStatus, ServiceStatus, TnmmAttachDetachGroupIdentityIndication, TnmmRegistrationIndication,
+        TnmmServiceIndication,
     };
 
     fn sample_registration_indication() -> TnmmRegistrationIndication {
@@ -187,5 +187,190 @@ mod tests {
             panic!("expected TnmmRegistrationIndication");
         };
         assert_eq!(*got, inner);
+    }
+
+    fn sample_tncc_basic() -> tetra_saps::tncc::TnccBasicServiceInformation {
+        use tetra_saps::tncc as t;
+        t::TnccBasicServiceInformation {
+            circuit_mode_service: t::CircuitModeService::SpeechService,
+            communication_type: t::CommunicationType::PointToMultipoint,
+            data_service: None,
+            data_call_capacity: None,
+            encryption_flag: t::EncryptionFlag::ClearEndToEndTransmission,
+            speech_service: Some(t::SpeechService::TetraEncodedOneTimeslotSpeech),
+        }
+    }
+
+    fn sample_tncc_events() -> Vec<TelemetryEvent> {
+        use tetra_saps::tncc as t;
+        vec![
+            TelemetryEvent::TnccAlertIndication {
+                call_identifier: 7,
+                indication: t::TnccAlertIndication {
+                    basic_service_information_offered: Some(sample_tncc_basic()),
+                    call_queued: Some(t::CallQueued::CallIsNotQueued),
+                    call_time_out_set_up_phase: t::CallTimeoutSetupPhase::Value4,
+                    notification_indicator: Some(3),
+                    simplex_duplex: t::SimplexDuplexSelection::SimplexOperation,
+                },
+            },
+            TelemetryEvent::TnccCompleteIndication {
+                call_identifier: 7,
+                indication: t::TnccCompleteIndication {
+                    call_time_out: t::CallTimeout::Value1,
+                    notification_indicator: Some(4),
+                    transmission_grant: t::TransmissionGrant::TransmissionGranted,
+                    transmission_request_permission: t::TransmissionRequestPermission::AllowedToRequestForTransmission,
+                    transmission_status: t::TransmissionStatus::TransmissionGranted,
+                },
+            },
+            TelemetryEvent::TnccCompleteConfirm {
+                call_identifier: 7,
+                confirm: t::TnccCompleteConfirm {
+                    call_time_out: t::CallTimeout::Value1,
+                    notification_indicator: None,
+                    transmission_grant: t::TransmissionGrant::TransmissionGranted,
+                    transmission_request_permission: t::TransmissionRequestPermission::AllowedToRequestForTransmission,
+                    transmission_status: t::TransmissionStatus::TransmissionGranted,
+                },
+            },
+            TelemetryEvent::TnccNotifyIndication {
+                call_identifier: 7,
+                indication: t::TnccNotifyIndication {
+                    call_status: Some(t::CallStatus::CallContinue),
+                    call_time_out_in_set_up_phase: None,
+                    call_time_out: Some(t::CallTimeout::Value2),
+                    call_ownership: Some(t::CallOwnership::ACallOwner),
+                    notification_indicator: Some(5),
+                    poll_response_percentage: None,
+                    poll_response_number: None,
+                    poll_response_addresses: None,
+                    poll_request: Some(false),
+                },
+            },
+            TelemetryEvent::TnccProceedIndication {
+                call_identifier: 7,
+                indication: t::TnccProceedIndication {
+                    basic_service_information_offered: Some(sample_tncc_basic()),
+                    call_status: Some(t::CallStatus::CallIsProgressing),
+                    hook_method: Some(t::HookMethodSelection::NoHookSignallingDirectThroughConnect),
+                    notification_indicator: Some(1),
+                    simplex_duplex: Some(t::SimplexDuplexSelection::SimplexOperation),
+                },
+            },
+            TelemetryEvent::TnccReleaseIndication {
+                call_identifier: 7,
+                indication: t::TnccReleaseIndication {
+                    disconnect_cause: t::DisconnectCause::UserRequestedDisconnection,
+                    notification_indicator: Some(1),
+                },
+            },
+            TelemetryEvent::TnccReleaseConfirm {
+                call_identifier: 7,
+                confirm: t::TnccReleaseConfirm {
+                    disconnect_cause: t::DisconnectCause::UserRequestedDisconnection,
+                    disconnect_status: t::DisconnectStatus::DisconnectionSuccessful,
+                    notification_indicator: None,
+                },
+            },
+            TelemetryEvent::TnccSetupIndication {
+                call_identifier: 7,
+                indication: Box::new(t::TnccSetupIndication {
+                    basic_service_information: sample_tncc_basic(),
+                    call_priority: t::CallPriority::PriorityNotDefined,
+                    call_time_out: t::CallTimeout::Value1,
+                    called_party_ssi: 91,
+                    called_party_extension: None,
+                    calling_party_ssi: Some(1001),
+                    calling_party_extension: None,
+                    external_subscriber_number_calling: None,
+                    clir_control: None,
+                    hook_method_selection: t::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+                    notification_indicator: Some(2),
+                    simplex_duplex_selection: t::SimplexDuplexSelection::SimplexOperation,
+                    transmission_grant: t::TransmissionGrant::TransmissionGrantedToAnotherUser,
+                    transmission_request_permission: t::TransmissionRequestPermission::AllowedToRequestForTransmission,
+                }),
+            },
+            TelemetryEvent::TnccSetupConfirm {
+                call_identifier: 7,
+                confirm: Box::new(t::TnccSetupConfirm {
+                    basic_service_information: sample_tncc_basic(),
+                    call_priority: Some(t::CallPriority::LowestPriority),
+                    call_ownership: t::CallOwnership::ACallOwner,
+                    call_amalgamation: t::CallAmalgamation::CallNotAmalgamated,
+                    call_time_out: t::CallTimeout::Value1,
+                    hook_method_selection: t::HookMethodSelection::NoHookSignallingDirectThroughConnect,
+                    notification_indicator: None,
+                    simplex_duplex_selection: t::SimplexDuplexSelection::SimplexOperation,
+                    transmission_grant: t::TransmissionGrant::TransmissionGranted,
+                    transmission_request_permission: t::TransmissionRequestPermission::AllowedToRequestForTransmission,
+                }),
+            },
+            TelemetryEvent::TnccTxIndication {
+                call_identifier: 7,
+                indication: t::TnccTxIndication {
+                    encryption_flag: t::EncryptionFlag::ClearEndToEndTransmission,
+                    notification_indicator: Some(1),
+                    transmitting_party_ssi: Some(1001),
+                    transmitting_party_extension: None,
+                    external_subscriber_number: None,
+                    transmit_request_permission: t::TransmissionRequestPermission::AllowedToRequestForTransmission,
+                    transmission_status: t::TransmissionStatus::TransmissionGranted,
+                },
+            },
+            TelemetryEvent::TnccTxConfirm {
+                call_identifier: 7,
+                confirm: t::TnccTxConfirm {
+                    encryption_flag: t::EncryptionFlag::ClearEndToEndTransmission,
+                    transmit_request_permission: t::TransmissionRequestPermission::AllowedToRequestForTransmission,
+                    transmission_status: t::TransmissionStatus::TransmissionGranted,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn test_roundtrip_json_and_bitcode_all_tncc_events() {
+        let json = TelemetryCodecJson;
+        let bitcode = TelemetryCodecBitcode;
+        for event in sample_tncc_events() {
+            let json_wire = json.encode(&event);
+            let json_decoded = json.decode(&json_wire).unwrap();
+            assert_eq!(
+                serde_json::to_string(&json_decoded).unwrap(),
+                serde_json::to_string(&event).unwrap()
+            );
+
+            let bitcode_wire = bitcode.encode(&event);
+            let bitcode_decoded = bitcode.decode(&bitcode_wire).unwrap();
+            assert_eq!(
+                serde_json::to_string(&bitcode_decoded).unwrap(),
+                serde_json::to_string(&event).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_schema_freeze_golden_wire_format_tncc() {
+        let codec = TelemetryCodecJson;
+        let enc = |e: &TelemetryEvent| String::from_utf8(codec.encode(e)).unwrap();
+        let events = sample_tncc_events();
+        let expected = vec![
+            r#"{"TnccAlertIndication":{"call_identifier":7,"indication":{"basic_service_information_offered":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"call_queued":"CallIsNotQueued","call_time_out_set_up_phase":"Value4","notification_indicator":3,"simplex_duplex":"SimplexOperation"}}}"#,
+            r#"{"TnccCompleteIndication":{"call_identifier":7,"indication":{"call_time_out":"Value1","notification_indicator":4,"transmission_grant":"TransmissionGranted","transmission_request_permission":"AllowedToRequestForTransmission","transmission_status":"TransmissionGranted"}}}"#,
+            r#"{"TnccCompleteConfirm":{"call_identifier":7,"confirm":{"call_time_out":"Value1","notification_indicator":null,"transmission_grant":"TransmissionGranted","transmission_request_permission":"AllowedToRequestForTransmission","transmission_status":"TransmissionGranted"}}}"#,
+            r#"{"TnccNotifyIndication":{"call_identifier":7,"indication":{"call_status":"CallContinue","call_time_out_in_set_up_phase":null,"call_time_out":"Value2","call_ownership":"ACallOwner","notification_indicator":5,"poll_response_percentage":null,"poll_response_number":null,"poll_response_addresses":null,"poll_request":false}}}"#,
+            r#"{"TnccProceedIndication":{"call_identifier":7,"indication":{"basic_service_information_offered":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"call_status":"CallIsProgressing","hook_method":"NoHookSignallingDirectThroughConnect","notification_indicator":1,"simplex_duplex":"SimplexOperation"}}}"#,
+            r#"{"TnccReleaseIndication":{"call_identifier":7,"indication":{"disconnect_cause":"UserRequestedDisconnection","notification_indicator":1}}}"#,
+            r#"{"TnccReleaseConfirm":{"call_identifier":7,"confirm":{"disconnect_cause":"UserRequestedDisconnection","disconnect_status":"DisconnectionSuccessful","notification_indicator":null}}}"#,
+            r#"{"TnccSetupIndication":{"call_identifier":7,"indication":{"basic_service_information":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"call_priority":"PriorityNotDefined","call_time_out":"Value1","called_party_ssi":91,"called_party_extension":null,"calling_party_ssi":1001,"calling_party_extension":null,"external_subscriber_number_calling":null,"clir_control":null,"hook_method_selection":"NoHookSignallingDirectThroughConnect","notification_indicator":2,"simplex_duplex_selection":"SimplexOperation","transmission_grant":"TransmissionGrantedToAnotherUser","transmission_request_permission":"AllowedToRequestForTransmission"}}}"#,
+            r#"{"TnccSetupConfirm":{"call_identifier":7,"confirm":{"basic_service_information":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"call_priority":"LowestPriority","call_ownership":"ACallOwner","call_amalgamation":"CallNotAmalgamated","call_time_out":"Value1","hook_method_selection":"NoHookSignallingDirectThroughConnect","notification_indicator":null,"simplex_duplex_selection":"SimplexOperation","transmission_grant":"TransmissionGranted","transmission_request_permission":"AllowedToRequestForTransmission"}}}"#,
+            r#"{"TnccTxIndication":{"call_identifier":7,"indication":{"encryption_flag":"ClearEndToEndTransmission","notification_indicator":1,"transmitting_party_ssi":1001,"transmitting_party_extension":null,"external_subscriber_number":null,"transmit_request_permission":"AllowedToRequestForTransmission","transmission_status":"TransmissionGranted"}}}"#,
+            r#"{"TnccTxConfirm":{"call_identifier":7,"confirm":{"encryption_flag":"ClearEndToEndTransmission","transmit_request_permission":"AllowedToRequestForTransmission","transmission_status":"TransmissionGranted"}}}"#,
+        ];
+        for (event, expected_json) in events.iter().zip(expected) {
+            assert_eq!(enc(event), expected_json);
+        }
     }
 }

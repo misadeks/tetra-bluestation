@@ -154,7 +154,7 @@ impl ComponentTest {
                     self.router.register_entity(Box::new(mle));
                 }
                 TetraEntity::Cmce => {
-                    let cmce = CmceMs::new(self.config.clone());
+                    let cmce = CmceMs::new(self.config.clone(), None, None);
                     self.router.register_entity(Box::new(cmce));
                 }
                 _ => {

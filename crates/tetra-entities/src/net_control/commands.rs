@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::management::{ManagementCommand, ManagementResponse};
 use crate::tnmm::{
-    TnmmAttachDetachGroupIdentityRequest, TnmmDeregistrationRequest, TnmmEnergySavingRequest,
-    TnmmRegistrationRequest, TnmmStatusRequest,
+    TnmmAttachDetachGroupIdentityRequest, TnmmDeregistrationRequest, TnmmEnergySavingRequest, TnmmRegistrationRequest, TnmmStatusRequest,
 };
+use tetra_saps::tncc::{TnccCompleteRequest, TnccReleaseRequest, TnccSetupRequest, TnccSetupResponse, TnccTxRequest};
 
 /// Command received from the remote command server.
 #[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
@@ -47,7 +47,10 @@ pub enum ControlCommand {
     // -----------------------------------------------------------------------
     /// TNMM-REGISTRATION request (Table 15.5, cl. 15.3.3.7). Larger payload is
     /// boxed to keep the enum small.
-    TnmmRegistration { handle: u32, request: Box<TnmmRegistrationRequest> },
+    TnmmRegistration {
+        handle: u32,
+        request: Box<TnmmRegistrationRequest>,
+    },
     /// TNMM-DEREGISTRATION request (Table 15.2, cl. 15.3.3.2).
     TnmmDeregistration { handle: u32, request: TnmmDeregistrationRequest },
     /// TNMM-ATTACH DETACH GROUP IDENTITY request (Table 15.1, cl. 15.3.3.1).
@@ -59,6 +62,40 @@ pub enum ControlCommand {
     TnmmStatus { handle: u32, request: TnmmStatusRequest },
     /// TNMM-ENERGY SAVING request (Table 15.3, cl. 15.3.3.5) — dormant.
     TnmmEnergySaving { handle: u32, request: TnmmEnergySavingRequest },
+
+    // -----------------------------------------------------------------------
+    // TNCC-SAP requests (Plane A, INBOUND) — ETSI TS 100 392-2 v3.10.1
+    // cl. 11.3.3. Payloads carry the Request/Response-column parameter sets of
+    // Tables 11.2/11.7/11.8/11.9. `handle` and `call_identifier` are local
+    // transport fields (correlation id and TNCC-SAP instance selector), not TNCC
+    // primitive parameters.
+    // -----------------------------------------------------------------------
+    /// TNCC-SETUP request (Table 11.8, cl. 11.3.3.8).
+    TnccSetup { handle: u32, request: Box<TnccSetupRequest> },
+    /// TNCC-SETUP response (Table 11.8, cl. 11.3.3.8).
+    TnccSetupResponse {
+        handle: u32,
+        call_identifier: u16,
+        response: TnccSetupResponse,
+    },
+    /// TNCC-COMPLETE request (Table 11.2, cl. 11.3.3.2).
+    TnccComplete {
+        handle: u32,
+        call_identifier: u16,
+        request: TnccCompleteRequest,
+    },
+    /// TNCC-TX request (Table 11.9, cl. 11.3.3.9).
+    TnccTx {
+        handle: u32,
+        call_identifier: u16,
+        request: TnccTxRequest,
+    },
+    /// TNCC-RELEASE request (Table 11.7, cl. 11.3.3.7).
+    TnccRelease {
+        handle: u32,
+        call_identifier: u16,
+        request: TnccReleaseRequest,
+    },
 
     // -----------------------------------------------------------------------
     // Management / provisioning (Plane B, **NON-STANDARD**). Wraps the
@@ -84,6 +121,15 @@ pub enum ControlResponse {
     /// this only reports whether MM acted on the request. `detail` documents a
     /// deferral for requests targeting features not implemented in this stack.
     TnmmAck {
+        handle: u32,
+        accepted: bool,
+        detail: Option<String>,
+    },
+
+    /// Transport-level acknowledgement that a TNCC request was accepted for
+    /// processing by CMCE/CC. The TNCC result is reported asynchronously through
+    /// TNCC-SAP indications/confirms on telemetry (cl. 11.3.2).
+    TnccAck {
         handle: u32,
         accepted: bool,
         detail: Option<String>,

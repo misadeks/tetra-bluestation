@@ -9,9 +9,13 @@ use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use crate::tnmm::{
-    TnmmAttachDetachGroupIdentityConfirm, TnmmAttachDetachGroupIdentityIndication, TnmmEnergySavingConfirm,
-    TnmmEnergySavingIndication, TnmmRegistrationConfirm, TnmmRegistrationIndication, TnmmReportIndication,
-    TnmmServiceIndication, TnmmStatusConfirm, TnmmStatusIndication,
+    TnmmAttachDetachGroupIdentityConfirm, TnmmAttachDetachGroupIdentityIndication, TnmmEnergySavingConfirm, TnmmEnergySavingIndication,
+    TnmmRegistrationConfirm, TnmmRegistrationIndication, TnmmReportIndication, TnmmServiceIndication, TnmmStatusConfirm,
+    TnmmStatusIndication,
+};
+use tetra_saps::tncc::{
+    TnccAlertIndication, TnccCompleteConfirm, TnccCompleteIndication, TnccNotifyIndication, TnccProceedIndication, TnccReleaseConfirm,
+    TnccReleaseIndication, TnccSetupConfirm, TnccSetupIndication, TnccTxConfirm, TnccTxIndication,
 };
 
 /// TelemetryEvent enum sent by a TetraEntity through the TelemetrySink
@@ -63,4 +67,66 @@ pub enum TelemetryEvent {
     TnmmEnergySavingIndication(TnmmEnergySavingIndication),
     /// TNMM-ENERGY SAVING confirm (Table 15.3, cl. 15.3.3.5) — dormant.
     TnmmEnergySavingConfirm(TnmmEnergySavingConfirm),
+
+    // -----------------------------------------------------------------------
+    // TNCC-SAP indications / confirms (Plane A, OUTBOUND) — ETSI TS 100 392-2
+    // v3.10.1 cl. 11.3.3. Payloads carry the exact primitive table parameter
+    // sets from Tables 11.1/11.2/11.5/11.6/11.7/11.8/11.9. `call_identifier`
+    // is a local TNCC-SAP instance selector, not a TNCC primitive parameter.
+    // -----------------------------------------------------------------------
+    /// TNCC-ALERT indication (Table 11.1, cl. 11.3.3.1).
+    TnccAlertIndication {
+        call_identifier: u16,
+        indication: TnccAlertIndication,
+    },
+    /// TNCC-COMPLETE indication (Table 11.2, cl. 11.3.3.2).
+    TnccCompleteIndication {
+        call_identifier: u16,
+        indication: TnccCompleteIndication,
+    },
+    /// TNCC-COMPLETE confirm (Table 11.2, cl. 11.3.3.2).
+    TnccCompleteConfirm {
+        call_identifier: u16,
+        confirm: TnccCompleteConfirm,
+    },
+    /// TNCC-NOTIFY indication (Table 11.5, cl. 11.3.3.5).
+    TnccNotifyIndication {
+        call_identifier: u16,
+        indication: TnccNotifyIndication,
+    },
+    /// TNCC-PROCEED indication (Table 11.6, cl. 11.3.3.6).
+    TnccProceedIndication {
+        call_identifier: u16,
+        indication: TnccProceedIndication,
+    },
+    /// TNCC-RELEASE indication (Table 11.7, cl. 11.3.3.7).
+    TnccReleaseIndication {
+        call_identifier: u16,
+        indication: TnccReleaseIndication,
+    },
+    /// TNCC-RELEASE confirm (Table 11.7, cl. 11.3.3.7).
+    TnccReleaseConfirm {
+        call_identifier: u16,
+        confirm: TnccReleaseConfirm,
+    },
+    /// TNCC-SETUP indication (Table 11.8, cl. 11.3.3.8).
+    TnccSetupIndication {
+        call_identifier: u16,
+        indication: Box<TnccSetupIndication>,
+    },
+    /// TNCC-SETUP confirm (Table 11.8, cl. 11.3.3.8).
+    TnccSetupConfirm {
+        call_identifier: u16,
+        confirm: Box<TnccSetupConfirm>,
+    },
+    /// TNCC-TX indication (Table 11.9, cl. 11.3.3.9).
+    TnccTxIndication {
+        call_identifier: u16,
+        indication: TnccTxIndication,
+    },
+    /// TNCC-TX confirm (Table 11.9, cl. 11.3.3.9).
+    TnccTxConfirm {
+        call_identifier: u16,
+        confirm: TnccTxConfirm,
+    },
 }
