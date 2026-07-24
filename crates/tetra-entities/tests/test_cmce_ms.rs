@@ -405,3 +405,67 @@ fn downlink_grant_wait_continue_and_release_update_ms_state() {
     assert_eq!(cc.call_count(), 0);
     assert!(!pop_config(&mut q).switch_u_plane);
 }
+
+/// M4b talker floor lifecycle (cl. 14.5.2) on an assigned traffic channel:
+/// PTT press -> U-TX-DEMAND stolen on the TCH-associated link -> await
+/// D-TX-GRANTED -> resume transmitting (U-plane tx-grant on) -> PTT release ->
+/// U-TX-CEASED stolen on the TCH-associated link -> idle (U-plane tx off).
+/// Proves the floor PDUs are carried as stolen, acknowledged BL-DATA on the TCH
+/// (link_id 2) once the call is on the traffic channel, not on MCCH.
+#[test]
+fn talker_floor_lifecycle_steals_tch_end_to_end() {
+    let mut cc = CcMsSubentity::new(None);
+    let mut q = MessageQueue::new();
+
+    // Call set up on a traffic channel, initially listening (granted to other).
+    cc.route_rd_deliver(
+        &mut q,
+        dl_msg(
+            &group_setup(TransmissionGrant::GrantedToOtherUser),
+            TetraAddress::new(GSSI, SsiType::Gssi),
+        ),
+    );
+    assert_eq!(cc.call(CALL_ID).unwrap().tx_grant_state, MsTxGrantState::GrantedOther);
+    assert!(pop_config(&mut q).switch_u_plane, "on the traffic channel (U-plane on)");
+
+    // PTT press: U-TX-DEMAND is stolen from the receive TCH half-slot.
+    assert!(cc.request_tx(&mut q, CALL_ID, 1));
+    let demand = pop_unitdata(&mut q);
+    assert!(demand.stealing_permission, "demand on TCH must steal");
+    assert_eq!(demand.link_id, 2, "demand on the TCH-associated basic link");
+    let mut demand_sdu = demand.sdu;
+    assert!(UTxDemand::from_bitbuf(&mut demand_sdu).is_ok());
+
+    // Await D-TX-GRANTED: grant to self -> resume transmitting (tx-grant on).
+    let granted = DTxGranted {
+        call_identifier: CALL_ID,
+        transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
+        transmission_request_permission: true,
+        encryption_control: false,
+        reserved: false,
+        notification_indicator: None,
+        transmitting_party_type_identifier: None,
+        transmitting_party_address_ssi: None,
+        transmitting_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    };
+    cc.route_rd_deliver(&mut q, dl_msg(&granted, TetraAddress::new(GSSI, SsiType::Gssi)));
+    assert_eq!(cc.call(CALL_ID).unwrap().tx_grant_state, MsTxGrantState::GrantedSelf);
+    let cfg = pop_config(&mut q);
+    assert!(cfg.switch_u_plane && cfg.tx_grant, "uplink transmit resumed");
+
+    // PTT release: U-TX-CEASED is stolen from the transmit TCH half-slot, then
+    // the U-plane transmit is torn down (talker returns to idle).
+    assert!(cc.cease_tx(&mut q, CALL_ID));
+    let ceased = pop_unitdata(&mut q);
+    assert!(ceased.stealing_permission, "cease on TCH must steal");
+    assert!(ceased.stealing_repeats_flag);
+    assert_eq!(ceased.link_id, 2, "cease on the TCH-associated basic link");
+    let mut ceased_sdu = ceased.sdu;
+    assert!(UTxCeased::from_bitbuf(&mut ceased_sdu).is_ok());
+    assert_eq!(cc.call(CALL_ID).unwrap().tx_grant_state, MsTxGrantState::None);
+    assert!(!pop_config(&mut q).switch_u_plane, "U-plane torn down (idle)");
+}
