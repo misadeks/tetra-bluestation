@@ -1742,19 +1742,39 @@ impl UmacMs {
     /// stolen: the STCH signalling block takes the first half and the TCH/S
     /// speech the second (normal training sequence 2, cl. 9.4.4.3.2).
     fn drive_uplink_traffic(&mut self, queue: &mut MessageQueue) {
-        // The uplink slot paired with the current downlink slot (cl. 9.3.9).
+        // TETRA numbers an uplink burst with the SAME frame and timeslot as the
+        // downlink slot it is paired with; the burst is only *physically*
+        // transmitted two timeslots later (ETSI TS 100 392-2 cl. 9.3.9 / 9.5.1:
+        // the MS uplink is delayed by 2 timeslots relative to the downlink). The
+        // BS recovers that pairing by subtracting the 2-slot offset from the air
+        // time it receives on (`lmac_bs`: `msg = dltime - 2`), so the slot the
+        // network assigned to us and the frame-18 control-frame rule are keyed on
+        // the *paired downlink slot* — our current `self.dltime` — NOT the
+        // physical air slot `dltime + 2`. Gating on the air slot instead lands
+        // the burst two timeslots away from the assigned traffic channel, where
+        // the BS has no uplink circuit and drops it (observed as the uplink
+        // scattering onto ts = assigned ± 2).
+        let paired = self.dltime;
+
+        // Physical air time of the burst: the paired slot delayed by two
+        // timeslots (cl. 9.3.9). This is what the PHY actually places on air
+        // (`phy_ms::local_uplink_time`) and what a BS observes before it
+        // subtracts the offset; used only as the emitted slot tag and in the
+        // correlation log below, never for the assignment/frame decision.
         let ul = self.dltime.add_timeslots(2);
 
-        // Frame 18 is the control frame — no traffic (cl. 9.5.1c / 23.4.2.1).
-        if ul.f == 18 {
+        // Frame 18 is the control frame — the traffic channel is interrupted, so
+        // no TCH/S uplink for a paired downlink slot in frame 18 (cl. 9.5.1c /
+        // 23.4.2.1).
+        if paired.f == 18 {
             return;
         }
 
         // Only emit on a timeslot the network assigned to this MS as a traffic
-        // channel (cl. 21.5.2). The uplink slot number equals the downlink slot
-        // number it is paired with, so the same assignment record applies.
-        let ts_idx = ul.t as usize - 1;
-        if !(1..=4).contains(&ul.t) || !self.assigned_traffic_slots[ts_idx] {
+        // channel (cl. 21.5.2). The assignment is indexed by the paired
+        // downlink/uplink slot number (the BS's numbering), so use `paired.t`.
+        let ts_idx = paired.t as usize - 1;
+        if !(1..=4).contains(&paired.t) || !self.assigned_traffic_slots[ts_idx] {
             return;
         }
 
@@ -4185,14 +4205,20 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [false, false, true, false]; // TS3
         umac.uplink_tx_granted = true;
-        umac.dltime = TdmaTime::default(); // t1/f1 -> paired UL t3/f1
+        // Emit when the *paired downlink slot* (our current dltime) is the
+        // assigned traffic slot ts3; the burst is physically placed 2 timeslots
+        // later on air (cl. 9.3.9), which the BS subtracts back to ts3.
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 };
 
         let mut q = MessageQueue::new();
         umac.drive_uplink_traffic(&mut q);
 
         let slot = extract_uplink_tchs(&q).expect("a TCH/S uplink burst must be emitted");
-        assert_eq!(slot.ts.t, 3, "emitted on the assigned uplink slot (dltime + 2)");
-        assert_eq!(slot.ts.f, 1);
+        assert_eq!(
+            slot.ts,
+            umac.dltime.add_timeslots(2),
+            "air slot tag is the assigned paired slot delayed 2 timeslots (cl. 9.3.9)"
+        );
         assert_eq!(slot.ul_phy_chan, PhysicalChannel::Tp, "traffic physical channel");
         assert!(!slot.reserved_access, "continuous traffic is clock-driven, not reserved-access");
         assert!(slot.blk2.is_none(), "single full-slot traffic block");
@@ -4210,7 +4236,8 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [false, false, true, false];
         umac.uplink_tx_granted = false;
-        umac.dltime = TdmaTime::default();
+        // Paired slot IS the assigned ts3 (so only the missing grant suppresses).
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 };
 
         let mut q = MessageQueue::new();
         umac.drive_uplink_traffic(&mut q);
@@ -4225,7 +4252,8 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [true, false, false, false]; // TS1 only
         umac.uplink_tx_granted = true;
-        umac.dltime = TdmaTime::default(); // paired UL is TS3, not assigned
+        // Paired downlink slot is ts3, which is NOT the assigned ts1: stay silent.
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 };
 
         let mut q = MessageQueue::new();
         umac.drive_uplink_traffic(&mut q);
@@ -4240,7 +4268,9 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [false, false, true, false];
         umac.uplink_tx_granted = true;
-        umac.dltime = TdmaTime { t: 1, f: 18, m: 1, h: 0 }; // paired UL t3/f18
+        // Paired slot is the assigned ts3 AND in frame 18: only the control-frame
+        // rule suppresses the burst.
+        umac.dltime = TdmaTime { t: 3, f: 18, m: 1, h: 0 };
 
         let mut q = MessageQueue::new();
         umac.drive_uplink_traffic(&mut q);
@@ -4255,7 +4285,9 @@ attach_groups = []
         umac.scrambling_code = None;
         umac.assigned_traffic_slots = [false, false, true, false];
         umac.uplink_tx_granted = true;
-        umac.dltime = TdmaTime::default();
+        // Paired slot IS the assigned ts3 (so only the missing scrambling code
+        // suppresses the burst).
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 };
 
         let mut q = MessageQueue::new();
         umac.drive_uplink_traffic(&mut q);
@@ -4305,7 +4337,7 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [false, false, true, false];
         umac.uplink_tx_granted = true;
-        umac.dltime = TdmaTime::default();
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 }; // paired slot == assigned ts3
 
         let mut q = MessageQueue::new();
         umac.rx_tmd_prim(&mut q, tmd_source(vec![0xFF; 35])); // distinctive, non-silence
@@ -4397,14 +4429,18 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [false, false, true, false];
         umac.uplink_tx_granted = true;
-        umac.dltime = TdmaTime::default(); // paired UL t3/f1
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 }; // paired slot == assigned ts3
 
         let mut q = MessageQueue::new();
         umac.rx_tma_prim(&mut q, tma_stealing_req(true, 2, None));
         umac.drive_uplink_traffic(&mut q);
 
         let slot = extract_stolen_burst(&q).expect("a stolen STCH burst must be emitted");
-        assert_eq!(slot.ts.t, 3, "stolen on the assigned uplink slot");
+        assert_eq!(
+            slot.ts,
+            umac.dltime.add_timeslots(2),
+            "stolen on the assigned paired slot, air-placed 2 timeslots later (cl. 9.3.9)"
+        );
         assert_eq!(slot.ul_phy_chan, PhysicalChannel::Tp, "traffic physical channel");
         let blk1 = slot.blk1.expect("blk1 (STCH) present");
         assert_eq!(blk1.logical_channel, LogicalChannel::Stch);
@@ -4426,7 +4462,7 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [false, false, true, false];
         umac.uplink_tx_granted = false; // listening, not the talker
-        umac.dltime = TdmaTime::default();
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 }; // paired slot == assigned ts3
 
         let mut q = MessageQueue::new();
         umac.rx_tma_prim(&mut q, tma_stealing_req(true, 2, None));
@@ -4449,7 +4485,7 @@ attach_groups = []
         umac.scrambling_code = Some(0x1234_5678);
         umac.assigned_traffic_slots = [false, false, true, false];
         umac.uplink_tx_granted = true;
-        umac.dltime = TdmaTime::default();
+        umac.dltime = TdmaTime { t: 3, f: 1, m: 1, h: 0 }; // paired slot == assigned ts3
 
         let reporter = TxReporter::new();
         let mut q = MessageQueue::new();
