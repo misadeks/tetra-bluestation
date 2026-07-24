@@ -21,6 +21,7 @@ use tetra_saps::{
     SapMsg, SapMsgInner,
     control::enums::{circuit_mode_type::CircuitModeType, communication_type::CommunicationType},
     lcmc::{LcmcMleConfigureReq, LcmcMleUnitdataReq},
+    tmd::TmdCircuitDataReq,
     tncc,
 };
 
@@ -333,5 +334,47 @@ mod tests {
         cc.rx_downlink_traffic(3, &[1u8; 274]);
         cc.rx_downlink_traffic(3, &[1u8; 274]);
         assert_eq!(cc.call(7).unwrap().rx_speech_frames, 2, "frames accepted while U-plane on");
+    }
+
+    #[test]
+    fn uplink_source_supplied_only_while_talker() {
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+
+        // No transmission grant yet: CC-MS supplies no uplink U-plane source.
+        cc.drive_uplink_source(&mut q);
+        assert_eq!(cc.call(7).unwrap().tx_speech_frames, 0, "no source frames without the floor");
+        assert!(
+            q.iter().all(|m| !matches!(m.msg, SapMsgInner::TmdCircuitDataReq(_))),
+            "no TMD source pushed to the MAC while not talking"
+        );
+
+        // Grant to self switches the U-plane on and makes us the talker
+        // (cl. 14.5.1.4); CC-MS now sources uplink speech frames down to the MAC.
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        let mut q2 = MessageQueue::new();
+        cc.drive_uplink_source(&mut q2);
+        assert_eq!(cc.call(7).unwrap().tx_speech_frames, 1, "one source frame supplied while talking");
+        let pushed: Vec<_> = q2
+            .iter()
+            .filter(|m| m.dest == TetraEntity::Umac && matches!(m.msg, SapMsgInner::TmdCircuitDataReq(_)))
+            .collect();
+        assert_eq!(pushed.len(), 1, "exactly one TMD source frame pushed to the MAC");
+        let SapMsgInner::TmdCircuitDataReq(req) = &pushed[0].msg else {
+            unreachable!()
+        };
+        assert_eq!(req.data.len(), 35, "labelled deterministic 274-bit (packed) silence frame");
     }
 }

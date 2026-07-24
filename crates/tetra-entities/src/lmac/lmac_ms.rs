@@ -314,10 +314,11 @@ impl LmacMs {
         };
 
         // The MS transmits a single uplink burst per granted (sub)slot. Unlike the
-        // BS downlink slot there is no BBK/AACH on the uplink, and a single access
-        // burst carries exactly one MAC block: SCH/HU on a Control Uplink Burst or
-        // SCH/F on a Normal Uplink Burst. ETSI TS 100 392-2 cl. 9.4.4.2 (uplink
-        // bursts), cl. 23.5 (MAC random/reserved access).
+        // BS downlink slot there is no BBK/AACH on the uplink, and a single burst
+        // carries exactly one MAC block: SCH/HU on a Control Uplink Burst, or
+        // SCH/F (signalling) / TCH/S (circuit-mode speech) on a Normal Uplink
+        // Burst. ETSI TS 100 392-2 cl. 9.4.4.2 (uplink bursts), cl. 23.5 (MAC
+        // random/reserved access) / cl. 23 (traffic scheduling).
         assert!(prim.bbk.is_none(), "rx_tmv_unitdata_req_slot: MS uplink has no BBK/AACH");
         assert!(prim.blk2.is_none(), "rx_tmv_unitdata_req_slot: MS uplink burst carries a single block");
         let blk1 = prim
@@ -337,14 +338,22 @@ impl LmacMs {
         let (burst_type, train_type) = match blk1.logical_channel {
             LogicalChannel::SchF => (BurstType::NUB, TrainingSequence::NormalTrainSeq1),
             LogicalChannel::SchHu => (BurstType::CUB, TrainingSequence::ExtendedTrainSeq),
+            // Uplink TCH/S speech: a full-slot Normal Uplink Burst with normal
+            // training sequence 1, mirroring the BS downlink NDB traffic burst
+            // (cl. 9.4.4.2 uplink bursts, cl. 8.2 channel coding).
+            LogicalChannel::TchS => (BurstType::NUB, TrainingSequence::NormalTrainSeq1),
             other => panic!("rx_tmv_unitdata_req_slot: unsupported uplink logical channel {:?}", other),
         };
 
-        // Channel-encode type1 -> type5: CRC16, convolutional encode, puncture,
-        // interleave and scramble (cl. 8.2 channel coding, cl. 8.2.5 scrambling).
-        // The uplink burst scrambling code is the serving cell's, already set from
-        // the received SYNC (same code used for downlink decode).
-        let type5 = errorcontrol::encode_cp(blk1);
+        // Channel-encode type1 -> type5. Traffic (TCH/S) uses the ACELP speech
+        // coding chain (`encode_tp`, cl. 8.2.3 / EN 300 395-2); signalling uses
+        // the control-channel chain (`encode_cp`, cl. 8.2.1). Both scramble with
+        // the serving cell's uplink code, already set from the received SYNC.
+        let type5 = if blk1.logical_channel.is_traffic() {
+            errorcontrol::encode_tp(blk1, 1)
+        } else {
+            errorcontrol::encode_cp(blk1)
+        };
 
         let prim_phy = TpUnitdataReqSlot {
             train_type,

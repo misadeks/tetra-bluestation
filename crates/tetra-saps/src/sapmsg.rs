@@ -71,6 +71,11 @@ pub enum SapMsgInner {
     TlmcConfigureReq(TlmcConfigureReq),
     /// TMC-SAP — MS runtime downlink retune (MLE -> UMAC).
     TlmcTuneReq(TlmcTuneReq),
+    /// TMC-SAP — MS U-plane transmit configuration (MLE -> UMAC): completes the
+    /// MLE-CONFIGURE (cl. 17.3.3) hop for U-plane switching / Tx-grant so the
+    /// upper MAC knows whether this MS may emit uplink TCH/S traffic (cl.
+    /// 14.5.1.4 / cl. 23).
+    TlmcUPlaneConfigureReq(TlmcUPlaneConfigureReq),
 
     // TMD-SAP (Uplane traffic and signalling)
     TmdCircuitDataReq(TmdCircuitDataReq),
@@ -190,6 +195,7 @@ impl Display for SapMsgInner {
 
             // TMC-SAP
             SapMsgInner::TlmcTuneReq(_) => write!(f, "TlmcTuneReq"),
+            SapMsgInner::TlmcUPlaneConfigureReq(_) => write!(f, "TlmcUPlaneConfigureReq"),
 
             // LCMC-SAP
             SapMsgInner::LcmcMleBreakInd(_) => write!(f, "LcmcMleBreakInd"),

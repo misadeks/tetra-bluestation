@@ -103,4 +103,55 @@ impl CcMsSubentity {
             "CC-MS: received downlink speech frame (U-plane)"
         );
     }
+
+    /// Supply an uplink TCH/S U-plane source frame while this MS holds the floor.
+    ///
+    /// Symmetric to `rx_downlink_traffic`: CC-MS owns the U-plane in both
+    /// directions (ETSI TS 100 392-2 cl. 14.5.1.4). While a call has the
+    /// transmission grant to self (`GrantedSelf`) with the U-plane switched on,
+    /// CC-MS is the source of the uplink speech stream and pushes frames down to
+    /// the MAC (TMD-SAP) transmit path. The MAC (UMAC) is the transmit *timing*
+    /// authority (cl. 23): it buffers these frames and clocks exactly one out per
+    /// granted uplink traffic slot, so this source rate is deliberately not the
+    /// emission gate.
+    ///
+    /// For now the source is a labelled deterministic silence / comfort-noise
+    /// 274-bit TCH/S type-1 frame (all zeros, packed bytes). A real ACELP vocoder
+    /// egress (microphone → speech codec) is a follow-up; no vocoder is invented
+    /// here.
+    pub fn drive_uplink_source(&mut self, queue: &mut MessageQueue) {
+        // Single simultaneous call on the serving carrier (as in the M1 receive
+        // path). Find the call currently transmitting on the U-plane.
+        let Some(call) = self.calls.values_mut().find(|c| {
+            c.tx_grant_state == MsTxGrantState::GrantedSelf
+                && c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false)
+        }) else {
+            return;
+        };
+
+        // Labelled deterministic silence frame: 274 zero type-1 bits carried as
+        // packed bytes (ceil(274/8) = 35). UMAC clamps to the TCH/S type-1 size.
+        // TODO: replace with real ACELP vocoder egress (follow-up).
+        const TCH_S_TYPE1_BYTES: usize = 35;
+        let data = vec![0u8; TCH_S_TYPE1_BYTES];
+
+        call.tx_speech_frames = call.tx_speech_frames.saturating_add(1);
+        let call_identifier = call.call_identifier;
+
+        queue.push_back(SapMsg {
+            sap: Sap::TmdSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq {
+                // Slot authority is UMAC's assigned-timeslot record (cl. 21.5.2),
+                // not this field; it is left at 0 as a "don't care".
+                ts: 0,
+                data,
+            }),
+        });
+        tracing::trace!(
+            call = call_identifier,
+            "CC-MS: supplied uplink speech source frame (U-plane, silence)"
+        );
+    }
 }

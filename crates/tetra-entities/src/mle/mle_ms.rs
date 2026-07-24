@@ -6,7 +6,7 @@ use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
 use tetra_saps::lmm::{LmmMleActivateConf, LmmMleBreakInd, LmmMleReopenInd, LmmMleRssiInd, LmmMleUnitdataInd};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
-use tetra_saps::tlmc::{TlmcConfigureReq, TlmcTuneReq, TlmcValidAddress};
+use tetra_saps::tlmc::{TlmcConfigureReq, TlmcTuneReq, TlmcUPlaneConfigureReq, TlmcValidAddress};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mle::enums::mle_pdu_type_dl::MlePduTypeDl;
@@ -1004,12 +1004,29 @@ impl MleMs {
                 self.rx_lcmc_mle_unitdata_req(queue, message);
             }
             SapMsgInner::LcmcMleConfigureReq(prim) => {
-                // CMCE-MS Phase 1 C-plane seam. ETSI TS 100 392-2 cl. 17.3.3
-                // defines MLE-CONFIGURE and cl. 14.5.1.4 requires CC to issue
-                // it for U-plane switching / Tx grant changes. The MS traffic
-                // path (TMD/TCH speech) is intentionally not implemented in
-                // Phase 1, so MLE records the request as a no-op handoff point.
-                tracing::info!("MLE-MS: CMCE configure request (U-plane stub): {:?}", prim);
+                // C-plane -> U-plane seam. ETSI TS 100 392-2 cl. 17.3.3 defines
+                // MLE-CONFIGURE and cl. 14.5.1.4 requires CC to issue it for
+                // U-plane switching / transmission-grant changes. MLE is the
+                // layer that configures the MAC, so forward the U-plane transmit
+                // state down to UMAC (TLMC-SAP) where the transmit scheduler
+                // (cl. 23) gates uplink TCH/S emission on it. Only the grant
+                // state is carried; the granted timeslot stays owned by UMAC's
+                // CHANNEL ALLOCATION record (cl. 21.5.2), the single slot
+                // authority.
+                tracing::info!(
+                    "MLE-MS: CMCE U-plane configure (switch_u_plane={}, tx_grant={})",
+                    prim.switch_u_plane,
+                    prim.tx_grant
+                );
+                queue.push_back(SapMsg {
+                    sap: Sap::TlmcSap,
+                    src: TetraEntity::Mle,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::TlmcUPlaneConfigureReq(TlmcUPlaneConfigureReq {
+                        switch_u_plane: prim.switch_u_plane,
+                        tx_grant: prim.tx_grant,
+                    }),
+                });
             }
             _ => panic!(),
         }

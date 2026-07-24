@@ -81,6 +81,13 @@ pub struct MsCall {
     /// minimal received-audio egress point until a real vocoder/audio sink is
     /// wired; also the observable signal that "the MS heard the call".
     pub rx_speech_frames: u32,
+    /// Count of uplink TCH/S speech frames this call has supplied into the
+    /// U-plane transmit path (i.e. produced while holding the transmission grant
+    /// with the U-plane switched on, cl. 14.5.1.4). A minimal labelled
+    /// deterministic source (silence/comfort-noise) feeding the MAC transmit
+    /// scheduler until a real ACELP vocoder egress is wired; also the observable
+    /// signal that "the MS is talking on the call".
+    pub tx_speech_frames: u32,
     pub(super) route: CallRoute,
     pub(super) simplex_duplex_selection: bool,
     /// Signalling mode dictated by the D-SETUP Hook method selection IE
@@ -129,6 +136,7 @@ impl MsCall {
             disconnect_cause: None,
             last_uplane: None,
             rx_speech_frames: 0,
+            tx_speech_frames: 0,
             route,
             simplex_duplex_selection,
             hook_on_off: false,

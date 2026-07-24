@@ -19,6 +19,30 @@ pub struct TlmcTuneReq {
     pub carrier_hz: u32,
 }
 
+/// MS only — U-plane transmit configuration, MLE -> upper-MAC (**[impl seam]**).
+///
+/// Completes the MLE-CONFIGURE (cl. 17.3.3) hop that CC-MS issues for U-plane
+/// switching / transmission-grant changes (cl. 14.5.1.4). CC-MS emits an
+/// `LcmcMleConfigureReq` on the LCMC-SAP; MLE forwards the U-plane transmit
+/// state down to UMAC here so the upper MAC (the transmit scheduler, cl. 23)
+/// knows whether this MS currently holds the floor and may emit uplink TCH/S
+/// traffic on its granted slot.
+///
+/// Per the single-source-of-truth rule this primitive carries only the
+/// transmit-grant state, NOT the granted timeslot: UMAC already holds the
+/// assigned uplink slot from the CHANNEL ALLOCATION element (cl. 21.5.2,
+/// `assigned_traffic_slots`), which stays the sole slot authority. Not an
+/// over-the-air primitive.
+#[derive(Debug, Clone)]
+pub struct TlmcUPlaneConfigureReq {
+    /// U-plane switched on for the call (cl. 14.5.1.4): the circuit-mode
+    /// U-plane is active (call present / traffic phase).
+    pub switch_u_plane: bool,
+    /// This MS holds the transmission grant (cl. 14.8.42): it is the current
+    /// talker and may emit uplink TCH/S traffic on its assigned slot.
+    pub tx_grant: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TlmcCellReadInd;
 #[derive(Debug, Clone)]
