@@ -1319,6 +1319,35 @@ attach_groups = []
         assert_eq!(req.link_id, 2, "TCH-associated link_id must be forwarded");
     }
 
+    /// M4c ACK-key regression (cl. 22.3.2.3): the MS floor steal is keyed on its
+    /// own individual ISSI (the on-air MAC source), so the SwMI's ISSI-addressed
+    /// BL-ACK matches the expected-ACK entry and clears it — no
+    /// retransmit-to-exhaustion. On air (group call) the pre-fix entry was keyed
+    /// on the group SSI and never matched (141x "unexpected ACK" + 36x
+    /// "exhausted retransmissions").
+    #[test]
+    fn test_ms_floor_steal_ack_clears_on_own_issi() {
+        let mut llc = llc("Ms");
+        let mut queue = MessageQueue::new();
+        // CMCE floor_route now keys the acknowledged BL-DATA on own ISSI.
+        llc.rx_tla_tldata_req_bl(&mut queue, steal_floor_req(2));
+        assert_eq!(llc.outbound_messages.len(), 1, "acknowledged uplink is tracked");
+        let ns = {
+            let entry = llc.outbound_messages.front_mut().unwrap();
+            assert_eq!(entry.addr.ssi, OWN_ISSI, "expected-ACK keyed on own ISSI");
+            // Mimic the burst having been handed to the Umac (submit step).
+            entry.t_submitted_to_umac = Some(entry.t_first);
+            entry.ns
+        };
+
+        // The SwMI acks the individual sender's own ISSI.
+        llc.process_incoming_ack(TetraAddress::new(OWN_ISSI, SsiType::Issi), ns);
+        assert!(
+            llc.outbound_messages.is_empty(),
+            "own-ISSI BL-ACK must clear the floor-steal expected-ACK entry"
+        );
+    }
+
     /// BS byte-identical guard: the same stealing request in BS mode must still
     /// produce unacknowledged BL-UDATA (the MS-only gate is a no-op for the BS).
     #[test]

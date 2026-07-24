@@ -208,6 +208,54 @@ mod tests {
         assert_eq!(prim.link_id, 2, "must use the TCH-associated basic link");
     }
 
+    /// M4c ACK-key regression (cl. 22.3.2.3): for a GROUP call the stored call
+    /// route addresses the group SSI, but the TCH-associated basic link is the
+    /// individual, point-to-point MS↔SwMI acknowledged link — the SwMI acks the
+    /// MS's own ISSI. The floor PDU must therefore be keyed on the own individual
+    /// ISSI, otherwise the SwMI's ISSI-addressed BL-ACK never matches the
+    /// group-keyed expected-ACK entry and the LLC retransmits to exhaustion.
+    #[test]
+    fn group_call_floor_signalling_keyed_on_own_issi() {
+        const OWN_ISSI: u32 = 1234567;
+        const GROUP_SSI: u32 = 220;
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(OWN_ISSI);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                // Group route as seen on air: the group number, Ssi-typed.
+                CallRoute {
+                    main_address: TetraAddress::new(GROUP_SSI, SsiType::Ssi),
+                    handle: 1,
+                    endpoint_id: 2,
+                    link_id: 0,
+                },
+                true,
+            ),
+        );
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        while q.pop_front().is_some() {}
+
+        assert!(cc.cease_tx(&mut q, 7));
+        let prim = loop {
+            match q.pop_front().expect("cease should emit signalling").msg {
+                SapMsgInner::LcmcMleUnitdataReq(p) => break p,
+                _ => continue,
+            }
+        };
+        assert_eq!(prim.main_address.ssi, OWN_ISSI, "floor PDU must be keyed on own ISSI");
+        assert!(matches!(prim.main_address.ssi_type, SsiType::Issi), "individual link");
+        assert_ne!(prim.main_address.ssi, GROUP_SSI, "must NOT key on the group SSI");
+        assert_eq!(prim.link_id, 2, "TCH-associated basic link");
+        assert!(prim.stealing_permission);
+    }
+
     // --- MT individual-call answer path (cl. 14.5.1.1.1) ----------------------
 
     use crate::net_telemetry::channel::telemetry_channel;
