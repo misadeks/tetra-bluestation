@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn uplink_source_supplied_only_while_talker() {
+    fn uplink_speech_forwarded_only_while_talker() {
         let mut cc = CcMsSubentity::new(None);
         let mut q = MessageQueue::new();
         cc.calls.insert(
@@ -669,7 +669,13 @@ mod tests {
             ),
         );
 
-        // No transmission grant yet: CC-MS supplies no uplink U-plane source.
+        // UI-supplied 274-bit type-1 block, one-bit-per-byte (alternating), the
+        // same layout as the downlink MsSpeechFrame.
+        let ui_frame: Vec<u8> = (0..274u16).map(|i| (i % 2) as u8).collect();
+
+        // Before any grant: a pushed frame is dropped (the MS must not transmit
+        // traffic it holds no floor for) and driving the source emits nothing.
+        cc.push_uplink_speech(7, 274, &ui_frame);
         cc.drive_uplink_source(&mut q);
         assert_eq!(cc.call(7).unwrap().tx_speech_frames, 0, "no source frames without the floor");
         assert!(
@@ -678,11 +684,23 @@ mod tests {
         );
 
         // Grant to self switches the U-plane on and makes us the talker
-        // (cl. 14.5.1.4); CC-MS now sources uplink speech frames down to the MAC.
+        // (cl. 14.5.1.4). With no queued UI frame yet, the source emits nothing —
+        // the MAC fills comfort silence on underrun (cl. 23), CC-MS does not.
         cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        let mut q_idle = MessageQueue::new();
+        cc.drive_uplink_source(&mut q_idle);
+        assert_eq!(cc.call(7).unwrap().tx_speech_frames, 0, "no synthesised source without UI audio");
+        assert!(
+            q_idle.iter().all(|m| !matches!(m.msg, SapMsgInner::TmdCircuitDataReq(_))),
+            "CC-MS pushes nothing on underrun; the MAC owns silence"
+        );
+
+        // Now the UI supplies a frame while we hold the floor: it is packed and
+        // clocked down to the MAC.
+        cc.push_uplink_speech(7, 274, &ui_frame);
         let mut q2 = MessageQueue::new();
         cc.drive_uplink_source(&mut q2);
-        assert_eq!(cc.call(7).unwrap().tx_speech_frames, 1, "one source frame supplied while talking");
+        assert_eq!(cc.call(7).unwrap().tx_speech_frames, 1, "one source frame forwarded while talking");
         let pushed: Vec<_> = q2
             .iter()
             .filter(|m| m.dest == TetraEntity::Umac && matches!(m.msg, SapMsgInner::TmdCircuitDataReq(_)))
@@ -691,6 +709,78 @@ mod tests {
         let SapMsgInner::TmdCircuitDataReq(req) = &pushed[0].msg else {
             unreachable!()
         };
-        assert_eq!(req.data.len(), 35, "labelled deterministic 274-bit (packed) silence frame");
+        assert_eq!(req.data.len(), 35, "274-bit type-1 block packed to 35 bytes");
+        // Verify the packing: bit i (one-bit-per-byte) → bit (7 - i%8) of byte i/8.
+        let mut expected = vec![0u8; 35];
+        for i in 0..274usize {
+            if ui_frame[i] & 1 != 0 {
+                expected[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        assert_eq!(req.data, expected, "type-1 bits MSB-first packed correctly");
+    }
+
+    #[test]
+    fn uplink_speech_dropped_when_floor_held_by_other() {
+        // cl. 14.5.1.4 / 23: while another party holds the floor (GrantedToOther,
+        // U-plane on for receive) the MS is not the talker and must not source
+        // uplink traffic. A pushed frame is discarded.
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::GrantedToOtherUser, Some(2200699));
+
+        let ui_frame: Vec<u8> = vec![1u8; 274];
+        cc.push_uplink_speech(7, 274, &ui_frame);
+        let mut q2 = MessageQueue::new();
+        cc.drive_uplink_source(&mut q2);
+        assert_eq!(cc.call(7).unwrap().tx_speech_frames, 0, "no uplink source while another party talks");
+        assert!(
+            q2.iter().all(|m| !matches!(m.msg, SapMsgInner::TmdCircuitDataReq(_))),
+            "no TMD source pushed while not the talker"
+        );
+    }
+
+    #[test]
+    fn uplink_source_fifo_bounded_drop_oldest() {
+        // Overflow protection (not a jitter buffer): the per-call source FIFO is
+        // bounded, dropping the oldest frame so transmit latency stays capped.
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+
+        // Push more frames than the bound in one burst; the FIFO must not grow
+        // past the bound.
+        for _ in 0..(super::uplane::UPLINK_SOURCE_MAX_FRAMES + 3) {
+            cc.push_uplink_speech(7, 274, &vec![1u8; 274]);
+        }
+        assert_eq!(
+            cc.call(7).unwrap().uplink_source_frames.len(),
+            super::uplane::UPLINK_SOURCE_MAX_FRAMES,
+            "FIFO bounded to the drop-oldest limit"
+        );
     }
 }

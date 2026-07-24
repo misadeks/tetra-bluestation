@@ -98,6 +98,28 @@ pub enum ControlCommand {
     },
 
     // -----------------------------------------------------------------------
+    // U-plane uplink speech (traffic), INBOUND. Symmetric counterpart of the
+    // outbound `TelemetryEvent::MsSpeechFrame`. Not a TNCC-SAP signalling
+    // primitive: it carries circuit-mode speech, delivered into the U-plane the
+    // CC has switched on (ETSI TS 100 392-2 cl. 14.5.1.4) and transmitted on the
+    // granted uplink traffic slot (cl. 23). The external UI runs the ACELP
+    // vocoder (microphone → speech codec, EN 300 395-2); the stack performs no
+    // vocoding.
+    // -----------------------------------------------------------------------
+    /// One uplink TCH/S speech block for a call this MS is transmitting on.
+    /// `data` is `frame_bits` bits carried one-bit-per-byte (274 for TCH/S = two
+    /// 137-bit ACELP frames), matching the downlink `MsSpeechFrame` layout.
+    /// Fire-and-forget: no response is produced — the frame rate makes per-frame
+    /// acknowledgement impractical, and a dropped frame is covered by the MAC's
+    /// silence-on-underrun (cl. 23). Frames arriving while the MS does not hold
+    /// the floor for the call are discarded.
+    MsUplinkSpeech {
+        call_identifier: u16,
+        frame_bits: u16,
+        data: Vec<u8>,
+    },
+
+    // -----------------------------------------------------------------------
     // Management / provisioning (Plane B, **NON-STANDARD**). Wraps the
     // implementation-defined `crate::management` command set. Kept in its own
     // variant so Plane B never mixes with the standardized TNMM-SAP (Plane A)

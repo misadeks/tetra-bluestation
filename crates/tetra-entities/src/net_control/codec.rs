@@ -454,4 +454,39 @@ mod tests {
             r#"{"TnccAck":{"handle":6,"accepted":true,"detail":null}}"#
         );
     }
+
+    #[test]
+    fn test_roundtrip_ms_uplink_speech_command() {
+        // U-plane uplink speech offload: a 274-bit TCH/S type-1 block carried
+        // one-bit-per-byte must survive both codecs byte-for-byte, symmetric to
+        // the downlink MsSpeechFrame telemetry event.
+        let data: Vec<u8> = (0..274u16).map(|i| (i % 2) as u8).collect();
+        let cmd = ControlCommand::MsUplinkSpeech {
+            call_identifier: 7,
+            frame_bits: 274,
+            data: data.clone(),
+        };
+        let json = ControlCodecJson;
+        let bitcode = ControlCodecBitcode;
+
+        let json_decoded = json.decode_command(&json.encode_command(&cmd)).unwrap();
+        assert_eq!(serde_json::to_string(&json_decoded).unwrap(), serde_json::to_string(&cmd).unwrap());
+        let bitcode_decoded = bitcode.decode_command(&bitcode.encode_command(&cmd)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&bitcode_decoded).unwrap(),
+            serde_json::to_string(&cmd).unwrap()
+        );
+
+        let ControlCommand::MsUplinkSpeech {
+            call_identifier,
+            frame_bits,
+            data: got,
+        } = json_decoded
+        else {
+            panic!("expected MsUplinkSpeech");
+        };
+        assert_eq!(call_identifier, 7);
+        assert_eq!(frame_bits, 274);
+        assert_eq!(got, data);
+    }
 }

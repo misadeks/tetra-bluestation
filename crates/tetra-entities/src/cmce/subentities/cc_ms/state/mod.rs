@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::VecDeque;
 
 /// CMCE CC-MS call state (ETSI TS 100 392-2 cl. 14.5.2 and 14.5.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,11 +84,20 @@ pub struct MsCall {
     pub rx_speech_frames: u32,
     /// Count of uplink TCH/S speech frames this call has supplied into the
     /// U-plane transmit path (i.e. produced while holding the transmission grant
-    /// with the U-plane switched on, cl. 14.5.1.4). A minimal labelled
-    /// deterministic source (silence/comfort-noise) feeding the MAC transmit
-    /// scheduler until a real ACELP vocoder egress is wired; also the observable
-    /// signal that "the MS is talking on the call".
+    /// with the U-plane switched on, cl. 14.5.1.4). The frames originate at the
+    /// external UI (microphone → ACELP encoder) and arrive over the control SAP;
+    /// this counter is the observable signal that "the MS is talking on the
+    /// call". Gaps between UI frames are filled by the MAC's silence-on-underrun
+    /// (cl. 23), so no vocoder is synthesised in the stack.
     pub tx_speech_frames: u32,
+    /// FIFO of uplink U-plane TCH/S type-1 blocks supplied by the UI while this
+    /// call holds the floor, in the packed byte layout the MAC transmits
+    /// (`ceil(274/8)=35` bytes). `drive_uplink_source` clocks one frame per tick
+    /// down to the MAC (TMD-SAP); the MAC is the transmit-timing authority
+    /// (cl. 23) and emits exactly one per granted uplink slot. Bounded
+    /// drop-oldest to cap transmit latency — this is overflow protection, not a
+    /// jitter buffer (the UI↔stack link is local).
+    pub(super) uplink_source_frames: VecDeque<Vec<u8>>,
     pub(super) route: CallRoute,
     pub(super) simplex_duplex_selection: bool,
     /// Signalling mode dictated by the D-SETUP Hook method selection IE
@@ -137,6 +147,7 @@ impl MsCall {
             last_uplane: None,
             rx_speech_frames: 0,
             tx_speech_frames: 0,
+            uplink_source_frames: VecDeque::new(),
             route,
             simplex_duplex_selection,
             hook_on_off: false,

@@ -137,24 +137,66 @@ impl CcMsSubentity {
         });
     }
 
-    /// Supply an uplink TCH/S U-plane source frame while this MS holds the floor.
+    /// Accept one uplink TCH/S U-plane speech block from the external UI while
+    /// this MS holds the floor for the call.
     ///
-    /// Symmetric to `rx_downlink_traffic`: CC-MS owns the U-plane in both
-    /// directions (ETSI TS 100 392-2 cl. 14.5.1.4). While a call has the
-    /// transmission grant to self (`GrantedSelf`) with the U-plane switched on,
-    /// CC-MS is the source of the uplink speech stream and pushes frames down to
-    /// the MAC (TMD-SAP) transmit path. The MAC (UMAC) is the transmit *timing*
-    /// authority (cl. 23): it buffers these frames and clocks exactly one out per
-    /// granted uplink traffic slot, so this source rate is deliberately not the
-    /// emission gate.
+    /// Symmetric intake to `rx_downlink_traffic`'s egress: CC-MS owns the
+    /// U-plane in both directions (ETSI TS 100 392-2 cl. 14.5.1.4). The UI runs
+    /// the ACELP vocoder (microphone → speech codec, EN 300 395-2) and delivers
+    /// each 274-bit type-1 block (cl. 19.4) here, `frame_bits` bits carried
+    /// one-bit-per-byte, matching the downlink `MsSpeechFrame` layout. The frame
+    /// is packed to the MAC transmit byte layout and queued; `drive_uplink_source`
+    /// clocks it down to the MAC, which is the transmit-timing authority (cl. 23).
     ///
-    /// For now the source is a labelled deterministic silence / comfort-noise
-    /// 274-bit TCH/S type-1 frame (all zeros, packed bytes). A real ACELP vocoder
-    /// egress (microphone → speech codec) is a follow-up; no vocoder is invented
-    /// here.
+    /// A frame is accepted only for a call whose transmission grant is to self
+    /// (`GrantedSelf`) with the U-plane switched on — i.e. the MS actually holds
+    /// the floor. Frames arriving otherwise (no grant, floor held by another
+    /// party, unknown call) are discarded: the MS must not transmit traffic it
+    /// has no grant for. No vocoder is synthesised in the stack.
+    pub fn push_uplink_speech(&mut self, call_identifier: u16, frame_bits: u16, data: &[u8]) {
+        let Some(call) = self.calls.get_mut(&call_identifier) else {
+            tracing::trace!(call = call_identifier, "push_uplink_speech: unknown call, dropping frame");
+            return;
+        };
+        let holds_floor = call.tx_grant_state == MsTxGrantState::GrantedSelf
+            && call.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false);
+        if !holds_floor {
+            tracing::trace!(
+                call = call_identifier,
+                grant = ?call.tx_grant_state,
+                "push_uplink_speech: MS does not hold the floor, dropping uplink speech frame"
+            );
+            return;
+        }
+
+        let Some(packed) = pack_tch_s_type1(frame_bits, data) else {
+            tracing::warn!(
+                call = call_identifier,
+                frame_bits,
+                got = data.len(),
+                "push_uplink_speech: malformed TCH/S type-1 block, dropping"
+            );
+            return;
+        };
+
+        // Bounded drop-oldest: cap transmit latency if the UI supplies frames
+        // faster than the MAC clocks them out. This is overflow protection, not a
+        // jitter buffer (the UI↔stack link is local, cl. 23 timing owns pacing).
+        if call.uplink_source_frames.len() >= UPLINK_SOURCE_MAX_FRAMES {
+            call.uplink_source_frames.pop_front();
+        }
+        call.uplink_source_frames.push_back(packed);
+    }
+
+    /// Clock one queued uplink U-plane speech frame down to the MAC per tick.
+    ///
+    /// While a call holds the floor (`GrantedSelf`, U-plane on), forward the next
+    /// UI-supplied TCH/S block (queued by `push_uplink_speech`) to the MAC over
+    /// the TMD-SAP. The MAC is the transmit-timing authority (cl. 23): it buffers
+    /// the frame and emits exactly one per granted uplink traffic slot, filling
+    /// silence on underrun — so when the UI has supplied nothing this tick, CC-MS
+    /// pushes nothing and the MAC transmits comfort silence on the granted slot.
     pub fn drive_uplink_source(&mut self, queue: &mut MessageQueue) {
-        // Single simultaneous call on the serving carrier (as in the M1 receive
-        // path). Find the call currently transmitting on the U-plane.
         let Some(call) = self.calls.values_mut().find(|c| {
             c.tx_grant_state == MsTxGrantState::GrantedSelf
                 && c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false)
@@ -162,11 +204,9 @@ impl CcMsSubentity {
             return;
         };
 
-        // Labelled deterministic silence frame: 274 zero type-1 bits carried as
-        // packed bytes (ceil(274/8) = 35). UMAC clamps to the TCH/S type-1 size.
-        // TODO: replace with real ACELP vocoder egress (follow-up).
-        const TCH_S_TYPE1_BYTES: usize = 35;
-        let data = vec![0u8; TCH_S_TYPE1_BYTES];
+        let Some(data) = call.uplink_source_frames.pop_front() else {
+            return;
+        };
 
         call.tx_speech_frames = call.tx_speech_frames.saturating_add(1);
         let call_identifier = call.call_identifier;
@@ -184,7 +224,41 @@ impl CcMsSubentity {
         });
         tracing::trace!(
             call = call_identifier,
-            "CC-MS: supplied uplink speech source frame (U-plane, silence)"
+            "CC-MS: supplied uplink speech source frame (U-plane) to the MAC"
         );
     }
+}
+
+/// Bound on the per-call uplink U-plane source FIFO (`uplink_source_frames`).
+/// Overflow protection only; the MAC owns transmit timing (cl. 23).
+pub(super) const UPLINK_SOURCE_MAX_FRAMES: usize = 4;
+
+/// Number of channel-coded TCH/S type-1 bits per speech block (ETSI TS 100
+/// 392-2 cl. 19.4): two 137-bit ACELP frames (EN 300 395-2).
+const TCH_S_TYPE1_BITS: usize = 274;
+
+/// Pack a UI-supplied TCH/S type-1 speech block into the MAC transmit byte
+/// layout (`ceil(274/8) = 35` bytes, MSB-first, last byte's low 2 bits padding).
+///
+/// The UI delivers `frame_bits` bits one-bit-per-byte (mirroring the downlink
+/// `MsSpeechFrame`); this accepts that unpacked form (>= 274 bytes) and, for
+/// robustness, an already-packed 35-byte block. Anything else is rejected.
+fn pack_tch_s_type1(frame_bits: u16, data: &[u8]) -> Option<Vec<u8>> {
+    const PACKED_BYTES: usize = (TCH_S_TYPE1_BITS + 7) / 8;
+
+    // Already packed — pass through.
+    if data.len() == PACKED_BYTES {
+        return Some(data.to_vec());
+    }
+    // Unpacked one-bit-per-byte: need at least a full type-1 block.
+    if (frame_bits as usize) < TCH_S_TYPE1_BITS || data.len() < TCH_S_TYPE1_BITS {
+        return None;
+    }
+    let mut out = vec![0u8; PACKED_BYTES];
+    for bit_idx in 0..TCH_S_TYPE1_BITS {
+        if data[bit_idx] & 1 != 0 {
+            out[bit_idx / 8] |= 1 << (7 - (bit_idx % 8));
+        }
+    }
+    Some(out)
 }

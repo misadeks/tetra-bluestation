@@ -163,6 +163,16 @@ impl CmceMs {
                 Ok(()) => self.tncc_ack(handle, true, None),
                 Err(detail) => self.tncc_ack(handle, false, Some(detail)),
             },
+            // U-plane uplink speech (cl. 14.5.1.4): buffer the frame for the MAC
+            // transmit scheduler. Fire-and-forget — no control response (the
+            // frame rate makes per-frame acks impractical).
+            ControlCommand::MsUplinkSpeech {
+                call_identifier,
+                frame_bits,
+                data,
+            } => {
+                self.cc.push_uplink_speech(call_identifier, frame_bits, &data);
+            }
             other => tracing::warn!("CMCE(MS): received non-TNCC control command, dropping: {:?}", other),
         }
     }
