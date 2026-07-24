@@ -69,6 +69,24 @@ impl CcMsSubentity {
         let mut sdu = BitBuffer::new_autoexpand(96);
         pdu.write(&mut sdu).expect("failed to serialize CMCE uplink PDU");
         sdu.seek(0);
+        // ACK-KEY / basic-link addressing (cl. 14.5 / basic-link addressing
+        // cl. 21 & 23; ACK correlation cl. 22.3.2.3): ALL uplink CMCE signalling
+        // to the SwMI travels over the MS's individual, acknowledged basic link,
+        // so the layer-2 `main_address` must be the MS's OWN individual ISSI. For
+        // a group call `route.main_address` (inherited from `call.route`) is the
+        // group number; keying an acknowledged BL-DATA on it makes the SwMI's
+        // ISSI-addressed BL-ACK unmatchable → the frame (e.g. U-DISCONNECT)
+        // retransmits to exhaustion. The called/group identity is carried *inside*
+        // the CMCE PDU as the Called-party / Call-identifier element
+        // (cl. 14.8.28 / 14.8.4), NOT as the layer-2 address. Re-key here so every
+        // sender (U-DISCONNECT/-RELEASE/-CONNECT/-ALERT/-CALL-RESTORE) is
+        // consistent; U-SETUP and the floor route already address own ISSI, so
+        // this is a no-op for them and for individual calls. On-air neutral: the
+        // MAC source address is UMAC's config ISSI regardless of this field.
+        let main_address = match self.own_issi {
+            Some(issi) => TetraAddress::new(issi, SsiType::Issi),
+            None => route.main_address,
+        };
         queue.push_back(SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -83,7 +101,7 @@ impl CcMsSubentity {
                 layer2_qos: 0,
                 stealing_permission: stealing,
                 stealing_repeats_flag: stealing_repeats,
-                main_address: route.main_address,
+                main_address,
                 chan_alloc: None,
                 tx_reporter: None,
             }),

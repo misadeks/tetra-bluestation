@@ -300,6 +300,43 @@ fn active_group_tx_demand_ceased_and_disconnect_pdus_decode() {
     assert_eq!(pdu.disconnect_cause, DisconnectCause::UserRequestedDisconnection);
 }
 
+/// ETSI TS 100 392-2 cl. 14.5 / basic-link addressing cl. 21 & 23; ACK
+/// correlation cl. 22.3.2.3: every uplink CMCE PDU on a GROUP call (here
+/// U-DISCONNECT) must be keyed at layer 2 on the MS's OWN individual ISSI, not
+/// the group SSI. The group identity is carried *inside* the PDU (Call
+/// identifier / Called-party element, cl. 14.8.4 / 14.8.28), never as the
+/// layer-2 address.
+///
+/// Regression: on the real network a group-call U-DISCONNECT keyed on the GSSI
+/// produced "received unexpected ACK for SSI <own ISSI>" plus
+/// "schedule_retransmissions: SSI <group> exhausted retransmissions" — the
+/// acknowledged BL-DATA was keyed on the group while the SwMI's BL-ACK is
+/// addressed to the MS's ISSI, so the ACK never matched and the frame
+/// retransmitted to exhaustion. The floor path (M4c) and U-SETUP already
+/// address own ISSI; this covers the remaining call-control senders.
+#[test]
+fn group_call_uplink_signalling_keyed_on_own_issi() {
+    let mut cc = CcMsSubentity::new_with_config(shared_ms_config(), None);
+    let mut q = MessageQueue::new();
+
+    // Genuine other-user group set-up on the GSSI -> creates the group call.
+    cc.route_rd_deliver(
+        &mut q,
+        dl_msg(&group_setup(TransmissionGrant::NotGranted), TetraAddress::new(GSSI, SsiType::Gssi)),
+    );
+    assert_eq!(cc.call(CALL_ID).unwrap().state, MsCcState::CallActive);
+    while q.pop_front().is_some() {}
+
+    assert!(cc.disconnect_call(&mut q, CALL_ID, DisconnectCause::UserRequestedDisconnection));
+    let mut prim = pop_unitdata(&mut q);
+    // Layer-2 address is the MS's own individual ISSI, NOT the group SSI.
+    assert_eq!(prim.main_address.ssi, ISSI, "uplink U-DISCONNECT must be keyed on own ISSI");
+    assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
+    // The group call is still identified inside the PDU body.
+    let pdu = UDisconnect::from_bitbuf(&mut prim.sdu).unwrap();
+    assert_eq!(pdu.call_identifier, CALL_ID);
+}
+
 /// ETSI TS 100 392-2 Table 14.81: the "transmission request permission" element
 /// is 0 = allowed to request, 1 = NOT allowed to request. A SwMI that signals
 /// bit 1 must block a subsequent U-TX-DEMAND; bit 0 must permit it.
