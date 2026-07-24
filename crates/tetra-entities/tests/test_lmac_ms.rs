@@ -159,6 +159,97 @@ fn test_lmac_ms_tx_tchs_nub_roundtrip() {
     );
 }
 
+/// Drive a single stolen-slot TMV-UNITDATA request (STCH signalling in the first
+/// half + TCH/S speech in the second half) through LmacMs and return the encoded
+/// TP-UNITDATA request slot it emits to PHY.
+fn encode_uplink_stolen(
+    stch_block: BitBuffer,
+    speech_block: BitBuffer,
+    scrambling_code: u32,
+) -> tetra_saps::tp::TpUnitdataReqSlot {
+    let mut test = ComponentTest::new(StackMode::Ms, None);
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Phy]);
+
+    let m = SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Lmac,
+        msg: SapMsgInner::TmvUnitdataReq(TmvUnitdataReqSlot {
+            ts: TdmaTime::default(),
+            ul_phy_chan: PhysicalChannel::Tp,
+            blk1: Some(TmvUnitdataReq {
+                mac_block: stch_block,
+                logical_channel: LogicalChannel::Stch,
+                scrambling_code,
+            }),
+            blk2: Some(TmvUnitdataReq {
+                mac_block: speech_block,
+                logical_channel: LogicalChannel::TchS,
+                scrambling_code,
+            }),
+            bbk: None,
+            reserved_access: false,
+        }),
+    };
+
+    test.submit_message(m);
+    test.deliver_all_messages();
+    let mut sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 1, "LmacMs should emit exactly one TP request");
+    let msg = sink_msgs.remove(0);
+    assert_eq!(msg.sap, Sap::TpSap);
+    assert_eq!(msg.dest, TetraEntity::Phy);
+    let SapMsgInner::TpUnitdataReq(slot) = msg.msg else {
+        panic!("expected TpUnitdataReq, got {:?}", msg.msg);
+    };
+    slot
+}
+
+#[test]
+/// Uplink FACCH/STCH stealing (M4b): when the MS steals a granted traffic slot to
+/// carry associated signalling (e.g. U-TX-CEASED / U-TX-DEMAND), LmacMs must emit
+/// a Normal Uplink Burst with normal training sequence 2 (cl. 9.4.4.3.2 / cl. 23),
+/// where the first half is the STCH signalling block (`encode_cp`, 216 bits) and
+/// the second half is the remaining TCH/S speech half (`encode_tp` blk 2, 216
+/// bits). This mirrors the BS downlink NDB/NormalTrainSeq2 two-half-block layout.
+///
+/// In-repo framing proof: the STCH half — the floor PDU the real BS must decode —
+/// round-trips bit-exact through the exact BS control decoder (`decode_cp`). The
+/// speech half is the second 216 type-5 bits of a 432-bit ACELP block; with the
+/// first half stolen it decodes as BFI at the vocoder, which is spec-correct at a
+/// PTT/stealing boundary, so only its framing (length) is asserted here.
+fn test_lmac_ms_tx_stolen_stch_nub_roundtrip() {
+    debug::setup_logging_verbose();
+
+    let scrambling_code = 1761749767;
+    let stch_block = make_block(124);
+    let stch_bits = bits_of(&stch_block, 124);
+    let speech_block = make_speech_frame();
+
+    let slot = encode_uplink_stolen(stch_block, speech_block, scrambling_code);
+
+    assert_eq!(slot.burst_type, BurstType::NUB, "stolen slot is a Normal Uplink Burst");
+    assert_eq!(slot.train_type, TrainingSequence::NormalTrainSeq2, "stolen slot uses NormalTrainSeq2");
+    assert!(slot.bbk.is_none());
+
+    let blk1 = slot.blk1.expect("blk1 (STCH) present");
+    assert_eq!(blk1.get_len(), 216, "STCH type-5 half-slot block is 216 bits");
+    let blk2 = slot.blk2.expect("blk2 (TCH/S speech half) present");
+    assert_eq!(blk2.get_len(), 216, "TCH/S stolen speech half is 216 bits");
+
+    // The stolen STCH signalling block must round-trip through the SAME control
+    // decoder the on-air BS runs, bit-for-bit — this is the floor PDU delivery
+    // guarantee at the heart of M4b.
+    let (decoded, crc_ok) = errorcontrol::decode_cp(LogicalChannel::Stch, tp_ind(blk1, PhyBlockType::NDB), Some(scrambling_code));
+    assert!(crc_ok, "CRC must pass on the stolen STCH round-trip");
+    assert_eq!(
+        bits_of(&decoded.expect("decoded STCH block"), 124),
+        stch_bits,
+        "recovered STCH signalling block must match the source floor PDU"
+    );
+}
+
 #[test]
 /// D-2 (tune plumbing): a TMV-TUNE from UMAC is forwarded down to the PHY as a
 /// TPC-TUNE carrying the same carrier (LMAC holds no radio-tuning state).
