@@ -331,6 +331,18 @@ pub struct UmacMs {
     /// MCCH's). Cross-carrier / cell-change allocations are deferred to M3.
     assigned_traffic_slots: [bool; 4],
 
+    /// SSI whose CHANNEL ALLOCATION the MS is currently following as its traffic
+    /// channel (the destination address the serving cell tagged the assignment
+    /// to). An individual (point-to-point) call's traffic is addressed to this
+    /// MS's own ISSI; a group call's to the GSSI. Used to arbitrate the single
+    /// transceiver: while engaged on an own-ISSI (individual) traffic channel, a
+    /// concurrently-notified group call's CHANNEL ALLOCATION must not `Replace`
+    /// the assigned slot and move the MS off the private call (ETSI TS 100 392-2
+    /// v3.10.1 cl. 14.2.4.1 — concurrent calls are an optional, capability-
+    /// limited feature; a single-transceiver MS has one traffic resource).
+    /// Cleared when the U-plane is switched off (the call released the resource).
+    traffic_channel_owner: Option<u32>,
+
     /// AACH downlink usage markers (ETSI TS 100 392-2 cl. 21.4.7.2) currently
     /// bound to calls this MS participates in, mapped to the destination SSI
     /// (group or individual) the serving cell addressed the assignment to. Built
@@ -439,6 +451,7 @@ impl UmacMs {
             derived_ul_freq: None,
             serving_carrier_num: None,
             assigned_traffic_slots: [false; 4],
+            traffic_channel_owner: None,
             active_traffic_usage_markers: BTreeMap::new(),
             current_traffic_usage_marker: None,
             uplink_tx_granted: false,
@@ -928,7 +941,7 @@ impl UmacMs {
             // on. Done before the LLC hand-off so the assigned-slot record is in
             // place when the U-plane later switches on. Same-carrier only in M2.
             if let Some(ca) = &pdu.chan_alloc_element {
-                self.act_on_channel_allocation(ca);
+                self.act_on_channel_allocation(ca, pdu.addr.unwrap().ssi);
             }
 
             // Learn the AACH usage marker the serving cell bound to this call
@@ -2769,6 +2782,15 @@ impl UmacMs {
                 if !granted {
                     self.uplink_audio.clear();
                 }
+                // Releasing the U-plane (switch off) frees the single traffic
+                // resource, so the individual-call engagement lock is cleared and
+                // a subsequently-notified group call may take the channel
+                // (cl. 14.2.4.1 / 14.5.1.1). While an individual call is engaged
+                // the CMCE gate keeps a group's switch-off from reaching here, so
+                // this only fires on the engaged call's own release.
+                if !prim.switch_u_plane {
+                    self.traffic_channel_owner = None;
+                }
             }
             _ => {
                 panic!();
@@ -2806,7 +2828,7 @@ impl UmacMs {
     /// M3 — here it is logged and ignored (no retune, no slot change), so the MS
     /// keeps decoding its current channel rather than acting half-way on an
     /// allocation it cannot yet follow.
-    fn act_on_channel_allocation(&mut self, ca: &ChanAllocElement) {
+    fn act_on_channel_allocation(&mut self, ca: &ChanAllocElement, alloc_ssi: u32) {
         // Cross-cell or extended (cross-band) carrier numbering: defer to M3.
         if ca.ext.is_some() || ca.cell_change_flag {
             tracing::info!(
@@ -2848,6 +2870,29 @@ impl UmacMs {
             return;
         }
 
+        // ETSI TS 100 392-2 v3.10.1 cl. 14.2.4.1 single-transceiver arbitration:
+        // while the MS is engaged on an individual (point-to-point) traffic
+        // channel — one addressed to its own ISSI — a concurrently-notified
+        // group call's CHANNEL ALLOCATION (addressed to the GSSI) must not move
+        // the MS's single transceiver off the private call. The serving cell
+        // re-broadcasts the group's assignment for late entry (cl. 14.5.1.1);
+        // following it here would `Replace` the private call's assigned slot and
+        // break it. Ignore any allocation whose destination differs from the
+        // own-ISSI channel we are engaged on; a same-owner (own-ISSI) refresh, a
+        // genuine hand-over of the private call, or (once the private call has
+        // released the resource) the group's own allocation are all still
+        // followed.
+        let own = self.own_issi();
+        let engaged_individual = self.traffic_channel_owner == Some(own);
+        if engaged_individual && alloc_ssi != own {
+            tracing::info!(
+                "rx_mac_resource: ignoring CHANNEL ALLOCATION for SSI {} while engaged on individual call (own ISSI {}) (cl. 14.2.4.1)",
+                alloc_ssi,
+                own
+            );
+            return;
+        }
+
         // Apply the assignment per its type (cl. 21.5.2 / 14.8.17a):
         //  - Replace / QuitAndGo / ReplaceWithCarrierSignalling: this becomes the
         //    traffic channel — overwrite the assigned-slot set.
@@ -2864,10 +2909,12 @@ impl UmacMs {
                 self.assigned_traffic_slots = ca.ts_assigned;
             }
         }
+        self.traffic_channel_owner = Some(alloc_ssi);
         tracing::info!(
-            "rx_mac_resource: following same-carrier CHANNEL ALLOCATION {} on carrier {}, assigned traffic slots {:?}",
+            "rx_mac_resource: following same-carrier CHANNEL ALLOCATION {} on carrier {} for SSI {}, assigned traffic slots {:?}",
             ca.alloc_type,
             ca.carrier_num,
+            alloc_ssi,
             self.assigned_traffic_slots
         );
     }
@@ -4096,13 +4143,17 @@ attach_groups = []
     fn test_channel_allocation_cross_carrier_deferred() {
         let mut umac = ms_umac();
         umac.serving_carrier_num = Some(1593);
+        let own = umac.own_issi();
 
-        umac.act_on_channel_allocation(&chan_alloc(
-            ChanAllocType::Replace,
-            [false, false, true, false],
-            1600, // different carrier
-            UlDlAssignment::Both,
-        ));
+        umac.act_on_channel_allocation(
+            &chan_alloc(
+                ChanAllocType::Replace,
+                [false, false, true, false],
+                1600, // different carrier
+                UlDlAssignment::Both,
+            ),
+            own,
+        );
         assert_eq!(umac.assigned_traffic_slots, [false; 4], "cross-carrier allocation not followed");
 
         let mut q = MessageQueue::new();
@@ -4121,33 +4172,106 @@ attach_groups = []
     fn test_channel_allocation_additional_and_ul_only() {
         let mut umac = ms_umac();
         umac.serving_carrier_num = Some(1593);
+        let own = umac.own_issi();
 
-        umac.act_on_channel_allocation(&chan_alloc(
-            ChanAllocType::Replace,
-            [false, false, true, false],
-            1593,
-            UlDlAssignment::Both,
-        ));
-        umac.act_on_channel_allocation(&chan_alloc(
-            ChanAllocType::Additional,
-            [false, true, false, false],
-            1593,
-            UlDlAssignment::Dl,
-        ));
+        umac.act_on_channel_allocation(
+            &chan_alloc(
+                ChanAllocType::Replace,
+                [false, false, true, false],
+                1593,
+                UlDlAssignment::Both,
+            ),
+            own,
+        );
+        umac.act_on_channel_allocation(
+            &chan_alloc(
+                ChanAllocType::Additional,
+                [false, true, false, false],
+                1593,
+                UlDlAssignment::Dl,
+            ),
+            own,
+        );
         assert_eq!(umac.assigned_traffic_slots, [false, true, true, false], "Additional adds TS2 to TS3");
 
         // An uplink-only assignment leaves the downlink assigned set untouched.
-        umac.act_on_channel_allocation(&chan_alloc(
-            ChanAllocType::Replace,
-            [true, false, false, false],
-            1593,
-            UlDlAssignment::Ul,
-        ));
+        umac.act_on_channel_allocation(
+            &chan_alloc(
+                ChanAllocType::Replace,
+                [true, false, false, false],
+                1593,
+                UlDlAssignment::Ul,
+            ),
+            own,
+        );
         assert_eq!(
             umac.assigned_traffic_slots,
             [false, true, true, false],
             "uplink-only allocation does not change DL slots"
         );
+    }
+
+    /// cl. 14.2.4.1 single-transceiver arbitration: while engaged on an
+    /// individual (own-ISSI) traffic channel, a concurrently-notified group
+    /// call's CHANNEL ALLOCATION (addressed to a GSSI) must not move the MS off
+    /// the private call. Once the private call releases the U-plane (owner
+    /// cleared) the group's allocation is followed again (late entry).
+    #[test]
+    fn test_channel_allocation_individual_call_not_preempted_by_group() {
+        let mut umac = ms_umac();
+        umac.serving_carrier_num = Some(1593);
+        let own = umac.own_issi();
+        let gssi = own + 1; // any SSI that is not our ISSI
+
+        // Engage on an individual (own-ISSI) traffic channel on TS3.
+        umac.act_on_channel_allocation(
+            &chan_alloc(
+                ChanAllocType::Replace,
+                [false, false, true, false],
+                1593,
+                UlDlAssignment::Both,
+            ),
+            own,
+        );
+        assert_eq!(umac.assigned_traffic_slots, [false, false, true, false]);
+        assert_eq!(umac.traffic_channel_owner, Some(own));
+
+        // A group call's Replace allocation (GSSI, TS4) arrives — must be ignored.
+        umac.act_on_channel_allocation(
+            &chan_alloc(
+                ChanAllocType::Replace,
+                [false, false, false, true],
+                1593,
+                UlDlAssignment::Both,
+            ),
+            gssi,
+        );
+        assert_eq!(
+            umac.assigned_traffic_slots,
+            [false, false, true, false],
+            "group allocation must not preempt the engaged individual call"
+        );
+        assert_eq!(umac.traffic_channel_owner, Some(own), "owner unchanged");
+
+        // The individual call releases the U-plane resource.
+        umac.traffic_channel_owner = None;
+
+        // Now the group's re-broadcast allocation (late entry) is followed.
+        umac.act_on_channel_allocation(
+            &chan_alloc(
+                ChanAllocType::Replace,
+                [false, false, false, true],
+                1593,
+                UlDlAssignment::Both,
+            ),
+            gssi,
+        );
+        assert_eq!(
+            umac.assigned_traffic_slots,
+            [false, false, false, true],
+            "group allocation followed once the private call has released"
+        );
+        assert_eq!(umac.traffic_channel_owner, Some(gssi));
     }
 
     // ─── M4a: uplink TCH/S traffic emission ────────────────────────────────

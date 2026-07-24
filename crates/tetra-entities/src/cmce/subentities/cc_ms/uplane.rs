@@ -63,28 +63,29 @@ impl CcMsSubentity {
         // ETSI TS 100 392-2 cl. 14.2.4.1 single-U-plane arbitration: while an
         // engaged individual (point-to-point) call holds the MS's sole U-plane /
         // traffic-channel resource, a concurrently-notified group call must not
-        // seize it. Withhold the group call's U-plane switch-ON (and the
-        // LCMC-MLE CONFIGURE that would retune/reconfigure the lower layers off
-        // the private call), which is what otherwise disrupts an active private
-        // call when a group call occurs. The group call remains tracked; its
-        // periodic D-SETUP late-entry re-broadcast (cl. 14.5.1.1) will switch the
-        // U-plane on once the individual call releases the resource. A switch-OFF
-        // (call_release) is never gated.
-        if switch_u_plane {
-            let is_group = self
-                .calls
-                .get(&call_identifier)
-                .map(|c| c.kind != MsCallKind::Individual)
-                .unwrap_or(false);
-            if is_group {
-                if let Some(active) = self.individual_call_holding_uplane(call_identifier) {
-                    tracing::info!(
-                        call_identifier,
-                        active_individual = active,
-                        "CMCE-MS: withholding group-call U-plane activation while engaged in individual call (cl. 14.2.4.1)"
-                    );
-                    return;
-                }
+        // touch it. Withhold ALL of the group call's U-plane reconfiguration —
+        // both the switch-ON (D-SETUP / D-TX-GRANTED) and, critically, the
+        // switch-OFF driven by the group's own floor churn (D-TX-CEASED /
+        // D-TX-WAIT): the LCMC-MLE CONFIGURE it emits reconfigures the SHARED
+        // lower-layer U-plane and would tear the private call's grant down. The
+        // group call stays tracked; its periodic D-SETUP late-entry re-broadcast
+        // (cl. 14.5.1.1) switches the U-plane on once the individual call
+        // releases the resource.
+        let is_group = self
+            .calls
+            .get(&call_identifier)
+            .map(|c| c.kind != MsCallKind::Individual)
+            .unwrap_or(false);
+        if is_group {
+            if let Some(active) = self.individual_call_holding_uplane(call_identifier) {
+                tracing::info!(
+                    call_identifier,
+                    active_individual = active,
+                    switch_u_plane,
+                    tx_grant,
+                    "CMCE-MS: withholding group-call U-plane (re)configuration while engaged in individual call (cl. 14.2.4.1)"
+                );
+                return;
             }
         }
         let Some(call) = self.calls.get_mut(&call_identifier) else { return };
