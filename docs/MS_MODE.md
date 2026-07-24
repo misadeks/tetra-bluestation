@@ -57,20 +57,20 @@ with a `MessageRouter` and exchange `SapMsg` over SAPs. MS mode reuses that fram
 with MS-specific entity implementations.
 
 ```
-        ┌────────────── UI process — misadeks/tetra-tn-web-ui (separate repo) ──────────────┐
-        │  portable-radio UI  •  codeplug programming  •  ACELP vocoder (TCH/S <-> PCM)   │
-        └───▲───────────────────────────────┬──────────────────────────────▲─────────────┘
-   telemetry│ (stack->UI)          control  │ (UI->stack)              voice │ frames
-        ┌───┴───────────────────────────────┴──────────────────────────────┴─────────────┐
-        │  CMCE-MS (CC / SDS / SS)   MM-MS (registration)   TNMM + management (Plane A/B)  │
-        │  ─────────────────────────────────────────────────────────────────────────────  │
+        ┌────────────── UI process — misadeks/tetra-tn-web-ui (separate repo) ──────────┐
+        │  portable-radio UI  •  codeplug programming  •  ACELP vocoder (TCH/S <-> PCM) │
+        └───▲───────────────────────────────┬──────────────────────────────▲────────────┘
+   telemetry│ (stack->UI)          control  │ (UI->stack)            voice │ frames
+        ┌───┴───────────────────────────────┴──────────────────────────────┴────────────────┐
+        │  CMCE-MS (CC / SDS / SS)   MM-MS (registration)   TNMM + management (Plane A/B)   │
+        │  ───────────────────────────────────────────────────────────────────────────────  │
         │  MLE-MS (cell selection, TL routing, BREAK/REOPEN)                                │
         │  LLC (shared, MS-gated ack behaviour)                                             │
         │  UMAC-MS (random access, reserved access, fragmentation, RX filter, U-plane gate) │
         │  LMAC-MS (channel coding, scrambling, TCH/S, STCH stealing)                       │
         │  PHY-MS (RX-driven clock, DL demod, discontinuous UL TX, uplink retune)           │
-        └───────────────────────────────────────▲──────────────────────────────────────────┘
-                                                 │  SoapySDR (RX = downlink, TX = uplink)
+        └───────────────────────────────────────▲───────────────────────────────────────────┘
+                                                │  SoapySDR (RX = downlink, TX = uplink)
 ```
 
 **The key architectural difference from BS mode:** the BS is the timing master (its TX
