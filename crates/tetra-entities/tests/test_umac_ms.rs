@@ -633,7 +633,7 @@ fn test_umac_ms_drops_speech_without_channel_allocation() {
             sap: Sap::TmdSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: vec![0u8; 8] }),
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: vec![0u8; 8], bfi: false }),
         });
     }
     test.deliver_all_messages();

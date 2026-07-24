@@ -1266,6 +1266,7 @@ impl UmacBs {
             SapMsgInner::TmdCircuitDataInd(prim) => {
                 let ts = prim.ts;
                 let data = prim.data;
+                let bfi = prim.bfi;
 
                 // Track last UL voice frame time for inactivity detection
                 if (1..=4).contains(&ts) {
@@ -1279,7 +1280,7 @@ impl UmacBs {
                             sap: Sap::TmdSap,
                             src: TetraEntity::Umac,
                             dest: TetraEntity::Brew,
-                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone() }),
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone(), bfi }),
                         };
                         queue.push_back(msg);
                     } else {

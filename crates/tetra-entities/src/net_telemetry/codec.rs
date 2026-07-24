@@ -76,6 +76,48 @@ mod tests {
         assert!(codec.decode(&[0xFF, 0x00]).is_err());
     }
 
+    #[test]
+    fn test_roundtrip_ms_speech_frame() {
+        // U-plane downlink speech offload: a 274-bit TCH/S type-1 block carried
+        // one-bit-per-byte, with sequence, BFI and talker, must survive both
+        // codecs byte-for-byte.
+        let data: Vec<u8> = (0..274u16).map(|i| (i % 2) as u8).collect();
+        let event = TelemetryEvent::MsSpeechFrame {
+            call_identifier: 68,
+            timeslot: 2,
+            sequence: 42,
+            transmitting_party_ssi: Some(2200699),
+            frame_bits: 274,
+            bad_frame: true,
+            data: data.clone(),
+        };
+
+        for decoded in [
+            TelemetryCodecBitcode.decode(&TelemetryCodecBitcode.encode(&event)).unwrap(),
+            TelemetryCodecJson.decode(&TelemetryCodecJson.encode(&event)).unwrap(),
+        ] {
+            let TelemetryEvent::MsSpeechFrame {
+                call_identifier,
+                timeslot,
+                sequence,
+                transmitting_party_ssi,
+                frame_bits,
+                bad_frame,
+                data: got,
+            } = decoded
+            else {
+                panic!("expected MsSpeechFrame");
+            };
+            assert_eq!(call_identifier, 68);
+            assert_eq!(timeslot, 2);
+            assert_eq!(sequence, 42);
+            assert_eq!(transmitting_party_ssi, Some(2200699));
+            assert_eq!(frame_bits, 274);
+            assert!(bad_frame);
+            assert_eq!(got, data);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // TNMM-SAP (cl. 15.3) telemetry roundtrips. TelemetryEvent itself is not
     // PartialEq, so we compare the (PartialEq) tnmm payloads after decoding.

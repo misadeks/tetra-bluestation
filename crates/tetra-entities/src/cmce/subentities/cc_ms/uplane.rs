@@ -78,13 +78,19 @@ impl CcMsSubentity {
     /// U-plane traffic is only meaningful while the CC has switched the U-plane
     /// on for an active call (call present / receiving speech), so a frame that
     /// arrives while every call has the U-plane switched off is discarded. When
-    /// a U-plane-on call is present the frame is accepted into that call's
-    /// receive path — the minimal audio egress until a vocoder/audio sink is
-    /// wired.
-    pub fn rx_downlink_traffic(&mut self, _ts: u8, data: &[u8]) {
+    /// a U-plane-on call is present the frame is forwarded to the external UI
+    /// over the telemetry SAP as a [`TelemetryEvent::MsSpeechFrame`].
+    ///
+    /// The payload is the channel-decoded TCH/S type-1 bit block (ETSI TS 100
+    /// 392-2 cl. 19.4): 274 bits carried one-bit-per-byte, i.e. two 137-bit ACELP
+    /// speech frames per EN 300 395-2. The stack performs no vocoding — the UI
+    /// runs the ACELP decoder (type-1 bits → PCM). `bfi` (bad-frame indicator)
+    /// carries the channel-decode CRC result so the UI can apply substitution and
+    /// muting on corrupted frames instead of decoding them as valid speech.
+    pub fn rx_downlink_traffic(&mut self, ts: u8, bfi: bool, data: &[u8]) {
         // Find the active call currently receiving on the U-plane. M1 assumes a
         // single simultaneous call on the serving carrier; the assigned-timeslot
-        // demux (matching `_ts` to a specific call) arrives with the
+        // demux (matching `ts` to a specific call) arrives with the
         // channel-allocation handling in a later milestone.
         let Some(call) = self
             .calls
@@ -96,12 +102,26 @@ impl CcMsSubentity {
         };
 
         call.rx_speech_frames = call.rx_speech_frames.saturating_add(1);
+        let call_identifier = call.call_identifier;
+        let sequence = call.rx_speech_frames;
+        let transmitting_party_ssi = call.current_speaker_ssi;
         tracing::info!(
-            call = call.call_identifier,
-            frames = call.rx_speech_frames,
+            call = call_identifier,
+            frames = sequence,
             bits = data.len(),
+            bfi,
             "CC-MS: received downlink speech frame (U-plane)"
         );
+
+        self.emit(TelemetryEvent::MsSpeechFrame {
+            call_identifier,
+            timeslot: ts,
+            sequence,
+            transmitting_party_ssi,
+            frame_bits: data.len() as u16,
+            bad_frame: bfi,
+            data: data.to_vec(),
+        });
     }
 
     /// Supply an uplink TCH/S U-plane source frame while this MS holds the floor.

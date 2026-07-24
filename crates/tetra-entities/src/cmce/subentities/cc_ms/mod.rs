@@ -542,16 +542,67 @@ mod tests {
         );
 
         // U-plane still switched off: received speech is discarded (cl. 14.5.1.4).
-        cc.rx_downlink_traffic(3, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, false, &[1u8; 274]);
         assert_eq!(cc.call(7).unwrap().rx_speech_frames, 0, "no frames accepted while U-plane off");
 
         // Grant switches the U-plane on; subsequent speech frames are accepted.
         cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
         assert_eq!(cc.call(7).unwrap().last_uplane.map(|u| u.switch_u_plane), Some(true));
 
-        cc.rx_downlink_traffic(3, &[1u8; 274]);
-        cc.rx_downlink_traffic(3, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, false, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, false, &[1u8; 274]);
         assert_eq!(cc.call(7).unwrap().rx_speech_frames, 2, "frames accepted while U-plane on");
+    }
+
+    #[test]
+    fn downlink_speech_emits_telemetry_frame() {
+        // cl. 14.5.1.4: with the U-plane switched on, each decoded TCH/S block is
+        // forwarded to the UI as an MsSpeechFrame carrying the type-1 bits, the
+        // per-call sequence, the BFI, and the current talker.
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            9,
+            MsCall::new(
+                9,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+        // GrantedToOtherUser switches the U-plane on for receive and records the
+        // remote talker as the current speaker.
+        cc.apply_transmission_grant(&mut q, 9, TransmissionGrant::GrantedToOtherUser, Some(2200699));
+        while source.try_recv().is_some() {} // discard grant-phase telemetry
+
+        // First frame is good, second is a bad frame (BFI set).
+        let good = vec![1u8; 274];
+        cc.rx_downlink_traffic(2, false, &good);
+        cc.rx_downlink_traffic(2, true, &vec![0u8; 274]);
+
+        let frames: Vec<_> = std::iter::from_fn(|| source.try_recv())
+            .filter_map(|ev| match ev {
+                TelemetryEvent::MsSpeechFrame {
+                    call_identifier,
+                    timeslot,
+                    sequence,
+                    transmitting_party_ssi,
+                    frame_bits,
+                    bad_frame,
+                    data,
+                } => Some((call_identifier, timeslot, sequence, transmitting_party_ssi, frame_bits, bad_frame, data)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(frames.len(), 2, "one MsSpeechFrame per decoded block");
+        assert_eq!(frames[0], (9, 2, 1, Some(2200699), 274, false, good.clone()));
+        assert_eq!(frames[1].2, 2, "per-call sequence increments");
+        assert!(frames[1].5, "BFI propagated on the bad frame");
     }
 
     #[test]

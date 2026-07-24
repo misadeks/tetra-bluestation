@@ -3852,7 +3852,7 @@ attach_groups = []
             sap: Sap::TmdSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data }),
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data, bfi: false }),
         }
     }
 

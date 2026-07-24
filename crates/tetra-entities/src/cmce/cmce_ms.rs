@@ -199,7 +199,7 @@ impl TetraEntityTrait for CmceMs {
             // call's U-plane receive path.
             Sap::TmdSap => match message.msg {
                 SapMsgInner::TmdCircuitDataInd(ind) => {
-                    self.cc.rx_downlink_traffic(ind.ts, &ind.data);
+                    self.cc.rx_downlink_traffic(ind.ts, ind.bfi, &ind.data);
                 }
                 _ => panic!("CMCE-MS: unexpected message on TMD-SAP: {:?}", message.msg),
             },

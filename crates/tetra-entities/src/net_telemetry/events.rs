@@ -129,4 +129,32 @@ pub enum TelemetryEvent {
         call_identifier: u16,
         confirm: TnccTxConfirm,
     },
+
+    // -----------------------------------------------------------------------
+    // U-plane speech (Plane U, OUTBOUND) — downlink circuit-mode traffic.
+    //
+    // Not a TNMM/TNCC control primitive: this is the received U-plane speech
+    // stream (ETSI TS 100 392-2 cl. 14.5.1.4, U-plane switching) offloaded to
+    // the external UI, which runs the ACELP speech decoder. The stack performs
+    // no vocoding.
+    // -----------------------------------------------------------------------
+    /// One decoded downlink TCH/S speech block for an active call.
+    ///
+    /// `data` is the channel-decoded type-1 bit block (cl. 19.4): `frame_bits`
+    /// bits carried one-bit-per-byte (274 for TCH/S = two 137-bit ACELP speech
+    /// frames, EN 300 395-2). `sequence` is a per-call monotonically increasing
+    /// frame counter for jitter/ordering at the UI. `bad_frame` is the
+    /// channel-decode CRC bad-frame indicator (BFI): when `true` the UI must
+    /// apply error concealment (substitution/muting) rather than decode the
+    /// block as valid speech. `transmitting_party_ssi` is the current talker
+    /// when known (from the last D-TX GRANTED), for UI attribution.
+    MsSpeechFrame {
+        call_identifier: u16,
+        timeslot: u8,
+        sequence: u32,
+        transmitting_party_ssi: Option<u32>,
+        frame_bits: u16,
+        bad_frame: bool,
+        data: Vec<u8>,
+    },
 }
