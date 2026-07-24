@@ -20,6 +20,17 @@ The documentation repository contains:
 
 Contributions to the documentation follow the same pull-request-based workflow as the main codebase, see the appropriate "Contributions" chapter.
 
+### Mobile Station (MS) mode
+
+Documentation for the mobile-station (portable-radio) mode lives in-repo:
+
+- [`docs/MS_MODE.md`](docs/MS_MODE.md) — architecture, full feature matrix with
+  implementation state, spec traceability, and build/run instructions.
+- [`docs/MS_CONFIG.md`](docs/MS_CONFIG.md) — the MS configuration-file reference.
+- [`examples/ms-interface/README.md`](examples/ms-interface/README.md) — the external
+  UI / management interface (TNMM + provisioning).
+- [`example_config/config-ms.toml`](example_config/config-ms.toml) — a commented example MS config.
+
 ## Acknowledgements
 
 - Thanks to Harald Welte and the osmocom crew for their amazing initial work on osmocom-tetra, without which this project would not have existed. 
