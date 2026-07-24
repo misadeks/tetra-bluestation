@@ -69,7 +69,9 @@ impl CcMsSubentity {
             pdu.basic_service_information,
             pdu.simplex_duplex_selection,
             route,
-            pdu.transmission_request_permission,
+            // ETSI 14.8.43 Table 14.81: transmission_request_permission bit 0 =
+            // "allowed to request"; invert into the MS's "allowed" flag.
+            !pdu.transmission_request_permission,
         );
         call.current_speaker_ssi = pdu.calling_party_address_ssi;
         // Record the signalling mode dictated by the D-SETUP Hook method
@@ -189,12 +191,13 @@ impl CcMsSubentity {
                 basic,
                 simplex,
                 route,
-                pdu.transmission_request_permission,
+                // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request; invert.
+                !pdu.transmission_request_permission,
             )
         });
         call.state = MsCcState::CallActive;
         call.route = route;
-        call.transmission_request_allowed = pdu.transmission_request_permission;
+        call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
         call.simplex_duplex_selection = pdu.simplex_duplex_selection;
         call.start_call_timer(self.dltime, pdu.call_time_out);
         call.timers.setup_phase_deadline = None;
@@ -228,7 +231,7 @@ impl CcMsSubentity {
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.state = MsCcState::CallActive;
             call.route = route;
-            call.transmission_request_allowed = pdu.transmission_request_permission;
+            call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
             call.timers.setup_phase_deadline = None;
             if let Ok(timeout) = CallTimeout::try_from(pdu.call_time_out as u64) {
                 call.start_call_timer(self.dltime, timeout);
@@ -258,7 +261,7 @@ impl CcMsSubentity {
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::CallActive;
-            call.transmission_request_allowed = pdu.transmission_request_permission;
+            call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
             call.current_speaker_ssi = pdu.transmitting_party_address_ssi.map(|v| v as u32);
         }
         if let Ok(grant) = TransmissionGrant::try_from(pdu.transmission_grant as u64) {
@@ -306,7 +309,7 @@ impl CcMsSubentity {
             call.state = MsCcState::CallActive;
             call.tx_grant_state = MsTxGrantState::None;
             call.current_speaker_ssi = None;
-            call.transmission_request_allowed = pdu.transmission_request_permission;
+            call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
             call.pending_tx_request = false;
             Some(call.simplex_duplex_selection)
         } else {
@@ -333,7 +336,7 @@ impl CcMsSubentity {
         let simplex_duplex = if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::Wait;
-            call.transmission_request_allowed = pdu.transmission_request_permission;
+            call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
             call.tx_grant_state = MsTxGrantState::Waiting;
             call.uplane_before_wait = call.last_uplane.filter(|u| u.switch_u_plane);
             Some(call.simplex_duplex_selection)
@@ -361,7 +364,7 @@ impl CcMsSubentity {
         let restore = if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::CallActive;
-            call.transmission_request_allowed = pdu.transmission_request_permission;
+            call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
             let restore = if pdu.do_continue { call.uplane_before_wait.take() } else { None };
             if restore.is_none() {
                 call.tx_grant_state = MsTxGrantState::None;
@@ -402,7 +405,7 @@ impl CcMsSubentity {
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::CallActive;
-            call.transmission_request_allowed = pdu.transmission_request_permission;
+            call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
             call.current_speaker_ssi = pdu.transmitting_party_address_ssi.map(|v| v as u32);
         }
         if let Ok(grant) = TransmissionGrant::try_from(pdu.transmission_grant as u64) {

@@ -16,8 +16,9 @@ use tetra_pdus::cmce::{
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
-        d_disconnect::DDisconnect, d_release::DRelease, d_setup::DSetup, d_tx_continue::DTxContinue, d_tx_granted::DTxGranted,
-        d_tx_wait::DTxWait, u_alert::UAlert, u_connect::UConnect, u_disconnect::UDisconnect, u_release::URelease, u_setup::USetup,
+        d_disconnect::DDisconnect, d_release::DRelease, d_setup::DSetup, d_tx_ceased::DTxCeased, d_tx_continue::DTxContinue,
+        d_tx_granted::DTxGranted, d_tx_wait::DTxWait, u_alert::UAlert, u_connect::UConnect, u_disconnect::UDisconnect,
+        u_release::URelease, u_setup::USetup,
         u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
     },
 };
@@ -84,6 +85,7 @@ dl_write!(DSetup);
 dl_write!(DTxGranted);
 dl_write!(DTxWait);
 dl_write!(DTxContinue);
+dl_write!(DTxCeased);
 dl_write!(DDisconnect);
 dl_write!(DRelease);
 
@@ -113,7 +115,7 @@ fn group_setup(grant: TransmissionGrant) -> DSetup {
         simplex_duplex_selection: false,
         basic_service_information: speech_service(CommunicationType::P2Mp),
         transmission_grant: grant,
-        transmission_request_permission: true,
+        transmission_request_permission: false, // ETSI 14.8.43 Table 14.81: 0 = allowed to request
         call_priority: 0,
         notification_indicator: None,
         temporary_address: None,
@@ -294,6 +296,46 @@ fn active_group_tx_demand_ceased_and_disconnect_pdus_decode() {
     assert_eq!(pdu.disconnect_cause, DisconnectCause::UserRequestedDisconnection);
 }
 
+/// ETSI TS 100 392-2 Table 14.81: the "transmission request permission" element
+/// is 0 = allowed to request, 1 = NOT allowed to request. A SwMI that signals
+/// bit 1 must block a subsequent U-TX-DEMAND; bit 0 must permit it.
+///
+/// Regression: the MS previously stored the raw permission bit into its
+/// `transmission_request_allowed` flag, inverting the meaning — so a SwMI's
+/// normal "allowed" (bit 0) was read as "disallowed" and every U-TX-DEMAND after
+/// the first grant was rejected ("SwMI disallows TX DEMAND") on the real network.
+#[test]
+fn tx_demand_gated_by_transmission_request_permission_per_spec() {
+    let mut cc = CcMsSubentity::new(None);
+    let mut q = MessageQueue::new();
+
+    // SwMI forbids requests (bit 1 = not allowed): U-TX-DEMAND must be rejected.
+    let mut setup = group_setup(TransmissionGrant::GrantedToOtherUser);
+    setup.transmission_request_permission = true; // 1 = not allowed to request
+    cc.route_rd_deliver(&mut q, dl_msg(&setup, TetraAddress::new(GSSI, SsiType::Gssi)));
+    while q.pop_front().is_some() {}
+    assert!(
+        !cc.request_tx(&mut q, CALL_ID, 1),
+        "bit 1 (not allowed) must block U-TX-DEMAND"
+    );
+
+    // SwMI permits requests (bit 0 = allowed): a D-TX-CEASED re-opens the floor.
+    let ceased = DTxCeased {
+        call_identifier: CALL_ID,
+        transmission_request_permission: false, // 0 = allowed to request
+        notification_indicator: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    };
+    cc.route_rd_deliver(&mut q, dl_msg(&ceased, TetraAddress::new(GSSI, SsiType::Gssi)));
+    while q.pop_front().is_some() {}
+    assert!(
+        cc.request_tx(&mut q, CALL_ID, 1),
+        "bit 0 (allowed) must permit U-TX-DEMAND"
+    );
+}
+
 #[test]
 fn incoming_individual_answer_and_network_disconnect_pdus_decode() {
     let mut cc = CcMsSubentity::new(None);
@@ -353,7 +395,7 @@ fn downlink_grant_wait_continue_and_release_update_ms_state() {
     let granted = DTxGranted {
         call_identifier: CALL_ID,
         transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
-        transmission_request_permission: true,
+        transmission_request_permission: false, // ETSI 14.8.43 Table 14.81: 0 = allowed to request
         encryption_control: false,
         reserved: false,
         notification_indicator: None,
@@ -371,7 +413,7 @@ fn downlink_grant_wait_continue_and_release_update_ms_state() {
 
     let wait = DTxWait {
         call_identifier: CALL_ID,
-        transmission_request_permission: true,
+        transmission_request_permission: false, // ETSI 14.8.43 Table 14.81: 0 = allowed to request
         notification_indicator: None,
         facility: None,
         dm_ms_address: None,
@@ -384,7 +426,7 @@ fn downlink_grant_wait_continue_and_release_update_ms_state() {
     let cont = DTxContinue {
         call_identifier: CALL_ID,
         do_continue: true,
-        transmission_request_permission: true,
+        transmission_request_permission: false, // ETSI 14.8.43 Table 14.81: 0 = allowed to request
         notification_indicator: None,
         facility: None,
         dm_ms_address: None,
@@ -440,7 +482,7 @@ fn talker_floor_lifecycle_steals_tch_end_to_end() {
     let granted = DTxGranted {
         call_identifier: CALL_ID,
         transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
-        transmission_request_permission: true,
+        transmission_request_permission: false, // ETSI 14.8.43 Table 14.81: 0 = allowed to request
         encryption_control: false,
         reserved: false,
         notification_indicator: None,
