@@ -56,6 +56,71 @@ impl CcMsSubentity {
 
     pub(in crate::cmce::subentities::cc_ms) fn rx_d_setup(&mut self, queue: &mut MessageQueue, pdu: DSetup, route: CallRoute) {
         let kind = kind_from_basic_service(&pdu.basic_service_information);
+        let is_group = kind != MsCallKind::Individual;
+
+        // ETSI TS 100 392-2 cl. 14.5.2.1.2: "CC shall ignore the D-SETUP PDU if
+        // the calling party address is the same as the MS's own address and
+        // shall send a CONFIGURE request primitive for lower layer configuration
+        // ignoring the channel change." The SwMI periodically re-broadcasts the
+        // group D-SETUP for late entry (cl. 14.5.1.1); for the call originator
+        // these echoes carry its own calling party address. Ignoring them (no
+        // CONFIGURE change is emitted, so the U-plane is left untouched) prevents
+        // recreating the call, raising a duplicate TNCC-SETUP indication to the
+        // user application, and — critically — applying the echoed transmission
+        // grant, which would knock a talking MS off its own granted floor.
+        if is_group
+            && pdu.calling_party_address_ssi.is_some()
+            && pdu.calling_party_address_ssi == self.own_issi
+        {
+            tracing::debug!(
+                call_identifier = pdu.call_identifier,
+                calling_party = ?pdu.calling_party_address_ssi,
+                "CMCE-MS: ignoring own-address group D-SETUP re-broadcast (cl. 14.5.2.1.2)"
+            );
+            return;
+        }
+
+        // ETSI TS 100 392-2 cl. 14.5.2.1.2: a group addressed D-SETUP for a call
+        // the MS already tracks (late-entry re-broadcast from another calling
+        // party) makes the MS enter/stay CALL ACTIVE and apply the transmission
+        // grant element (U-plane reception), but it is not a new incoming call:
+        // the call is updated in place — it is NOT recreated and NO fresh
+        // TNCC-SETUP indication is raised. A genuine talker change is surfaced to
+        // the user application as a TNCC-TX indication only when the current
+        // speaker actually changes.
+        if is_group && self.calls.contains_key(&pdu.call_identifier) {
+            let prev_speaker = self.calls.get(&pdu.call_identifier).and_then(|c| c.current_speaker_ssi);
+            if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
+                call.route = route;
+                call.state = MsCcState::CallActive;
+                call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
+            }
+            self.apply_transmission_grant(queue, pdu.call_identifier, pdu.transmission_grant, pdu.calling_party_address_ssi);
+            let new_speaker = self.calls.get(&pdu.call_identifier).and_then(|c| c.current_speaker_ssi);
+            tracing::debug!(
+                call_identifier = pdu.call_identifier,
+                grant = ?pdu.transmission_grant,
+                speaker = ?new_speaker,
+                permission_not_allowed = pdu.transmission_request_permission,
+                "CMCE-MS: group D-SETUP re-broadcast — updating floor in place (cl. 14.5.2.1.2)"
+            );
+            if new_speaker != prev_speaker {
+                self.emit(TelemetryEvent::TnccTxIndication {
+                    call_identifier: pdu.call_identifier,
+                    indication: tncc::TnccTxIndication {
+                        encryption_flag: tncc::EncryptionFlag::ClearEndToEndTransmission,
+                        notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                        transmitting_party_ssi: new_speaker,
+                        transmitting_party_extension: None,
+                        external_subscriber_number: None,
+                        transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                        transmission_status: tncc_transmission_status_from_grant(pdu.transmission_grant),
+                    },
+                });
+            }
+            return;
+        }
+
         let setup_basic_for_event = pdu.basic_service_information.clone();
         let state = if kind == MsCallKind::Individual {
             MsCcState::MtCallSetup
@@ -257,6 +322,13 @@ impl CcMsSubentity {
     }
 
     fn rx_d_tx_granted(&mut self, queue: &mut MessageQueue, pdu: DTxGranted, route: CallRoute) {
+        tracing::info!(
+            call_identifier = pdu.call_identifier,
+            grant = pdu.transmission_grant,
+            transmitting_party_ssi = ?pdu.transmitting_party_address_ssi,
+            permission_not_allowed = pdu.transmission_request_permission,
+            "CMCE-MS: rx D-TX-GRANTED"
+        );
         let pending_before = self.calls.get(&pdu.call_identifier).map(|c| c.pending_tx_request).unwrap_or(false);
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
@@ -304,6 +376,11 @@ impl CcMsSubentity {
     }
 
     fn rx_d_tx_ceased(&mut self, queue: &mut MessageQueue, pdu: DTxCeased, route: CallRoute) {
+        tracing::info!(
+            call_identifier = pdu.call_identifier,
+            permission_not_allowed = pdu.transmission_request_permission,
+            "CMCE-MS: rx D-TX-CEASED"
+        );
         let simplex_duplex = if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::CallActive;
@@ -333,6 +410,11 @@ impl CcMsSubentity {
     }
 
     fn rx_d_tx_wait(&mut self, queue: &mut MessageQueue, pdu: DTxWait, route: CallRoute) {
+        tracing::info!(
+            call_identifier = pdu.call_identifier,
+            permission_not_allowed = pdu.transmission_request_permission,
+            "CMCE-MS: rx D-TX-WAIT"
+        );
         let simplex_duplex = if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::Wait;
@@ -361,6 +443,12 @@ impl CcMsSubentity {
     }
 
     fn rx_d_tx_continue(&mut self, queue: &mut MessageQueue, pdu: DTxContinue, route: CallRoute) {
+        tracing::info!(
+            call_identifier = pdu.call_identifier,
+            do_continue = pdu.do_continue,
+            permission_not_allowed = pdu.transmission_request_permission,
+            "CMCE-MS: rx D-TX-CONTINUE"
+        );
         let restore = if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::CallActive;
@@ -402,6 +490,13 @@ impl CcMsSubentity {
     }
 
     fn rx_d_tx_interrupt(&mut self, queue: &mut MessageQueue, pdu: DTxInterrupt, route: CallRoute) {
+        tracing::info!(
+            call_identifier = pdu.call_identifier,
+            grant = pdu.transmission_grant,
+            transmitting_party_ssi = ?pdu.transmitting_party_address_ssi,
+            permission_not_allowed = pdu.transmission_request_permission,
+            "CMCE-MS: rx D-TX-INTERRUPT"
+        );
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
             call.state = MsCcState::CallActive;

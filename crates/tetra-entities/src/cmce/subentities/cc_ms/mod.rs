@@ -256,6 +256,105 @@ mod tests {
         assert!(prim.stealing_permission);
     }
 
+    /// ETSI TS 100 392-2 cl. 14.5.2.1.2: the SwMI periodically re-broadcasts the
+    /// group D-SETUP for late entry. For the call originator these echoes carry
+    /// its OWN calling party address and must be ignored — not recreate the
+    /// call, not raise a duplicate TNCC-SETUP indication, and not apply the
+    /// echoed transmission grant (which would knock the talking MS off its own
+    /// granted floor).
+    #[test]
+    fn own_address_group_dsetup_rebroadcast_is_ignored() {
+        const OWN_ISSI: u32 = 1234567;
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        cc.own_issi = Some(OWN_ISSI);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+        // MS holds the floor (GrantedSelf).
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        assert_eq!(cc.call(7).unwrap().tx_grant_state, MsTxGrantState::GrantedSelf);
+        while source.try_recv().is_some() {} // discard prior telemetry
+        while q.pop_front().is_some() {}
+
+        // Own-address group D-SETUP re-broadcast granting the floor to "another
+        // user" (the group echo of our own hold).
+        let mut pdu = d_setup(7, false);
+        pdu.basic_service_information = default_speech_basic_service();
+        pdu.calling_party_address_ssi = Some(OWN_ISSI);
+        pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
+        cc.rx_d_setup(&mut q, pdu, route());
+
+        // Ignored: floor state preserved (still GrantedSelf), and NO TNCC event.
+        assert_eq!(
+            cc.call(7).unwrap().tx_grant_state,
+            MsTxGrantState::GrantedSelf,
+            "own-address D-SETUP echo must not knock the MS off its own floor"
+        );
+        assert!(
+            source.try_recv().is_none(),
+            "own-address D-SETUP re-broadcast must not raise any TNCC indication"
+        );
+    }
+
+    /// ETSI TS 100 392-2 cl. 14.5.2.1.2: a group D-SETUP for a call the MS
+    /// already tracks (late-entry re-broadcast from ANOTHER calling party)
+    /// updates the floor in place — it does not raise a duplicate TNCC-SETUP
+    /// indication — and surfaces the new talker as a TNCC-TX indication.
+    #[test]
+    fn known_group_dsetup_updates_in_place_and_surfaces_talker() {
+        const OWN_ISSI: u32 = 1234567;
+        const OTHER_TALKER: u32 = 555;
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        cc.own_issi = Some(OWN_ISSI);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+        while source.try_recv().is_some() {}
+
+        let mut pdu = d_setup(7, false);
+        pdu.basic_service_information = default_speech_basic_service();
+        pdu.calling_party_address_ssi = Some(OTHER_TALKER);
+        pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
+        cc.rx_d_setup(&mut q, pdu, route());
+
+        let mut saw_setup = false;
+        let mut tx_talker = None;
+        while let Some(ev) = source.try_recv() {
+            match ev {
+                TelemetryEvent::TnccSetupIndication { .. } => saw_setup = true,
+                TelemetryEvent::TnccTxIndication { indication, .. } => {
+                    tx_talker = indication.transmitting_party_ssi;
+                }
+                _ => {}
+            }
+        }
+        assert!(!saw_setup, "known-call re-broadcast must NOT raise a duplicate TNCC-SETUP indication");
+        assert_eq!(tx_talker, Some(OTHER_TALKER), "the new talker must be surfaced via TNCC-TX indication");
+        assert_eq!(cc.call(7).unwrap().current_speaker_ssi, Some(OTHER_TALKER));
+    }
+
     // --- MT individual-call answer path (cl. 14.5.1.1.1) ----------------------
 
     use crate::net_telemetry::channel::telemetry_channel;

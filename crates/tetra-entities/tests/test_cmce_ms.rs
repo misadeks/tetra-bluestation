@@ -33,6 +33,10 @@ mod default_stack;
 const CALL_ID: u16 = 77;
 const GSSI: u32 = 91;
 const ISSI: u32 = 1_000_001;
+// A different group member (the current talker). Per ETSI TS 100 392-2
+// cl. 14.5.2.1.2 a group D-SETUP whose calling party is the MS's OWN address is
+// ignored, so late-entry / floor-signalling fixtures must use another user.
+const OTHER_ISSI: u32 = 1_000_009;
 
 fn speech_service(communication_type: CommunicationType) -> BasicServiceInformation {
     BasicServiceInformation {
@@ -119,7 +123,7 @@ fn group_setup(grant: TransmissionGrant) -> DSetup {
         call_priority: 0,
         notification_indicator: None,
         temporary_address: None,
-        calling_party_address_ssi: Some(ISSI),
+        calling_party_address_ssi: Some(OTHER_ISSI),
         calling_party_extension: None,
         external_subscriber_number: None,
         facility: None,
@@ -236,7 +240,7 @@ fn cmce_ms_downlink_setup_emits_tncc_setup_indication() {
     };
     assert_eq!(call_identifier, CALL_ID);
     assert_eq!(indication.called_party_ssi, GSSI);
-    assert_eq!(indication.calling_party_ssi, Some(ISSI));
+    assert_eq!(indication.calling_party_ssi, Some(OTHER_ISSI));
 }
 #[test]
 fn ms_originated_setup_pdus_decode_with_tetra_pdus() {
