@@ -27,6 +27,7 @@ use tetra_pdus::umac::pdus::access_assign::AccessAssign;
 use tetra_pdus::umac::pdus::access_assign_fr18::AccessAssignFr18;
 use tetra_pdus::umac::pdus::access_define::AccessDefine;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
+use tetra_pdus::umac::pdus::mac_data::MacData;
 use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
 use tetra_pdus::umac::pdus::mac_end_ul::MacEndUl;
@@ -338,6 +339,32 @@ pub struct UmacMs {
     /// Drop-oldest on overflow so a slow consumer cannot grow it without bound;
     /// on underrun the scheduler emits a silence frame instead.
     uplink_audio: VecDeque<Vec<u8>>,
+
+    /// Queue of associated-signalling MAC blocks (STCH, cl. 21.4.3.3 MAC-DATA)
+    /// awaiting transmission by stealing a half-slot of the granted uplink
+    /// traffic channel (FACCH/STCH stealing, cl. 23). Populated by `rx_tma_prim`
+    /// when L3 requests stealing (`stealing_permission`) while this MS holds an
+    /// active uplink traffic grant on an assigned slot — e.g. U-TX-CEASED /
+    /// U-TX-DEMAND floor PDUs carried as acknowledged BL-DATA on the
+    /// TCH-associated basic link. `drive_uplink_traffic` drains one per granted
+    /// traffic slot, placing it in the first (stolen) half of a Normal Uplink
+    /// Burst (normal training sequence 2) with the remaining TCH/S speech in the
+    /// second half. Each entry carries the LLC transmit receipt so the
+    /// acknowledged-mode outbound entry is marked transmitted when the block is
+    /// actually emitted (cl. 22.3.2.3).
+    pending_stolen_signalling: VecDeque<PendingStolenSignalling>,
+}
+
+/// One associated-signalling block queued for FACCH/STCH half-slot stealing on
+/// the granted uplink traffic channel (cl. 23).
+struct PendingStolenSignalling {
+    /// The 124-bit STCH type-1 MAC block (MAC-DATA header + LLC SDU + fill).
+    mac_block: BitBuffer,
+    /// Serving-cell uplink scrambling code the block must be encoded with.
+    scrambling_code: u32,
+    /// LLC acknowledged-mode transmit receipt (cl. 22.3.2.3), marked transmitted
+    /// when the stolen block is emitted so the basic link does not wedge.
+    tx_reporter: Option<TxReporter>,
 }
 
 impl UmacMs {
@@ -379,6 +406,7 @@ impl UmacMs {
             assigned_traffic_slots: [false; 4],
             uplink_tx_granted: false,
             uplink_audio: VecDeque::new(),
+            pending_stolen_signalling: VecDeque::new(),
         }
     }
 
@@ -1596,34 +1624,33 @@ impl UmacMs {
         }
     }
 
-    /// Emit the MS uplink TCH/S traffic burst for this timeslot, if this MS is
-    /// the current talker on its granted slot.
+    /// Emit the MS uplink burst on the assigned traffic slot for this timeslot:
+    /// continuous TCH/S speech while this MS is the talker, and/or a stolen
+    /// half-slot (FACCH/STCH, cl. 23) carrying associated signalling.
     ///
     /// Mirrors the BS downlink traffic emitter (`lmac_bs` NDB path) for the
     /// uplink direction. UMAC is the transmit timing authority (ETSI TS 100
-    /// 392-2 cl. 23): once per timeslot it decides whether a traffic burst is
-    /// due and clocks exactly one 274-bit TCH/S type-1 frame down to the LMAC,
-    /// which channel-codes it into a Normal Uplink Burst (cl. 9.4.4.2). The
-    /// stream itself is supplied by CC-MS (the U-plane owner, cl. 14.5.1.4) via
-    /// the jitter buffer; on underrun a silence frame is emitted so the granted
-    /// slot is never left dark mid-call.
+    /// 392-2 cl. 23): once per timeslot it decides whether a burst is due and
+    /// clocks exactly one down to the LMAC, which channel-codes it into a Normal
+    /// Uplink Burst (cl. 9.4.4.2). The speech stream is supplied by CC-MS (the
+    /// U-plane owner, cl. 14.5.1.4) via the jitter buffer; on underrun a silence
+    /// frame is emitted so a granted slot is never left dark mid-call.
     ///
-    /// Emission is gated on three independent conditions:
-    /// - `uplink_tx_granted`: this MS holds the transmission grant with the
-    ///   U-plane switched on (cl. 14.5.1.4, from the MLE-CONFIGURE seam);
-    /// - the paired uplink slot (`dltime + 2`, cl. 9.3.9) is one the network
-    ///   assigned to us as a traffic channel (`assigned_traffic_slots`, cl.
-    ///   21.5.2) — never hardcoded to a fixed timeslot;
-    /// - a valid serving-cell scrambling code is known (we are camped).
+    /// A burst is emitted on the paired uplink slot (`dltime + 2`, cl. 9.3.9)
+    /// only when all of the following hold:
+    /// - the slot is one the network assigned to us as a traffic channel
+    ///   (`assigned_traffic_slots`, cl. 21.5.2) — never hardcoded to a fixed
+    ///   timeslot — and it is not the frame-18 control frame (cl. 9.5.1c);
+    /// - a valid serving-cell scrambling code is known (we are camped); and
+    /// - either we hold the transmission grant (`uplink_tx_granted`, the talker,
+    ///   cl. 14.5.1.4) — emitting speech — or associated signalling is queued to
+    ///   steal a half-slot (e.g. a U-TX-DEMAND floor request while listening).
+    ///   With neither, a non-talking party stays silent.
     ///
-    /// Frame 18 of the multiframe carries no TCH/S: it is the control frame
-    /// reserved for the associated control channel signalling (cl. 9.5.1c /
-    /// 23.4.2.1), so no traffic burst is emitted there.
+    /// When both hold (talking and a signalling PDU is queued) the slot is
+    /// stolen: the STCH signalling block takes the first half and the TCH/S
+    /// speech the second (normal training sequence 2, cl. 9.4.4.3.2).
     fn drive_uplink_traffic(&mut self, queue: &mut MessageQueue) {
-        if !self.uplink_tx_granted {
-            return;
-        }
-
         // The uplink slot paired with the current downlink slot (cl. 9.3.9).
         let ul = self.dltime.add_timeslots(2);
 
@@ -1640,6 +1667,16 @@ impl UmacMs {
             return;
         }
 
+        // Two reasons to key the transmitter on the assigned uplink slot:
+        //  - we hold the transmission grant (talker) → emit continuous TCH/S; or
+        //  - associated signalling is queued to steal a half-slot (FACCH/STCH,
+        //    cl. 23) — e.g. a U-TX-DEMAND floor request while still listening.
+        // With neither, stay silent (a non-talking party does not transmit).
+        let has_steal = !self.pending_stolen_signalling.is_empty();
+        if !self.uplink_tx_granted && !has_steal {
+            return;
+        }
+
         // Uplink bursts are scrambled with the serving cell's code, known only
         // once camped (set from the received SYNC). Without it we cannot form a
         // decodable burst, so stay silent.
@@ -1647,12 +1684,15 @@ impl UmacMs {
             return;
         };
 
-        // Take the next queued U-plane source frame, or synthesise a silence
-        // frame on underrun (all-zero 274-bit type-1 block, mirroring the BS
-        // downlink silence path). Non-silence frames arrive as packed bytes;
-        // `BitBuffer::from_vec` wraps them and we clamp to the TCH/S type-1 size.
+        // The TCH/S speech half. When we are the talker, take the next queued
+        // U-plane source frame or synthesise silence on underrun (all-zero
+        // 274-bit type-1 block, mirroring the BS downlink silence path). When we
+        // are only stealing a slot to signal (not the talker) there is no speech
+        // to send, so the speech half is silence. Non-silence frames arrive as
+        // packed bytes; `BitBuffer::from_vec` wraps them and we clamp to the
+        // TCH/S type-1 size.
         let mac_block = match self.uplink_audio.pop_front() {
-            Some(frame) if !frame.is_empty() => {
+            Some(frame) if self.uplink_tx_granted && !frame.is_empty() => {
                 let mut buf = BitBuffer::from_vec(frame);
                 let end = (buf.get_raw_start() + TCH_S_TYPE1_BITS).min(buf.get_raw_end());
                 buf.set_raw_end(end);
@@ -1666,6 +1706,29 @@ impl UmacMs {
             logical_channel: LogicalChannel::TchS,
             scrambling_code,
         };
+
+        // If associated signalling is queued for FACCH/STCH stealing (cl. 23),
+        // steal the first half of this traffic slot: blk1 carries the STCH
+        // signalling block, blk2 the remaining TCH/S speech half. The burst then
+        // uses normal training sequence 2 (selected in the LMAC from the STCH
+        // logical channel). Otherwise the whole slot carries TCH/S speech (blk1
+        // only). Mark the stolen block's LLC receipt transmitted so the
+        // acknowledged-mode basic link progresses (cl. 22.3.2.3).
+        let (blk1, blk2) = match self.pending_stolen_signalling.pop_front() {
+            Some(steal) => {
+                if let Some(tx_reporter) = steal.tx_reporter {
+                    tx_reporter.try_mark_transmitted();
+                }
+                let stch = TmvUnitdataReq {
+                    mac_block: steal.mac_block,
+                    logical_channel: LogicalChannel::Stch,
+                    scrambling_code: steal.scrambling_code,
+                };
+                (stch, Some(blk))
+            }
+            None => (blk, None),
+        };
+
         let m = SapMsg {
             sap: Sap::TmvSap,
             src: self.self_component,
@@ -1675,8 +1738,8 @@ impl UmacMs {
                 // Traffic physical channel carries the TCH/S burst (cl. 9.4.4.2),
                 // matching the BS which uses Tp for traffic and Cp otherwise.
                 ul_phy_chan: PhysicalChannel::Tp,
-                blk1: Some(blk),
-                blk2: None,
+                blk1: Some(blk1),
+                blk2,
                 bbk: None,
                 // Continuous traffic is clock-driven on the assigned slot, not a
                 // BS-reserved random-access opportunity (cl. 23.5.2); the PHY may
@@ -1767,6 +1830,46 @@ impl UmacMs {
         // entry (cl. 22.3.2.3). Marking it drives the LLC retransmit/give-up
         // logic; see PendingUplink::tx_reporter.
         let tx_reporter = prim.tx_reporter.take();
+
+        // ── FACCH/STCH stealing on the granted traffic channel (cl. 23) ──────
+        // When L3 requests channel stealing (`stealing_permission`) and this MS
+        // has a traffic channel assigned for the call, the associated signalling
+        // (e.g. U-TX-CEASED while talking, or U-TX-DEMAND while listening) must be
+        // carried on the TCH by stealing a half-slot (STCH) — as acknowledged
+        // BL-DATA on the TCH-associated basic link — rather than contending for
+        // MCCH random access. Wrap the LLC SDU in a MAC-DATA PDU (cl. 21.4.3.3)
+        // and queue it for `drive_uplink_traffic` to emit in the stolen first
+        // half of the next burst on the assigned uplink slot. If no traffic
+        // channel is assigned yet (pre-TCH floor request) we fall through to the
+        // MCCH access path below, which now carries the PDU as acknowledged
+        // BL-DATA too.
+        if prim.stealing_permission && self.has_assigned_traffic_slot() {
+            prim.pdu.seek(0);
+            match Self::build_stch_mac_data_block(issi, &mut prim.pdu) {
+                Some(mac_block) => {
+                    tracing::info!(
+                        "rx_tma_prim: stealing granted traffic slot for associated signalling \
+                         (STCH MAC-DATA, {} SDU bits) for ISSI {}",
+                        prim.pdu.get_len(),
+                        issi
+                    );
+                    self.pending_stolen_signalling.push_back(PendingStolenSignalling {
+                        mac_block,
+                        scrambling_code,
+                        tx_reporter,
+                    });
+                    return;
+                }
+                None => {
+                    tracing::warn!(
+                        "rx_tma_prim: signalling SDU too large to steal a single STCH half-slot; \
+                         falling back to MCCH random access"
+                    );
+                    // Fall through to the MCCH access path with the receipt intact.
+                }
+            }
+        }
+
         // L3-specified PDU priority + emergency flag for the random-access gate
         // (cl. 23.5.1.4.4). Read before `prim.pdu` is consumed below.
         let pdu_priority = prim.pdu_priority;
@@ -1969,6 +2072,59 @@ impl UmacMs {
     /// "0" to the end of the MAC block). The receiver (cl. 23.4.3.2) treats the
     /// PDU as filling the block and strips the trailing fill bits, so the
     /// padding is never mis-decoded as a spurious second concatenated MAC PDU.
+    /// True when the network has assigned this MS at least one uplink traffic
+    /// slot via a same-carrier CHANNEL ALLOCATION element (cl. 21.5.2). Gates
+    /// FACCH/STCH stealing: without a granted traffic channel there is nothing to
+    /// steal, so associated signalling must go over the MCCH instead.
+    fn has_assigned_traffic_slot(&self) -> bool {
+        self.assigned_traffic_slots.iter().any(|&s| s)
+    }
+
+    /// Build a 124-bit STCH type-1 MAC block wrapping `sdu` (an LLC BL-DATA PDU)
+    /// in a MAC-DATA header (ETSI TS 100 392-2 cl. 21.4.3.3) for FACCH/STCH
+    /// half-slot stealing on the granted uplink traffic channel (cl. 23).
+    ///
+    /// Mirrors the BS downlink FACCH builder (`rx_ul_tma_unitdata_req` STCH path)
+    /// but for the uplink direction, where the MS uses MAC-DATA rather than the
+    /// downlink-only MAC-RESOURCE. The length indication covers header + SDU +
+    /// sub-octet fill (cl. 23.4.2.2); bits beyond `length_ind` octets are ignored
+    /// by the receiver. Returns `None` if the PDU does not fit a single STCH
+    /// half-slot, in which case the caller falls back to MCCH random access.
+    fn build_stch_mac_data_block(issi: u32, sdu: &mut BitBuffer) -> Option<BitBuffer> {
+        const STCH_TYPE1_BITS: usize = 124;
+
+        let mut pdu = MacData {
+            fill_bits: false,
+            encrypted: false,
+            addr: Some(TetraAddress {
+                ssi_type: SsiType::Issi,
+                ssi: issi,
+            }),
+            event_label: None,
+            // Complete (non-fragmented) PDU: carry an explicit length indication
+            // rather than a capacity request (cl. 21.4.3.3). Filled in below.
+            length_ind: Some(0),
+            frag_flag: None,
+            reservation_req: None,
+        };
+
+        let sdu_len = sdu.get_len();
+        let num_fill_bits = pdu.update_len_and_fill_ind(sdu_len);
+        let content_len = pdu.length_ind.unwrap() as usize * 8;
+        if content_len > STCH_TYPE1_BITS {
+            // Does not fit a single stolen half-slot.
+            return None;
+        }
+
+        let mut block = BitBuffer::new(STCH_TYPE1_BITS);
+        pdu.to_bitbuf(&mut block);
+        sdu.seek(0);
+        block.copy_bits(sdu, sdu_len);
+        fillbits::addition::write(&mut block, Some(num_fill_bits));
+        block.seek(0);
+        Some(block)
+    }
+
     pub fn build_mac_access_block(issi: u32, sdu: &mut BitBuffer) -> Option<BitBuffer> {
         let mut pdu = MacAccess {
             fill_bits: false,
@@ -3954,5 +4110,161 @@ attach_groups = []
             "emitted the buffered (non-silence) source frame, not synthesised silence"
         );
         assert!(umac.uplink_audio.is_empty(), "buffered frame consumed on emit");
+    }
+
+    // ─── M4b: FACCH/STCH stealing of associated signalling ─────────────────
+
+    /// Build a TMA-UNITDATA request with a configurable stealing permission and
+    /// link, carrying a short floor-control-sized SDU, as the LLC hands a floor
+    /// PDU (BL-DATA) down to the MAC.
+    fn tma_stealing_req(stealing: bool, link_id: u32, reporter: Option<TxReporter>) -> SapMsg {
+        SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: 0,
+                // ~24-bit floor PDU (U-TX-CEASED / U-TX-DEMAND are tiny).
+                pdu: BitBuffer::from_bitstr(&"1".repeat(24)),
+                main_address: TetraAddress::issi(1000001),
+                link_id,
+                endpoint_id: 0,
+                pdu_priority: None,
+                is_emergency: false,
+                stealing_permission: stealing,
+                subscriber_class: 0,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: reporter,
+            }),
+        }
+    }
+
+    /// Extract the emitted stolen uplink burst (blk1 = STCH signalling,
+    /// blk2 = TCH/S speech half), if any.
+    fn extract_stolen_burst(q: &MessageQueue) -> Option<TmvUnitdataReqSlot> {
+        q.iter().find_map(|m| match &m.msg {
+            SapMsgInner::TmvUnitdataReq(slot)
+                if m.dest == TetraEntity::Lmac
+                    && slot
+                        .blk1
+                        .as_ref()
+                        .map(|b| b.logical_channel == LogicalChannel::Stch)
+                        .unwrap_or(false) =>
+            {
+                Some(slot.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// When a traffic channel is assigned and L3 requests stealing, the floor PDU
+    /// is queued for FACCH/STCH stealing on the TCH — NOT sent by MCCH random
+    /// access. `rx_tma_prim` neither emits a burst nor sets a random-access
+    /// pending transfer; it parks the block in `pending_stolen_signalling`.
+    #[test]
+    fn test_ms_stealing_request_queues_on_assigned_tch() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false]; // TS3 assigned
+
+        let mut q = MessageQueue::new();
+        umac.rx_tma_prim(&mut q, tma_stealing_req(true, 2, None));
+
+        assert_eq!(umac.pending_stolen_signalling.len(), 1, "floor PDU queued for stealing");
+        assert!(umac.pending_uplink.is_none(), "no MCCH random-access transfer started");
+        assert_eq!(q.iter().count(), 0, "nothing emitted from rx_tma_prim itself");
+    }
+
+    /// Talker stealing: granted + assigned + a queued floor PDU → the granted
+    /// slot is stolen. blk1 carries the STCH signalling MAC block (a 124-bit
+    /// type-1 block), blk2 the remaining TCH/S speech half; the LMAC will select
+    /// normal training sequence 2 from the STCH channel.
+    #[test]
+    fn test_ms_stealing_emits_stolen_burst_when_talker() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false];
+        umac.uplink_tx_granted = true;
+        umac.dltime = TdmaTime::default(); // paired UL t3/f1
+
+        let mut q = MessageQueue::new();
+        umac.rx_tma_prim(&mut q, tma_stealing_req(true, 2, None));
+        umac.drive_uplink_traffic(&mut q);
+
+        let slot = extract_stolen_burst(&q).expect("a stolen STCH burst must be emitted");
+        assert_eq!(slot.ts.t, 3, "stolen on the assigned uplink slot");
+        assert_eq!(slot.ul_phy_chan, PhysicalChannel::Tp, "traffic physical channel");
+        let blk1 = slot.blk1.expect("blk1 (STCH) present");
+        assert_eq!(blk1.logical_channel, LogicalChannel::Stch);
+        assert_eq!(blk1.mac_block.get_len(), 124, "STCH type-1 half-slot block");
+        assert_eq!(blk1.scrambling_code, 0x1234_5678);
+        let blk2 = slot.blk2.expect("blk2 (TCH/S speech half) present");
+        assert_eq!(blk2.logical_channel, LogicalChannel::TchS);
+        assert_eq!(blk2.mac_block.get_len(), 274, "TCH/S speech type-1 frame");
+        assert!(umac.pending_stolen_signalling.is_empty(), "queued block consumed");
+    }
+
+    /// Listener stealing (U-TX-DEMAND while not the talker): a floor PDU can be
+    /// stolen on the assigned uplink slot even without the transmission grant —
+    /// the speech half is silence. This is how the MS requests the floor mid-call
+    /// over the TCH rather than the MCCH.
+    #[test]
+    fn test_ms_stealing_emits_stolen_burst_when_listening() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false];
+        umac.uplink_tx_granted = false; // listening, not the talker
+        umac.dltime = TdmaTime::default();
+
+        let mut q = MessageQueue::new();
+        umac.rx_tma_prim(&mut q, tma_stealing_req(true, 2, None));
+        umac.drive_uplink_traffic(&mut q);
+
+        let slot = extract_stolen_burst(&q).expect("a stolen STCH burst must be emitted while listening");
+        let blk1 = slot.blk1.expect("blk1 (STCH) present");
+        assert_eq!(blk1.logical_channel, LogicalChannel::Stch);
+        let blk2 = slot.blk2.expect("blk2 (silence speech half) present");
+        assert_eq!(blk2.logical_channel, LogicalChannel::TchS);
+        assert_eq!(blk2.mac_block.get_len(), 274, "silence TCH/S frame fills the speech half");
+    }
+
+    /// The stolen block's LLC transmit receipt is marked transmitted when the
+    /// block is actually emitted (cl. 22.3.2.3), so the acknowledged-mode basic
+    /// link progresses rather than wedging.
+    #[test]
+    fn test_ms_stealing_marks_tx_reporter_on_emit() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false];
+        umac.uplink_tx_granted = true;
+        umac.dltime = TdmaTime::default();
+
+        let reporter = TxReporter::new();
+        let mut q = MessageQueue::new();
+        umac.rx_tma_prim(&mut q, tma_stealing_req(true, 2, Some(reporter.clone())));
+        assert!(!reporter.is_transmitted(), "not yet transmitted while queued");
+
+        umac.drive_uplink_traffic(&mut q);
+        assert!(reporter.is_transmitted(), "receipt marked transmitted on emit");
+    }
+
+    /// Fallback: with NO traffic channel assigned (pre-TCH floor request), a
+    /// stealing request cannot steal a slot, so it goes over the MCCH by random
+    /// access (a MAC-ACCESS on SCH/HU) — nothing is queued for stealing.
+    #[test]
+    fn test_ms_stealing_falls_back_to_mcch_without_tch() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false; 4]; // no TCH assigned
+
+        let mut q = MessageQueue::new();
+        umac.rx_tma_prim(&mut q, tma_stealing_req(true, 2, None));
+
+        assert!(umac.pending_stolen_signalling.is_empty(), "nothing to steal without a TCH");
+        let pending = umac.pending_uplink.as_ref().expect("MCCH random-access transfer started");
+        assert_eq!(pending.logical_channel, LogicalChannel::SchHu, "carried on SCH/HU (MCCH access)");
     }
 }
