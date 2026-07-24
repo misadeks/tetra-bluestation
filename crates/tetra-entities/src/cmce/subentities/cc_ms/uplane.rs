@@ -87,17 +87,29 @@ impl CcMsSubentity {
     /// runs the ACELP decoder (type-1 bits → PCM). `bfi` (bad-frame indicator)
     /// carries the channel-decode CRC result so the UI can apply substitution and
     /// muting on corrupted frames instead of decoding them as valid speech.
-    pub fn rx_downlink_traffic(&mut self, ts: u8, bfi: bool, data: &[u8]) {
-        // Find the active call currently receiving on the U-plane. M1 assumes a
-        // single simultaneous call on the serving carrier; the assigned-timeslot
-        // demux (matching `ts` to a specific call) arrives with the
-        // channel-allocation handling in a later milestone.
-        let Some(call) = self
-            .calls
-            .values_mut()
-            .find(|c| c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false))
-        else {
-            tracing::trace!("rx_downlink_traffic: no call with U-plane switched on, dropping speech frame");
+    pub fn rx_downlink_traffic(&mut self, ts: u8, bfi: bool, usage_marker: Option<u8>, owner_ssi: Option<u32>, data: &[u8]) {
+        // Demultiplex the frame to the call it belongs to. The MAC tags each
+        // frame with the destination SSI the serving cell bound the traffic's
+        // usage marker to (cl. 23.5.5); attribute it to the call addressed to
+        // that party whose U-plane is switched on (cl. 14.5.1.4). When the MAC
+        // could not resolve an owner (`owner_ssi` is `None` — e.g. an individual
+        // call before the usage-marker binding is observed), fall back to the
+        // sole U-plane-on call, preserving the single-call receive behaviour.
+        let call = match owner_ssi {
+            Some(ssi) => self.calls.values_mut().find(|c| {
+                c.route.main_address.ssi == ssi && c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false)
+            }),
+            None => self
+                .calls
+                .values_mut()
+                .find(|c| c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false)),
+        };
+        let Some(call) = call else {
+            tracing::trace!(
+                "rx_downlink_traffic: no U-plane-on call for owner {:?} (marker {:?}), dropping speech frame",
+                owner_ssi,
+                usage_marker
+            );
             return;
         };
 
@@ -110,6 +122,7 @@ impl CcMsSubentity {
             frames = sequence,
             bits = data.len(),
             bfi,
+            marker = usage_marker,
             "CC-MS: received downlink speech frame (U-plane)"
         );
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic;
 
 use tetra_config::bluestation::{SharedConfig, StackMode};
@@ -319,6 +319,28 @@ pub struct UmacMs {
     /// MCCH's). Cross-carrier / cell-change allocations are deferred to M3.
     assigned_traffic_slots: [bool; 4],
 
+    /// AACH downlink usage markers (ETSI TS 100 392-2 cl. 21.4.7.2) currently
+    /// bound to calls this MS participates in, mapped to the destination SSI
+    /// (group or individual) the serving cell addressed the assignment to. Built
+    /// from each MAC-RESOURCE that carries an SSI + usage-marker address element
+    /// (cl. 21.4.3.1) accepted by the downlink address filter — i.e. the marker
+    /// the BS assigned to *our* call (cl. 23.5.5). Used to gate and label the
+    /// U-plane TCH/S relay: a decoded traffic burst is forwarded up to CMCE only
+    /// when the current slot's AACH usage marker is one of these, and it is
+    /// tagged with the owning SSI so CC-MS can demultiplex concurrent calls to
+    /// the correct call. This replaces the earlier `assigned_traffic_slots`
+    /// timeslot-bitmap receive gate, which could not represent concurrent calls
+    /// on different slots and disagreed with the authoritative AACH marker.
+    active_traffic_usage_markers: BTreeMap<u8, u32>,
+
+    /// The AACH downlink usage marker of the slot currently being processed
+    /// (cl. 21.4.7.2), captured in `rx_tmv_aach` from this slot's ACCESS-ASSIGN
+    /// and consumed in `rx_tmd_prim` when that slot's TCH/S block is delivered.
+    /// `Some(m)` when the slot's downlink usage is `Traffic(m)`, `None`
+    /// otherwise (control/unallocated, or frame 18). Reset every slot so a stale
+    /// marker cannot leak onto a later slot.
+    current_traffic_usage_marker: Option<u8>,
+
     /// U-plane transmit grant for this MS, set from the MLE-CONFIGURE seam
     /// (`TlmcUPlaneConfigureReq`, cl. 17.3.3 / cl. 14.5.1.4). `true` while CC-MS
     /// holds the transmission grant and the U-plane is switched on, i.e. this MS
@@ -404,6 +426,8 @@ impl UmacMs {
             derived_ul_freq: None,
             serving_carrier_num: None,
             assigned_traffic_slots: [false; 4],
+            active_traffic_usage_markers: BTreeMap::new(),
+            current_traffic_usage_marker: None,
             uplink_tx_granted: false,
             uplink_audio: VecDeque::new(),
             pending_stolen_signalling: VecDeque::new(),
@@ -894,6 +918,23 @@ impl UmacMs {
                 self.act_on_channel_allocation(ca);
             }
 
+            // Learn the AACH usage marker the serving cell bound to this call
+            // (cl. 21.4.3.1 SSI + usage-marker addressing / cl. 23.5.5). The
+            // MAC-RESOURCE that assigns a traffic channel to us carries our
+            // destination SSI together with the usage marker; recording the
+            // pairing lets the U-plane relay gate/attribute decoded speech by
+            // marker (see `active_traffic_usage_markers`). `pdu.addr` is `Some`
+            // here (null PDU returned above).
+            if let Some(marker) = pdu.usage_marker {
+                self.active_traffic_usage_markers.insert(marker, pdu.addr.unwrap().ssi);
+                tracing::debug!(
+                    "rx_mac_resource: usage marker {} bound to {} (active markers: {:?})",
+                    marker,
+                    pdu.addr.unwrap(),
+                    self.active_traffic_usage_markers
+                );
+            }
+
             if pdu.length_ind == 0b111111 {
                 // Fragmentation start, add to defragmenter
                 self.defrag.insert_first(&mut prim.pdu, self.dltime, pdu.addr.unwrap(), None);
@@ -1147,6 +1188,10 @@ impl UmacMs {
         // Keep the parsed ACCESS-ASSIGN so we can drive the random access state
         // machine (cl. 23.5.1.4) against this slot's uplink access rights.
         let mut access_assign: Option<AccessAssign> = None;
+        // Reset the per-slot downlink usage marker: it describes only this slot
+        // (cl. 21.4.7.2) and gates this slot's TCH/S relay in `rx_tmd_prim`. A
+        // stale value must never leak onto a later slot.
+        self.current_traffic_usage_marker = None;
         let is_traffic = if self.dltime.f != 18 {
             let pdu = match AccessAssign::from_bitbuf(&mut prim.pdu) {
                 Ok(pdu) => {
@@ -1160,6 +1205,10 @@ impl UmacMs {
             };
 
             let traffic = pdu.dl_usage.is_traffic();
+            // Record this slot's traffic usage marker (cl. 21.4.7.2): the call
+            // identity the serving cell is carrying on this downlink slot. Used
+            // to gate/attribute the TCH/S block delivered later this slot.
+            self.current_traffic_usage_marker = pdu.dl_usage.get_tchan();
             access_assign = Some(pdu);
             traffic
         } else {
@@ -2777,25 +2826,36 @@ impl UmacMs {
     /// U-plane switch and call state live in CMCE (CC-MS, cl. 14.5.1.4), so the
     /// MAC simply forwards the frame upward; it performs no audio processing.
     ///
-    /// As a MAC-level guard it relays only on a timeslot the network has
-    /// assigned to us as a traffic channel via a same-carrier CHANNEL ALLOCATION
-    /// element (cl. 21.5.2, recorded in `assigned_traffic_slots`). The assigned
-    /// slot is followed from the element — a same-carrier TCH is on some slot
-    /// other than the control channel, so this is never hardcoded to TS1. Bursts
-    /// on control or other-call timeslots are dropped here. The LMAC still gates
-    /// the physical decode on the per-slot AACH traffic marker (cl. 21.4.7.2),
-    /// and the definitive U-plane switch gate (is the call actually receiving)
-    /// remains in CC-MS.
+    /// As a MAC-level guard it relays only traffic whose slot carried an AACH
+    /// downlink usage marker (cl. 21.4.7.2) that the serving cell assigned to a
+    /// call this MS participates in (cl. 23.5.5, recorded in
+    /// `active_traffic_usage_markers`). The usage marker — not a static timeslot
+    /// bitmap — is the authoritative traffic-channel identity: it identifies the
+    /// call regardless of which physical slot the cell places it on, and it is
+    /// exactly what the AACH and the STCH talker-identity path already follow.
+    /// Traffic for markers we do not participate in (other groups' calls) is
+    /// dropped here. Each relayed frame is tagged with the marker and the owning
+    /// SSI so CC-MS can demultiplex concurrent calls; the definitive U-plane
+    /// switch gate (is the call actually receiving) remains in CC-MS.
     fn rx_tmd_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tmd_prim");
         match message.msg {
-            SapMsgInner::TmdCircuitDataInd(prim) => {
-                let ts = prim.ts;
-                let assigned = (1..=4).contains(&ts) && self.assigned_traffic_slots[(ts - 1) as usize];
-                if !assigned {
-                    tracing::trace!("rx_tmd_prim: ts={} not an assigned traffic timeslot, dropping speech frame", ts);
+            SapMsgInner::TmdCircuitDataInd(mut prim) => {
+                // Gate on the AACH usage marker of the slot this block arrived
+                // on (cl. 21.4.7.2 / 23.5.5): forward only when the marker is one
+                // the serving cell assigned to a call this MS participates in.
+                let marker = self.current_traffic_usage_marker;
+                let owner = marker.and_then(|m| self.active_traffic_usage_markers.get(&m).copied());
+                let Some(owner_ssi) = owner else {
+                    tracing::trace!(
+                        "rx_tmd_prim: usage marker {:?} on ts={} not assigned to any of our calls, dropping speech frame",
+                        marker,
+                        prim.ts
+                    );
                     return;
-                }
+                };
+                prim.usage_marker = marker;
+                prim.owner_ssi = Some(owner_ssi);
                 queue.push_back(SapMsg {
                     sap: Sap::TmdSap,
                     src: TetraEntity::Umac,
@@ -3852,47 +3912,61 @@ attach_groups = []
             sap: Sap::TmdSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data, bfi: false }),
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                ts,
+                data,
+                bfi: false,
+                usage_marker: None,
+                owner_ssi: None,
+            }),
         }
     }
 
-    /// M2: a same-carrier CHANNEL ALLOCATION assigning a non-control timeslot is
-    /// followed — the assigned slot is recorded from the element (cl. 21.5.2),
-    /// never hardcoded to the control channel — and it gates the U-plane TMD
-    /// relay: speech on the assigned slot relays to CMCE, speech on any other
-    /// timeslot is dropped.
+    /// The U-plane TMD relay is gated on the AACH downlink usage marker (cl.
+    /// 21.4.7.2 / 23.5.5): speech on a slot whose usage marker the serving cell
+    /// assigned to one of our calls is relayed to CMCE — tagged with the marker
+    /// and the owning SSI — while speech carrying any other marker is dropped.
+    /// This follows the call's traffic-channel identity, independent of which
+    /// physical slot the cell places it on.
     #[test]
-    fn test_channel_allocation_same_carrier_follows_assigned_slot() {
+    fn test_traffic_relay_gated_on_usage_marker() {
         let mut umac = ms_umac();
-        umac.serving_carrier_num = Some(1593);
 
-        // Traffic assigned on TS3 (a non-control timeslot) on the serving carrier.
-        umac.act_on_channel_allocation(&chan_alloc(
-            ChanAllocType::Replace,
-            [false, false, true, false],
-            1593,
-            UlDlAssignment::Both,
-        ));
-        assert_eq!(umac.assigned_traffic_slots, [false, false, true, false], "follows assigned TS3");
+        // The serving cell bound usage marker 16 to our group GSSI 220 (learned
+        // from a MAC-RESOURCE with an SSI + usage-marker address element).
+        umac.active_traffic_usage_markers.insert(16, 220);
 
         let mut q = MessageQueue::new();
+
+        // This slot's AACH designates Traffic(16) — our call. Speech relays.
+        umac.current_traffic_usage_marker = Some(16);
         umac.rx_tmd_prim(&mut q, tmd_speech(3, vec![1, 2, 3]));
-        umac.rx_tmd_prim(&mut q, tmd_speech(1, vec![9, 9, 9]));
+
+        // A slot carrying another group's marker (17) is dropped.
+        umac.current_traffic_usage_marker = Some(17);
+        umac.rx_tmd_prim(&mut q, tmd_speech(2, vec![9, 9, 9]));
+
+        // A control/unallocated slot (no marker) is dropped.
+        umac.current_traffic_usage_marker = None;
+        umac.rx_tmd_prim(&mut q, tmd_speech(4, vec![7, 7, 7]));
+
         let relayed: Vec<_> = q
             .iter()
             .filter(|m| m.dest == TetraEntity::Cmce && matches!(m.msg, SapMsgInner::TmdCircuitDataInd(_)))
             .collect();
-        assert_eq!(relayed.len(), 1, "only assigned-slot (TS3) speech relayed");
+        assert_eq!(relayed.len(), 1, "only our-marker speech relayed");
         let SapMsgInner::TmdCircuitDataInd(ind) = &relayed[0].msg else {
             unreachable!()
         };
-        assert_eq!(ind.ts, 3, "assigned timeslot tag preserved");
+        assert_eq!(ind.ts, 3, "timeslot tag preserved");
         assert_eq!(ind.data, vec![1, 2, 3], "speech payload preserved");
+        assert_eq!(ind.usage_marker, Some(16), "relayed frame tagged with its usage marker");
+        assert_eq!(ind.owner_ssi, Some(220), "relayed frame tagged with the owning SSI");
     }
 
-    /// M2: a CHANNEL ALLOCATION on a different carrier is a cross-carrier retune,
+    /// A CHANNEL ALLOCATION on a different carrier is a cross-carrier retune,
     /// deferred to M3 — the MS must NOT act on it (no assigned-slot change, no
-    /// retune), so speech on that slot stays gated out.
+    /// retune). With no usage marker bound to us, speech stays gated out.
     #[test]
     fn test_channel_allocation_cross_carrier_deferred() {
         let mut umac = ms_umac();
@@ -3907,10 +3981,11 @@ attach_groups = []
         assert_eq!(umac.assigned_traffic_slots, [false; 4], "cross-carrier allocation not followed");
 
         let mut q = MessageQueue::new();
+        umac.current_traffic_usage_marker = Some(16);
         umac.rx_tmd_prim(&mut q, tmd_speech(3, vec![1, 2, 3]));
         assert!(
             q.iter().all(|m| !matches!(m.msg, SapMsgInner::TmdCircuitDataInd(_))),
-            "no speech relayed for a cross-carrier (unfollowed) allocation"
+            "no speech relayed when no usage marker is bound to us"
         );
     }
 

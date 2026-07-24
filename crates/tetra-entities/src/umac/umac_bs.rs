@@ -1280,7 +1280,7 @@ impl UmacBs {
                             sap: Sap::TmdSap,
                             src: TetraEntity::Umac,
                             dest: TetraEntity::Brew,
-                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone(), bfi }),
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone(), bfi, usage_marker: None, owner_ssi: None }),
                         };
                         queue.push_back(msg);
                     } else {

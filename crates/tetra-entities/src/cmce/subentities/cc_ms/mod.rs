@@ -542,15 +542,15 @@ mod tests {
         );
 
         // U-plane still switched off: received speech is discarded (cl. 14.5.1.4).
-        cc.rx_downlink_traffic(3, false, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
         assert_eq!(cc.call(7).unwrap().rx_speech_frames, 0, "no frames accepted while U-plane off");
 
         // Grant switches the U-plane on; subsequent speech frames are accepted.
         cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
         assert_eq!(cc.call(7).unwrap().last_uplane.map(|u| u.switch_u_plane), Some(true));
 
-        cc.rx_downlink_traffic(3, false, &[1u8; 274]);
-        cc.rx_downlink_traffic(3, false, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
         assert_eq!(cc.call(7).unwrap().rx_speech_frames, 2, "frames accepted while U-plane on");
     }
 
@@ -581,8 +581,8 @@ mod tests {
 
         // First frame is good, second is a bad frame (BFI set).
         let good = vec![1u8; 274];
-        cc.rx_downlink_traffic(2, false, &good);
-        cc.rx_downlink_traffic(2, true, &vec![0u8; 274]);
+        cc.rx_downlink_traffic(2, false, None, None, &good);
+        cc.rx_downlink_traffic(2, true, None, None, &vec![0u8; 274]);
 
         let frames: Vec<_> = std::iter::from_fn(|| source.try_recv())
             .filter_map(|ev| match ev {
@@ -603,6 +603,53 @@ mod tests {
         assert_eq!(frames[0], (9, 2, 1, Some(2200699), 274, false, good.clone()));
         assert_eq!(frames[1].2, 2, "per-call sequence increments");
         assert!(frames[1].5, "BFI propagated on the bad frame");
+    }
+
+    /// cl. 23.5.5: with several concurrent group calls all U-plane-on, a decoded
+    /// speech frame tagged (by the MAC) with the owning SSI is attributed to the
+    /// call addressed to that party — not an arbitrary U-plane-on call.
+    #[test]
+    fn downlink_speech_demuxed_by_owner_ssi() {
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+
+        let mk_route = |ssi: u32| CallRoute {
+            main_address: TetraAddress::new(ssi, SsiType::Gssi),
+            handle: 1,
+            endpoint_id: 2,
+            link_id: 3,
+        };
+        for (call_id, gssi) in [(10u16, 220u32), (11u16, 2208u32)] {
+            cc.calls.insert(
+                call_id,
+                MsCall::new(
+                    call_id,
+                    MsCcState::CallActive,
+                    MsCallKind::Group,
+                    default_speech_basic_service(),
+                    false,
+                    mk_route(gssi),
+                    true,
+                ),
+            );
+            // Both calls have the U-plane switched on (remote talker).
+            cc.apply_transmission_grant(&mut q, call_id, TransmissionGrant::GrantedToOtherUser, None);
+        }
+
+        // A frame owned by GSSI 2208 must land only on call 11.
+        cc.rx_downlink_traffic(2, false, Some(19), Some(2208), &[1u8; 274]);
+        assert_eq!(cc.call(10).unwrap().rx_speech_frames, 0, "frame not misattributed to the other group");
+        assert_eq!(cc.call(11).unwrap().rx_speech_frames, 1, "frame attributed to its owning call");
+
+        // A frame owned by GSSI 220 lands only on call 10.
+        cc.rx_downlink_traffic(3, false, Some(17), Some(220), &[1u8; 274]);
+        assert_eq!(cc.call(10).unwrap().rx_speech_frames, 1, "second owner routed independently");
+        assert_eq!(cc.call(11).unwrap().rx_speech_frames, 1, "unchanged");
+
+        // A frame owned by a group we have no call for is dropped.
+        cc.rx_downlink_traffic(4, false, Some(30), Some(9999), &[1u8; 274]);
+        assert_eq!(cc.call(10).unwrap().rx_speech_frames, 1, "unknown-owner frame dropped");
+        assert_eq!(cc.call(11).unwrap().rx_speech_frames, 1, "unknown-owner frame dropped");
     }
 
     #[test]

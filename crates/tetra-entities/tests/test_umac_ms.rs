@@ -616,24 +616,31 @@ fn test_uplink_fragmentation_three_slot_roundtrip() {
 }
 
 #[test]
-/// M2: with no traffic channel assigned (no CHANNEL ALLOCATION acted on), the
-/// MAC drops decoded downlink speech arriving over the TMD-SAP rather than
-/// relaying it to CMCE. This is the default-closed U-plane relay gate — the MS
-/// only follows a timeslot the network has explicitly assigned to it (cl.
-/// 21.5.2); the positive follow path is covered by the UMAC unit tests. The
-/// definitive U-plane switch gate additionally lives in CC-MS (cl. 14.5.1.4).
+/// M2: with no traffic channel assigned (no usage marker bound to any of our
+/// calls), the MAC drops decoded downlink speech arriving over the TMD-SAP
+/// rather than relaying it to CMCE. This is the default-closed U-plane relay
+/// gate — the MS only relays traffic whose slot carries an AACH usage marker
+/// assigned to one of its calls (cl. 21.4.7.2 / 23.5.5); the positive follow
+/// path is covered by the UMAC unit tests. The definitive U-plane switch gate
+/// additionally lives in CC-MS (cl. 14.5.1.4).
 fn test_umac_ms_drops_speech_without_channel_allocation() {
     debug::setup_logging_verbose();
     let mut test = ComponentTest::new(StackMode::Ms, None);
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce, TetraEntity::Lmac]);
 
-    // Speech on any timeslot with no prior channel allocation must be dropped.
+    // Speech on any timeslot with no usage marker bound to us must be dropped.
     for ts in 1..=4u8 {
         test.submit_message(SapMsg {
             sap: Sap::TmdSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: vec![0u8; 8], bfi: false }),
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                ts,
+                data: vec![0u8; 8],
+                bfi: false,
+                usage_marker: None,
+                owner_ssi: None,
+            }),
         });
     }
     test.deliver_all_messages();
