@@ -231,6 +231,18 @@ const MAX_UPLINK_QUEUE: usize = 16;
 pub struct UmacMs {
     // config: Option<SharedConfig>,
     dltime: TdmaTime,
+
+    /// The demodulator-recovered downlink slot time supplied to `tick_start`
+    /// on the previous ticked slot (the router's RX-driven stack clock, see
+    /// `messagerouter::run_stack_ms`). Used to advance `dltime` by the *actual*
+    /// number of physically-demodulated slots between ticks rather than a blind
+    /// `+1`, so UMAC's absolute downlink time stays phase-locked to the slot the
+    /// PHY is demodulating and transmitting from (ETSI TS 100 392-2 cl. 9.5.1:
+    /// the MS derives its transmit timing from the received downlink). `None`
+    /// until the first ticked slot; re-seeded exactly at each MAC-SYNC in
+    /// `rx_tmv_bsch`.
+    last_recovered_dltime: Option<TdmaTime>,
+
     self_component: TetraEntity,
     config: SharedConfig,
     defrag: MsDefrag,
@@ -407,6 +419,7 @@ impl UmacMs {
         };
         Self {
             dltime: TdmaTime::default(),
+            last_recovered_dltime: None,
             self_component: TetraEntity::Umac,
             config,
             defrag: MsDefrag::new(),
@@ -2942,13 +2955,33 @@ impl TetraEntityTrait for UmacMs {
         }
     }
 
-    fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
-        // The MS free-runs the absolute downlink time between SYNC bursts,
-        // advancing one timeslot per received slot. It is re-seeded from each
-        // BSCH in `rx_tmv_bsch` (ETSI TS 100 392-2 cl. 7 / 21.4.4.2). The
-        // router's `ts` is a relative pacing clock in MS mode, so it is
-        // intentionally not used here.
-        self.dltime = self.dltime.add_timeslots(1);
+    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        // Advance the absolute downlink time to stay phase-locked to the slot
+        // the PHY just demodulated. In MS mode the stack is receive-timed: the
+        // router blocks on the downlink and drives `tick_start` with the
+        // demodulator-recovered slot time (`messagerouter::run_stack_ms`), which
+        // is the true physical-slot clock the modulator's TX timing is anchored
+        // to (ETSI TS 100 392-2 cl. 9.5.1: the MS synchronises transmit timing
+        // to the received downlink). A single `drive_rx` cycle can yield more
+        // than one demodulated slot (cl. 9.3, the single RX channel walks the
+        // frame), so `ts` may advance by several slots per tick; a blind `+1`
+        // would then desync UMAC's slot phase from the physically-transmitted
+        // slot and scatter uplink traffic bursts off the BS-assigned timeslot.
+        // Advance by the *actual* recovered delta instead, preserving the
+        // network-absolute frame/multiframe/hyperframe numbering re-seeded from
+        // each BSCH SYNC in `rx_tmv_bsch` (cl. 7 / 21.4.4.2). Before the first
+        // recovered slot there is no reference, so bootstrap with `+1` (pre-sync
+        // `dltime` is provisional until the first SYNC re-seed anyway).
+        match self.last_recovered_dltime {
+            Some(prev) => {
+                let advance = ts.diff(prev);
+                self.dltime = self.dltime.add_timeslots(advance);
+            }
+            None => {
+                self.dltime = self.dltime.add_timeslots(1);
+            }
+        }
+        self.last_recovered_dltime = Some(ts);
 
         // Drive any in-flight multi-slot reserved uplink transfer: emit the next
         // MAC-FRAG-UL/MAC-END-UL block when its reserved slot (dltime + 2) is
@@ -3020,6 +3053,54 @@ attach_groups = []
     fn ms_umac() -> UmacMs {
         let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
         UmacMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// `tick_start` must advance the absolute downlink time by the *actual*
+    /// number of slots the demodulator recovered since the previous tick, not a
+    /// blind `+1`. In MS mode the stack is receive-timed and a single `drive_rx`
+    /// cycle can yield more than one slot (cl. 9.3), so the router hands
+    /// `tick_start` a recovered downlink time that may jump several slots; UMAC's
+    /// slot phase must track it exactly or uplink bursts scatter off the
+    /// BS-assigned timeslot (ETSI TS 100 392-2 cl. 9.5.1). A BSCH SYNC re-seed of
+    /// `dltime` (done in `rx_tmv_bsch`) stays authoritative: subsequent ticks
+    /// advance from the re-seeded value by the recovered delta.
+    #[test]
+    fn test_tick_start_advances_by_recovered_delta() {
+        let mut umac = ms_umac();
+        let start = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        umac.dltime = start;
+        let mut q = MessageQueue::new();
+
+        // First tick has no previous reference: bootstrap by one slot and record
+        // the recovered time.
+        let rx0 = TdmaTime { t: 3, f: 5, m: 10, h: 0 };
+        umac.tick_start(&mut q, rx0);
+        assert_eq!(umac.dltime, start.add_timeslots(1), "bootstrap advances one slot");
+        assert_eq!(umac.last_recovered_dltime, Some(rx0));
+
+        // Next demodulated batch jumped two slots: dltime must advance by two,
+        // not one.
+        let rx1 = rx0.add_timeslots(2);
+        umac.tick_start(&mut q, rx1);
+        assert_eq!(
+            umac.dltime,
+            start.add_timeslots(3),
+            "advances by the recovered 2-slot delta"
+        );
+        assert_eq!(umac.last_recovered_dltime, Some(rx1));
+
+        // A BSCH SYNC re-seed re-anchors dltime to the network-absolute time
+        // (as rx_tmv_bsch does); the following tick advances from the re-seeded
+        // base by the next recovered delta.
+        let reseed = TdmaTime { t: 2, f: 18, m: 44, h: 3 };
+        umac.dltime = reseed;
+        let rx2 = rx1.add_timeslots(1);
+        umac.tick_start(&mut q, rx2);
+        assert_eq!(
+            umac.dltime,
+            reseed.add_timeslots(1),
+            "advances from the SYNC-re-seeded base by the recovered delta"
+        );
     }
 
     /// An ACCESS-ASSIGN granting an ongoing-frame random access opportunity for
@@ -3379,10 +3460,14 @@ attach_groups = []
         assert!(!reporter.is_transmitted(), "receipt not marked until the last block");
 
         // Advance downlink ticks until the second reserved slot (slot0 + 4) is
-        // reached; the MAC-END-UL is emitted then and the receipt marked.
+        // reached; the MAC-END-UL is emitted then and the receipt marked. The
+        // router drives `tick_start` with the demodulator-recovered downlink
+        // time, which advances one slot per tick, so feed an incrementing clock.
         let mut emitted_end = None;
+        let mut rx_ts = TdmaTime::default();
         for _ in 0..4 {
-            umac.tick_start(&mut q, TdmaTime::default());
+            umac.tick_start(&mut q, rx_ts);
+            rx_ts = rx_ts.add_timeslots(1);
             if let Some(m) = q.pop_front() {
                 emitted_end = Some(m);
             }
