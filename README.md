@@ -29,6 +29,9 @@ Documentation for the mobile-station (portable-radio) mode lives in-repo:
 - [`docs/MS_CONFIG.md`](docs/MS_CONFIG.md) — the MS configuration-file reference.
 - [`examples/ms-interface/README.md`](examples/ms-interface/README.md) — the external
   UI / management interface (TNMM + provisioning).
+- [`misadeks/tetra-tn-web-ui`](https://github.com/misadeks/tetra-tn-web-ui) — the companion
+  portable-radio web UI (call control, codeplug programming, ACELP vocoder) that drives the
+  MS stack.
 - [`example_config/config-ms.toml`](example_config/config-ms.toml) — a commented example MS config.
 
 ## Acknowledgements

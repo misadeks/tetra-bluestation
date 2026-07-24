@@ -13,8 +13,14 @@ frequency. It runs the same `bluestation-bs` binary as BS mode, selected by
 
 This document is the map of **what exists, how it is put together, and how far each
 feature has been proven**. For the configuration file, see
-[`MS_CONFIG.md`](./MS_CONFIG.md). For the external UI/management interface, see
-[`../examples/ms-interface/README.md`](../examples/ms-interface/README.md).
+[`MS_CONFIG.md`](./MS_CONFIG.md). For the external UI/management interface protocol,
+see [`../examples/ms-interface/README.md`](../examples/ms-interface/README.md).
+
+The companion **portable-radio UI** — codeplug programming, call control, and the ACELP
+vocoder (TCH/S ↔ PCM) that this stack offloads by design — lives in a separate repository:
+[**misadeks/tetra-tn-web-ui**](https://github.com/misadeks/tetra-tn-web-ui). It is the
+reference client that drives this stack over the control/telemetry/voice SAPs described
+below.
 
 ---
 
@@ -51,7 +57,7 @@ with a `MessageRouter` and exchange `SapMsg` over SAPs. MS mode reuses that fram
 with MS-specific entity implementations.
 
 ```
-        ┌──────────────────────────── UI process (separate) ────────────────────────────┐
+        ┌────────────── UI process — misadeks/tetra-tn-web-ui (separate repo) ──────────────┐
         │  portable-radio UI  •  codeplug programming  •  ACELP vocoder (TCH/S <-> PCM)   │
         └───▲───────────────────────────────┬──────────────────────────────▲─────────────┘
    telemetry│ (stack->UI)          control  │ (UI->stack)              voice │ frames
