@@ -181,6 +181,10 @@ impl TetraEntityTrait for CmceMs {
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.poll_control(queue);
         self.cc.tick_start(queue, ts);
+        // Supply the uplink U-plane speech source while this MS holds the floor
+        // (cl. 14.5.1.4). CC-MS owns the U-plane both directions; the MAC clocks
+        // these frames out on the granted slot (cl. 23).
+        self.cc.drive_uplink_source(queue);
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {

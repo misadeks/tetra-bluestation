@@ -85,6 +85,19 @@ const MAX_UL_FRAG_SLOTS: usize = 6;
 /// 392-2 addressing). MAC PDUs addressed to it are processed by every MS.
 const BROADCAST_SSI: u32 = 0xFF_FFFF;
 
+/// TCH/S type-1 (ACELP) speech frame length in bits (ETSI TS 100 392-2 cl. 8.2
+/// / EN 300 395-2): a full traffic slot carries one 274-bit type-1 block, which
+/// `errorcontrol::encode_tp` channel-codes to a 432-bit type-5 Normal Uplink
+/// Burst payload. Matches the BS downlink `TCH_S_CAP`.
+const TCH_S_TYPE1_BITS: usize = 274;
+
+/// Bound on the uplink U-plane jitter buffer (`uplink_audio`). UMAC consumes one
+/// frame per granted uplink traffic slot; CC-MS may supply frames at a different
+/// cadence (cl. 14.5.1.4). A few frames of slack absorb that jitter; older
+/// frames are dropped past this cap so a rate mismatch cannot grow the buffer
+/// without bound (cl. 23, transmit scheduling).
+const UPLINK_AUDIO_MAX_FRAMES: usize = 4;
+
 /// A MAC block built and queued for uplink transmission, awaiting a valid
 /// access opportunity. ETSI TS 100 392-2 cl. 23.5 (MAC access). The random
 /// access slot-selection algorithm (cl. 23.5.1.4) that decides *when* to send
@@ -304,6 +317,27 @@ pub struct UmacMs {
     /// control timeslot (a same-carrier TCH is on some slot other than the
     /// MCCH's). Cross-carrier / cell-change allocations are deferred to M3.
     assigned_traffic_slots: [bool; 4],
+
+    /// U-plane transmit grant for this MS, set from the MLE-CONFIGURE seam
+    /// (`TlmcUPlaneConfigureReq`, cl. 17.3.3 / cl. 14.5.1.4). `true` while CC-MS
+    /// holds the transmission grant and the U-plane is switched on, i.e. this MS
+    /// is the current talker and may emit uplink TCH/S traffic. The transmit
+    /// scheduler (cl. 23) gates uplink traffic emission on this AND on the
+    /// assigned uplink slot from `assigned_traffic_slots` (cl. 21.5.2, the sole
+    /// slot authority). Cleared when the grant/U-plane is switched off, which
+    /// also flushes any buffered uplink audio so a later grant cannot emit stale
+    /// frames.
+    uplink_tx_granted: bool,
+
+    /// Bounded jitter buffer of uplink U-plane source frames supplied by CC-MS
+    /// (the U-plane owner, cl. 14.5.1.4) over the TMD-SAP. UMAC is the transmit
+    /// timing authority (cl. 23): it clocks exactly one frame out per granted
+    /// uplink traffic slot in `tick_start`, independent of the rate at which
+    /// CC-MS pushes frames. Each entry is a 274-bit TCH/S type-1 frame carried
+    /// as packed bytes (mirrors the BS `TmdCircuitDataReq` producer convention).
+    /// Drop-oldest on overflow so a slow consumer cannot grow it without bound;
+    /// on underrun the scheduler emits a silence frame instead.
+    uplink_audio: VecDeque<Vec<u8>>,
 }
 
 impl UmacMs {
@@ -343,6 +377,8 @@ impl UmacMs {
             derived_ul_freq: None,
             serving_carrier_num: None,
             assigned_traffic_slots: [false; 4],
+            uplink_tx_granted: false,
+            uplink_audio: VecDeque::new(),
         }
     }
 
@@ -1560,6 +1596,97 @@ impl UmacMs {
         }
     }
 
+    /// Emit the MS uplink TCH/S traffic burst for this timeslot, if this MS is
+    /// the current talker on its granted slot.
+    ///
+    /// Mirrors the BS downlink traffic emitter (`lmac_bs` NDB path) for the
+    /// uplink direction. UMAC is the transmit timing authority (ETSI TS 100
+    /// 392-2 cl. 23): once per timeslot it decides whether a traffic burst is
+    /// due and clocks exactly one 274-bit TCH/S type-1 frame down to the LMAC,
+    /// which channel-codes it into a Normal Uplink Burst (cl. 9.4.4.2). The
+    /// stream itself is supplied by CC-MS (the U-plane owner, cl. 14.5.1.4) via
+    /// the jitter buffer; on underrun a silence frame is emitted so the granted
+    /// slot is never left dark mid-call.
+    ///
+    /// Emission is gated on three independent conditions:
+    /// - `uplink_tx_granted`: this MS holds the transmission grant with the
+    ///   U-plane switched on (cl. 14.5.1.4, from the MLE-CONFIGURE seam);
+    /// - the paired uplink slot (`dltime + 2`, cl. 9.3.9) is one the network
+    ///   assigned to us as a traffic channel (`assigned_traffic_slots`, cl.
+    ///   21.5.2) — never hardcoded to a fixed timeslot;
+    /// - a valid serving-cell scrambling code is known (we are camped).
+    ///
+    /// Frame 18 of the multiframe carries no TCH/S: it is the control frame
+    /// reserved for the associated control channel signalling (cl. 9.5.1c /
+    /// 23.4.2.1), so no traffic burst is emitted there.
+    fn drive_uplink_traffic(&mut self, queue: &mut MessageQueue) {
+        if !self.uplink_tx_granted {
+            return;
+        }
+
+        // The uplink slot paired with the current downlink slot (cl. 9.3.9).
+        let ul = self.dltime.add_timeslots(2);
+
+        // Frame 18 is the control frame — no traffic (cl. 9.5.1c / 23.4.2.1).
+        if ul.f == 18 {
+            return;
+        }
+
+        // Only emit on a timeslot the network assigned to this MS as a traffic
+        // channel (cl. 21.5.2). The uplink slot number equals the downlink slot
+        // number it is paired with, so the same assignment record applies.
+        let ts_idx = ul.t as usize - 1;
+        if !(1..=4).contains(&ul.t) || !self.assigned_traffic_slots[ts_idx] {
+            return;
+        }
+
+        // Uplink bursts are scrambled with the serving cell's code, known only
+        // once camped (set from the received SYNC). Without it we cannot form a
+        // decodable burst, so stay silent.
+        let Some(scrambling_code) = self.scrambling_code else {
+            return;
+        };
+
+        // Take the next queued U-plane source frame, or synthesise a silence
+        // frame on underrun (all-zero 274-bit type-1 block, mirroring the BS
+        // downlink silence path). Non-silence frames arrive as packed bytes;
+        // `BitBuffer::from_vec` wraps them and we clamp to the TCH/S type-1 size.
+        let mac_block = match self.uplink_audio.pop_front() {
+            Some(frame) if !frame.is_empty() => {
+                let mut buf = BitBuffer::from_vec(frame);
+                let end = (buf.get_raw_start() + TCH_S_TYPE1_BITS).min(buf.get_raw_end());
+                buf.set_raw_end(end);
+                buf
+            }
+            _ => BitBuffer::new(TCH_S_TYPE1_BITS),
+        };
+
+        let blk = TmvUnitdataReq {
+            mac_block,
+            logical_channel: LogicalChannel::TchS,
+            scrambling_code,
+        };
+        let m = SapMsg {
+            sap: Sap::TmvSap,
+            src: self.self_component,
+            dest: TetraEntity::Lmac,
+            msg: SapMsgInner::TmvUnitdataReq(TmvUnitdataReqSlot {
+                ts: ul,
+                // Traffic physical channel carries the TCH/S burst (cl. 9.4.4.2),
+                // matching the BS which uses Tp for traffic and Cp otherwise.
+                ul_phy_chan: PhysicalChannel::Tp,
+                blk1: Some(blk),
+                blk2: None,
+                bbk: None,
+                // Continuous traffic is clock-driven on the assigned slot, not a
+                // BS-reserved random-access opportunity (cl. 23.5.2); the PHY may
+                // schedule it at the paired uplink slot like BS downlink traffic.
+                reserved_access: false,
+            }),
+        };
+        queue.push_back(m);
+    }
+
     pub fn rx_tmv_bsch(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_tmv_bsch");
         let SapMsgInner::TmvUnitdataInd(prim) = &mut message.msg else {
@@ -2334,6 +2461,28 @@ impl UmacMs {
             SapMsgInner::TlmcTuneReq(_) => {
                 self.rx_tlmc_tune_req(queue, message);
             }
+            SapMsgInner::TlmcUPlaneConfigureReq(prim) => {
+                // MLE-CONFIGURE U-plane transmit state (cl. 17.3.3 / 14.5.1.4),
+                // forwarded down from CC-MS via MLE. This MS may emit uplink
+                // TCH/S traffic only while it holds the transmission grant AND
+                // the U-plane is switched on (it is the current talker). The
+                // granted slot is not carried here — it stays owned by the
+                // CHANNEL ALLOCATION record (cl. 21.5.2). On de-grant, flush the
+                // uplink jitter buffer so a later grant cannot emit stale audio.
+                let granted = prim.tx_grant && prim.switch_u_plane;
+                if granted != self.uplink_tx_granted {
+                    tracing::info!(
+                        "UMAC-MS: U-plane transmit grant {} (tx_grant={}, switch_u_plane={})",
+                        if granted { "acquired" } else { "released" },
+                        prim.tx_grant,
+                        prim.switch_u_plane
+                    );
+                }
+                self.uplink_tx_granted = granted;
+                if !granted {
+                    self.uplink_audio.clear();
+                }
+            }
             _ => {
                 panic!();
             }
@@ -2469,6 +2618,19 @@ impl UmacMs {
                     msg: SapMsgInner::TmdCircuitDataInd(prim),
                 });
             }
+            SapMsgInner::TmdCircuitDataReq(prim) => {
+                // Uplink U-plane source frame from CC-MS (the U-plane owner, cl.
+                // 14.5.1.4). UMAC is the transmit timing authority (cl. 23): it
+                // buffers the frame here and clocks exactly one out per granted
+                // uplink traffic slot in `tick_start`. The `ts` field is not used
+                // for slot selection — the assigned uplink slot comes from the
+                // CHANNEL ALLOCATION record (cl. 21.5.2). Drop-oldest keeps the
+                // buffer bounded if CC supplies faster than we emit.
+                if self.uplink_audio.len() >= UPLINK_AUDIO_MAX_FRAMES {
+                    self.uplink_audio.pop_front();
+                }
+                self.uplink_audio.push_back(prim.data);
+            }
             _ => {
                 panic!("UMAC-MS: unexpected message on TMD-SAP: {:?}", message.msg);
             }
@@ -2527,6 +2689,12 @@ impl TetraEntityTrait for UmacMs {
         // MAC-FRAG-UL/MAC-END-UL block when its reserved slot (dltime + 2) is
         // reached (cl. 23.4.2.1.2 / 23.5.2). No-op when nothing is reserved.
         self.drive_reserved_tx(queue);
+
+        // Emit the MS uplink TCH/S traffic burst on the granted slot when this
+        // MS is the current talker (cl. 23 transmit scheduling / cl. 14.5.1.4
+        // U-plane). No-op unless a U-plane transmit grant and an assigned
+        // traffic slot are both active.
+        self.drive_uplink_traffic(queue);
     }
 }
 
@@ -3595,5 +3763,196 @@ attach_groups = []
             [false, true, true, false],
             "uplink-only allocation does not change DL slots"
         );
+    }
+
+    // ─── M4a: uplink TCH/S traffic emission ────────────────────────────────
+
+    /// Extract the emitted uplink TCH/S traffic burst (TMV-UNITDATA to LMAC),
+    /// if any.
+    fn extract_uplink_tchs(q: &MessageQueue) -> Option<TmvUnitdataReqSlot> {
+        q.iter().find_map(|m| match &m.msg {
+            SapMsgInner::TmvUnitdataReq(slot)
+                if m.dest == TetraEntity::Lmac
+                    && slot
+                        .blk1
+                        .as_ref()
+                        .map(|b| b.logical_channel == LogicalChannel::TchS)
+                        .unwrap_or(false) =>
+            {
+                Some(slot.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// An MLE-CONFIGURE U-plane transmit configuration (cl. 17.3.3) forwarded to
+    /// UMAC over the TLMC-SAP.
+    fn uplane_cfg(switch_u_plane: bool, tx_grant: bool) -> SapMsg {
+        SapMsg {
+            sap: Sap::TlmcSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TlmcUPlaneConfigureReq(tetra_saps::tlmc::TlmcUPlaneConfigureReq {
+                switch_u_plane,
+                tx_grant,
+            }),
+        }
+    }
+
+    /// An uplink U-plane source frame from CC-MS (TMD-SAP, cl. 14.5.1.4).
+    fn tmd_source(data: Vec<u8>) -> SapMsg {
+        SapMsg {
+            sap: Sap::TmdSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmdCircuitDataReq(tetra_saps::tmd::TmdCircuitDataReq { ts: 0, data }),
+        }
+    }
+
+    /// A camped MS holding the transmission grant on an assigned traffic slot
+    /// emits exactly one TCH/S Normal-Uplink-Burst request on the paired uplink
+    /// slot (dltime + 2, cl. 9.3.9), tagged with the traffic physical channel
+    /// and clock-driven (not reserved-access). The slot is followed from the
+    /// CHANNEL ALLOCATION record (cl. 21.5.2), never hardcoded.
+    #[test]
+    fn test_ms_uplink_traffic_emitted_on_granted_assigned_slot() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false]; // TS3
+        umac.uplink_tx_granted = true;
+        umac.dltime = TdmaTime::default(); // t1/f1 -> paired UL t3/f1
+
+        let mut q = MessageQueue::new();
+        umac.drive_uplink_traffic(&mut q);
+
+        let slot = extract_uplink_tchs(&q).expect("a TCH/S uplink burst must be emitted");
+        assert_eq!(slot.ts.t, 3, "emitted on the assigned uplink slot (dltime + 2)");
+        assert_eq!(slot.ts.f, 1);
+        assert_eq!(slot.ul_phy_chan, PhysicalChannel::Tp, "traffic physical channel");
+        assert!(!slot.reserved_access, "continuous traffic is clock-driven, not reserved-access");
+        assert!(slot.blk2.is_none(), "single full-slot traffic block");
+        assert!(slot.bbk.is_none(), "no BBK/AACH on the uplink");
+        let blk1 = slot.blk1.expect("blk1 present");
+        assert_eq!(blk1.logical_channel, LogicalChannel::TchS);
+        assert_eq!(blk1.scrambling_code, 0x1234_5678, "serving-cell scrambling code");
+        assert_eq!(blk1.mac_block.get_len(), 274, "one 274-bit TCH/S type-1 frame");
+    }
+
+    /// With no floor grant the MS is silent even on its assigned traffic slot.
+    #[test]
+    fn test_ms_uplink_traffic_suppressed_when_not_granted() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false];
+        umac.uplink_tx_granted = false;
+        umac.dltime = TdmaTime::default();
+
+        let mut q = MessageQueue::new();
+        umac.drive_uplink_traffic(&mut q);
+        assert!(extract_uplink_tchs(&q).is_none(), "no traffic emitted without a transmit grant");
+    }
+
+    /// Granted, but the paired uplink slot is not one assigned to this MS: stay
+    /// silent (do not step on another call's / the control timeslot).
+    #[test]
+    fn test_ms_uplink_traffic_suppressed_on_unassigned_slot() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [true, false, false, false]; // TS1 only
+        umac.uplink_tx_granted = true;
+        umac.dltime = TdmaTime::default(); // paired UL is TS3, not assigned
+
+        let mut q = MessageQueue::new();
+        umac.drive_uplink_traffic(&mut q);
+        assert!(extract_uplink_tchs(&q).is_none(), "no traffic emitted on an unassigned slot");
+    }
+
+    /// Frame 18 is the control frame — no TCH/S traffic is emitted there even on
+    /// an assigned, granted slot (cl. 9.5.1c / 23.4.2.1).
+    #[test]
+    fn test_ms_uplink_traffic_suppressed_on_frame_18() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false];
+        umac.uplink_tx_granted = true;
+        umac.dltime = TdmaTime { t: 1, f: 18, m: 1, h: 0 }; // paired UL t3/f18
+
+        let mut q = MessageQueue::new();
+        umac.drive_uplink_traffic(&mut q);
+        assert!(extract_uplink_tchs(&q).is_none(), "no traffic on the control frame (18)");
+    }
+
+    /// Granted and assigned, but not yet camped (no scrambling code): cannot form
+    /// a decodable burst, so stay silent.
+    #[test]
+    fn test_ms_uplink_traffic_suppressed_without_scrambling_code() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = None;
+        umac.assigned_traffic_slots = [false, false, true, false];
+        umac.uplink_tx_granted = true;
+        umac.dltime = TdmaTime::default();
+
+        let mut q = MessageQueue::new();
+        umac.drive_uplink_traffic(&mut q);
+        assert!(extract_uplink_tchs(&q).is_none(), "no traffic emitted before camping");
+    }
+
+    /// The MLE-CONFIGURE seam drives the transmit grant: tx_grant AND
+    /// switch_u_plane together arm emission; either off disarms it and flushes
+    /// any buffered uplink audio so a later grant cannot emit stale frames.
+    #[test]
+    fn test_ms_uplane_configure_seam_sets_and_flushes_grant() {
+        let mut umac = ms_umac();
+        let mut q = MessageQueue::new();
+
+        umac.uplink_audio.push_back(vec![0u8; 35]);
+        umac.rx_tlmc_prim(&mut q, uplane_cfg(true, true));
+        assert!(umac.uplink_tx_granted, "grant armed when tx_grant && switch_u_plane");
+
+        // Grant to another user (tx_grant true, U-plane still on) is NOT us.
+        umac.rx_tlmc_prim(&mut q, uplane_cfg(true, false));
+        assert!(!umac.uplink_tx_granted, "not the talker when tx_grant is false");
+        assert!(umac.uplink_audio.is_empty(), "de-grant flushes buffered uplink audio");
+    }
+
+    /// The uplink U-plane source buffer is bounded (drop-oldest) so a CC push
+    /// rate faster than the emit rate cannot grow it without bound (cl. 23).
+    #[test]
+    fn test_ms_uplink_audio_buffer_bounded() {
+        let mut umac = ms_umac();
+        let mut q = MessageQueue::new();
+        for i in 0..(UPLINK_AUDIO_MAX_FRAMES + 3) {
+            umac.rx_tmd_prim(&mut q, tmd_source(vec![i as u8; 35]));
+        }
+        assert_eq!(
+            umac.uplink_audio.len(),
+            UPLINK_AUDIO_MAX_FRAMES,
+            "buffer capped, oldest frames dropped"
+        );
+    }
+
+    /// A buffered (non-silence) source frame is clocked out on the granted slot:
+    /// the emitted type-1 block carries the supplied audio, and the buffer entry
+    /// is consumed.
+    #[test]
+    fn test_ms_uplink_emits_buffered_source_frame() {
+        let mut umac = ms_umac();
+        umac.scrambling_code = Some(0x1234_5678);
+        umac.assigned_traffic_slots = [false, false, true, false];
+        umac.uplink_tx_granted = true;
+        umac.dltime = TdmaTime::default();
+
+        let mut q = MessageQueue::new();
+        umac.rx_tmd_prim(&mut q, tmd_source(vec![0xFF; 35])); // distinctive, non-silence
+        umac.drive_uplink_traffic(&mut q);
+
+        let slot = extract_uplink_tchs(&q).expect("a TCH/S uplink burst must be emitted");
+        let mac_block = slot.blk1.expect("blk1 present").mac_block;
+        assert_eq!(mac_block.get_len(), 274);
+        assert!(
+            mac_block.to_bitstr().contains('1'),
+            "emitted the buffered (non-silence) source frame, not synthesised silence"
+        );
+        assert!(umac.uplink_audio.is_empty(), "buffered frame consumed on emit");
     }
 }

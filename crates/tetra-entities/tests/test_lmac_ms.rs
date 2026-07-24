@@ -126,6 +126,40 @@ fn test_lmac_ms_tx_schf_nub() {
 }
 
 #[test]
+/// Uplink TCH/S speech (M4a): LmacMs must encode a 274-bit type-1 ACELP frame
+/// to a 432-bit type-5 Normal Uplink Burst with normal training sequence 1
+/// (mirroring the BS downlink NDB traffic burst, cl. 9.4.4.2 / cl. 8.2), so the
+/// exact BS traffic decoder (`decode_tp`) recovers the source frame. This is the
+/// in-repo framing proof that the MS uplink emitter is bit-compatible with the
+/// real BS: the emitted type-5 bits round-trip through the same decode the
+/// on-air BS runs.
+fn test_lmac_ms_tx_tchs_nub_roundtrip() {
+    debug::setup_logging_verbose();
+
+    let scrambling_code = 1761749767;
+    let mac_block = make_block(274);
+    let orig_bits = bits_of(&mac_block, 274);
+
+    let slot = encode_uplink(LogicalChannel::TchS, mac_block, scrambling_code);
+
+    assert_eq!(slot.burst_type, BurstType::NUB, "TCH/S uplink is a Normal Uplink Burst");
+    assert_eq!(slot.train_type, TrainingSequence::NormalTrainSeq1);
+    assert!(slot.bbk.is_none());
+    assert!(slot.blk2.is_none());
+    let type5 = slot.blk1.expect("blk1 present");
+    assert_eq!(type5.get_len(), 432, "TCH/S type-5 block is 432 bits");
+
+    // Decode with the SAME traffic decoder the real BS uses (decode_tp).
+    let (decoded, crc_ok) = errorcontrol::decode_tp(LogicalChannel::TchS, type5, scrambling_code);
+    assert!(crc_ok, "CRC must pass on TCH/S round-trip");
+    assert_eq!(
+        bits_of(&decoded.expect("decoded speech frame"), 274),
+        orig_bits,
+        "recovered ACELP frame must match the source"
+    );
+}
+
+#[test]
 /// D-2 (tune plumbing): a TMV-TUNE from UMAC is forwarded down to the PHY as a
 /// TPC-TUNE carrying the same carrier (LMAC holds no radio-tuning state).
 fn test_lmac_ms_forwards_tune_to_phy() {
