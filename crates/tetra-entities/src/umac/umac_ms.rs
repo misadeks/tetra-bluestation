@@ -804,8 +804,12 @@ impl UmacMs {
                     pdu.length_ind as usize * 8
                 }
                 0b111110 => {
-                    // Second half slot stolen in STCH
-                    unimplemented_log!("rx_mac_resource: SECOND HALF SLOT STOLEN IN STCH but signal not implemented");
+                    // Second half slot stolen in STCH (cl. 9.4.4.3.2 / Table
+                    // 21.55): this MAC PDU occupies the rest of the first stolen
+                    // half-slot and the second half-slot is also stolen for
+                    // associated signalling. The block1 PDU is still delivered to
+                    // LLC below; the LMAC is told to route Block2 as STCH (not
+                    // TCH/S) in the delivery branch further down.
                     prim.pdu.get_len()
                 }
                 0b111111 => {
@@ -893,9 +897,16 @@ impl UmacMs {
             if pdu.length_ind == 0b111111 {
                 // Fragmentation start, add to defragmenter
                 self.defrag.insert_first(&mut prim.pdu, self.dltime, pdu.addr.unwrap(), None);
-            } else if pdu.length_ind == 0b111110 {
-                tracing::warn!("rx_mac_resource: SECOND HALF SLOT STOLEN IN STCH but not implemented");
             } else {
+                if pdu.length_ind == 0b111110 {
+                    // Second half slot stolen in STCH (cl. 9.4.4.3.2): tell LMAC
+                    // to route this slot's Block2 as STCH signalling rather than
+                    // TCH/S speech, so a group-addressed D-TX GRANTED carried in
+                    // the second stolen half (e.g. naming the current group-call
+                    // talker) reaches CMCE. Must be signalled before Block2 is
+                    // classified; the block1 PDU below is delivered normally.
+                    self.signal_lmac_second_half_stolen(queue);
+                }
                 // Pass directly to LLC
                 let sdu = {
                     if pdu.length_ind == 0 {
@@ -943,6 +954,24 @@ impl UmacMs {
         prim.pdu.set_raw_end(orig_end);
         prim.pdu.set_raw_pos(prim.pdu.get_raw_start() + pdu_len_bits + num_fill_bits);
         prim.pdu.set_raw_start(prim.pdu.get_raw_pos());
+    }
+
+    /// Tell LMAC that this slot's Block2 is also stolen for associated
+    /// signalling (STCH, not TCH/S speech), so it is decoded on the control-plane
+    /// chain rather than the speech path (cl. 9.4.4.3.2). Immediate priority so
+    /// LMAC applies it before classifying the Block2 burst. Mirrors
+    /// `UmacBs::signal_lmac_second_half_stolen`.
+    fn signal_lmac_second_half_stolen(&mut self, queue: &mut MessageQueue) {
+        let m = SapMsg {
+            sap: Sap::TmvSap,
+            src: TetraEntity::Umac,
+            dest: TetraEntity::Lmac,
+            msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
+                blk2_stolen: Some(true),
+                ..Default::default()
+            }),
+        };
+        queue.push_prio(m, MessagePrio::Immediate);
     }
 
     fn rx_mac_frag(&mut self, _queue: &mut MessageQueue, message: &mut SapMsg) {

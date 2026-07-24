@@ -33,7 +33,9 @@ impl Default for LmacTrafficChan {
 pub struct CurBurst {
     pub is_traffic: bool,
     pub usage: Option<u8>,
-    pub blk1_stolen: bool,
+    /// Set when Block1's STCH MAC PDU signalled that the second half-slot is
+    /// also stolen for associated signalling (length indication 111110, cl.
+    /// 9.4.4.3.2). Consumed when classifying Block2, reset each slot in `rx_bbk`.
     pub blk2_stolen: bool,
 }
 
@@ -69,6 +71,12 @@ impl LmacMs {
 
     fn rx_bbk(&mut self, queue: &mut MessageQueue, bbk: TpUnitdataInd) {
         // tracing::trace!("rx_bbk: {:?}", bbk.block.dump_bin());
+
+        // The BBK (AACH) opens every downlink slot (cl. 21.4.7.1), so this is the
+        // clean point to clear any per-slot channel-stealing state carried over
+        // from a previous slot. `blk2_stolen` is (re)asserted only if this slot's
+        // Block1 STCH MAC PDU flags the second half stolen (cl. 9.4.4.3.2).
+        self.cur_burst.blk2_stolen = false;
 
         let type5 = bbk.block;
         tracing::trace!("rx_bbk type5: {:?}", type5.dump_bin_full(true));
@@ -123,19 +131,34 @@ impl LmacMs {
             return LogicalChannel::Bnch;
         }
 
-        // is_traffic was previously extracted from the BBK block
-        // If traffic, but block was stolen, we're still signalling (e.g. SCH_HD)
+        // is_traffic was previously extracted from the BBK block (AACH downlink
+        // usage marker, cl. 21.4.7.2). On an assigned traffic channel the burst
+        // *training sequence* — surfaced by PhyMs as the block split — tells us
+        // whether a half-slot was stolen for associated signalling (FACCH/STCH,
+        // cl. 23 / cl. 9.4.4.3.2): NTS1 arrives as one full-slot block (`Both`)
+        // and carries TCH/S speech; NTS2 arrives as two half-blocks and the
+        // stolen half carries signalling. Block1 is always the stolen STCH half;
+        // Block2 is STCH only when Block1's MAC PDU flagged the second half
+        // stolen (length indication 111110), otherwise it is the remaining TCH/S
+        // speech half. This mirrors the BS uplink receive path
+        // (`LmacBs::determine_logical_channel_ul`).
         if self.cur_burst.is_traffic {
-            if (blk.block_num == PhyBlockNum::Block1 && self.cur_burst.blk1_stolen)
-                || (blk.block_num == PhyBlockNum::Block2 && self.cur_burst.blk2_stolen)
-            {
-                // This block is stolen traffic
-                return LogicalChannel::Stch;
-            } else {
-                // Traffic
-                // TODO FIXME determine which KIND of traffic
-                return LogicalChannel::TchS;
-            }
+            return match blk.block_num {
+                // NTS1 full-slot traffic burst: TCH/S speech.
+                PhyBlockNum::Both => LogicalChannel::TchS,
+                // NTS2 first stolen half-slot: always STCH signalling.
+                PhyBlockNum::Block1 => LogicalChannel::Stch,
+                // NTS2 second half-slot: STCH when both halves were stolen,
+                // otherwise the continuing TCH/S speech half.
+                PhyBlockNum::Block2 => {
+                    if self.cur_burst.blk2_stolen {
+                        LogicalChannel::Stch
+                    } else {
+                        LogicalChannel::TchS
+                    }
+                }
+                PhyBlockNum::Undefined => LogicalChannel::TchS,
+            };
         }
 
         // By default, we're on the signalling channel
@@ -492,5 +515,134 @@ impl TetraEntityTrait for LmacMs {
             self.ts = Some(mod_time.add_timeslots(1));
             tracing::debug!("tick: new TdmaTime: {:?}", self.ts.unwrap());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tetra_config::bluestation::{SharedConfig, from_toml_str};
+    use tetra_core::BitBuffer;
+
+    /// Minimal valid MS config (mirrors `example_config/config-ms.toml`).
+    const MS_TOML: &str = r#"
+config_version = "0.6"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 439825000
+rx_freq = 430425000
+ppm_err = 0
+device = "driver=sx"
+sample_rate = 600000
+rx_antenna = "RX"
+tx_antenna = "TX"
+rx_gain_lna = 48.0
+rx_gain_pga = 8.0
+tx_gain_dac = 0.0
+tx_gain_mixer = 0.0
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+freq_band = 4
+main_carrier = 1593
+duplex_spacing = 7
+custom_duplex_spacing = 9400000
+freq_offset = 0
+reverse_operation = false
+location_area = 1
+colour_code = 1
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+"#;
+
+    fn ms_lmac() -> LmacMs {
+        let cfg = from_toml_str(MS_TOML).expect("valid MS test config");
+        LmacMs::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    /// A downlink Normal Downlink Burst block as delivered by PhyMs: NTS1 yields
+    /// one full-slot block (`Both`); NTS2 (channel stealing) yields two split
+    /// half-blocks (`Block1`/`Block2`).
+    fn ndb_block(block_num: PhyBlockNum, train: TrainingSequence) -> TpUnitdataInd {
+        TpUnitdataInd {
+            train_type: train,
+            burst_type: BurstType::NDB,
+            block_type: PhyBlockType::NDB,
+            block_num,
+            block: BitBuffer::new(216),
+            time: TdmaTime::default(),
+        }
+    }
+
+    /// Full-slot (NTS1) traffic burst on an assigned TCH decodes as TCH/S speech.
+    #[test]
+    fn full_slot_traffic_burst_is_tchs() {
+        let mut lmac = ms_lmac();
+        lmac.cur_burst.is_traffic = true;
+        let t = TdmaTime::default();
+        let blk = ndb_block(PhyBlockNum::Both, TrainingSequence::NormalTrainSeq1);
+        assert_eq!(lmac.determine_logical_channel_dl(&blk, &t), LogicalChannel::TchS);
+    }
+
+    /// A stolen first half-slot (NTS2 split, Block1) on the TCH is STCH
+    /// associated signalling — this is the burst that carries a group-addressed
+    /// D-TX GRANTED naming the current talker (cl. 23 / cl. 9.4.4.3.2). Before the
+    /// fix this fell through to TCH/S and the floor PDU was silently dropped.
+    #[test]
+    fn stolen_first_half_on_tch_is_stch() {
+        let mut lmac = ms_lmac();
+        lmac.cur_burst.is_traffic = true;
+        let t = TdmaTime::default();
+        let blk = ndb_block(PhyBlockNum::Block1, TrainingSequence::NormalTrainSeq2);
+        assert_eq!(lmac.determine_logical_channel_dl(&blk, &t), LogicalChannel::Stch);
+    }
+
+    /// The second half-slot is STCH only when Block1's MAC PDU flagged the second
+    /// half stolen (length indication 111110 → `blk2_stolen`). Both halves stolen
+    /// is how the BS delivers an individual + a group-addressed D-TX GRANTED in a
+    /// single stolen slot.
+    #[test]
+    fn stolen_second_half_is_stch_when_flagged() {
+        let mut lmac = ms_lmac();
+        lmac.cur_burst.is_traffic = true;
+        lmac.cur_burst.blk2_stolen = true;
+        let t = TdmaTime::default();
+        let blk = ndb_block(PhyBlockNum::Block2, TrainingSequence::NormalTrainSeq2);
+        assert_eq!(lmac.determine_logical_channel_dl(&blk, &t), LogicalChannel::Stch);
+    }
+
+    /// When only the first half was stolen, the second half is the continuing
+    /// TCH/S speech, not signalling.
+    #[test]
+    fn unflagged_second_half_is_tchs() {
+        let mut lmac = ms_lmac();
+        lmac.cur_burst.is_traffic = true;
+        lmac.cur_burst.blk2_stolen = false;
+        let t = TdmaTime::default();
+        let blk = ndb_block(PhyBlockNum::Block2, TrainingSequence::NormalTrainSeq2);
+        assert_eq!(lmac.determine_logical_channel_dl(&blk, &t), LogicalChannel::TchS);
+    }
+
+    /// `blk2_stolen` is per-slot state: it must be cleared when the next slot's
+    /// AACH (BBK) opens, so a stale STCH signal never mis-routes a later Block2
+    /// speech half into the signalling path.
+    #[test]
+    fn blk2_stolen_cleared_on_new_slot_bbk() {
+        let mut lmac = ms_lmac();
+        lmac.cur_burst.blk2_stolen = true;
+        let mut q = MessageQueue::new();
+        // rx_bbk clears the flag before the scrambling-code guard returns early.
+        lmac.rx_bbk(&mut q, ndb_block(PhyBlockNum::Undefined, TrainingSequence::SyncTrainSeq));
+        assert!(!lmac.cur_burst.blk2_stolen, "blk2_stolen reset at slot start");
     }
 }
