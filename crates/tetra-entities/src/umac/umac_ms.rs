@@ -1779,6 +1779,26 @@ impl UmacMs {
             _ => BitBuffer::new(TCH_S_TYPE1_BITS),
         };
 
+        // Diagnostic (uplink voice, hardware-troubleshooting): log every emitted
+        // TCH/S traffic burst with the exact target uplink slot, grant/steal
+        // state, and the type-1 speech block length. The BS decodes the burst as
+        // traffic only if it arrives on the slot whose UL physical channel it
+        // marked `Tp` (lmac_bs::uplink_phy_chan, keyed to the DL traffic slot);
+        // `encode_tp` only applies the mandatory ACELP channel reorder when the
+        // block is exactly 274 type-1 bits (else the speech is mis-ordered). This
+        // line lets us correlate the MS transmit slot against the BS receive slot
+        // (add_timeslots(-2)) and confirm the 274-bit block, purely from the MS log.
+        tracing::info!(
+            ul = %ul,
+            dltime = %self.dltime,
+            ul_ts = ul.t,
+            assigned_ts = ?self.assigned_traffic_slots,
+            granted = self.uplink_tx_granted,
+            has_steal,
+            speech_bits = mac_block.get_len_remaining(),
+            "MS uplink traffic: emitting TCH/S burst"
+        );
+
         let blk = TmvUnitdataReq {
             mac_block,
             logical_channel: LogicalChannel::TchS,

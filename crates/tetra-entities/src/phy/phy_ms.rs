@@ -399,6 +399,8 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 // (cl. 9.4.3.4).
                 let net_time = prim.time;
                 let reserved = prim.reserved_access;
+                let burst_type = prim.burst_type;
+                let train_type = prim.train_type;
                 let granted = self.local_uplink_time();
 
                 // Refuse to transmit until the uplink carrier has been derived
@@ -423,6 +425,8 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                     network = ?net_time,
                     dl = %self.dltime,
                     bits = pending.burst.len(),
+                    burst = ?burst_type,
+                    train = ?train_type,
                     "PhyMs: queued uplink burst at exact grant (dltime+2)"
                 );
                 if self.pending_tx.is_some() {
