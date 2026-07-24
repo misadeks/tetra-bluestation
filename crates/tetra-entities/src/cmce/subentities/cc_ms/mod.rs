@@ -355,6 +355,63 @@ mod tests {
         assert_eq!(cc.call(7).unwrap().current_speaker_ssi, Some(OTHER_TALKER));
     }
 
+    /// ETSI TS 100 392-2 cl. 14.5.2.1.2 / 14.5.1.1: while THIS MS holds the floor
+    /// (GrantedSelf), a periodic group D-SETUP late-entry re-broadcast carrying a
+    /// PREVIOUS talker's calling-party address and a stale GrantedToOtherUser
+    /// grant must NOT revoke our own active transmission. Real-time floor control
+    /// is governed only by D-TX-GRANTED / D-TX-CEASED / D-TX-INTERRUPT. (Observed
+    /// on-air: the re-broadcast cut the MS off its own floor mid-talkspurt.)
+    #[test]
+    fn foreign_address_group_dsetup_rebroadcast_does_not_revoke_own_floor() {
+        const OWN_ISSI: u32 = 1234567;
+        const PREV_TALKER: u32 = 2200699;
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        cc.own_issi = Some(OWN_ISSI);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+        // MS holds the floor (GrantedSelf) — it is actively transmitting.
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        assert_eq!(cc.call(7).unwrap().tx_grant_state, MsTxGrantState::GrantedSelf);
+        while source.try_recv().is_some() {} // discard prior telemetry
+        while q.pop_front().is_some() {}
+
+        // Stale late-entry re-broadcast: calling party = the PREVIOUS talker,
+        // grant = GrantedToOtherUser.
+        let mut pdu = d_setup(7, false);
+        pdu.basic_service_information = default_speech_basic_service();
+        pdu.calling_party_address_ssi = Some(PREV_TALKER);
+        pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
+        cc.rx_d_setup(&mut q, pdu, route());
+
+        // Our floor is preserved and no U-plane reconfigure (tx_grant off) is
+        // emitted, so the MS keeps transmitting.
+        assert_eq!(
+            cc.call(7).unwrap().tx_grant_state,
+            MsTxGrantState::GrantedSelf,
+            "a foreign-address D-SETUP re-broadcast must not knock the MS off its own floor"
+        );
+        assert!(
+            source.try_recv().is_none(),
+            "re-broadcast while holding the floor must not raise a TNCC-TX indication"
+        );
+        assert!(
+            q.pop_front().is_none(),
+            "re-broadcast while holding the floor must not emit an LCMC-CONFIGURE (tx_grant off)"
+        );
+    }
+
     // --- MT individual-call answer path (cl. 14.5.1.1.1) ----------------------
 
     use crate::net_telemetry::channel::telemetry_channel;

@@ -90,10 +90,36 @@ impl CcMsSubentity {
         // speaker actually changes.
         if is_group && self.calls.contains_key(&pdu.call_identifier) {
             let prev_speaker = self.calls.get(&pdu.call_identifier).and_then(|c| c.current_speaker_ssi);
+            // ETSI TS 100 392-2 cl. 14.5.2.1.2 / 14.5.1.1: the periodic group
+            // D-SETUP re-broadcast is a late-entry beacon whose transmission-grant
+            // element reflects the floor state at the time the SwMI queued it and
+            // can therefore be stale. While THIS MS currently holds the floor
+            // (GrantedSelf), real-time floor control is governed solely by
+            // D-TX-GRANTED / D-TX-CEASED / D-TX-INTERRUPT (cl. 14.8). Applying the
+            // re-broadcast's grant here would revoke our own active transmission —
+            // the same hazard the own-address guard above prevents for our own
+            // echo, but reached via a re-broadcast that carries a previous talker's
+            // calling-party address. So keep the call-active housekeeping but do
+            // NOT re-apply the floor grant (or raise a talker-change indication)
+            // when we are the current transmitter; a genuine revocation arrives via
+            // D-TX-INTERRUPT / D-TX-CEASED.
+            let holds_floor_self = self
+                .calls
+                .get(&pdu.call_identifier)
+                .map(|c| c.tx_grant_state == MsTxGrantState::GrantedSelf)
+                .unwrap_or(false);
             if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
                 call.route = route;
                 call.state = MsCcState::CallActive;
                 call.transmission_request_allowed = !pdu.transmission_request_permission; // ETSI 14.8.43 Table 14.81: bit 0 = allowed to request
+            }
+            if holds_floor_self {
+                tracing::debug!(
+                    call_identifier = pdu.call_identifier,
+                    grant = ?pdu.transmission_grant,
+                    "CMCE-MS: group D-SETUP re-broadcast ignored for floor (MS holds the floor; cl. 14.5.2.1.2)"
+                );
+                return;
             }
             self.apply_transmission_grant(queue, pdu.call_identifier, pdu.transmission_grant, pdu.calling_party_address_ssi);
             let new_speaker = self.calls.get(&pdu.call_identifier).and_then(|c| c.current_speaker_ssi);
