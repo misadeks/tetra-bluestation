@@ -28,6 +28,42 @@ pub struct MacData {
 }
 
 impl MacData {
+    /// Computes the MAC-DATA header length in bits for the length-indication
+    /// form (a complete, non-fragmented PDU with an explicit length), ETSI TS
+    /// 100 392-2 cl. 21.4.3.3: mac_pdu_type(2) + fill_bit_ind(1) + encrypted(1) +
+    /// address_type(2) + address(24) or event_label(10) + length_ind_flag(1) +
+    /// length_ind(6).
+    fn compute_header_len(&self) -> usize {
+        let mut ret = 2 + 1 + 1 + 2; // mac_pdu_type + fill + encrypted + addr_type
+        if self.addr.is_some() {
+            ret += 24;
+        } else if self.event_label.is_some() {
+            ret += 10;
+        }
+        ret += 1; // length_ind_or_cap_req flag
+        ret += 6; // length_ind
+        ret
+    }
+
+    /// Sets `length_ind` (in octets, covering header + SDU + sub-octet fill) and
+    /// the `fill_bits` flag from the header length and the provided SDU length,
+    /// selecting the length-indication form (clears any capacity-request fields).
+    /// Returns the number of sub-octet fill bits to append after the SDU. Mirrors
+    /// [`MacResource::update_len_and_fill_ind`] for uplink FACCH/STCH stealing
+    /// (cl. 21.4.3.3 / 23.4.2.2).
+    pub fn update_len_and_fill_ind(&mut self, sdu_len: usize) -> usize {
+        let hdr_len = self.compute_header_len();
+        let total_len = hdr_len + sdu_len;
+        let total_len_bytes = total_len.div_ceil(8);
+        let num_fill_bits = (8 - (total_len % 8)) % 8;
+
+        self.length_ind = Some(total_len_bytes as u8);
+        self.frag_flag = None;
+        self.reservation_req = None;
+        self.fill_bits = num_fill_bits != 0;
+        num_fill_bits
+    }
+
     pub fn from_bitbuf(buf: &mut BitBuffer) -> Result<Self, PduParseErr> {
         // required constant mac_pdu_type
         assert!(buf.read_field(2, "mac_pdu_type")? == 0);

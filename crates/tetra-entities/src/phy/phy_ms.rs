@@ -318,13 +318,34 @@ impl<D: RxTxDev> PhyMs<D> {
 
         let burst: Vec<u8> = match prim.burst_type {
             BurstType::NUB => {
-                // SCH/F: the type-5 block spans both half-slots (two 216-bit
-                // sub-blocks bkn1/bkn2), split either side of the normal training
-                // sequence (cl. 9.4.4.2.4 / Table 9.5).
                 let mut blk1 = [0u8; NUB_BLK_BITS];
                 let mut blk2 = [0u8; NUB_BLK_BITS];
-                type5.to_bitarr(&mut blk1);
-                type5.to_bitarr(&mut blk2);
+                match prim.train_type {
+                    // Full-slot Normal Uplink Burst (SCH/F or TCH/S): one 432-bit
+                    // type-5 block spans both half-slots (two 216-bit sub-blocks
+                    // bkn1/bkn2), split either side of normal training sequence 1
+                    // (cl. 9.4.4.2.4 / Table 9.5).
+                    TrainingSequence::NormalTrainSeq1 => {
+                        type5.to_bitarr(&mut blk1);
+                        type5.to_bitarr(&mut blk2);
+                    }
+                    // Stolen Normal Uplink Burst (FACCH/STCH stealing, cl. 23):
+                    // the two half-slots carry *independent* 216-bit type-5 blocks
+                    // separated by normal training sequence 2 (cl. 9.4.4.3.2). The
+                    // first half (blk1) is the stolen STCH signalling block, the
+                    // second half (blk2) the remaining TCH/S speech half. This
+                    // mirrors the BS downlink NDB/NormalTrainSeq2 two-half-block
+                    // path in `lmac_bs`.
+                    TrainingSequence::NormalTrainSeq2 => {
+                        type5.to_bitarr(&mut blk1);
+                        let mut half2 = prim
+                            .blk2
+                            .expect("PhyMs stolen NUB (NormalTrainSeq2) must carry blk2");
+                        half2.seek(0);
+                        half2.to_bitarr(&mut blk2);
+                    }
+                    other => panic!("PhyMs: unsupported NUB training sequence {:?}", other),
+                }
                 slotter::build_nub(prim.train_type, &blk1, &blk2).to_vec()
             }
             BurstType::CUB => {

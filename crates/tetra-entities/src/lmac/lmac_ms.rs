@@ -314,17 +314,20 @@ impl LmacMs {
         };
 
         // The MS transmits a single uplink burst per granted (sub)slot. Unlike the
-        // BS downlink slot there is no BBK/AACH on the uplink, and a single burst
-        // carries exactly one MAC block: SCH/HU on a Control Uplink Burst, or
-        // SCH/F (signalling) / TCH/S (circuit-mode speech) on a Normal Uplink
-        // Burst. ETSI TS 100 392-2 cl. 9.4.4.2 (uplink bursts), cl. 23.5 (MAC
-        // random/reserved access) / cl. 23 (traffic scheduling).
+        // BS downlink slot there is no BBK/AACH on the uplink. A burst carries
+        // either one MAC block — SCH/HU on a Control Uplink Burst, or SCH/F
+        // (signalling) / TCH/S (circuit-mode speech) full-slot on a Normal Uplink
+        // Burst — or, when a traffic slot is stolen for associated signalling
+        // (FACCH/STCH, cl. 23), two half-slot blocks: STCH signalling (blk1) plus
+        // the remaining TCH/S speech half (blk2). ETSI TS 100 392-2 cl. 9.4.4.2
+        // (uplink bursts), cl. 23.5 (MAC random/reserved access) / cl. 23
+        // (traffic scheduling & channel stealing).
         assert!(prim.bbk.is_none(), "rx_tmv_unitdata_req_slot: MS uplink has no BBK/AACH");
-        assert!(prim.blk2.is_none(), "rx_tmv_unitdata_req_slot: MS uplink burst carries a single block");
         let blk1 = prim
             .blk1
             .take()
             .expect("rx_tmv_unitdata_req_slot: blk1 must be present");
+        let blk2 = prim.blk2.take();
 
         // The upper MAC schedules the uplink burst in a specific granted slot
         // (the random/reserved-access opportunity, cl. 23.5). Carry that absolute
@@ -334,7 +337,8 @@ impl LmacMs {
 
         // Select uplink burst type + training sequence from the logical channel
         // (cl. 9.4.4.2). SCH/F uses normal training sequence 1 (n), SCH/HU uses the
-        // extended training sequence (x).
+        // extended training sequence (x). A stolen traffic slot uses normal
+        // training sequence 2 (p) to flag the two-half-block layout (cl. 9.4.4.3.2).
         let (burst_type, train_type) = match blk1.logical_channel {
             LogicalChannel::SchF => (BurstType::NUB, TrainingSequence::NormalTrainSeq1),
             LogicalChannel::SchHu => (BurstType::CUB, TrainingSequence::ExtendedTrainSeq),
@@ -342,25 +346,45 @@ impl LmacMs {
             // training sequence 1, mirroring the BS downlink NDB traffic burst
             // (cl. 9.4.4.2 uplink bursts, cl. 8.2 channel coding).
             LogicalChannel::TchS => (BurstType::NUB, TrainingSequence::NormalTrainSeq1),
+            // Stolen traffic slot carrying associated signalling: STCH in the
+            // first half, the remaining TCH/S speech in the second half. A Normal
+            // Uplink Burst with normal training sequence 2 marks the stolen layout
+            // (cl. 23 channel stealing, cl. 9.4.4.3.2), mirroring the BS downlink
+            // NDB/NormalTrainSeq2 two-half-block path in `lmac_bs`.
+            LogicalChannel::Stch => {
+                assert!(blk2.is_some(), "rx_tmv_unitdata_req_slot: stolen STCH burst must carry blk2");
+                (BurstType::NUB, TrainingSequence::NormalTrainSeq2)
+            }
             other => panic!("rx_tmv_unitdata_req_slot: unsupported uplink logical channel {:?}", other),
         };
 
         // Channel-encode type1 -> type5. Traffic (TCH/S) uses the ACELP speech
-        // coding chain (`encode_tp`, cl. 8.2.3 / EN 300 395-2); signalling uses
-        // the control-channel chain (`encode_cp`, cl. 8.2.1). Both scramble with
-        // the serving cell's uplink code, already set from the received SYNC.
-        let type5 = if blk1.logical_channel.is_traffic() {
+        // coding chain (`encode_tp`, cl. 8.2.3 / EN 300 395-2); signalling
+        // (SCH/F, SCH/HU, STCH) uses the control-channel chain (`encode_cp`,
+        // cl. 8.2.1). Both scramble with the serving cell's uplink code, already
+        // set from the received SYNC. For a full-slot traffic burst `blk_num` is
+        // 1 (all 432 bits); for a stolen slot the speech half is encoded as
+        // `blk_num` 2 (the second 216 bits, cl. 23 — missing first half triggers
+        // BFI at the vocoder, acceptable at a PTT/stealing boundary).
+        let type5_blk1 = if blk1.logical_channel.is_traffic() {
             errorcontrol::encode_tp(blk1, 1)
         } else {
             errorcontrol::encode_cp(blk1)
         };
+        let type5_blk2 = blk2.map(|blk2| {
+            if blk2.logical_channel.is_traffic() {
+                errorcontrol::encode_tp(blk2, 2)
+            } else {
+                errorcontrol::encode_cp(blk2)
+            }
+        });
 
         let prim_phy = TpUnitdataReqSlot {
             train_type,
             burst_type,
             bbk: None,
-            blk1: Some(type5),
-            blk2: None,
+            blk1: Some(type5_blk1),
+            blk2: type5_blk2,
             time: Some(ul_time),
             // Carry the reserved/contention distinction down to PhyMs so it can
             // enforce exact-slot transmission for reserved access (cl. 23.5.2.2.2).
