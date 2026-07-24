@@ -137,6 +137,77 @@ mod tests {
         assert!(matches!(q.pop_front().unwrap().msg, SapMsgInner::LcmcMleConfigureReq(_)));
     }
 
+    /// M4b (cl. 14.5.2 / 14.5.1.4): once the call is on a traffic channel (the
+    /// U-plane has been switched on), floor-control PDUs are stolen from the
+    /// assigned TCH half-slot (FACCH) and sent as acknowledged BL-DATA on the
+    /// TCH-associated basic link (link_id 2), not on the setup control link.
+    #[test]
+    fn floor_signalling_steals_tch_once_on_traffic_channel() {
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(), // control link_id 3
+                true,
+            ),
+        );
+        // Grant self → U-plane switched on: the call is now on the traffic channel.
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        while q.pop_front().is_some() {}
+
+        // U-TX-CEASED while on the TCH must be stolen on the TCH-associated link.
+        assert!(cc.cease_tx(&mut q, 7));
+        let prim = loop {
+            match q.pop_front().expect("cease should emit signalling").msg {
+                SapMsgInner::LcmcMleUnitdataReq(p) => break p,
+                _ => continue,
+            }
+        };
+        assert!(prim.stealing_permission, "cease on TCH must steal the half-slot");
+        assert!(prim.stealing_repeats_flag);
+        assert_eq!(prim.link_id, 2, "must use the TCH-associated basic link");
+    }
+
+    /// U-TX-DEMAND raised while listening on the traffic channel is likewise
+    /// stolen from the TCH (the MS is not the current talker but owns the U-plane
+    /// receive path, cl. 14.5.1.4), on the TCH-associated basic link.
+    #[test]
+    fn tx_demand_steals_tch_while_listening() {
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                route(),
+                true,
+            ),
+        );
+        // Grant to another user → U-plane switched on (receiving), MS is listening.
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::GrantedToOtherUser, None);
+        while q.pop_front().is_some() {}
+
+        assert!(cc.request_tx(&mut q, 7, 1));
+        let prim = loop {
+            match q.pop_front().expect("demand should emit signalling").msg {
+                SapMsgInner::LcmcMleUnitdataReq(p) => break p,
+                _ => continue,
+            }
+        };
+        assert!(prim.stealing_permission, "demand on TCH must steal the half-slot");
+        assert_eq!(prim.link_id, 2, "must use the TCH-associated basic link");
+    }
+
     // --- MT individual-call answer path (cl. 14.5.1.1.1) ----------------------
 
     use crate::net_telemetry::channel::telemetry_channel;

@@ -276,8 +276,12 @@ fn active_group_tx_demand_ceased_and_disconnect_pdus_decode() {
 
     assert!(cc.cease_tx(&mut q, CALL_ID));
     let mut prim = pop_unitdata(&mut q);
-    assert!(prim.stealing_permission);
-    assert!(prim.stealing_repeats_flag);
+    // M4b (cl. 14.5.2): no traffic channel is assigned here (the D-SETUP granted
+    // no U-plane), so the cease falls back to the assigned control channel as
+    // plain acknowledged BL-DATA — it is NOT stolen. Stealing pre-TCH would force
+    // the LLC onto unacknowledged BL-UDATA, which the SwMI discards.
+    assert!(!prim.stealing_permission);
+    assert_eq!(prim.link_id, 33, "pre-TCH cease stays on the control link");
     let pdu = UTxCeased::from_bitbuf(&mut prim.sdu).unwrap();
     assert_eq!(pdu.call_identifier, CALL_ID);
     let cfg = pop_config(&mut q);
