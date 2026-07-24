@@ -709,6 +709,100 @@ mod tests {
         assert_eq!(cc.call(11).unwrap().rx_speech_frames, 1, "unknown-owner frame dropped");
     }
 
+    /// ETSI TS 100 392-2 cl. 14.2.4.1: a single-transceiver MS has one U-plane /
+    /// traffic-channel resource. While an individual (point-to-point) call is
+    /// engaged and holds that resource, a concurrently-notified group call must
+    /// NOT seize it — the group's U-plane switch-on (and the LCMC-MLE CONFIGURE
+    /// that would reconfigure the lower layers off the private call) is withheld,
+    /// so the active private call is never disrupted.
+    #[test]
+    fn group_call_uplane_withheld_while_individual_call_engaged() {
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        let grp_route = CallRoute {
+            main_address: TetraAddress::new(220, SsiType::Gssi),
+            handle: 1,
+            endpoint_id: 4,
+            link_id: 3,
+        };
+
+        // Engaged duplex individual call: its U-plane is switched on (GrantedSelf).
+        cc.calls.insert(
+            5,
+            MsCall::new(5, MsCcState::CallActive, MsCallKind::Individual, default_speech_basic_service(), true, route(), true),
+        );
+        cc.apply_transmission_grant(&mut q, 5, TransmissionGrant::Granted, None);
+        assert_eq!(cc.call(5).unwrap().last_uplane.map(|u| u.switch_u_plane), Some(true));
+        while q.pop_front().is_some() {} // discard the individual call's CONFIGURE
+
+        // A group call is notified (remote talker) while the private call runs.
+        cc.calls.insert(
+            9,
+            MsCall::new(9, MsCcState::CallActive, MsCallKind::Group, default_speech_basic_service(), false, grp_route, true),
+        );
+        cc.apply_transmission_grant(&mut q, 9, TransmissionGrant::GrantedToOtherUser, Some(2200699));
+
+        // No U-plane CONFIGURE was emitted for the group call, and its U-plane
+        // stayed off; the individual call keeps the resource.
+        assert!(
+            q.iter().all(|m| !matches!(m.msg, SapMsgInner::LcmcMleConfigureReq(_))),
+            "group call must not reconfigure the U-plane while an individual call is engaged"
+        );
+        assert_ne!(
+            cc.call(9).unwrap().last_uplane.map(|u| u.switch_u_plane),
+            Some(true),
+            "group U-plane must stay off while the individual call is engaged"
+        );
+        assert_eq!(cc.call(5).unwrap().last_uplane.map(|u| u.switch_u_plane), Some(true));
+
+        // Group downlink traffic is therefore not played out (U-plane off).
+        cc.rx_downlink_traffic(2, false, Some(19), Some(220), &[1u8; 274]);
+        assert_eq!(cc.call(9).unwrap().rx_speech_frames, 0, "no group audio while the private call is engaged");
+    }
+
+    /// ETSI TS 100 392-2 cl. 14.2.4.1 / 14.5.1.1: once the engaged individual
+    /// call releases the sole U-plane resource, a withheld group call's periodic
+    /// D-SETUP late-entry re-broadcast switches its U-plane on (late entry).
+    #[test]
+    fn withheld_group_call_activates_when_individual_call_releases() {
+        let mut cc = CcMsSubentity::new(None);
+        let mut q = MessageQueue::new();
+        let grp_route = CallRoute {
+            main_address: TetraAddress::new(220, SsiType::Gssi),
+            handle: 1,
+            endpoint_id: 4,
+            link_id: 3,
+        };
+
+        cc.calls.insert(
+            5,
+            MsCall::new(5, MsCcState::CallActive, MsCallKind::Individual, default_speech_basic_service(), true, route(), true),
+        );
+        cc.apply_transmission_grant(&mut q, 5, TransmissionGrant::Granted, None);
+        cc.calls.insert(
+            9,
+            MsCall::new(9, MsCcState::CallActive, MsCallKind::Group, default_speech_basic_service(), false, grp_route, true),
+        );
+        cc.apply_transmission_grant(&mut q, 9, TransmissionGrant::GrantedToOtherUser, Some(2200699));
+        assert_ne!(cc.call(9).unwrap().last_uplane.map(|u| u.switch_u_plane), Some(true), "withheld while engaged");
+
+        // Private call ends, freeing the U-plane resource.
+        cc.calls.remove(&5);
+        while q.pop_front().is_some() {}
+
+        // Periodic group re-broadcast now switches the U-plane on (late entry).
+        cc.apply_transmission_grant(&mut q, 9, TransmissionGrant::GrantedToOtherUser, Some(2200699));
+        assert_eq!(
+            cc.call(9).unwrap().last_uplane.map(|u| u.switch_u_plane),
+            Some(true),
+            "group U-plane activates once the individual call frees the resource"
+        );
+        assert!(
+            q.iter().any(|m| matches!(m.msg, SapMsgInner::LcmcMleConfigureReq(_))),
+            "CONFIGURE emitted for the group call after the private call releases"
+        );
+    }
+
     /// cl. 23.5.5 / 14.5.1.4: in a duplex or MS-originated group call the serving
     /// cell also addresses this MS individually (floor grants / MAC-RESOURCE) on
     /// the call's shared usage marker, so the MAC transiently binds the marker to
