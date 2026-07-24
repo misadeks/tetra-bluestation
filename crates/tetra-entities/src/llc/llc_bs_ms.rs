@@ -330,7 +330,16 @@ impl Llc {
         // the TL-SDU on the BL-ACK instead of sending an empty BL-ACK followed by
         // BL-UDATA. This matches the TL-DATA response primitive: the response
         // payload is not explicitly acknowledged by the peer entity.
-        if prim.stealing_permission {
+        //
+        // MS EXCEPTION (cl. 22.3.2.3): an MS that steals a traffic-channel
+        // half-slot for floor control (U-TX-CEASED / U-TX-DEMAND) must send its
+        // PDU as *acknowledged* BL-DATA (or BL-ADATA when it also owes an ACK) on
+        // the TCH-associated basic link, not piggybacked on an unacknowledged
+        // BL-ACK — otherwise the BS MLE discards the floor PDU as an unexpected
+        // TL-UNITDATA. So the MS never takes the BL-ACK piggyback fork; it always
+        // falls through to the acknowledged path below. The `!is_ms_mode()` guard
+        // keeps the BS behaviour byte-identical (it is always true for the BS).
+        if prim.stealing_permission && !self.is_ms_mode() {
             if let Some(out_ack_n) = self.get_out_ack_seq_if_any(prim.main_address) {
                 let mut pdu_buf = BitBuffer::new_autoexpand(32);
                 let pdu = BlAck {
@@ -372,7 +381,17 @@ impl Llc {
         // Use unacknowledged mode (BL-UDATA) when there is no pending uplink
         // ACK to piggyback onto, or for GSSI-addressed group messages without an
         // individual LLC link.
-        if prim.stealing_permission || prim.main_address.ssi_type == SsiType::Gssi {
+        //
+        // MS EXCEPTION (cl. 22.3.2.3): stealing on the MS uplink only happens for
+        // point-to-point floor control on the TCH-associated basic link, which
+        // must be *acknowledged* BL-DATA so the BS call control actually receives
+        // it (an unacknowledged TL-UNITDATA is discarded by the BS MLE). The MS
+        // therefore never emits BL-UDATA merely because it is stealing; it falls
+        // through to the acknowledged BL-DATA/BL-ADATA path below (carrying
+        // `stealing_permission` and `link_id` to the MAC). GSSI group messages
+        // stay unacknowledged for the MS too (a group PDU cannot be acked). The
+        // `!is_ms_mode()` guard keeps the BS byte-identical (always true for BS).
+        if (prim.stealing_permission && !self.is_ms_mode()) || prim.main_address.ssi_type == SsiType::Gssi {
             let mut pdu_buf = BitBuffer::new_autoexpand(32);
             let pdu = BlUdata { has_fcs: false };
             pdu.to_bitbuf(&mut pdu_buf);
@@ -1227,6 +1246,102 @@ attach_groups = []
             1,
             "BS must keep the entry (deferred) when the ack precedes t_umac_done"
         );
+    }
+
+    /// Builds a floor-control TL-DATA request that steals a traffic half-slot
+    /// (U-TX-CEASED / U-TX-DEMAND on the TCH-associated basic link, link_id 2).
+    fn steal_floor_req(link_id: u32) -> SapMsg {
+        let mut sdu = BitBuffer::new_autoexpand(8);
+        sdu.write_bits(0b00011, 5); // stand-in floor-control SDU
+        sdu.seek(0);
+        SapMsg::new(
+            Sap::TlaSap,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+                main_address: TetraAddress::new(OWN_ISSI, SsiType::Issi),
+                link_id,
+                endpoint_id: 0,
+                tl_sdu: sdu,
+                pdu_priority: None,
+                is_emergency: false,
+                stealing_permission: true,
+                subscriber_class: 0,
+                fcs_flag: false,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_class_info: None,
+                req_handle: 0,
+                graceful_degradation: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        )
+    }
+
+    /// bl_pdu_type field (bits 2..4 of the LLC PDU header, cl. 22.2):
+    /// 0=BL-ADATA, 1=BL-DATA, 2=BL-UDATA, 3=BL-ACK.
+    fn bl_pdu_type(pdu: &BitBuffer) -> u64 {
+        let mut b = pdu.clone();
+        b.seek(0);
+        b.read_bits(1); // llc_link_type
+        b.read_bits(1); // has_fcs
+        b.read_bits(2).expect("bl_pdu_type field")
+    }
+
+    /// M4b regression (cl. 22.3.2.3): an MS stealing a traffic half-slot for
+    /// floor control must emit *acknowledged* BL-DATA on the TCH-associated
+    /// basic link (so the BS MLE processes it), not unacknowledged BL-UDATA on
+    /// MCCH. The stealing flag and link_id must be forwarded to the MAC intact.
+    #[test]
+    fn test_ms_stealing_floor_pdu_is_acknowledged_bl_data() {
+        let mut llc = llc("Ms");
+        let mut queue = MessageQueue::new();
+        llc.rx_tla_tldata_req_bl(&mut queue, steal_floor_req(2));
+
+        assert!(
+            llc.outbound_udata_messages.is_empty(),
+            "MS floor steal must NOT go out as unacknowledged BL-UDATA"
+        );
+        assert_eq!(
+            llc.outbound_messages.len(),
+            1,
+            "MS floor steal must be tracked as an acknowledged uplink"
+        );
+
+        let SapMsgInner::TmaUnitdataReq(req) =
+            &llc.outbound_messages.front().unwrap().retransmission_buf.msg
+        else {
+            panic!("expected TmaUnitdataReq to the MAC");
+        };
+        assert_eq!(bl_pdu_type(&req.pdu), 1, "must be BL-DATA (acknowledged)");
+        assert!(req.stealing_permission, "stealing flag must be forwarded");
+        assert_eq!(req.link_id, 2, "TCH-associated link_id must be forwarded");
+    }
+
+    /// BS byte-identical guard: the same stealing request in BS mode must still
+    /// produce unacknowledged BL-UDATA (the MS-only gate is a no-op for the BS).
+    #[test]
+    fn test_bs_stealing_still_unacknowledged_bl_udata() {
+        let mut llc = llc("Bs");
+        let mut queue = MessageQueue::new();
+        llc.rx_tla_tldata_req_bl(&mut queue, steal_floor_req(2));
+
+        assert!(
+            llc.outbound_messages.is_empty(),
+            "BS stealing must not create an acknowledged-uplink entry"
+        );
+        assert_eq!(
+            llc.outbound_udata_messages.len(),
+            1,
+            "BS stealing behaviour is unchanged (BL-UDATA)"
+        );
+        let SapMsgInner::TmaUnitdataReq(req) =
+            &llc.outbound_udata_messages.front().unwrap().msg
+        else {
+            panic!("expected TmaUnitdataReq to the MAC");
+        };
+        assert_eq!(bl_pdu_type(&req.pdu), 2, "BS must still emit BL-UDATA");
     }
 }
 
