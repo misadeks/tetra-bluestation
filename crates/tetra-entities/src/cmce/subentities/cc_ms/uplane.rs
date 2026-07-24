@@ -91,19 +91,38 @@ impl CcMsSubentity {
         // Demultiplex the frame to the call it belongs to. The MAC tags each
         // frame with the destination SSI the serving cell bound the traffic's
         // usage marker to (cl. 23.5.5); attribute it to the call addressed to
-        // that party whose U-plane is switched on (cl. 14.5.1.4). When the MAC
-        // could not resolve an owner (`owner_ssi` is `None` — e.g. an individual
-        // call before the usage-marker binding is observed), fall back to the
-        // sole U-plane-on call, preserving the single-call receive behaviour.
-        let call = match owner_ssi {
-            Some(ssi) => self.calls.values_mut().find(|c| {
-                c.route.main_address.ssi == ssi && c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false)
-            }),
-            None => self
-                .calls
-                .values_mut()
-                .find(|c| c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false)),
-        };
+        // that party whose U-plane is switched on (cl. 14.5.1.4).
+        let uplane_on = |c: &MsCall| c.last_uplane.map(|u| u.switch_u_plane).unwrap_or(false);
+
+        // Primary attribution: the U-plane-on call whose main address is the
+        // party the marker was bound to (group call → GSSI). This keeps
+        // concurrent calls strictly separated (cl. 23.5.5).
+        let mut target = owner_ssi.and_then(|ssi| {
+            self.calls
+                .values()
+                .find(|c| c.route.main_address.ssi == ssi && uplane_on(c))
+                .map(|c| c.call_identifier)
+        });
+
+        // Fallback: no call is addressed to that party. This happens when the
+        // MAC could not resolve an owner (`owner_ssi` is `None` — e.g. an
+        // individual call before the usage-marker binding is observed), OR when
+        // the marker was bound to this MS's own individual address because the
+        // serving cell addressed us individually (a floor grant / MAC-RESOURCE)
+        // on the call's shared usage marker in a duplex or MS-originated call —
+        // the traffic still belongs to that call, not a new one. Attribute it to
+        // the *sole* U-plane-on call, preserving single-call receive behaviour
+        // without ever mis-attributing across concurrent calls (cl. 14.5.1.4):
+        // if two or more calls have the U-plane on, an unresolved owner is
+        // dropped rather than guessed.
+        if target.is_none() {
+            let mut on = self.calls.values().filter(|c| uplane_on(c));
+            if let (Some(c), None) = (on.next(), on.next()) {
+                target = Some(c.call_identifier);
+            }
+        }
+
+        let call = target.and_then(|cid| self.calls.get_mut(&cid));
         let Some(call) = call else {
             tracing::trace!(
                 "rx_downlink_traffic: no U-plane-on call for owner {:?} (marker {:?}), dropping speech frame",

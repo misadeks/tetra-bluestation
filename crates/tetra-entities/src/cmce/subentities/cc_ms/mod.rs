@@ -652,6 +652,55 @@ mod tests {
         assert_eq!(cc.call(11).unwrap().rx_speech_frames, 1, "unknown-owner frame dropped");
     }
 
+    /// cl. 23.5.5 / 14.5.1.4: in a duplex or MS-originated group call the serving
+    /// cell also addresses this MS individually (floor grants / MAC-RESOURCE) on
+    /// the call's shared usage marker, so the MAC transiently binds the marker to
+    /// our own ISSI. Downlink traffic that arrives tagged with that own address
+    /// (not any call's main address) must still be delivered to the sole
+    /// U-plane-on call — never dropped — while remaining unambiguous when only one
+    /// call is active.
+    #[test]
+    fn downlink_speech_recovered_when_marker_bound_to_own_issi() {
+        const OWN_ISSI: u32 = 1234567;
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(OWN_ISSI);
+        let mut q = MessageQueue::new();
+
+        cc.calls.insert(
+            22,
+            MsCall::new(
+                22,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false,
+                CallRoute {
+                    main_address: TetraAddress::new(2200699, SsiType::Gssi),
+                    handle: 1,
+                    endpoint_id: 2,
+                    link_id: 3,
+                },
+                true,
+            ),
+        );
+        // Remote talker: the sole call's U-plane is switched on.
+        cc.apply_transmission_grant(&mut q, 22, TransmissionGrant::GrantedToOtherUser, None);
+
+        // Frame tagged with the group address is delivered (primary attribution).
+        cc.rx_downlink_traffic(4, false, Some(22), Some(2200699), &[1u8; 274]);
+        assert_eq!(cc.call(22).unwrap().rx_speech_frames, 1, "group-owned frame delivered");
+
+        // Frame tagged with our OWN ISSI (marker contaminated by an individual
+        // MAC-RESOURCE addressed to us) is recovered onto the sole U-plane-on
+        // call, not dropped.
+        cc.rx_downlink_traffic(4, false, Some(22), Some(OWN_ISSI), &[1u8; 274]);
+        assert_eq!(
+            cc.call(22).unwrap().rx_speech_frames,
+            2,
+            "own-ISSI-tagged frame recovered onto the sole U-plane-on call"
+        );
+    }
+
     #[test]
     fn uplink_speech_forwarded_only_while_talker() {
         let mut cc = CcMsSubentity::new(None);
