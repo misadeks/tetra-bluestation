@@ -250,8 +250,11 @@ divergence fails a test rather than only showing up on air.
 5. **Calls.** Receive/participate in group and individual/duplex calls; downlink TCH/S
    speech is forwarded to the UI (`MsSpeechFrame`); uplink mic audio from the UI is
    emitted on granted traffic slots.
-6. **Shutdown.** If registered, send a best-effort U-ITSI DETACH (cl. 16.6.1) during a
-   bounded drain, then exit.
+6. **Shutdown.** On Ctrl+C: if camped **and** registered, send a best-effort U-ITSI
+   DETACH (cl. 16.6.1) during a bounded drain, then exit. If **not** synchronized to a
+   base station (still scanning / out of coverage), the receive loop is interrupted
+   cooperatively so the process exits promptly instead of waiting for a downlink to
+   appear first (`run_flag` in `phy/components/soapy_dev.rs`).
 
 ---
 

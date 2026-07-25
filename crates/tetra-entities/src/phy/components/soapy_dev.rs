@@ -2,6 +2,8 @@
 //! between SDR device and modulator/demodulator code.
 
 use rustfft;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::TdmaTime;
 
@@ -57,6 +59,15 @@ pub struct RxTxDevSoapySdr {
     sdr: soapyio::SoapyIo,
     rx_dsp: Option<RxDsp>,
     tx_dsp: Option<TxDsp>,
+    /// Cooperative shutdown flag (MS mode). While the MS is unsynchronized the
+    /// downlink demodulator stays in `Mode::DlUnsynchronized` and never yields a
+    /// demodulated slot, so `rxtx_timeslot`'s RX loop would otherwise spin until
+    /// the MS camps on a cell — meaning a Ctrl+C while not connected to a base
+    /// station is only acted on once a downlink appears. When this flag is
+    /// present and cleared, the RX loop returns promptly so the run loop can
+    /// observe the stop request and shut down. `None` (the default, and always
+    /// for BS mode) leaves behaviour unchanged.
+    run_flag: Option<Arc<AtomicBool>>,
 }
 
 type FftPlanner = rustfft::FftPlanner<RealSample>;
@@ -153,7 +164,31 @@ impl RxTxDevSoapySdr {
             },
 
             sdr,
+            run_flag: None,
         }
+    }
+
+    /// Install the cooperative shutdown flag (MS mode). Passed the process-wide
+    /// `is_running` flag so the blocking RX loop can bail out promptly when a
+    /// shutdown is requested even while the MS is not yet synchronized to a base
+    /// station (see [`RxTxDevSoapySdr::run_flag`]).
+    pub fn set_run_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.run_flag = Some(flag);
+    }
+
+    /// True when a cooperative shutdown has been requested (run flag present and
+    /// cleared). Always false when no flag is installed (BS mode / tests), so
+    /// behaviour there is unchanged.
+    fn stop_requested(&self) -> bool {
+        self.run_flag
+            .as_ref()
+            .is_some_and(|f| !f.load(Ordering::Relaxed))
+    }
+
+    /// True when the serving-cell downlink is synchronized. `false` when there
+    /// is no RX DSP (TX-only) or no downlink lock yet.
+    fn dl_synchronized(&self) -> bool {
+        self.rx_dsp.as_ref().is_some_and(|rx| rx.dl_synchronized())
     }
 
     /// Process a block of received signal.
@@ -200,6 +235,20 @@ impl RxTxDev for RxTxDevSoapySdr {
         while self.process_tx_block(tx_slot)? {}
 
         while self.process_rx_block()? {
+            // Cooperative shutdown: while the MS is unsynchronized the downlink
+            // demodulator (Mode::DlUnsynchronized) never yields a demodulated
+            // slot, so this loop would otherwise spin until the MS camps on a
+            // cell — a Ctrl+C while not connected to a base station would only
+            // take effect once a downlink appears. When a shutdown has been
+            // requested *and* we are not yet synchronized, bail out so the MS
+            // run loop can observe the stop flag and exit. Restricted to the
+            // unsynchronized case so a shutdown while camped is untouched: there
+            // the loop already returns each slot on its own, letting MM transmit
+            // its U-ITSI DETACH before the streams close. No-op in BS mode (no
+            // flag installed).
+            if self.stop_requested() && !self.dl_synchronized() {
+                break;
+            }
             // Continue producing TX signal if possible.
             while self.process_tx_block(tx_slot)? {}
         }
@@ -348,6 +397,13 @@ impl RxDsp {
         self.monitors
             .iter()
             .find_map(|pair| pair.dl.demodulator.synchronized_reference_time())
+    }
+
+    /// True when any serving-cell downlink demodulator has achieved downlink
+    /// lock. While this is false the demodulators never yield a slot, so the
+    /// RX processing loop only terminates once a shutdown is requested.
+    fn dl_synchronized(&self) -> bool {
+        self.monitors.iter().any(|pair| pair.dl.is_synchronized())
     }
 
     /// Reset every serving-cell downlink demodulator to `DlUnsynchronized`,
@@ -727,6 +783,11 @@ impl DemodulatorChannel {
             );
         }
         !self.demodulator.demodulated_slot_available()
+    }
+
+    /// True once this channel's demodulator has downlink lock (`Mode::Dl`).
+    fn is_synchronized(&self) -> bool {
+        self.demodulator.is_synchronized()
     }
 }
 
