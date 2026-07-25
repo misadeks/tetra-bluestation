@@ -150,6 +150,19 @@ impl MessageRouter {
         }
     }
 
+    /// Service the offline-serviceable external-interface command subset on every
+    /// entity while the stack is not yet synchronized (RX-first modes recover no
+    /// downlink slot, so there is no stack clock and [`Self::tick_start`] is not
+    /// run). This lets the control link answer config read/staging and read-only
+    /// state requests before the MS has synced/registered; commands that need a
+    /// real tick are buffered by the entity and replayed on the first tick. See
+    /// [`TetraEntityTrait::drive_offline_control`].
+    fn drive_offline_control(&mut self) {
+        for entity in self.entities.values_mut() {
+            entity.drive_offline_control(&mut self.msg_queue);
+        }
+    }
+
     /// Executes all end-of-tick functions:
     /// - LLC sends down all outstanding BL-ACKs
     /// - UMAC finalizes any resources for ts and sends down to LMAC
@@ -335,6 +348,14 @@ impl MessageRouter {
             if let Some(ts) = recovered {
                 self.ts = ts;
                 self.tick_start();
+            } else {
+                // Not yet synchronized: no recovered slot means no stack clock,
+                // so the entities are not ticked. Still service the offline-safe
+                // management subset (config read/staging + read-only state) so the
+                // external interface works as soon as the control link is up,
+                // independent of registration/service state. Non-offline commands
+                // are buffered by the entity and replayed on the first real tick.
+                self.drive_offline_control();
             }
 
             // Always drain the message queue after driving the PHY, even when no
