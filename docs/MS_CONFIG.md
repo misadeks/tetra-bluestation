@@ -229,6 +229,7 @@ For a `Range` list, add a nested **single-bracket** sub-table `[frequency_list.r
 | `start_carrier` | int | First carrier number. |
 | `stop_carrier` | int | Last carrier number (inclusive). |
 | `step` | int | Step in carrier units (multiples of 25 kHz), ≥ 1. |
+| `offsets` | array of int (Hz) | Optional. Carrier offsets to probe for **each** enumerated carrier. TETRA permits only four (D-MLE-SYNC "Offset" field): `0`, `6250`, `-6250`, `12500`. Omitted/empty = `[0]` (nominal 25 kHz raster only). A range with `offsets = [0, 6250]` scans each carrier at both its nominal and +6.25 kHz frequency (duplicates removed). |
 
 ```toml
 [[frequency_list]]
@@ -246,6 +247,7 @@ dwell_ms = 800
 #   start_carrier = 1500
 #   stop_carrier = 1700
 #   step = 1
+#   offsets = [0, 6250, 12500]   # optional: also probe +6.25 / +12.5 kHz carriers
 ```
 
 ### `[[scanlist]]` — named talkgroup scan/affiliation sets (optional)

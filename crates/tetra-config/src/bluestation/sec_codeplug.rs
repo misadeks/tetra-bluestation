@@ -170,7 +170,16 @@ pub struct CfgFrequencyRange {
     pub stop_carrier: u16,
     /// Step in carrier units (multiples of 25 kHz). Must be >= 1.
     pub step: u16,
+    /// Carrier frequency offsets (Hz) to probe for each enumerated carrier.
+    /// TETRA permits four offsets from the 25 kHz raster (EN 300 392-2, the
+    /// D-MLE-SYNC "Frequency band"/"Offset" elements): 0, +6250, -6250, +12500.
+    /// Empty is treated as `[0]` (nominal raster only, the historical behaviour).
+    pub offsets: Vec<i16>,
 }
+
+/// The four carrier frequency offsets (Hz) permitted by TETRA (EN 300 392-2,
+/// D-MLE-SYNC "Offset" 2-bit field): none, +6.25 kHz, -6.25 kHz, +12.5 kHz.
+pub const LEGAL_FREQ_OFFSETS_HZ: [i16; 4] = [0, 6250, -6250, 12500];
 
 /// A named frequency list the radio scans (**[impl policy]**). Each list is
 /// either an explicit set of downlink frequencies (`List`) or an enumerated
@@ -212,9 +221,15 @@ impl CfgFrequencyList {
                 let mut out = Vec::new();
                 if let Some(ref r) = self.range {
                     let step = r.step.max(1);
+                    let offsets: &[i16] = if r.offsets.is_empty() { &[0] } else { &r.offsets };
                     let mut c = r.start_carrier;
                     while c <= r.stop_carrier {
-                        out.push(channel_dl_hz(r.band, c, 0));
+                        for &off in offsets {
+                            let hz = channel_dl_hz(r.band, c, off);
+                            if !out.contains(&hz) {
+                                out.push(hz);
+                            }
+                        }
                         c = c.saturating_add(step);
                     }
                 }
@@ -494,7 +509,7 @@ impl CfgCodeplug {
                 FrequencyListMode::Range => {
                     let Some(ref r) = fl.range else {
                         return Err(format!(
-                            "frequency_list '{}' (Range) requires a [[frequency_list.range]] section",
+                            "frequency_list '{}' (Range) requires a [frequency_list.range] section",
                             fl.name
                         ));
                     };
@@ -509,6 +524,14 @@ impl CfgCodeplug {
                     }
                     if r.start_carrier >= r.stop_carrier {
                         return Err(format!("frequency_list '{}' range start_carrier must be < stop_carrier", fl.name));
+                    }
+                    for &off in &r.offsets {
+                        if !LEGAL_FREQ_OFFSETS_HZ.contains(&off) {
+                            return Err(format!(
+                                "frequency_list '{}' range offset {} Hz is invalid (allowed: 0, 6250, -6250, 12500)",
+                                fl.name, off
+                            ));
+                        }
                     }
                 }
             }
@@ -615,6 +638,7 @@ pub struct FrequencyRangeDto {
     pub start_carrier: u16,
     pub stop_carrier: u16,
     pub step: Option<u16>,
+    pub offsets: Option<Vec<i16>>,
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
 }
@@ -712,6 +736,7 @@ fn frequency_list_dto_to_cfg(dto: FrequencyListDto) -> CfgFrequencyList {
             start_carrier: r.start_carrier,
             stop_carrier: r.stop_carrier,
             step: r.step.unwrap_or(1),
+            offsets: r.offsets.unwrap_or_default(),
         }),
         dwell_ms: dto.dwell_ms.unwrap_or(1000),
     }
@@ -856,6 +881,7 @@ pub fn cfg_to_frequency_list_dtos(cp: &CfgCodeplug) -> Option<Vec<FrequencyListD
                     start_carrier: r.start_carrier,
                     stop_carrier: r.stop_carrier,
                     step: Some(r.step),
+                    offsets: if r.offsets.is_empty() { None } else { Some(r.offsets.clone()) },
                     extra: HashMap::new(),
                 }),
                 dwell_ms: Some(s.dwell_ms),
@@ -1169,6 +1195,46 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_illegal_range_offset() {
+        let cp = CfgCodeplug {
+            frequency_lists: vec![CfgFrequencyList {
+                name: "r".to_string(),
+                mode: FrequencyListMode::Range,
+                range: Some(CfgFrequencyRange {
+                    band: 4,
+                    start_carrier: 1500,
+                    stop_carrier: 1600,
+                    step: 1,
+                    offsets: vec![0, 5000],
+                }),
+                ..CfgFrequencyList::default()
+            }],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_accepts_legal_range_offsets() {
+        let cp = CfgCodeplug {
+            frequency_lists: vec![CfgFrequencyList {
+                name: "r".to_string(),
+                mode: FrequencyListMode::Range,
+                range: Some(CfgFrequencyRange {
+                    band: 4,
+                    start_carrier: 1500,
+                    stop_carrier: 1600,
+                    step: 1,
+                    offsets: vec![0, 6250, -6250, 12500],
+                }),
+                ..CfgFrequencyList::default()
+            }],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_ok());
+    }
+
+    #[test]
     fn test_networks_sorted_by_priority() {
         let cp = CfgCodeplug {
             networks: vec![
@@ -1202,11 +1268,33 @@ mod tests {
         let list = CfgFrequencyList {
             name: "r".to_string(),
             mode: FrequencyListMode::Range,
-            range: Some(CfgFrequencyRange { band: 4, start_carrier: 1593, stop_carrier: 1595, step: 1 }),
+            range: Some(CfgFrequencyRange { band: 4, start_carrier: 1593, stop_carrier: 1595, step: 1, offsets: Vec::new() }),
             ..CfgFrequencyList::default()
         };
         let freqs = list.candidate_frequencies();
         assert_eq!(freqs, vec![439_825_000, 439_850_000, 439_875_000]);
+    }
+
+    #[test]
+    fn test_range_candidate_frequencies_with_offsets() {
+        // For each 25 kHz carrier, also probe the +6.25 kHz offset. Nominal and
+        // offset candidates interleave per carrier and are deduped.
+        let list = CfgFrequencyList {
+            name: "r".to_string(),
+            mode: FrequencyListMode::Range,
+            range: Some(CfgFrequencyRange {
+                band: 4,
+                start_carrier: 1593,
+                stop_carrier: 1594,
+                step: 1,
+                offsets: vec![0, 6250],
+            }),
+            ..CfgFrequencyList::default()
+        };
+        assert_eq!(
+            list.candidate_frequencies(),
+            vec![439_825_000, 439_831_250, 439_850_000, 439_856_250],
+        );
     }
 
     #[test]
@@ -1223,7 +1311,7 @@ mod tests {
                     name: "b".to_string(),
                     mode: FrequencyListMode::Range,
                     // 439_850_000 overlaps list "a" and must be deduped.
-                    range: Some(CfgFrequencyRange { band: 4, start_carrier: 1594, stop_carrier: 1595, step: 1 }),
+                    range: Some(CfgFrequencyRange { band: 4, start_carrier: 1594, stop_carrier: 1595, step: 1, offsets: Vec::new() }),
                     ..CfgFrequencyList::default()
                 },
             ],

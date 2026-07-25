@@ -201,6 +201,8 @@ dwell_ms = 800
 # Range-based list example. Enumerates band 4 carriers from start to stop in `step`
 # carrier units (multiples of 25 kHz). Uncomment to add it to the scan set. The range
 # is a single-bracket sub-table (one range per list), NOT a [[...]] array of tables.
+# The optional `offsets` list probes carrier offsets (Hz) per carrier; TETRA allows
+# only 0, 6250, -6250, 12500 (D-MLE-SYNC Offset field). Omitted = [0] (raster only).
 # [[frequency_list]]
 # name = "band4-sweep"
 # mode = "Range"
@@ -211,4 +213,5 @@ dwell_ms = 800
 # start_carrier = 1500
 # stop_carrier = 1700
 # step = 1
+# offsets = [0, 6250, 12500]
 
