@@ -194,7 +194,7 @@ Legend:
 | Telemetry (stack→UI) + control (UI→stack) wiring for MS | 🧪 | WebSocket + JSON + TLS + argon2; mock-transport CI green. |
 | Plane A — TNMM indications (REGISTRATION / SERVICE / GROUP-IDENTITY confirm) | 🧪 | Verbatim to cl. 15.3 Tables 15.1–15.7. |
 | Plane A — TNMM requests (REGISTRATION / DEREGISTRATION / GROUP ATTACH-DETACH) | 🧪 | STATUS / ENERGY-SAVING defined-but-dormant. |
-| Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; hybrid apply (structural = restart, operational = live). |
+| Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; hybrid apply (structural = restart, operational = live). Config read/staging is serviced as soon as the control link is up — before sync/registration (see below). |
 | Scan lists (codeplug + live activation) | 🧪 | Maps to the group-affiliation superset (cl. 16.8.2). |
 
 > **On-air proof points:** camp-on, scrambling/cell selection, ITSI-attach
@@ -202,6 +202,21 @@ Legend:
 > directions), individual/duplex voice (both directions), and STCH talker identity are
 > all confirmed on real RF. Everything marked 🧪 builds and passes tests but still needs
 > an on-air run to promote to ✅.
+
+> **Offline config servicing (pre-synchronization):** The MS stack is receive-timed
+> — entities are only ticked once the PHY recovers a downlink slot (DL-synchronized),
+> so before the radio finds a base station the normal control-command path never runs.
+> To let a UI inspect and stage the codeplug on a radio that has not yet synced or
+> registered, `MessageRouter::run_stack_ms` calls `TetraEntityTrait::drive_offline_control`
+> on every loop iteration that recovers **no** slot. MM overrides it to service only the
+> offline-safe management subset — `GetConfig`, `SetConfig`, `ApplyConfig`, `GetState`,
+> `GetInterfaceVersion` — none of which inject SAP traffic that needs the stack clock or a
+> serving cell. Any other command that arrives while unsynchronized (TNMM requests, scan-list
+> toggles) is buffered and replayed, in arrival order, on the first real tick, so
+> registration and on-air behaviour are byte-identical to never having run offline.
+> `SetConfig` stages to disk and applies on the next `ApplyConfig` restart exactly as when
+> synchronized; `GetConfig` returns the live active codeplug (secrets redacted) regardless of
+> `registration_state` / `service_status`.
 
 ---
 

@@ -31,6 +31,17 @@ pub trait TetraEntityTrait: Send + AsAny {
     /// Called at the start of each TDMA tick
     fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {}
 
+    /// Service offline-serviceable external-interface commands while the stack is
+    /// not yet synchronized (RX-first modes: the [`crate::MessageRouter`] recovers
+    /// no downlink slot, so there is no stack clock and `tick_start` is not run).
+    ///
+    /// An MS MM entity overrides this so that management config read/staging and
+    /// read-only state queries over the control link work as soon as the link is
+    /// up — independent of registration/service state. Commands that require a
+    /// real tick are buffered by the entity and replayed on the first tick, so
+    /// registration / on-air behaviour is unchanged. The default is a no-op.
+    fn drive_offline_control(&mut self, _queue: &mut MessageQueue) {}
+
     /// Called at the end of each TDMA tick
     fn tick_end(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         false

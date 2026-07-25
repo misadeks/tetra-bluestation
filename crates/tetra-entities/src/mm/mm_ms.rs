@@ -236,6 +236,14 @@ pub struct MmMs {
     /// `ManagementCommand::ActivateScanlist`, which resolves the change to a
     /// standalone group attach/detach (cl. 16.8.2).
     active_scanlists: BTreeSet<String>,
+    /// Control commands received over the external interface while the stack was
+    /// not yet ticking (DL-unsynchronized, no stack clock) that are NOT part of
+    /// the offline-serviceable management subset. They are buffered here by
+    /// [`Self::poll_control_offline`] and replayed, in arrival order, on the
+    /// first real tick (see [`Self::poll_control`]) so that registration /
+    /// on-air behaviour is byte-identical to never having run offline.
+    /// **NON-STANDARD** (Plane B plumbing).
+    deferred_control: Vec<crate::net_control::ControlCommand>,
 }
 
 /// Runtime plumbing for the Plane B management write/apply handlers
@@ -304,6 +312,7 @@ impl MmMs {
             attached_gssis,
             pending_group_op: None,
             active_scanlists,
+            deferred_control: Vec::new(),
         }
     }
 
@@ -1768,6 +1777,17 @@ impl MmMs {
     /// from an external UI process and an unexpected/unsupported variant must not
     /// be able to crash the MS stack.
     fn poll_control(&mut self, queue: &mut MessageQueue) {
+        // Replay, in arrival order, any commands buffered while the stack was
+        // not yet ticking (deferred by `poll_control_offline`). This runs on the
+        // first real tick, so a command that arrived before DL synchronization is
+        // acted upon exactly as if it had arrived now — registration / on-air
+        // behaviour is unchanged by the offline config-service path.
+        if !self.deferred_control.is_empty() {
+            let deferred = std::mem::take(&mut self.deferred_control);
+            for cmd in deferred {
+                self.handle_control_command(queue, cmd);
+            }
+        }
         let mut commands = Vec::new();
         if let Some(cep) = &self.control {
             while let Some(cmd) = cep.try_recv() {
@@ -1777,6 +1797,59 @@ impl MmMs {
         for cmd in commands {
             self.handle_control_command(queue, cmd);
         }
+    }
+
+    /// Service the *offline-serviceable* external-interface command subset while
+    /// the stack is not yet ticking (DL-unsynchronized: `run_stack_ms` recovers
+    /// no slot, so there is no stack clock and `tick_start`/`poll_control` never
+    /// run). Config read/staging and read-only state queries must work as soon as
+    /// the control link is up — independent of registration/service state
+    /// (including out of service) — so the UI can inspect and stage the codeplug
+    /// on a radio that has never seen a base station.
+    ///
+    /// Only commands that touch process-local config/state (no air-interface side
+    /// effects, no SAP traffic that needs a clock) are handled here; see
+    /// [`Self::is_offline_serviceable`]. Every other command (TNMM requests,
+    /// scan-list toggles, …) is buffered in `deferred_control` and replayed on
+    /// the first real tick by [`Self::poll_control`], so nothing about
+    /// registration or on-air timing changes. **NON-STANDARD** (Plane B).
+    fn poll_control_offline(&mut self, queue: &mut MessageQueue) {
+        let mut commands = Vec::new();
+        if let Some(cep) = &self.control {
+            while let Some(cmd) = cep.try_recv() {
+                commands.push(cmd);
+            }
+        }
+        for cmd in commands {
+            if Self::is_offline_serviceable(&cmd) {
+                self.handle_control_command(queue, cmd);
+            } else {
+                self.deferred_control.push(cmd);
+            }
+        }
+    }
+
+    /// Whether a control command may be serviced before the stack is
+    /// synchronized (see [`Self::poll_control_offline`]). Limited to the
+    /// management config/state subset, none of which injects SAP traffic that
+    /// depends on the (absent) stack clock or a serving cell:
+    /// `GetConfig`/`SetConfig`/`ApplyConfig` (config read + staging + the
+    /// restart request) and the read-only `GetState`/`GetInterfaceVersion`.
+    /// `ActivateScanlist` is deliberately excluded because it resolves to a
+    /// group attach/detach (cl. 16.8.2) that must run on a real tick.
+    fn is_offline_serviceable(cmd: &crate::net_control::ControlCommand) -> bool {
+        use crate::management::ManagementCommand;
+        use crate::net_control::ControlCommand;
+        matches!(
+            cmd,
+            ControlCommand::Management(
+                ManagementCommand::GetConfig { .. }
+                    | ManagementCommand::SetConfig { .. }
+                    | ManagementCommand::ApplyConfig { .. }
+                    | ManagementCommand::GetState { .. }
+                    | ManagementCommand::GetInterfaceVersion { .. }
+            )
+        )
     }
 
     /// Send a control response back to the UI, if a control endpoint is wired.
@@ -2541,6 +2614,17 @@ impl TetraEntityTrait for MmMs {
 
     fn set_config(&mut self, config: SharedConfig) {
         self.config = config;
+    }
+
+    /// Service the offline-serviceable management subset (config read/staging +
+    /// read-only state) while the stack is not yet synchronized. The router
+    /// calls this each `run_stack_ms` iteration that recovers no downlink slot,
+    /// so the external interface answers config/state requests as soon as the
+    /// control link is up — regardless of registration/service state. All other
+    /// commands are buffered and replayed on the first real tick. See
+    /// [`MmMs::poll_control_offline`].
+    fn drive_offline_control(&mut self, queue: &mut MessageQueue) {
+        self.poll_control_offline(queue);
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
@@ -5125,6 +5209,134 @@ order = 2\n"
         assert!(!restart_required);
         assert!(!path.exists(), "no file written for rejected config");
         assert!(!mm.runtime_snapshot().restart_required);
+    }
+
+    // -----------------------------------------------------------------------
+    // Offline (pre-synchronization) management servicing: config read/staging
+    // and read-only state must work as soon as the control link is up, before
+    // the MS has synced/registered. Driven via `drive_offline_control` (what
+    // `MessageRouter::run_stack_ms` calls on every iteration that recovers no
+    // downlink slot), NOT `tick_start`.
+    // -----------------------------------------------------------------------
+
+    /// GetConfig is answered while unsynchronized (no tick): the full active
+    /// codeplug is returned and re-parses through the startup validator. This
+    /// is the fix for "GetConfig returns empty before registration" — the
+    /// command was simply never serviced until the stack started ticking.
+    #[test]
+    fn test_offline_get_config_before_sync() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 200 }));
+        // No slot recovered => router services only the offline subset.
+        mm.drive_offline_control(&mut q);
+
+        let (handle, toml) = last_config(&dispatcher);
+        assert_eq!(handle, 200);
+        let reparsed = from_toml_str(&toml).expect("offline GetConfig TOML must re-parse");
+        assert_eq!(reparsed.net.mcc, 901);
+        assert_eq!(reparsed.net.mnc, 9999);
+        assert_eq!(reparsed.ms.as_ref().unwrap().issi, 1000001);
+        // Purely a read: never touches registration state or emits a PDU.
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(q.pop_front().is_none());
+    }
+
+    /// SetConfig validates + persists while unsynchronized and flags a pending
+    /// restart, exactly as it does on a real tick. The staged file re-parses;
+    /// the process is not bounced.
+    #[test]
+    fn test_offline_set_config_persists_before_sync() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-offcfg-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested.clone(), is_running.clone());
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 201,
+            toml: MS_TOML.to_string(),
+        }));
+        mm.drive_offline_control(&mut q);
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 201);
+        assert!(accepted, "offline SetConfig accepted while unregistered");
+        assert!(restart_required, "restart flagged after offline staging");
+        let written = std::fs::read_to_string(&path).expect("offline SetConfig persisted");
+        assert!(from_toml_str(&written).is_ok(), "persisted config must re-parse");
+        assert!(is_running.load(std::sync::atomic::Ordering::SeqCst), "SetConfig must not stop the loop");
+        assert!(!restart_requested.load(std::sync::atomic::Ordering::SeqCst), "SetConfig must not request restart");
+        assert_eq!(mm.reg_state, RegState::Idle);
+
+        // A subsequent offline GetConfig is still serviced (returns the live
+        // active config; staged changes apply on the next ApplyConfig restart).
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 202 }));
+        mm.drive_offline_control(&mut q);
+        let (h2, toml2) = last_config(&dispatcher);
+        assert_eq!(h2, 202);
+        assert!(from_toml_str(&toml2).is_ok());
+        assert!(mm.runtime_snapshot().restart_required, "snapshot reflects the pending restart");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// GetConfig offline still redacts secrets on the wire (no regression in the
+    /// ******** sentinel handling for the pre-sync path).
+    #[test]
+    fn test_offline_get_config_redacts_secret() {
+        use crate::management::ManagementCommand;
+        use tetra_config::bluestation::REDACTED_SECRET;
+        let (mut mm, _source, dispatcher) = ms_mm_wired_from(MS_TOML_WITH_SECRET);
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 203 }));
+        mm.drive_offline_control(&mut q);
+
+        let (_handle, toml) = last_config(&dispatcher);
+        assert!(!toml.contains("supersecret"), "offline GetConfig must not leak the password");
+        assert!(toml.contains(REDACTED_SECRET), "offline GetConfig carries the redaction sentinel");
+    }
+
+    /// Non-management commands received while unsynchronized are NOT acted upon
+    /// offline: a TNMM-REGISTRATION request is buffered and only takes effect on
+    /// the first real tick, so registration / on-air behaviour is unchanged by
+    /// the offline config-service path. GetConfig sent alongside is still served.
+    #[test]
+    fn test_offline_defers_tnmm_registration_until_tick() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        // Both arrive before synchronization.
+        dispatcher.send(ControlCommand::Management(ManagementCommand::GetConfig { handle: 204 }));
+        dispatcher.send(ControlCommand::TnmmRegistration {
+            handle: 205,
+            request: Box::new(own_registration_request()),
+        });
+        mm.drive_offline_control(&mut q);
+
+        // GetConfig serviced offline; registration deferred (no state change, no
+        // demand emitted, no ack yet).
+        let (h, _toml) = last_config(&dispatcher);
+        assert_eq!(h, 204);
+        assert_eq!(mm.reg_state, RegState::Idle, "registration must not run offline");
+        assert!(q.pop_front().is_none(), "no registration demand emitted offline");
+        assert_eq!(mm.deferred_control.len(), 1, "registration buffered for the first tick");
+
+        // First real tick replays the buffered registration exactly as if it had
+        // just arrived: MS transitions to Registering and queues the demand.
+        mm.tick_start(&mut q, TdmaTime::default());
+        assert_eq!(mm.reg_state, RegState::Registering, "deferred registration acted on at first tick");
+        let msg = q.pop_front().expect("registration demand queued on first tick");
+        assert!(matches!(msg.msg, SapMsgInner::LmmMleUnitdataReq(_)));
+        assert!(mm.deferred_control.is_empty(), "deferred buffer drained");
     }
 
     // An MS config that additionally configures a control endpoint with HTTP

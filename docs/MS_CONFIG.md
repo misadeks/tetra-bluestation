@@ -320,6 +320,14 @@ Via the management interface (Plane B):
 - **Operational** TNMM actions (register/deregister, group attach/detach, energy saving,
   scan-list activation) apply **live** — no restart.
 
+> **Availability before registration.** `GetConfig`, `SetConfig`, and `ApplyConfig` are
+> serviced as soon as the control link is up — independent of registration or service
+> state (including out of service, and before the MS has ever synced to a base station).
+> The stack is receive-timed, so while unsynchronized it services this config/state subset
+> off a dedicated pre-tick path; any other command received meanwhile is buffered and
+> replayed on the first real tick, leaving registration / on-air behaviour unchanged. See
+> [`MS_MODE.md` §3.7 "Offline config servicing"](./MS_MODE.md#37-external-interface-tnmm--management).
+
 ---
 
 ## Minimal MS config
