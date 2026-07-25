@@ -4,6 +4,7 @@
 use rustfft;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::TdmaTime;
 
@@ -31,6 +32,23 @@ use super::soapyio;
 /// this is the single knob to tune against a real base station if the burst
 /// lands slightly early/late in the uplink slot. Positive = transmit later.
 const MS_TX_SAMPLE_DELAY: SampleCount = 0;
+
+/// While the MS downlink is unsynchronized the demodulator stays in
+/// `Mode::DlUnsynchronized` and never yields a demodulated slot, so
+/// `rxtx_timeslot`'s RX loop would run continuously until the MS camps on a
+/// cell. Because the stack is single-threaded and receive-timed, that would
+/// starve the run loop of any chance to make progress before synchronization —
+/// in particular it could not service the external control interface (config
+/// read/staging must work as soon as the control link is up, before the MS has
+/// synced or registered) nor drive scan-dwell cell selection (cl. 18.3.4).
+///
+/// To keep the run loop responsive, the unsynchronized RX loop yields back to
+/// the caller (returning with no demodulated slot) after this much wall-clock
+/// time. The demodulator's correlation state persists across calls, so
+/// re-acquisition simply resumes on the next invocation. This affects only the
+/// unsynchronized state: once the downlink is synchronized the loop returns each
+/// slot on its own and is byte-identical (and it is never installed in BS mode).
+const UNSYNC_YIELD: Duration = Duration::from_millis(20);
 
 pub struct SdrConfig<'a> {
     /// SoapySDR device arguments
@@ -234,20 +252,35 @@ impl RxTxDev for RxTxDevSoapySdr {
         // First generate as much TX signal as possible at the moment.
         while self.process_tx_block(tx_slot)? {}
 
+        // Reference for the unsynchronized cooperative-yield window (see
+        // UNSYNC_YIELD). Cheap timestamp read; ignored while synchronized.
+        let unsync_start = Instant::now();
+
         while self.process_rx_block()? {
-            // Cooperative shutdown: while the MS is unsynchronized the downlink
-            // demodulator (Mode::DlUnsynchronized) never yields a demodulated
-            // slot, so this loop would otherwise spin until the MS camps on a
-            // cell — a Ctrl+C while not connected to a base station would only
-            // take effect once a downlink appears. When a shutdown has been
-            // requested *and* we are not yet synchronized, bail out so the MS
-            // run loop can observe the stop flag and exit. Restricted to the
-            // unsynchronized case so a shutdown while camped is untouched: there
-            // the loop already returns each slot on its own, letting MM transmit
-            // its U-ITSI DETACH before the streams close. No-op in BS mode (no
-            // flag installed).
-            if self.stop_requested() && !self.dl_synchronized() {
-                break;
+            // While the MS is unsynchronized the downlink demodulator
+            // (Mode::DlUnsynchronized) never yields a demodulated slot, so this
+            // loop would otherwise spin until the MS camps on a cell. Because
+            // the stack is single-threaded and receive-timed, that starves the
+            // run loop before synchronization. Restricted to the unsynchronized
+            // case so a synchronized/camped MS is untouched: there the loop
+            // already returns each slot on its own (letting MM transmit e.g. its
+            // U-ITSI DETACH before the streams close). All of this is a no-op in
+            // BS mode (no run flag installed, and the BS downlink is always
+            // synchronized to its own clock).
+            if !self.dl_synchronized() {
+                // Cooperative shutdown: a Ctrl+C while not connected to a base
+                // station is observed here so the run loop can exit promptly
+                // instead of only once a downlink appears.
+                if self.stop_requested() {
+                    break;
+                }
+                // Cooperative yield: return with no slot so the run loop regains
+                // control periodically and can service the external control
+                // interface (offline config/state) and drive scan-dwell cell
+                // selection even though the downlink is not yet synchronized.
+                if unsync_start.elapsed() >= UNSYNC_YIELD {
+                    break;
+                }
             }
             // Continue producing TX signal if possible.
             while self.process_tx_block(tx_slot)? {}
