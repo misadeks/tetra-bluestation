@@ -147,6 +147,8 @@ Legend:
 |---|---|---|---|
 | TL-SDU routing (DL/UL, BREAK/REOPEN) | ✅ | cl. 18 | |
 | Initial cell selection | ✅ | cl. 18.3.4.6 | Serving-cell identity held by `(MCC, MNC, LA)`. |
+| Manual cell survey (receive-only carrier scan of `[[frequency_list]]`) | 🧪 | cl. 18.3.4 | Operator-triggered; reports each found cell (MCC/MNC/LA/reg/late-entry/RSSI) then a completion. Transmits nothing. |
+| Register-to-cell (operator camp + forced registration) | 🧪 | cl. 18.3.4.6, 16.4 | `CampOnCell` arms a camp on a chosen carrier; adopts + registers even in manual mode. |
 | LMM-ACTIVATE confirm (registration trigger) | ✅ | cl. 17.3.2, 18.4.2.2 | Carries `registration_required` + `system_wide_services`. |
 | Service-loss → LMM-BREAK/REOPEN to MM (TNMM-SERVICE) | 🧪 | cl. 18.3.3, 18.3.4.5.3 | Keeps `Registered`, adds separate coverage/service status. |
 | MLE-IDENTITIES (runtime attached-group set) | 🧪 | cl. 23.4.1.2 | Feeds the MAC RX filter from live state, not just config. |
@@ -196,6 +198,7 @@ Legend:
 | Plane A — TNMM requests (REGISTRATION / DEREGISTRATION / GROUP ATTACH-DETACH) | 🧪 | STATUS / ENERGY-SAVING defined-but-dormant. |
 | Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; hybrid apply (structural = restart, operational = live). Config read/staging is serviced as soon as the control link is up — before sync/registration (see below). |
 | Scan lists (codeplug + live activation) | 🧪 | Maps to the group-affiliation superset (cl. 16.8.2). |
+| Manual cell selection (Auto/Manual toggle, carrier survey, register-to-cell) | 🧪 | Plane B commands `SetCellSelectionMode` / `StartCellScan` / `StopCellScan` / `CampOnCell`; results as `MsScanResult` / `MsScanComplete` telemetry. Schema `bluestation-ms-interface-3`. |
 
 > **On-air proof points:** camp-on, scrambling/cell selection, ITSI-attach
 > registration, group affiliation, runtime uplink retune, group-call voice (both

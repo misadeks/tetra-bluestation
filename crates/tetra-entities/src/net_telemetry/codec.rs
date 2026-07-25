@@ -118,7 +118,59 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
+    #[test]
+    fn test_roundtrip_ms_scan_events() {
+        // Manual survey (Plane B): a found-cell result and the completion must
+        // survive both codecs.
+        let result = TelemetryEvent::MsScanResult {
+            carrier_hz: 439_825_000,
+            mcc: 901,
+            mnc: 9999,
+            location_area: Some(1),
+            colour_code: None,
+            rssi_dbfs: Some(-55.0),
+            registration_required: Some(true),
+            late_entry_supported: true,
+        };
+        for decoded in [
+            TelemetryCodecBitcode.decode(&TelemetryCodecBitcode.encode(&result)).unwrap(),
+            TelemetryCodecJson.decode(&TelemetryCodecJson.encode(&result)).unwrap(),
+        ] {
+            let TelemetryEvent::MsScanResult {
+                carrier_hz,
+                mcc,
+                mnc,
+                location_area,
+                colour_code,
+                rssi_dbfs,
+                registration_required,
+                late_entry_supported,
+            } = decoded
+            else {
+                panic!("expected MsScanResult");
+            };
+            assert_eq!(carrier_hz, 439_825_000);
+            assert_eq!(mcc, 901);
+            assert_eq!(mnc, 9999);
+            assert_eq!(location_area, Some(1));
+            assert_eq!(colour_code, None);
+            assert_eq!(rssi_dbfs, Some(-55.0));
+            assert_eq!(registration_required, Some(true));
+            assert!(late_entry_supported);
+        }
+
+        let complete = TelemetryEvent::MsScanComplete { found: 3, scanned: 8 };
+        for decoded in [
+            TelemetryCodecBitcode.decode(&TelemetryCodecBitcode.encode(&complete)).unwrap(),
+            TelemetryCodecJson.decode(&TelemetryCodecJson.encode(&complete)).unwrap(),
+        ] {
+            let TelemetryEvent::MsScanComplete { found, scanned } = decoded else {
+                panic!("expected MsScanComplete");
+            };
+            assert_eq!(found, 3);
+            assert_eq!(scanned, 8);
+        }
+    }
     // TNMM-SAP (cl. 15.3) telemetry roundtrips. TelemetryEvent itself is not
     // PartialEq, so we compare the (PartialEq) tnmm payloads after decoding.
     // -----------------------------------------------------------------------

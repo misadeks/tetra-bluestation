@@ -162,6 +162,7 @@ mod tests {
             attached_groups: vec![100, 200],
             active_scanlists: vec!["Alpha".to_string()],
             restart_required: false,
+            selection_mode_manual: false,
         };
         let resp = ControlResponse::Management(ManagementResponse::State {
             handle: 5,
@@ -236,7 +237,7 @@ mod tests {
     /// These golden-string assertions pin the exact on-the-wire JSON so any
     /// accidental rename of a wrapper, variant, or field breaks the build with a
     /// clear diff. The strings here are the contract the reference UI is built
-    /// against (schema `bluestation-ms-interface-2`).
+    /// against (schema `bluestation-ms-interface-3`).
     #[test]
     fn test_json_schema_freeze_golden_wire_format() {
         use crate::management::{MS_INTERFACE_SCHEMA_VERSION, ManagementCommand, ManagementResponse};
@@ -276,6 +277,29 @@ mod tests {
             })),
             r#"{"Management":{"ActivateScanlist":{"handle":6,"name":"Alpha","active":true}}}"#
         );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::SetCellSelectionMode {
+                handle: 10,
+                manual: true,
+            })),
+            r#"{"Management":{"SetCellSelectionMode":{"handle":10,"manual":true}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::StartCellScan { handle: 11 })),
+            r#"{"Management":{"StartCellScan":{"handle":11}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::StopCellScan { handle: 12 })),
+            r#"{"Management":{"StopCellScan":{"handle":12}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::Management(ManagementCommand::CampOnCell {
+                handle: 13,
+                carrier_hz: 430425000,
+                register: true,
+            })),
+            r#"{"Management":{"CampOnCell":{"handle":13,"carrier_hz":430425000,"register":true}}}"#
+        );
 
         // --- Plane B (management) responses ---
         assert_eq!(
@@ -283,10 +307,10 @@ mod tests {
                 handle: 7,
                 version: MS_INTERFACE_SCHEMA_VERSION.to_string(),
             })),
-            r#"{"Management":{"InterfaceVersion":{"handle":7,"version":"bluestation-ms-interface-2"}}}"#
+            r#"{"Management":{"InterfaceVersion":{"handle":7,"version":"bluestation-ms-interface-3"}}}"#
         );
         // Guard the frozen constant itself so a bump is a deliberate, visible edit.
-        assert_eq!(MS_INTERFACE_SCHEMA_VERSION, "bluestation-ms-interface-2");
+        assert_eq!(MS_INTERFACE_SCHEMA_VERSION, "bluestation-ms-interface-3");
         assert_eq!(
             enc_resp(&ControlResponse::Management(ManagementResponse::Config {
                 handle: 3,

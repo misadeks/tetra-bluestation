@@ -3,7 +3,10 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, unimplemented_log};
 use tetra_saps::lcmc::{LcmcMleBreakInd, LcmcMleReopenInd, LcmcMleUnitdataInd};
-use tetra_saps::lmm::{LmmMleActivateConf, LmmMleBreakInd, LmmMleReopenInd, LmmMleRssiInd, LmmMleUnitdataInd};
+use tetra_saps::lmm::{
+    LmmMleActivateConf, LmmMleBreakInd, LmmMleReopenInd, LmmMleRssiInd, LmmMleScanCompleteInd, LmmMleScanResultInd,
+    LmmMleUnitdataInd,
+};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcTuneReq, TlmcUPlaneConfigureReq, TlmcValidAddress};
@@ -34,6 +37,32 @@ struct ServingCell {
     /// `false` = the cell advertises "system wide services temporarily not
     /// supported" (cl. 16.4.8). `None` until the first SYSINFO for this cell.
     system_wide_services: Option<bool>,
+}
+
+/// A cell discovered during an operator survey (**[impl policy]**, Plane B).
+///
+/// Built receive-only from the candidate carrier's D-MLE-SYNC (cl. 18.4.2.1) and
+/// refined from its D-MLE-SYSINFO (cl. 18.4.2.2). It is NOT a serving cell: the
+/// MLE never camps on it. Reported to MM as an `LmmMleScanResultInd`.
+#[derive(Debug, Clone)]
+struct FoundCell {
+    /// Downlink carrier the cell was found on (Hz).
+    carrier_hz: u32,
+    mcc: u16,
+    mnc: u16,
+    /// Location area from D-MLE-SYSINFO; `None` if SYSINFO was not seen in time.
+    location_area: Option<u16>,
+    /// Colour code, if surfaced to the MLE. Currently always `None` — the colour
+    /// code is a MAC-layer quantity (used for the scrambling code) and is not
+    /// carried in D-MLE-SYNC, so it is not available here without threading it up
+    /// from the MAC. Reported as `None` rather than invented.
+    colour_code: Option<u8>,
+    /// Uncalibrated downlink level (dBFS) at capture time.
+    rssi_dbfs: Option<f32>,
+    /// D-MLE-SYSINFO BS service details "registration" flag; `None` if SYSINFO
+    /// was not seen in time.
+    registration_required: Option<bool>,
+    late_entry_supported: bool,
 }
 
 /// MS-side Mobile Link Entity.
@@ -77,6 +106,39 @@ pub struct MleMs {
     scanning: bool,
     scan_candidates: Vec<u32>,
     scan_index: usize,
+    /// Cell-selection mode (**[impl policy]**, Plane B operator control on top of
+    /// cl. 18.3.4). `false` (default) = automatic: the MLE auto-camps on the
+    /// first suitable cell (cl. 18.3.4.6). `true` = manual: auto-camp is
+    /// suppressed; the operator drives selection with a survey and an explicit
+    /// camp request. Set via `LmmMleSelectionModeReq` from MM.
+    selection_mode_manual: bool,
+    /// Armed by an operator `LmmMleCampReq` so that, in manual mode, the very
+    /// next suitable SYNC is allowed through the normal adopt/camp path
+    /// (cl. 18.3.4.6). Cleared once the cell is confirmed to MM. Ignored in
+    /// automatic mode (which always camps).
+    camp_armed: bool,
+    /// When a camp was operator-requested with `register = true`, MM is asked to
+    /// register even if the cell advertises registration-not-required. The
+    /// registration decision lives in MM; the MLE only relays the cell via
+    /// `LmmMleActivateConf`, so this flag is not needed by the MLE beyond
+    /// logging — kept alongside `camp_armed` for observability.
+    camp_force_register: bool,
+    /// Receive-only survey state (**[impl policy]**). `true` while a single pass
+    /// over the candidate carriers is in progress; the MLE reports each found
+    /// cell to MM but never adopts a serving cell, configures L2, or transmits.
+    survey: bool,
+    survey_candidates: Vec<u32>,
+    survey_index: usize,
+    /// The cell currently being characterised on the tuned survey carrier: set
+    /// from its D-MLE-SYNC, refined from D-MLE-SYSINFO, then finalized (reported
+    /// + advanced). `None` between carriers / while waiting for a SYNC.
+    survey_pending: Option<FoundCell>,
+    /// Number of D-MLE-SYNC PDUs seen for the current `survey_pending` cell while
+    /// still awaiting its SYSINFO; bounds the per-carrier SYSINFO wait so a cell
+    /// that syncs but is slow to broadcast SYSINFO is still reported (partial).
+    survey_sync_repeats: u8,
+    /// Count of cells reported during the current survey (for the completion).
+    survey_found: u32,
 }
 
 impl MleMs {
@@ -90,6 +152,15 @@ impl MleMs {
             scanning: false,
             scan_candidates: Vec::new(),
             scan_index: 0,
+            selection_mode_manual: false,
+            camp_armed: false,
+            camp_force_register: false,
+            survey: false,
+            survey_candidates: Vec::new(),
+            survey_index: 0,
+            survey_pending: None,
+            survey_sync_repeats: 0,
+            survey_found: 0,
         }
     }
 
@@ -426,6 +497,150 @@ impl MleMs {
         }
     }
 
+    /// Bound on how many D-MLE-SYNC PDUs the survey waits for a cell's SYSINFO
+    /// before reporting it with the SYNC-only identity (LA / registration flag
+    /// left `None`). Keeps the per-carrier dwell short while still giving the
+    /// broadcast SYSINFO (BNCH) a chance to arrive.
+    const SURVEY_SYSINFO_SYNC_LIMIT: u8 = 4;
+
+    /// Begin a receive-only survey of the codeplug candidate carriers
+    /// (**[impl policy]** on top of cl. 18.3.4). Clears any camp, caches the
+    /// candidate set and tunes to the first candidate. Reports each found cell to
+    /// MM and finishes with a completion. No-op (immediate empty completion) when
+    /// the codeplug programs no candidate carriers.
+    fn start_survey(&mut self, queue: &mut MessageQueue) {
+        let candidates = self.scan_candidate_carriers();
+        // Cancel any automatic scan and drop any camp: a survey is receive-only
+        // and must not leave a stale serving cell adopted.
+        self.scanning = false;
+        self.serving_cell = None;
+        self.activate_confirmed = false;
+        self.survey_pending = None;
+        self.survey_sync_repeats = 0;
+        self.survey_found = 0;
+        self.survey_index = 0;
+        self.survey_candidates = candidates;
+        if self.survey_candidates.is_empty() {
+            tracing::info!("MLE: survey requested but no candidate carriers programmed - completing empty");
+            self.survey = false;
+            self.emit_scan_complete(queue, 0);
+            return;
+        }
+        self.survey = true;
+        let first = self.survey_candidates[0];
+        tracing::info!(
+            "MLE: starting operator survey over {} candidate carrier(s); first {} Hz (cl. 18.3.4, receive-only)",
+            self.survey_candidates.len(),
+            first
+        );
+        self.request_tune(queue, first);
+    }
+
+    /// Cancel a survey in progress (operator `LmmMleScanReq{start:false}`),
+    /// reporting a completion for the carriers visited so far.
+    fn cancel_survey(&mut self, queue: &mut MessageQueue) {
+        if !self.survey {
+            return;
+        }
+        let scanned = self.survey_index as u32;
+        tracing::info!("MLE: operator survey cancelled after {} carrier(s)", scanned);
+        self.survey = false;
+        self.survey_pending = None;
+        self.survey_sync_repeats = 0;
+        self.emit_scan_complete(queue, scanned);
+    }
+
+    /// Finalize the current `survey_pending` cell: report it to MM and advance to
+    /// the next candidate carrier.
+    fn survey_finalize_pending(&mut self, queue: &mut MessageQueue) {
+        if let Some(mut cell) = self.survey_pending.take() {
+            // Attach the latest measured downlink level.
+            cell.rssi_dbfs = self.serving_cell_rssi_dbfs;
+            tracing::info!(
+                "MLE: survey found cell MCC={} MNC={} on {} Hz (LA={:?}, reg_required={:?}, late_entry={})",
+                cell.mcc,
+                cell.mnc,
+                cell.carrier_hz,
+                cell.location_area,
+                cell.registration_required,
+                cell.late_entry_supported,
+            );
+            self.survey_found += 1;
+            self.emit_scan_result(queue, &cell);
+        }
+        self.survey_sync_repeats = 0;
+        self.survey_advance(queue);
+    }
+
+    /// Advance the survey to the next candidate carrier, or finish the pass when
+    /// the last candidate has been visited.
+    fn survey_advance(&mut self, queue: &mut MessageQueue) {
+        self.survey_index += 1;
+        if self.survey_index >= self.survey_candidates.len() {
+            let scanned = self.survey_candidates.len() as u32;
+            tracing::info!("MLE: survey complete - {} cell(s) over {} carrier(s)", self.survey_found, scanned);
+            self.survey = false;
+            self.survey_pending = None;
+            self.emit_scan_complete(queue, scanned);
+            return;
+        }
+        let next = self.survey_candidates[self.survey_index];
+        tracing::info!(
+            "MLE: survey advancing to candidate {}/{}: {} Hz",
+            self.survey_index + 1,
+            self.survey_candidates.len(),
+            next
+        );
+        self.request_tune(queue, next);
+    }
+
+    /// Survey handling of the PHY scan-dwell heartbeat: the tuned carrier yielded
+    /// no downlink within the dwell window, so finalize a pending cell (partial,
+    /// SYNC-only) or record an empty carrier, then advance.
+    fn survey_on_dwell(&mut self, queue: &mut MessageQueue) {
+        if self.survey_pending.is_some() {
+            self.survey_finalize_pending(queue);
+        } else {
+            tracing::debug!(
+                "MLE: survey carrier {} Hz had no cell within dwell - advancing",
+                self.survey_candidates.get(self.survey_index).copied().unwrap_or(0)
+            );
+            self.survey_advance(queue);
+        }
+    }
+
+    /// Emit an `LmmMleScanResultInd` (one found cell) up to MM.
+    fn emit_scan_result(&self, queue: &mut MessageQueue, cell: &FoundCell) {
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Mm,
+            msg: SapMsgInner::LmmMleScanResultInd(LmmMleScanResultInd {
+                carrier_hz: cell.carrier_hz,
+                mcc: cell.mcc,
+                mnc: cell.mnc,
+                location_area: cell.location_area,
+                colour_code: cell.colour_code,
+                rssi_dbfs: cell.rssi_dbfs,
+                registration_required: cell.registration_required,
+                late_entry_supported: cell.late_entry_supported,
+            }),
+        });
+    }
+
+    /// Emit an `LmmMleScanCompleteInd` up to MM.
+    fn emit_scan_complete(&self, queue: &mut MessageQueue, scanned: u32) {
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Mm,
+            msg: SapMsgInner::LmmMleScanCompleteInd(LmmMleScanCompleteInd {
+                found: self.survey_found,
+                scanned,
+            }),
+        });
+    }
+
     fn rx_tlmb_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tlmb_prim");
         match message.msg {
@@ -463,10 +678,21 @@ impl MleMs {
     /// or no scan is programmed this is ignored (the PHY only emits it while
     /// un-synchronized, so a camped MS normally never sees it).
     fn rx_tlmb_scan_dwell_ind(&mut self, queue: &mut MessageQueue) {
+        // Operator survey owns the dwell heartbeat while running: advance the
+        // receive-only pass regardless of camp/scan state.
+        if self.survey {
+            self.survey_on_dwell(queue);
+            return;
+        }
         if self.serving_cell.is_some() {
             // Already camped: nothing to select. (A brief pre-recovery window
-            // could see a stray heartbeat; ignore it â€” link failure is handled
+            // could see a stray heartbeat; ignore it - link failure is handled
             // by the monitoring indication path.)
+            return;
+        }
+        // Manual cell selection: the operator drives selection via survey/camp,
+        // so the automatic scan engine is suppressed (no auto-stepping).
+        if self.selection_mode_manual {
             return;
         }
         if self.scanning {
@@ -605,6 +831,20 @@ impl MleMs {
         // advertises "system wide services temporarily not supported".
         let system_wide_services = pdu.bs_service_details.system_wide_services;
 
+        // Operator survey (receive-only): fill in the pending cell's LA and
+        // registration flag from SYSINFO, then report it and advance. Never adopt
+        // a serving cell or configure L2 here.
+        if self.survey {
+            if let Some(cell) = self.survey_pending.as_mut() {
+                cell.location_area = Some(pdu.location_area);
+                cell.registration_required = Some(registration_required);
+                self.survey_finalize_pending(queue);
+            } else {
+                tracing::debug!("MLE: survey SYSINFO with no pending SYNC cell, ignoring");
+            }
+            return;
+        }
+
         let confirm = match self.serving_cell.as_mut() {
             Some(cell) => {
                 let la_changed = cell.location_area != Some(pdu.location_area);
@@ -725,6 +965,12 @@ impl MleMs {
             }),
         };
         queue.push_back(m);
+        // An operator-armed camp has now been honoured (the cell is confirmed to
+        // MM); disarm so a later manual re-selection is required to camp again.
+        if self.camp_armed {
+            tracing::info!("MLE: operator camp completed (force_register={})", self.camp_force_register);
+            self.camp_armed = false;
+        }
     }
 
     /// ETSI TS 100 392-2 cl. 18.3.4.6: initial cell selection. Adopt the cell
@@ -756,6 +1002,50 @@ impl MleMs {
             .as_ref()
             .map(|c| c.mcc != pdu.mcc || c.mnc != pdu.mnc)
             .unwrap_or(true);
+
+        // Operator survey (receive-only): characterise the cell on the tuned
+        // candidate carrier from SYNC, then wait (bounded) for its SYSINFO to add
+        // LA / registration flag before reporting. Never adopt a serving cell,
+        // configure L2, or confirm to MM while surveying.
+        if self.survey {
+            let carrier_hz = self.survey_candidates.get(self.survey_index).copied().unwrap_or(0);
+            match self.survey_pending.as_ref() {
+                Some(cell) if cell.mcc == pdu.mcc && cell.mnc == pdu.mnc => {
+                    // Same cell re-broadcasting SYNC while we await its SYSINFO;
+                    // bound the wait so a slow/absent SYSINFO still gets reported.
+                    self.survey_sync_repeats = self.survey_sync_repeats.saturating_add(1);
+                    if self.survey_sync_repeats >= Self::SURVEY_SYSINFO_SYNC_LIMIT {
+                        self.survey_finalize_pending(queue);
+                    }
+                }
+                _ => {
+                    self.survey_sync_repeats = 0;
+                    self.survey_pending = Some(FoundCell {
+                        carrier_hz,
+                        mcc: pdu.mcc,
+                        mnc: pdu.mnc,
+                        location_area: None,
+                        colour_code: None,
+                        rssi_dbfs: self.serving_cell_rssi_dbfs,
+                        registration_required: None,
+                        late_entry_supported: pdu.late_entry_supported,
+                    });
+                }
+            }
+            return;
+        }
+
+        // Manual cell selection: auto-camp is suppressed unless the operator has
+        // explicitly armed a camp (LmmMleCampReq). A newly seen cell is left
+        // un-adopted so the MS parks without registering.
+        if self.selection_mode_manual && newly_selected && !self.camp_armed {
+            tracing::debug!(
+                "MLE: manual mode, SYNC for MCC/MNC {}/{} but no camp armed - not selecting",
+                pdu.mcc,
+                pdu.mnc
+            );
+            return;
+        }
 
         // Cell suitability (ETSI cl. 18.3.4): only camp on a cell whose network
         // is allowed. The network identity is the D-MLE-SYNC MCC/MNC
@@ -904,8 +1194,72 @@ impl MleMs {
             SapMsgInner::LmmMleIdentitiesReq(_prim) => {
                 self.rx_lmm_mle_identities_req(queue, message);
             }
+            SapMsgInner::LmmMleSelectionModeReq(prim) => {
+                self.rx_lmm_mle_selection_mode_req(prim.manual);
+            }
+            SapMsgInner::LmmMleScanReq(prim) => {
+                let start = prim.start;
+                self.rx_lmm_mle_scan_req(queue, start);
+            }
+            SapMsgInner::LmmMleCampReq(prim) => {
+                let (carrier_hz, register) = (prim.carrier_hz, prim.register);
+                self.rx_lmm_mle_camp_req(queue, carrier_hz, register);
+            }
             _ => panic!(),
         }
+    }
+
+    /// MM -> MLE: set the cell-selection mode (**[impl policy]**, Plane B).
+    /// Switching to manual stops any automatic scan so the operator drives
+    /// selection; switching back to automatic re-arms automatic scanning if the
+    /// MS is not currently camped.
+    fn rx_lmm_mle_selection_mode_req(&mut self, manual: bool) {
+        if self.selection_mode_manual == manual {
+            return;
+        }
+        self.selection_mode_manual = manual;
+        self.camp_armed = false;
+        self.camp_force_register = false;
+        if manual {
+            // Stop the automatic scan; leave any current camp in place until the
+            // operator surveys/camps elsewhere.
+            self.scanning = false;
+            tracing::info!("MLE: cell selection mode set to MANUAL (operator-driven)");
+        } else {
+            tracing::info!("MLE: cell selection mode set to AUTOMATIC (cl. 18.3.4.6)");
+        }
+    }
+
+    /// MM -> MLE: start or cancel a receive-only survey (**[impl policy]**).
+    fn rx_lmm_mle_scan_req(&mut self, queue: &mut MessageQueue, start: bool) {
+        if start {
+            self.start_survey(queue);
+        } else {
+            self.cancel_survey(queue);
+        }
+    }
+
+    /// MM -> MLE: camp (and optionally register) on a chosen candidate carrier
+    /// (**[impl policy]**). Arms a camp so the next suitable SYNC on the tuned
+    /// carrier is adopted through the normal selection path (cl. 18.3.4.6), even
+    /// in manual mode. Rejects a carrier that is not a codeplug candidate.
+    fn rx_lmm_mle_camp_req(&mut self, queue: &mut MessageQueue, carrier_hz: u32, register: bool) {
+        let candidates = self.scan_candidate_carriers();
+        if !candidates.is_empty() && !candidates.contains(&carrier_hz) {
+            tracing::warn!("MLE: camp request for {} Hz is not a codeplug candidate carrier - ignoring", carrier_hz);
+            return;
+        }
+        // End any survey and clear any current camp so the next SYNC on the
+        // requested carrier triggers a fresh selection.
+        self.survey = false;
+        self.survey_pending = None;
+        self.scanning = false;
+        self.serving_cell = None;
+        self.activate_confirmed = false;
+        self.camp_armed = true;
+        self.camp_force_register = register;
+        tracing::info!("MLE: operator camp requested on {} Hz (register={})", carrier_hz, register);
+        self.request_tune(queue, carrier_hz);
     }
 
     /// MLE-IDENTITIES request from MM (cl. 17.3.2): the set of identities by
@@ -1625,5 +1979,264 @@ dwell_ms = 500
 
         assert!(!mle.scanning, "scanning not enabled without a scan codeplug");
         assert_eq!(tuned_carrier(&queue), None, "no retune when not scanning");
+    }
+
+    // ----------------------------------------------------------------------
+    // Manual cell survey + register-to-cell (UI-driven, receive-only)
+    // ETSI TS 100 392-2 cl. 18.3.4 (survey), 18.3.4.6 (camp), 16.4 (register).
+    // ----------------------------------------------------------------------
+
+    /// Build an operator survey start/stop request (MM -> MLE, LMM SAP).
+    fn scan_req(start: bool) -> SapMsg {
+        use tetra_saps::lmm::LmmMleScanReq;
+        SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleScanReq(LmmMleScanReq { start }),
+        }
+    }
+
+    /// Build a selection-mode request (MM -> MLE, LMM SAP).
+    fn selection_mode_req(manual: bool) -> SapMsg {
+        use tetra_saps::lmm::LmmMleSelectionModeReq;
+        SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleSelectionModeReq(LmmMleSelectionModeReq { manual }),
+        }
+    }
+
+    /// Build an operator camp request (MM -> MLE, LMM SAP).
+    fn camp_req(carrier_hz: u32, register: bool) -> SapMsg {
+        use tetra_saps::lmm::LmmMleCampReq;
+        SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleCampReq(LmmMleCampReq { carrier_hz, register }),
+        }
+    }
+
+    /// All scan-result indications emitted to MM since the queue was drained.
+    fn scan_results(queue: &MessageQueue) -> Vec<&LmmMleScanResultInd> {
+        queue
+            .iter()
+            .filter_map(|m| match &m.msg {
+                SapMsgInner::LmmMleScanResultInd(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The single scan-complete indication emitted to MM, if any.
+    fn scan_complete(queue: &MessageQueue) -> Option<&LmmMleScanCompleteInd> {
+        queue.iter().find_map(|m| match &m.msg {
+            SapMsgInner::LmmMleScanCompleteInd(c) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Survey: `StartCellScan` tunes to the first candidate and enters the
+    /// receive-only survey mode without camping.
+    #[test]
+    fn test_survey_starts_and_tunes_first_candidate() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true));
+
+        assert!(mle.survey, "survey mode entered");
+        assert!(!mle.scanning, "automatic scan not running during a survey");
+        assert!(mle.serving_cell.is_none(), "no cell camped at survey start");
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F0), "tuned to first candidate");
+    }
+
+    /// Survey: visits each candidate once (no wrap), reporting one result per
+    /// found cell and a single completion, and never camps/registers.
+    #[test]
+    fn test_survey_reports_each_cell_and_completes() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true)); // start -> tune F0
+        queue = MessageQueue::new();
+
+        // A cell appears on F0: SYNC then SYSINFO characterise it and advance.
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+        assert!(mle.serving_cell.is_none(), "survey never adopts a serving cell");
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(1, 0b1));
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced to second candidate");
+
+        // A different cell on F1.
+        mle.rx_tlmb_prim(&mut queue, sync_ind(238, 6));
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(2, 0b1));
+
+        let results = scan_results(&queue);
+        assert_eq!(results.len(), 2, "one result per found cell");
+        assert_eq!(results[0].carrier_hz, SCAN_F0);
+        assert_eq!(results[0].mcc, 901);
+        assert_eq!(results[0].mnc, 9999);
+        assert_eq!(results[0].location_area, Some(1));
+        assert_eq!(results[0].registration_required, Some(true));
+        assert_eq!(results[1].carrier_hz, SCAN_F1);
+        assert_eq!(results[1].mcc, 238);
+        assert_eq!(results[1].location_area, Some(2));
+
+        let complete = scan_complete(&queue).expect("survey completion emitted");
+        assert_eq!(complete.found, 2);
+        assert_eq!(complete.scanned, 2);
+        assert!(!mle.survey, "survey finished after the last candidate");
+        assert!(mle.serving_cell.is_none(), "never camped during survey");
+        assert!(!mle.activate_confirmed, "never confirmed/registered during survey");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LmmMleActivateConf(_))).count(),
+            0,
+            "survey emits no LMM-ACTIVATE (no registration)"
+        );
+    }
+
+    /// Survey: a candidate that yields no cell within the dwell is recorded as an
+    /// empty carrier (no result) and the survey advances (cl. 18.3.4).
+    #[test]
+    fn test_survey_empty_carrier_advances_on_dwell() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true)); // start -> F0
+        queue = MessageQueue::new();
+
+        // No cell on F0: the dwell heartbeat advances to F1.
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind());
+        assert!(scan_results(&queue).is_empty(), "empty carrier yields no result");
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced past the empty carrier");
+
+        // No cell on F1 either: the survey completes with zero found cells.
+        queue = MessageQueue::new();
+        mle.rx_tlmb_prim(&mut queue, scan_dwell_ind());
+        let complete = scan_complete(&queue).expect("survey completion emitted");
+        assert_eq!(complete.found, 0);
+        assert_eq!(complete.scanned, 2);
+        assert!(!mle.survey, "survey finished");
+    }
+
+    /// Survey: a SYNC-only cell (SYSINFO never arrives) is still reported after
+    /// the bounded wait, with LA/registration left unknown.
+    #[test]
+    fn test_survey_reports_sync_only_cell_after_bound() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true)); // start -> F0
+        queue = MessageQueue::new();
+
+        // Repeated SYNC without SYSINFO: bounded by SURVEY_SYSINFO_SYNC_LIMIT.
+        for _ in 0..MleMs::SURVEY_SYSINFO_SYNC_LIMIT + 1 {
+            mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+        }
+
+        let results = scan_results(&queue);
+        assert_eq!(results.len(), 1, "SYNC-only cell reported once");
+        assert_eq!(results[0].mcc, 901);
+        assert_eq!(results[0].location_area, None, "LA unknown without SYSINFO");
+        assert_eq!(results[0].registration_required, None, "reg flag unknown without SYSINFO");
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced after the bound");
+    }
+
+    /// Survey: a foreign/disallowed-network cell is still characterised and
+    /// reported (a survey observes, it does not filter by allowed-network).
+    #[test]
+    fn test_survey_reports_disallowed_network_cell() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true)); // start -> F0
+        queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, sync_ind(238, 6)); // foreign network
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(7, 0b1));
+
+        let results = scan_results(&queue);
+        assert_eq!(results.len(), 1, "disallowed cell still reported by the survey");
+        assert_eq!(results[0].mcc, 238);
+        assert_eq!(results[0].mnc, 6);
+        assert!(mle.serving_cell.is_none(), "survey never adopts the foreign cell");
+    }
+
+    /// Survey: `StopCellScan` cancels an in-progress survey and reports a
+    /// completion for the carriers visited so far.
+    #[test]
+    fn test_survey_cancel_reports_completion() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true)); // start -> F0
+        queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(false)); // cancel
+
+        assert!(!mle.survey, "survey cancelled");
+        assert!(scan_complete(&queue).is_some(), "cancellation reports a completion");
+    }
+
+    /// Manual mode: a SYNC for a suitable cell is NOT adopted (auto-camp is
+    /// suppressed) until the operator arms a camp.
+    #[test]
+    fn test_manual_mode_suppresses_auto_camp() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, selection_mode_req(true));
+        assert!(mle.selection_mode_manual, "manual mode set");
+        queue = MessageQueue::new();
+
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+        assert!(mle.serving_cell.is_none(), "manual mode does not auto-camp");
+        assert!(!mle.activate_confirmed, "no registration in manual mode without a camp");
+    }
+
+    /// Register-to-cell: an operator `CampOnCell` on a valid candidate arms a
+    /// camp, tunes the carrier, and the next suitable SYNC+SYSINFO adopts the
+    /// cell and confirms to MM (cl. 18.3.4.6) even in manual mode.
+    #[test]
+    fn test_camp_request_adopts_and_confirms() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, selection_mode_req(true)); // manual
+        queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, camp_req(SCAN_F1, true));
+        assert!(mle.camp_armed, "camp armed");
+        assert!(mle.camp_force_register, "force-register recorded");
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "tuned to the chosen carrier");
+        queue = MessageQueue::new();
+
+        // The cell on the camped carrier is adopted despite manual mode.
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+        assert!(mle.serving_cell.is_some(), "camped cell adopted");
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(1, 0b1));
+
+        assert!(mle.activate_confirmed, "cell confirmed to MM");
+        assert!(!mle.camp_armed, "camp disarmed after honouring it");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LmmMleActivateConf(_))).count(),
+            1,
+            "LMM-ACTIVATE confirmation sent to MM"
+        );
+    }
+
+    /// Register-to-cell: a camp request for a carrier that is not a codeplug
+    /// candidate is rejected (no arm, no retune).
+    #[test]
+    fn test_camp_request_rejects_unknown_carrier() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, camp_req(123_000_000, true));
+
+        assert!(!mle.camp_armed, "camp not armed for an unknown carrier");
+        assert_eq!(tuned_carrier(&queue), None, "no retune for an unknown carrier");
     }
 }
