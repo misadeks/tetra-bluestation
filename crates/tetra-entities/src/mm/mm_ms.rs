@@ -9,7 +9,9 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, TxReporter, TxState, unimplemented_log};
-use tetra_saps::lmm::{LmmMleActivateConf, LmmMleIdentitiesReq, LmmMleUnitdataReq};
+use tetra_saps::lmm::{
+    LmmMleActivateConf, LmmMleCampReq, LmmMleIdentitiesReq, LmmMleScanReq, LmmMleSelectionModeReq, LmmMleUnitdataReq,
+};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
@@ -244,6 +246,16 @@ pub struct MmMs {
     /// on-air behaviour is byte-identical to never having run offline.
     /// **NON-STANDARD** (Plane B plumbing).
     deferred_control: Vec<crate::net_control::ControlCommand>,
+    /// Cell-selection mode mirror (**NON-STANDARD**, Plane B). Mirrors the mode
+    /// last requested via `SetCellSelectionMode` so the management runtime
+    /// snapshot / UI can show Auto vs Manual. The authoritative mode lives in the
+    /// MLE; MM only tracks it for the snapshot and to relay the request.
+    selection_mode_manual: bool,
+    /// Operator "register on camp" intent from the last `CampOnCell{register:
+    /// true}` (**NON-STANDARD**, Plane B). Consumed on the next LMM-ACTIVATE
+    /// confirmation so the MS registers (cl. 16.4) even when the cell advertises
+    /// registration-not-required. Cleared once acted on.
+    camp_force_register: bool,
 }
 
 /// Runtime plumbing for the Plane B management write/apply handlers
@@ -313,6 +325,8 @@ impl MmMs {
             pending_group_op: None,
             active_scanlists,
             deferred_control: Vec::new(),
+            selection_mode_manual: false,
+            camp_force_register: false,
         }
     }
 
@@ -885,6 +899,93 @@ impl MmMs {
         }
     }
 
+    /// Whether a manual-selection operation (survey / mode switch / camp) is
+    /// permitted right now (**NON-STANDARD**, Plane B; resolved design decision
+    /// #4). These operations retune the SDR / change the serving cell, which
+    /// would disrupt an active call, so they must be blocked while a call is up.
+    ///
+    /// MM does not yet hold CMCE call state (there is no CMCE->MM call-active
+    /// signalling primitive in the stack). Rather than invent one or guess, the
+    /// guard is intentionally conservative-but-honest: it is a single chokepoint
+    /// so that, once a CMCE->MM "call active" indication is wired, only this
+    /// method changes. Today it returns `Ok(())` (no known active call visible to
+    /// MM). Documented as a follow-up; the survey itself is receive-only.
+    fn manual_selection_allowed(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Send an LMM-SAP request primitive to the MLE (**NON-STANDARD**, Plane B
+    /// internal plumbing for manual cell selection; not an ETSI primitive).
+    fn send_lmm_to_mle(&self, queue: &mut MessageQueue, msg: SapMsgInner) {
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg,
+        });
+    }
+
+    /// Set the cell-selection mode (Plane B; cl. 18.3.4 policy). Relays the mode
+    /// to the MLE and mirrors it for the runtime snapshot.
+    fn handle_set_cell_selection_mode(&mut self, handle: u32, manual: bool, queue: &mut MessageQueue) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        let ack = |accepted: bool, message: String| {
+            ControlResponse::Management(ManagementResponse::Ack { handle, accepted, restart_required: false, message })
+        };
+
+        if let Err(reason) = self.manual_selection_allowed() {
+            self.respond(ack(false, format!("cell-selection mode change rejected: {reason}")));
+            return;
+        }
+
+        self.selection_mode_manual = manual;
+        self.send_lmm_to_mle(queue, SapMsgInner::LmmMleSelectionModeReq(LmmMleSelectionModeReq { manual }));
+        tracing::info!("MM(MS): cell-selection mode -> {}", if manual { "manual" } else { "automatic" });
+        self.respond(ack(true, format!("cell-selection mode set to {}", if manual { "manual" } else { "automatic" })));
+    }
+
+    /// Start or stop a receive-only cell survey (Plane B; cl. 18.3.4 policy).
+    fn handle_cell_scan(&mut self, handle: u32, start: bool, queue: &mut MessageQueue) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        let ack = |accepted: bool, message: String| {
+            ControlResponse::Management(ManagementResponse::Ack { handle, accepted, restart_required: false, message })
+        };
+
+        if start {
+            if let Err(reason) = self.manual_selection_allowed() {
+                self.respond(ack(false, format!("cell scan rejected: {reason}")));
+                return;
+            }
+        }
+        self.send_lmm_to_mle(queue, SapMsgInner::LmmMleScanReq(LmmMleScanReq { start }));
+        tracing::info!("MM(MS): {} cell survey", if start { "start" } else { "stop" });
+        self.respond(ack(true, format!("cell survey {}", if start { "started" } else { "stopped" })));
+    }
+
+    /// Camp on (and optionally register to) an operator-selected carrier
+    /// (Plane B; cl. 18.3.4.6 camp + cl. 16.4 registration).
+    fn handle_camp_on_cell(&mut self, handle: u32, carrier_hz: u32, register: bool, queue: &mut MessageQueue) {
+        use crate::management::ManagementResponse;
+        use crate::net_control::ControlResponse;
+        let ack = |accepted: bool, message: String| {
+            ControlResponse::Management(ManagementResponse::Ack { handle, accepted, restart_required: false, message })
+        };
+
+        if let Err(reason) = self.manual_selection_allowed() {
+            self.respond(ack(false, format!("camp rejected: {reason}")));
+            return;
+        }
+
+        // Remember the operator's force-register intent; it is consumed on the
+        // resulting LMM-ACTIVATE confirmation (see rx_activate_conf).
+        self.camp_force_register = register;
+        self.send_lmm_to_mle(queue, SapMsgInner::LmmMleCampReq(LmmMleCampReq { carrier_hz, register }));
+        tracing::info!("MM(MS): camp on {} Hz (register={})", carrier_hz, register);
+        self.respond(ack(true, format!("camping on {carrier_hz} Hz")));
+    }
+
     /// Begin a standalone group-identity amendment (cl. 16.8.2) that attaches
     /// `attach` and detaches `detach` GSSIs in a single U-ATTACH/DETACH GROUP
     /// IDENTITY (amendment mode), WITHOUT emitting any control-plane response.
@@ -983,6 +1084,12 @@ impl MmMs {
         // services temporarily not supported" (system_wide_services == false)
         // requires registration even inside the registered area and even if the
         // cell does not otherwise set the registration flag.
+        // Consume the operator's "register on camp" intent (Plane B, resolved
+        // decision #2). When set via `CampOnCell{register:true}`, force a
+        // registration on this newly-camped cell even if the cell advertises
+        // registration-not-required. Consumed once here.
+        let force_register = std::mem::take(&mut self.camp_force_register);
+
         let restricted = !conf.system_wide_services;
         let lu_type = if self.reg_state == RegState::Registered {
             match self.registered_cell {
@@ -1012,12 +1119,22 @@ impl MmMs {
                     } else {
                         // No condition applies: returning to / staying on the
                         // registered cell requires no location update
-                        // (cl. 18.3.4.7.1a NOTE 2).
-                        tracing::debug!(
-                            "MM: activate-conf for the registered cell (MCC={} MNC={} LA={}); no re-registration",
-                            cell.mcc, cell.mnc, cell.la
-                        );
-                        return;
+                        // (cl. 18.3.4.7.1a NOTE 2) -- unless the operator forced
+                        // a register-on-camp (decision #2).
+                        if force_register {
+                            tracing::info!(
+                                "MM: operator forced registration on the registered cell (MCC={} MNC={} LA={}); \
+                                 roaming location updating",
+                                cell.mcc, cell.mnc, cell.la
+                            );
+                            LocationUpdateType::RoamingLocationUpdating
+                        } else {
+                            tracing::debug!(
+                                "MM: activate-conf for the registered cell (MCC={} MNC={} LA={}); no re-registration",
+                                cell.mcc, cell.mnc, cell.la
+                            );
+                            return;
+                        }
                     }
                 }
                 // Different network (MNI): migrating location updating is required
@@ -1035,7 +1152,7 @@ impl MmMs {
                 // (cond. 2), or if the cell is restricted (cond. 5), or if we hold
                 // a temporary registration (cond. 4).
                 _ => {
-                    if !conf.registration_required && !restricted && !self.temporary_registration {
+                    if !conf.registration_required && !restricted && !self.temporary_registration && !force_register {
                         tracing::info!(
                             "MM: LA changed to {} but new cell does not require registration; \
                              not registering (cl. 18.3.4.7.1a cond. 2)",
@@ -1056,14 +1173,21 @@ impl MmMs {
             // performed when the selected cell requires registration (registration
             // flag) or advertises "system wide services temporarily not supported"
             // (cl. 16.4.1.0 cond. 5).
-            if !conf.registration_required && !restricted {
+            if !conf.registration_required && !restricted && !force_register {
                 tracing::info!(
                     "MM: serving cell (LA={}) does not require registration; not registering",
                     conf.la
                 );
                 return;
             }
-            tracing::info!("MM: serving cell selected (LA={}), initiating ITSI attach registration", conf.la);
+            if force_register && !conf.registration_required && !restricted {
+                tracing::info!(
+                    "MM: operator forced registration on cell (LA={}) that does not require it; ITSI attach",
+                    conf.la
+                );
+            } else {
+                tracing::info!("MM: serving cell selected (LA={}), initiating ITSI attach registration", conf.la);
+            }
             LocationUpdateType::ItsiAttach
         };
 
@@ -1837,6 +1961,10 @@ impl MmMs {
     /// restart request) and the read-only `GetState`/`GetInterfaceVersion`.
     /// `ActivateScanlist` is deliberately excluded because it resolves to a
     /// group attach/detach (cl. 16.8.2) that must run on a real tick.
+    ///
+    /// The manual cell-survey commands ARE offline-serviceable: a survey is
+    /// specifically run while the MS is not camped/synchronized (that is its
+    /// purpose), and the selection-mode / camp requests only stage MLE state.
     fn is_offline_serviceable(cmd: &crate::net_control::ControlCommand) -> bool {
         use crate::management::ManagementCommand;
         use crate::net_control::ControlCommand;
@@ -1848,6 +1976,10 @@ impl MmMs {
                     | ManagementCommand::ApplyConfig { .. }
                     | ManagementCommand::GetState { .. }
                     | ManagementCommand::GetInterfaceVersion { .. }
+                    | ManagementCommand::SetCellSelectionMode { .. }
+                    | ManagementCommand::StartCellScan { .. }
+                    | ManagementCommand::StopCellScan { .. }
+                    | ManagementCommand::CampOnCell { .. }
             )
         )
     }
@@ -2419,6 +2551,22 @@ impl MmMs {
             ManagementCommand::ActivateScanlist { handle, name, active } => {
                 self.handle_activate_scanlist(handle, name, active, queue);
             }
+            // Manual cell-selection mode toggle (Plane B, cl. 18.3.4 policy).
+            ManagementCommand::SetCellSelectionMode { handle, manual } => {
+                self.handle_set_cell_selection_mode(handle, manual, queue);
+            }
+            // Start a receive-only survey of the codeplug candidate carriers.
+            ManagementCommand::StartCellScan { handle } => {
+                self.handle_cell_scan(handle, true, queue);
+            }
+            // Abort an in-progress survey.
+            ManagementCommand::StopCellScan { handle } => {
+                self.handle_cell_scan(handle, false, queue);
+            }
+            // Camp on / register to an operator-selected carrier.
+            ManagementCommand::CampOnCell { handle, carrier_hz, register } => {
+                self.handle_camp_on_cell(handle, carrier_hz, register, queue);
+            }
         }
     }
 
@@ -2590,6 +2738,7 @@ impl MmMs {
             attached_groups: self.attach_groups(),
             active_scanlists: self.active_scanlists.iter().cloned().collect(),
             restart_required: self.restart_required,
+            selection_mode_manual: self.selection_mode_manual,
         }
     }
 }
@@ -2756,6 +2905,26 @@ impl TetraEntityTrait for MmMs {
             SapMsgInner::LmmMleReopenInd(_) => {
                 self.rx_mle_reopen();
             }
+            SapMsgInner::LmmMleScanResultInd(ind) => {
+                // Manual survey (Plane B): forward the found cell to the UI as a
+                // telemetry event. Parsed per spec at the MLE; MM only relays.
+                self.emit(crate::net_telemetry::TelemetryEvent::MsScanResult {
+                    carrier_hz: ind.carrier_hz,
+                    mcc: ind.mcc,
+                    mnc: ind.mnc,
+                    location_area: ind.location_area,
+                    colour_code: ind.colour_code,
+                    rssi_dbfs: ind.rssi_dbfs,
+                    registration_required: ind.registration_required,
+                    late_entry_supported: ind.late_entry_supported,
+                });
+            }
+            SapMsgInner::LmmMleScanCompleteInd(ind) => {
+                self.emit(crate::net_telemetry::TelemetryEvent::MsScanComplete {
+                    found: ind.found,
+                    scanned: ind.scanned,
+                });
+            }
             _ => {
                 panic!();
             }
@@ -2809,6 +2978,7 @@ mod tests {
     use tetra_config::bluestation::from_toml_str;
     use tetra_saps::lmm::LmmMleUnitdataInd;
     use tetra_saps::lmm::LmmMleRssiInd;
+    use tetra_saps::lmm::{LmmMleScanCompleteInd, LmmMleScanResultInd};
     use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
     use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 
@@ -5041,6 +5211,217 @@ order = 2\n"
         assert!(accepted, "idempotent re-activate accepted");
         assert!(mm.pending_group_op.is_none());
         assert!(q.pop_front().is_none(), "no PDU for a no-op");
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual cell survey / register-to-cell (Plane B, NON-STANDARD): the four
+    // management commands relay internal LMM-SAP requests to the MLE, forward
+    // the survey result/complete indications up as telemetry, and CampOnCell's
+    // force-register intent is consumed on the next LMM-ACTIVATE confirmation.
+    // -----------------------------------------------------------------------
+
+    /// The first LMM request of a given kind forwarded to the MLE, if any.
+    fn forwarded_lmm(queue: &MessageQueue) -> Option<&SapMsgInner> {
+        queue
+            .iter()
+            .find(|m| {
+                m.dest == TetraEntity::Mle
+                    && matches!(
+                        m.msg,
+                        SapMsgInner::LmmMleSelectionModeReq(_)
+                            | SapMsgInner::LmmMleScanReq(_)
+                            | SapMsgInner::LmmMleCampReq(_)
+                    )
+            })
+            .map(|m| &m.msg)
+    }
+
+    /// Deliver an MLE->MM survey result indication (as MLE forwards it).
+    fn deliver_scan_result(mm: &mut MmMs, q: &mut MessageQueue, ind: LmmMleScanResultInd) {
+        mm.rx_prim(
+            q,
+            SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Mm,
+                msg: SapMsgInner::LmmMleScanResultInd(ind),
+            },
+        );
+    }
+
+    /// SetCellSelectionMode relays the mode to the MLE, mirrors it in the runtime
+    /// snapshot, and acknowledges the request.
+    #[test]
+    fn test_set_cell_selection_mode_forwards_and_snapshots() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetCellSelectionMode {
+            handle: 40,
+            manual: true,
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _restart) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 40);
+        assert!(accepted);
+        assert!(mm.runtime_snapshot().selection_mode_manual, "snapshot mirrors manual mode");
+        match forwarded_lmm(&q).expect("selection-mode req forwarded to MLE") {
+            SapMsgInner::LmmMleSelectionModeReq(r) => assert!(r.manual),
+            other => panic!("expected LmmMleSelectionModeReq, got {other:?}"),
+        }
+    }
+
+    /// StartCellScan / StopCellScan relay an LmmMleScanReq to the MLE with the
+    /// matching start flag, and are acknowledged.
+    #[test]
+    fn test_cell_scan_commands_forward_scan_req() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::StartCellScan { handle: 41 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert!(accepted);
+        match forwarded_lmm(&q).expect("scan req forwarded") {
+            SapMsgInner::LmmMleScanReq(r) => assert!(r.start, "StartCellScan -> start=true"),
+            other => panic!("expected LmmMleScanReq, got {other:?}"),
+        }
+
+        q = MessageQueue::new();
+        dispatcher.send(ControlCommand::Management(ManagementCommand::StopCellScan { handle: 42 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        let (_h, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert!(accepted);
+        match forwarded_lmm(&q).expect("scan req forwarded") {
+            SapMsgInner::LmmMleScanReq(r) => assert!(!r.start, "StopCellScan -> start=false"),
+            other => panic!("expected LmmMleScanReq, got {other:?}"),
+        }
+    }
+
+    /// The four manual-selection commands are serviceable before registration
+    /// (the survey is receive-only and must work while camped-less/unregistered).
+    #[test]
+    fn test_cell_scan_serviceable_while_unregistered() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        assert_eq!(mm.reg_state, RegState::Idle);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::StartCellScan { handle: 43 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_h, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert!(accepted, "scan accepted while unregistered");
+        assert!(forwarded_lmm(&q).is_some(), "scan req forwarded even when Idle");
+    }
+
+    /// CampOnCell relays an LmmMleCampReq to the MLE with the chosen carrier +
+    /// register flag, records the operator's force-register intent, and acks.
+    #[test]
+    fn test_camp_on_cell_forwards_and_records_force_register() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::CampOnCell {
+            handle: 44,
+            carrier_hz: 396_000_000,
+            register: true,
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 44);
+        assert!(accepted);
+        assert!(mm.camp_force_register, "force-register intent recorded for the next activate-conf");
+        match forwarded_lmm(&q).expect("camp req forwarded") {
+            SapMsgInner::LmmMleCampReq(r) => {
+                assert_eq!(r.carrier_hz, 396_000_000);
+                assert!(r.register);
+            }
+            other => panic!("expected LmmMleCampReq, got {other:?}"),
+        }
+    }
+
+    /// A survey result/complete indication from the MLE is forwarded to the UI as
+    /// `MsScanResult` / `MsScanComplete` telemetry (MM only relays; the MLE parsed
+    /// the cell per spec).
+    #[test]
+    fn test_scan_result_and_complete_emit_telemetry() {
+        let (mut mm, source, _dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        deliver_scan_result(
+            &mut mm,
+            &mut q,
+            LmmMleScanResultInd {
+                carrier_hz: 390_000_000,
+                mcc: 901,
+                mnc: 9999,
+                location_area: Some(1),
+                colour_code: None,
+                rssi_dbfs: Some(-72.0),
+                registration_required: Some(true),
+                late_entry_supported: true,
+            },
+        );
+        mm.rx_prim(
+            &mut q,
+            SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Mm,
+                msg: SapMsgInner::LmmMleScanCompleteInd(LmmMleScanCompleteInd { found: 1, scanned: 2 }),
+            },
+        );
+
+        let events = drain(&source);
+        let result = events
+            .iter()
+            .find_map(|e| match e {
+                TelemetryEvent::MsScanResult { carrier_hz, mcc, mnc, location_area, registration_required, .. } => {
+                    Some((*carrier_hz, *mcc, *mnc, *location_area, *registration_required))
+                }
+                _ => None,
+            })
+            .expect("MsScanResult telemetry emitted");
+        assert_eq!(result, (390_000_000, 901, 9999, Some(1), Some(true)));
+
+        let complete = events
+            .iter()
+            .find_map(|e| match e {
+                TelemetryEvent::MsScanComplete { found, scanned } => Some((*found, *scanned)),
+                _ => None,
+            })
+            .expect("MsScanComplete telemetry emitted");
+        assert_eq!(complete, (1, 2));
+    }
+
+    /// Register-to-cell (decision #2): with the operator's force-register intent
+    /// set, MM performs an ITSI attach on the next LMM-ACTIVATE confirmation even
+    /// when the cell advertises registration-not-required.
+    #[test]
+    fn test_camp_force_register_forces_lu_when_not_required() {
+        let mut mm = ms_mm();
+        let mut q = MessageQueue::new();
+
+        // Operator armed "register on camp"; MM would normally skip an LU on a
+        // cell that does not require registration.
+        mm.camp_force_register = true;
+        mm.rx_activate_conf(&mut q, &activate_conf(false));
+
+        assert_eq!(mm.reg_state, RegState::Registering, "forced ITSI attach despite reg-not-required");
+        let msg = q.pop_front().expect("a demand must be emitted");
+        let SapMsgInner::LmmMleUnitdataReq(mut req) = msg.msg else {
+            panic!("expected LmmMleUnitdataReq");
+        };
+        req.sdu.seek(0);
+        let pdu = ULocationUpdateDemand::from_bitbuf(&mut req.sdu).expect("BS must parse the forced demand");
+        assert_eq!(pdu.location_update_type, LocationUpdateType::ItsiAttach);
+        assert!(!mm.camp_force_register, "force-register intent consumed once");
     }
 
     // -----------------------------------------------------------------------

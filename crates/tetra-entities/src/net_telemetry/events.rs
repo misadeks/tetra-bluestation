@@ -157,4 +157,42 @@ pub enum TelemetryEvent {
         bad_frame: bool,
         data: Vec<u8>,
     },
+
+    // -----------------------------------------------------------------------
+    // Manual cell survey (Plane B, non-standard OUTBOUND) — results of an
+    // operator-driven receive-only scan of the codeplug candidate carriers.
+    //
+    // Not a TNMM primitive: the survey UX is implementation policy layered on
+    // ETSI cl. 18.3.4 initial cell selection. Each per-cell field is parsed
+    // per spec (D-MLE-SYNC cl. 18.4.2.1, D-MLE-SYSINFO cl. 18.4.2.2); the
+    // survey transmits nothing.
+    // -----------------------------------------------------------------------
+    /// One cell found during a manual survey. Emitted once per surveyed cell.
+    MsScanResult {
+        /// Downlink carrier the cell was found on (Hz).
+        carrier_hz: u32,
+        /// Mobile Country Code (D-MLE-SYNC, cl. 18.4.2.1).
+        mcc: u16,
+        /// Mobile Network Code (D-MLE-SYNC, cl. 18.4.2.1).
+        mnc: u16,
+        /// Location Area (D-MLE-SYSINFO, cl. 18.4.2.2); `None` if the cell
+        /// synced but no SYSINFO was captured within the dwell.
+        location_area: Option<u16>,
+        /// Colour code — not available at MLE (a MAC-layer scrambling quantity);
+        /// always `None`, carried for a stable UI schema.
+        colour_code: Option<u8>,
+        /// Serving-cell downlink receive level in uncalibrated dBFS, if measured.
+        rssi_dbfs: Option<f32>,
+        /// Whether the cell advertises that registration is required
+        /// (BS service details, cl. 18.4.2.2); `None` if SYSINFO not captured.
+        registration_required: Option<bool>,
+        /// Whether the cell supports late entry (D-MLE-SYNC, cl. 18.4.2.1).
+        late_entry_supported: bool,
+    },
+    /// End of a manual survey: `found` cells were reported across `scanned`
+    /// candidate carriers.
+    MsScanComplete {
+        found: u32,
+        scanned: u32,
+    },
 }

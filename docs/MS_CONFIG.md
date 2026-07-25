@@ -207,6 +207,12 @@ named lists; the radio scans **all** lists combined into a single candidate set
 (duplicates removed) and camps on the best suitable cell. With no `[[frequency_list]]`,
 the MS does not scan.
 
+> **Reused by the UI-driven manual carrier survey.** The manual cell survey
+> (`SetCellSelectionMode` → `StartCellScan`, results as `MsScanResult` telemetry) and
+> register-to-cell (`CampOnCell`) surveys / camps this **same** combined candidate set —
+> **no new config keys are introduced** for that feature. A `CampOnCell` carrier must be a
+> member of this set.
+
 | Key | Type | Description |
 |---|---|---|
 | `name` | string | Unique label. |

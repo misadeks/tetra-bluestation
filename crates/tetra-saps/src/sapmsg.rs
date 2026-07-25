@@ -115,6 +115,19 @@ pub enum SapMsgInner {
     /// available again (serving-cell downlink recovered).
     LmmMleReopenInd(LmmMleReopenInd),
 
+    // Operator-driven cell survey / selection (implementation-defined, Plane B;
+    // NOT ETSI LMM primitives). See `crate::lmm`.
+    /// MM -> MLE: switch between automatic and manual cell selection.
+    LmmMleSelectionModeReq(LmmMleSelectionModeReq),
+    /// MM -> MLE: start/stop a receive-only survey of candidate carriers.
+    LmmMleScanReq(LmmMleScanReq),
+    /// MM -> MLE: camp (and optionally register) on a chosen candidate carrier.
+    LmmMleCampReq(LmmMleCampReq),
+    /// MLE -> MM: one cell found during a survey.
+    LmmMleScanResultInd(LmmMleScanResultInd),
+    /// MLE -> MM: the survey pass finished.
+    LmmMleScanCompleteInd(LmmMleScanCompleteInd),
+
     // LCMC-SAP (MLE-CMCE)
     LcmcMleUnitdataInd(LcmcMleUnitdataInd),
     LcmcMleUnitdataReq(LcmcMleUnitdataReq),
@@ -207,6 +220,11 @@ impl Display for SapMsgInner {
             SapMsgInner::LmmMleRssiInd(_) => write!(f, "LmmMleRssiInd"),
             SapMsgInner::LmmMleBreakInd(_) => write!(f, "LmmMleBreakInd"),
             SapMsgInner::LmmMleReopenInd(_) => write!(f, "LmmMleReopenInd"),
+            SapMsgInner::LmmMleSelectionModeReq(_) => write!(f, "LmmMleSelectionModeReq"),
+            SapMsgInner::LmmMleScanReq(_) => write!(f, "LmmMleScanReq"),
+            SapMsgInner::LmmMleCampReq(_) => write!(f, "LmmMleCampReq"),
+            SapMsgInner::LmmMleScanResultInd(_) => write!(f, "LmmMleScanResultInd"),
+            SapMsgInner::LmmMleScanCompleteInd(_) => write!(f, "LmmMleScanCompleteInd"),
 
             // Control/Brew
             SapMsgInner::MmSubscriberUpdate(_) => write!(f, "MmSubscriberUpdate"),

@@ -32,11 +32,15 @@ use crate::tnmm::ServiceStatus;
 /// A UI discovers this at runtime via [`ManagementCommand::GetInterfaceVersion`]
 /// so it can gate on the message catalog it was built against. Bump this (and
 /// the documented message catalog) whenever the Plane A/B message shapes change
-/// `2` adds the scan-list management command
+/// `3` adds the manual cell-survey / register-to-cell commands
+/// ([`ManagementCommand::SetCellSelectionMode`], `StartCellScan`,
+/// `StopCellScan`, `CampOnCell`), the `selection_mode_manual` field on
+/// [`MsRuntimeState`], and the `MsScanResult` / `MsScanComplete` telemetry
+/// events. `2` adds the scan-list management command
 /// ([`ManagementCommand::ActivateScanlist`]) and the `active_scanlists` field
 /// on [`MsRuntimeState`]; `1` was the first frozen revision covering T1 TNMM
 /// indications, T2 TNMM requests and T3 management read/write.
-pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-2";
+pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-3";
 
 /// MS registration state, mirrored for the management snapshot (non-standard).
 ///
@@ -97,6 +101,12 @@ pub struct MsRuntimeState {
     /// only takes effect after a controlled restart (`ApplyConfig`). Purely a
     /// UI hint so the operator can see a "pending restart" indication.
     pub restart_required: bool,
+    /// Cell-selection mode (**non-standard**, Plane B operator control on top of
+    /// ETSI cl. 18.3.4). `false` = automatic (the MS auto-camps on the first
+    /// suitable cell, cl. 18.3.4.6); `true` = manual (auto-camp is suppressed;
+    /// the operator drives a survey and an explicit camp). Set via
+    /// [`ManagementCommand::SetCellSelectionMode`].
+    pub selection_mode_manual: bool,
 }
 
 /// Management command (UI -> stack), **non-standard** Plane B.
@@ -138,6 +148,25 @@ pub enum ManagementCommand {
     /// false}`. Applies immediately when registered; otherwise it just updates
     /// the desired set so the groups are affiliated at the next registration.
     ActivateScanlist { handle: u32, name: String, active: bool },
+    /// Set the cell-selection mode (**non-standard**, Plane B). `manual = true`
+    /// switches to manual selection: the MS stops auto-camping and waits for the
+    /// operator to survey and pick a cell; `false` restores automatic selection
+    /// (cl. 18.3.4.6). Rejected (`Ack{accepted:false}`) while a call is active.
+    SetCellSelectionMode { handle: u32, manual: bool },
+    /// Start a receive-only survey of every candidate downlink carrier in the
+    /// codeplug `[[frequency_list]]`s. Each found cell is reported via a
+    /// `MsScanResult` telemetry event, followed by a single `MsScanComplete`.
+    /// The survey transmits nothing and never camps/registers. Rejected while a
+    /// call is active.
+    StartCellScan { handle: u32 },
+    /// Abort an in-progress cell survey. A `MsScanComplete` is still emitted with
+    /// the count of cells found so far.
+    StopCellScan { handle: u32 },
+    /// Camp on (and optionally register to) a specific carrier chosen by the
+    /// operator from the survey results. `register = true` forces a registration
+    /// (cl. 16.4) even if the cell advertises registration-not-required;
+    /// `register = false` camps only. Rejected while a call is active.
+    CampOnCell { handle: u32, carrier_hz: u32, register: bool },
 }
 
 /// Management response (stack -> UI), **non-standard** Plane B.

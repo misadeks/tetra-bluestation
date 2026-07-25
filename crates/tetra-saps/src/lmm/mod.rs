@@ -231,3 +231,73 @@ pub struct LmmMleUpdateReq {
     pub cell_type_prefs: Option<Todo>,
     pub registration_result: Todo,
 }
+
+// ---------------------------------------------------------------------------
+// Operator-driven cell survey / selection (IMPLEMENTATION-DEFINED, Plane B).
+//
+// These primitives are NOT part of the ETSI LMM-SAP. They are a local Plane B
+// interface between MM (which owns the external management surface) and the MLE
+// (which owns cell selection, cl. 18.3.4) so an operator UI can: switch the MS
+// between automatic and manual cell selection, run a receive-only survey of the
+// codeplug candidate carriers, and camp/register on a chosen cell. Every
+// per-cell action underneath stays spec (D-MLE-SYNC parse cl. 18.4.2.1,
+// D-MLE-SYSINFO parse cl. 18.4.2.2, suitability cl. 18.3.4, camp cl. 18.3.4.6);
+// only the enumeration/orchestration and this SAP are implementation policy, as
+// the existing automatic scan already is.
+// ---------------------------------------------------------------------------
+
+/// MM -> MLE cell-selection mode request. `manual = false` is the default
+/// automatic behaviour (MLE auto-camps on the first suitable cell, cl. 18.3.4.6);
+/// `manual = true` suppresses auto-camp so the operator drives selection via a
+/// survey ([`LmmMleScanReq`]) and an explicit camp ([`LmmMleCampReq`]).
+#[derive(Debug, Clone)]
+pub struct LmmMleSelectionModeReq {
+    pub manual: bool,
+}
+
+/// MM -> MLE survey request. `start = true` begins a single receive-only pass
+/// over the codeplug candidate carriers (cl. 18.3.4 enumeration is
+/// **[impl policy]**), reporting each found cell via [`LmmMleScanResultInd`] and
+/// finishing with [`LmmMleScanCompleteInd`]; `start = false` cancels a survey in
+/// progress. The survey transmits nothing and does not camp.
+#[derive(Debug, Clone)]
+pub struct LmmMleScanReq {
+    pub start: bool,
+}
+
+/// MM -> MLE camp-on-cell request: tune to `carrier_hz` (which must be one of
+/// the codeplug candidate carriers) and perform normal cell selection there
+/// (cl. 18.3.4.6), so the MLE adopts the cell and confirms it to MM
+/// ([`LmmMleActivateConf`]). `register` conveys the operator's explicit intent
+/// to register even if the cell advertises registration-not-required; the
+/// registration decision itself remains in MM (cl. 16.4).
+#[derive(Debug, Clone)]
+pub struct LmmMleCampReq {
+    pub carrier_hz: u32,
+    pub register: bool,
+}
+
+/// MLE -> MM survey result: one cell found during a survey. Receive-only, so no
+/// registration/service state is implied. `location_area`, `colour_code` and
+/// `registration_required` are `None` when not yet known for this cell (SYSINFO
+/// not seen, or the colour code is not surfaced to the MLE). `rssi_dbfs` is the
+/// uncalibrated downlink level (as [`LmmMleRssiInd`]).
+#[derive(Debug, Clone)]
+pub struct LmmMleScanResultInd {
+    pub carrier_hz: u32,
+    pub mcc: u16,
+    pub mnc: u16,
+    pub location_area: Option<u16>,
+    pub colour_code: Option<u8>,
+    pub rssi_dbfs: Option<f32>,
+    pub registration_required: Option<bool>,
+    pub late_entry_supported: bool,
+}
+
+/// MLE -> MM survey completion: the single pass finished. `found` is the number
+/// of cells reported, `scanned` the number of candidate carriers visited.
+#[derive(Debug, Clone)]
+pub struct LmmMleScanCompleteInd {
+    pub found: u32,
+    pub scanned: u32,
+}
