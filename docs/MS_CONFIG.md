@@ -220,7 +220,8 @@ the MS does not scan.
 | `frequencies` | array of int (Hz) | Downlink frequencies for a `List` list (a single entry = "one fixed channel"). |
 | `dwell_ms` | int (ms) | Per-candidate dwell time while scanning. |
 
-For a `Range` list, add a nested `[[frequency_list.range]]`:
+For a `Range` list, add a nested **single-bracket** sub-table `[frequency_list.range]`
+(one range per list — **not** a `[[...]]` array of tables):
 
 | Key | Type | Description |
 |---|---|---|
@@ -240,7 +241,7 @@ dwell_ms = 800
 # name = "band4-sweep"
 # mode = "Range"
 # dwell_ms = 800
-#   [[frequency_list.range]]
+#   [frequency_list.range]
 #   band = 4
 #   start_carrier = 1500
 #   stop_carrier = 1700
