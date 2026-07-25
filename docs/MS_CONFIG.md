@@ -325,7 +325,9 @@ Via the management interface (Plane B):
 > state (including out of service, and before the MS has ever synced to a base station).
 > The stack is receive-timed, so while unsynchronized it services this config/state subset
 > off a dedicated pre-tick path; any other command received meanwhile is buffered and
-> replayed on the first real tick, leaving registration / on-air behaviour unchanged. See
+> replayed on the first real tick, leaving registration / on-air behaviour unchanged. The MS
+> PHY cooperatively yields the receive loop (~20 ms) while it has no downlink lock so this
+> path actually runs before the radio finds a base station. See
 > [`MS_MODE.md` §3.7 "Offline config servicing"](./MS_MODE.md#37-external-interface-tnmm--management).
 
 ---

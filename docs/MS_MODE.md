@@ -217,6 +217,16 @@ Legend:
 > `SetConfig` stages to disk and applies on the next `ApplyConfig` restart exactly as when
 > synchronized; `GetConfig` returns the live active codeplug (secrets redacted) regardless of
 > `registration_state` / `service_status`.
+>
+> For this to work the PHY must actually return control to the run loop while unsynchronized.
+> The MS downlink demodulator stays in `Mode::DlUnsynchronized` and never yields a demodulated
+> slot until it locks onto a base station, so `RxTxDevSoapySdr::rxtx_timeslot`'s RX loop would
+> otherwise block indefinitely and the offline pump above would never be reached. While the
+> downlink is **not** synchronized, that loop therefore yields back to the caller (returning
+> with no slot) after a short wall-clock window (`UNSYNC_YIELD`, 20 ms) — and also on a
+> cooperative shutdown request. The demodulator's correlation state persists across calls, so
+> sync acquisition is unaffected. Once synchronized the loop returns each slot on its own and is
+> byte-identical; the mechanism is never installed in BS mode.
 
 ---
 
