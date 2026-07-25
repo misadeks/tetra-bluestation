@@ -189,7 +189,7 @@ rx_only = true
 # cell. Define one or more named lists; the radio scans ALL lists combined into a
 # single candidate set (duplicates removed) and camps on the best suitable cell.
 #   mode = "List"  -> scan the explicitly listed frequencies
-#   mode = "Range" -> enumerate a carrier range (see [[frequency_list.range]] below)
+#   mode = "Range" -> enumerate a carrier range (see [frequency_list.range] below)
 # A single-frequency "camp on one carrier" setup is just a List with one frequency.
 # With no [[frequency_list]] programmed, the MS does not scan.
 [[frequency_list]]
@@ -199,13 +199,14 @@ frequencies = [439825000, 439850000]
 dwell_ms = 800
 
 # Range-based list example. Enumerates band 4 carriers from start to stop in `step`
-# carrier units (multiples of 25 kHz). Uncomment to add it to the scan set.
+# carrier units (multiples of 25 kHz). Uncomment to add it to the scan set. The range
+# is a single-bracket sub-table (one range per list), NOT a [[...]] array of tables.
 # [[frequency_list]]
 # name = "band4-sweep"
 # mode = "Range"
 # dwell_ms = 800
 #
-# [[frequency_list.range]]
+# [frequency_list.range]
 # band = 4
 # start_carrier = 1500
 # stop_carrier = 1700
