@@ -217,7 +217,12 @@ fn build_ms_stack(
     match cfg.config().phy_io.backend {
         PhyBackend::SoapySdr => {
             // soapyio already maps StackMode::Ms to RX=downlink / TX=uplink.
-            let rxdev = RxTxDevSoapySdr::new(cfg);
+            let mut rxdev = RxTxDevSoapySdr::new(cfg);
+            // Give the SDR RX loop the shutdown flag so a Ctrl+C is acted on
+            // promptly even while the MS is not synchronized to a base station
+            // (otherwise the unsynchronized RX loop blocks until a downlink
+            // appears — the process would "await connection" before exiting).
+            rxdev.set_run_flag(is_running.clone());
             let phy = PhyMs::new(cfg.clone(), rxdev);
             router.register_entity(Box::new(phy));
         }

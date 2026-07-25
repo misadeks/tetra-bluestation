@@ -431,6 +431,14 @@ impl Demodulator {
         }
     }
 
+    /// True once the demodulator has achieved downlink lock (`Mode::Dl`). While
+    /// false the demodulator is still searching for a synchronization training
+    /// sequence and never yields a demodulated slot, so a caller looping until a
+    /// slot is produced would block indefinitely on an empty/absent downlink.
+    pub fn is_synchronized(&self) -> bool {
+        self.mode == Mode::Dl
+    }
+
     /// Synchronize an uplink demodulator to a downlink demodulator
     /// for simultaneous UL/DL monitoring.
     pub fn sync_to_demodulator(&mut self, demod: &Demodulator) {
