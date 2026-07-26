@@ -139,6 +139,15 @@ pub struct MleMs {
     survey_sync_repeats: u8,
     /// Count of cells reported during the current survey (for the completion).
     survey_found: u32,
+    /// Backstop per-carrier dwell counter for the survey, incremented on each PHY
+    /// monitoring indication (`TlmbMonitorInd`). The PHY only emits the scan-dwell
+    /// heartbeat while *unsynchronized*; a candidate carrier that demod-locks onto
+    /// a signal the MS cannot decode into a D-MLE-SYNC (e.g. a non-TETRA emitter or
+    /// an undecodable/oscillating cell) would otherwise produce only monitoring
+    /// indications and never advance the survey. This counter bounds that wait so
+    /// the survey advances off such a carrier. Reset on each new candidate and on
+    /// each decodable SYNC (progress).
+    survey_monitor_ticks: u16,
 }
 
 impl MleMs {
@@ -161,6 +170,7 @@ impl MleMs {
             survey_pending: None,
             survey_sync_repeats: 0,
             survey_found: 0,
+            survey_monitor_ticks: 0,
         }
     }
 
@@ -503,6 +513,16 @@ impl MleMs {
     /// broadcast SYSINFO (BNCH) a chance to arrive.
     const SURVEY_SYSINFO_SYNC_LIMIT: u8 = 4;
 
+    /// Backstop bound on the number of PHY monitoring indications
+    /// (`TlmbMonitorInd`) tolerated on a single survey candidate carrier before
+    /// the survey advances, when the carrier locks a signal but yields no
+    /// decodable cell. The PHY refreshes the monitor indication roughly once per
+    /// multiframe (~255 ms) while synced plus on each sync/failure transition, so
+    /// this bounds the "locked but undecodable" dwell to a few seconds. Without
+    /// it, such a carrier (which never returns to the unsynchronized scan-dwell
+    /// heartbeat) would stall the survey indefinitely.
+    const SURVEY_MONITOR_TICK_LIMIT: u16 = 8;
+
     /// Begin a receive-only survey of the codeplug candidate carriers
     /// (**[impl policy]** on top of cl. 18.3.4). Clears any camp, caches the
     /// candidate set and tunes to the first candidate. Reports each found cell to
@@ -519,6 +539,7 @@ impl MleMs {
         self.survey_sync_repeats = 0;
         self.survey_found = 0;
         self.survey_index = 0;
+        self.survey_monitor_ticks = 0;
         self.survey_candidates = candidates;
         if self.survey_candidates.is_empty() {
             tracing::info!("MLE: survey requested but no candidate carriers programmed - completing empty");
@@ -576,6 +597,7 @@ impl MleMs {
     /// the last candidate has been visited.
     fn survey_advance(&mut self, queue: &mut MessageQueue) {
         self.survey_index += 1;
+        self.survey_monitor_ticks = 0;
         if self.survey_index >= self.survey_candidates.len() {
             let scanned = self.survey_candidates.len() as u32;
             tracing::info!("MLE: survey complete - {} cell(s) over {} carrier(s)", self.survey_found, scanned);
@@ -603,6 +625,32 @@ impl MleMs {
         } else {
             tracing::debug!(
                 "MLE: survey carrier {} Hz had no cell within dwell - advancing",
+                self.survey_candidates.get(self.survey_index).copied().unwrap_or(0)
+            );
+            self.survey_advance(queue);
+        }
+    }
+
+    /// Survey handling of a PHY monitoring indication (`TlmbMonitorInd`). The PHY
+    /// emits these once it demod-locks a carrier (and on each sync/failure
+    /// transition), *instead of* the unsynchronized scan-dwell heartbeat. During a
+    /// survey there is no serving cell, so this must not run the serving-cell
+    /// break/reopen machine; it is used purely as a backstop per-carrier dwell so
+    /// a carrier that locks a signal but never yields a decodable D-MLE-SYNC still
+    /// advances. A decodable SYNC (which sets `survey_pending`) resets the count,
+    /// and the SYNC/SYSINFO paths finalize good cells long before this fires.
+    fn survey_on_monitor(&mut self, queue: &mut MessageQueue) {
+        self.survey_monitor_ticks = self.survey_monitor_ticks.saturating_add(1);
+        if self.survey_monitor_ticks < Self::SURVEY_MONITOR_TICK_LIMIT {
+            return;
+        }
+        if self.survey_pending.is_some() {
+            // A cell was seen (SYNC) but its characterisation never completed
+            // within the dwell; report the partial cell and move on.
+            self.survey_finalize_pending(queue);
+        } else {
+            tracing::debug!(
+                "MLE: survey carrier {} Hz locked a signal but yielded no decodable cell within dwell - advancing",
                 self.survey_candidates.get(self.survey_index).copied().unwrap_or(0)
             );
             self.survey_advance(queue);
@@ -713,6 +761,13 @@ impl MleMs {
     /// NOTE 2; a changed LA/network => a location update). On recovery the MLE
     /// issues MLE-REOPEN.
     fn rx_tlmb_monitor_ind(&mut self, queue: &mut MessageQueue, downlink_available: bool) {
+        // A receive-only survey has no serving cell: never run the break/reopen
+        // machine while surveying. Use the indication as a backstop dwell so a
+        // carrier that locks an undecodable signal still advances the pass.
+        if self.survey {
+            self.survey_on_monitor(queue);
+            return;
+        }
         match (downlink_available, self.out_of_service) {
             (false, false) => {
                 // Serving-cell radio link failure: declare out of service.
@@ -1009,6 +1064,10 @@ impl MleMs {
         // configure L2, or confirm to MM while surveying.
         if self.survey {
             let carrier_hz = self.survey_candidates.get(self.survey_index).copied().unwrap_or(0);
+            // A decodable SYNC is progress on this carrier: reset the monitor-tick
+            // backstop so the SYSINFO wait (bounded by SURVEY_SYSINFO_SYNC_LIMIT)
+            // is not cut short.
+            self.survey_monitor_ticks = 0;
             match self.survey_pending.as_ref() {
                 Some(cell) if cell.mcc == pdu.mcc && cell.mnc == pdu.mnc => {
                     // Same cell re-broadcasting SYNC while we await its SYSINFO;
@@ -1864,6 +1923,18 @@ dwell_ms = 500
         }
     }
 
+    /// A PHY downlink-monitoring indication (carrier locked / lock lost). The PHY
+    /// emits these once demod-synchronized instead of the scan-dwell heartbeat.
+    fn monitor_ind(downlink_available: bool) -> SapMsg {
+        use tetra_saps::tlmb::TlmbMonitorInd;
+        SapMsg {
+            sap: Sap::TlmbSap,
+            src: TetraEntity::Phy,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlmbMonitorInd(TlmbMonitorInd { downlink_available, rssi_dbfs: Some(-70.0) }),
+        }
+    }
+
     /// The single tune carrier emitted since the queue was last drained, or
     /// `None` if no TlmcTuneReq is present.
     fn tuned_carrier(queue: &MessageQueue) -> Option<u32> {
@@ -2095,6 +2166,81 @@ dwell_ms = 500
             0,
             "survey emits no LMM-ACTIVATE (no registration)"
         );
+    }
+
+    /// Survey (regression): a candidate carrier that demod-locks a signal but
+    /// never yields a decodable D-MLE-SYNC produces only PHY monitoring
+    /// indications (never the unsynchronized scan-dwell heartbeat). The survey
+    /// must still advance off it after the monitor-tick backstop, must not report
+    /// a cell, and must never enter the serving-cell break/reopen path.
+    #[test]
+    fn test_survey_advances_off_locked_undecodable_carrier() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true)); // start -> tune F0
+        queue = MessageQueue::new();
+
+        // F0 locks a signal but no SYNC decodes: only monitor indications arrive.
+        // Below the backstop nothing happens; at the limit the survey advances.
+        for _ in 0..MleMs::SURVEY_MONITOR_TICK_LIMIT - 1 {
+            mle.rx_tlmb_prim(&mut queue, monitor_ind(true));
+        }
+        assert_eq!(tuned_carrier(&queue), None, "no advance before the backstop limit");
+        mle.rx_tlmb_prim(&mut queue, monitor_ind(true)); // reaches the limit
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced off the undecodable carrier");
+        assert!(scan_results(&queue).is_empty(), "no cell reported for an undecodable carrier");
+        assert!(!mle.out_of_service, "survey never declares out of service");
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LmmMleBreakInd(_))).count(),
+            0,
+            "survey emits no MLE-BREAK to MM"
+        );
+        assert_eq!(
+            queue.iter().filter(|m| matches!(m.msg, SapMsgInner::LcmcMleBreakInd(_))).count(),
+            0,
+            "survey emits no MLE-BREAK to CMCE"
+        );
+
+        // F1 also locks-but-undecodable: the survey completes (no cells found).
+        queue = MessageQueue::new();
+        for _ in 0..MleMs::SURVEY_MONITOR_TICK_LIMIT {
+            mle.rx_tlmb_prim(&mut queue, monitor_ind(true));
+        }
+        let complete = scan_complete(&queue).expect("survey completes over the candidate set");
+        assert_eq!(complete.found, 0);
+        assert_eq!(complete.scanned, 2);
+        assert!(!mle.survey, "survey finished");
+    }
+
+    /// Survey: monitoring indications interleaved with a SYNC must not cut the
+    /// carrier short — a decodable SYNC resets the backstop so the cell is still
+    /// characterised and reported.
+    #[test]
+    fn test_survey_monitor_ticks_do_not_preempt_a_synced_cell() {
+        let mut mle = ms_mle_scan();
+        let mut queue = MessageQueue::new();
+
+        mle.rx_lmm_prim(&mut queue, scan_req(true)); // start -> F0
+        queue = MessageQueue::new();
+
+        // A few monitor indications, then a SYNC (progress) resets the backstop.
+        for _ in 0..MleMs::SURVEY_MONITOR_TICK_LIMIT - 1 {
+            mle.rx_tlmb_prim(&mut queue, monitor_ind(true));
+        }
+        mle.rx_tlmb_prim(&mut queue, sync_ind(901, 9999));
+        assert_eq!(tuned_carrier(&queue), None, "SYNC reset the backstop; no premature advance");
+
+        // A couple more monitor ticks (still below the reset limit), then SYSINFO
+        // finalizes and reports the cell before advancing.
+        mle.rx_tlmb_prim(&mut queue, monitor_ind(true));
+        mle.rx_tlmb_prim(&mut queue, sysinfo_ind(1, 0b1));
+
+        let results = scan_results(&queue);
+        assert_eq!(results.len(), 1, "the synced cell is reported, not skipped");
+        assert_eq!(results[0].carrier_hz, SCAN_F0);
+        assert_eq!(results[0].mcc, 901);
+        assert_eq!(tuned_carrier(&queue), Some(SCAN_F1), "advanced after finalizing the cell");
     }
 
     /// Survey: a candidate that yields no cell within the dwell is recorded as an
