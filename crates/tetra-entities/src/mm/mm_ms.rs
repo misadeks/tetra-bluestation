@@ -256,6 +256,14 @@ pub struct MmMs {
     /// confirmation so the MS registers (cl. 16.4) even when the cell advertises
     /// registration-not-required. Cleared once acted on.
     camp_force_register: bool,
+    /// Deferred operator survey (**NON-STANDARD**, Plane B). Set when a
+    /// `StartCellScan` arrives while the MS is registered (or already
+    /// de-registering): starting a receive-only survey abandons the serving
+    /// cell, so MM first drives a clean de-registration (U-ITSI DETACH,
+    /// cl. 16.6.1) while still camped, and only launches the survey once that
+    /// detach drain completes. Cleared when the survey is finally started or a
+    /// `StopCellScan` cancels it.
+    pending_scan_after_detach: bool,
 }
 
 /// Runtime plumbing for the Plane B management write/apply handlers
@@ -327,6 +335,7 @@ impl MmMs {
             deferred_control: Vec::new(),
             selection_mode_manual: false,
             camp_force_register: false,
+            pending_scan_after_detach: false,
         }
     }
 
@@ -939,6 +948,19 @@ impl MmMs {
             return;
         }
 
+        // Switching to manual selection abandons automatic (re)selection and
+        // leaves the operator in control of the serving cell. A registration is
+        // bound to the serving cell's location area (cl. 16.4), so entering
+        // manual mode while registered must first cleanly de-register from the
+        // SwMI (U-ITSI DETACH, cl. 16.6.1) rather than leave a stale
+        // registration behind. Manual mode keeps the current camp in place (see
+        // MLE `rx_lmm_mle_selection_mode_req`), so the detach transmits normally
+        // over the still-usable serving-cell link during the drain.
+        if manual && self.reg_state == RegState::Registered {
+            tracing::info!("MM(MS): entering manual selection while registered - de-registering (U-ITSI DETACH, cl. 16.6.1)");
+            self.begin_deregistration(queue);
+        }
+
         self.selection_mode_manual = manual;
         self.send_lmm_to_mle(queue, SapMsgInner::LmmMleSelectionModeReq(LmmMleSelectionModeReq { manual }));
         tracing::info!("MM(MS): cell-selection mode -> {}", if manual { "manual" } else { "automatic" });
@@ -958,10 +980,35 @@ impl MmMs {
                 self.respond(ack(false, format!("cell scan rejected: {reason}")));
                 return;
             }
+            // A receive-only survey abandons the serving cell (it tunes across
+            // candidate carriers), so a registration bound to that cell must be
+            // torn down first. If the MS is registered, begin a clean
+            // de-registration (U-ITSI DETACH, cl. 16.6.1) while still camped;
+            // if a de-registration is already draining (e.g. triggered by the
+            // preceding switch to manual selection), wait for it. In either case
+            // defer the survey until the detach drain completes so the detach
+            // actually reaches the air before the MS tunes away.
+            if self.reg_state == RegState::Registered {
+                tracing::info!("MM(MS): scan requested while registered - de-registering (U-ITSI DETACH, cl. 16.6.1) before survey");
+                self.begin_deregistration(queue);
+            }
+            if self.deregistration_pending() {
+                self.pending_scan_after_detach = true;
+                tracing::info!("MM(MS): survey deferred until de-registration drain completes");
+                self.respond(ack(true, "cell survey will start after de-registration".to_string()));
+                return;
+            }
+            self.send_lmm_to_mle(queue, SapMsgInner::LmmMleScanReq(LmmMleScanReq { start }));
+            tracing::info!("MM(MS): start cell survey");
+            self.respond(ack(true, "cell survey started".to_string()));
+            return;
         }
+
+        // Stop: cancel any survey and drop a not-yet-launched deferred survey.
+        self.pending_scan_after_detach = false;
         self.send_lmm_to_mle(queue, SapMsgInner::LmmMleScanReq(LmmMleScanReq { start }));
-        tracing::info!("MM(MS): {} cell survey", if start { "start" } else { "stop" });
-        self.respond(ack(true, format!("cell survey {}", if start { "started" } else { "stopped" })));
+        tracing::info!("MM(MS): stop cell survey");
+        self.respond(ack(true, "cell survey stopped".to_string()));
     }
 
     /// Camp on (and optionally register to) an operator-selected carrier
@@ -2831,6 +2878,14 @@ impl TetraEntityTrait for MmMs {
                  (cl. 16.6.1), returning to Idle (ready to register again)"
             );
             self.reg_state = RegState::Idle;
+            // If an operator survey was deferred behind this de-registration
+            // (StartCellScan while registered/detaching), launch it now that the
+            // detach has drained and the MS is free to tune away.
+            if self.pending_scan_after_detach {
+                self.pending_scan_after_detach = false;
+                tracing::info!("MM(MS): de-registration complete; starting deferred operator survey");
+                self.send_lmm_to_mle(queue, SapMsgInner::LmmMleScanReq(LmmMleScanReq { start: true }));
+            }
             return;
         }
 
@@ -5316,6 +5371,152 @@ order = 2\n"
         let (_h, accepted, _r) = last_mgmt_ack(&dispatcher);
         assert!(accepted, "scan accepted while unregistered");
         assert!(forwarded_lmm(&q).is_some(), "scan req forwarded even when Idle");
+    }
+
+    /// Entering manual cell selection while registered must first cleanly
+    /// de-register from the SwMI (U-ITSI DETACH, cl. 16.6.1): a registration is
+    /// bound to the serving cell and manual selection abandons automatic
+    /// (re)selection. Manual mode keeps the current camp, so the detach can
+    /// still be transmitted over the serving-cell link during the drain, and the
+    /// mode is still relayed to the MLE.
+    #[test]
+    fn test_manual_selection_deregisters_when_registered() {
+        use crate::management::ManagementCommand;
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetCellSelectionMode {
+            handle: 50,
+            manual: true,
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_h, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert!(accepted);
+        assert_eq!(mm.reg_state, RegState::Detaching, "manual mode while registered de-registers");
+        assert!(mm.deregistration_pending());
+
+        // A U-ITSI DETACH is emitted (parseable by the BS) and the manual mode is
+        // still relayed to the MLE.
+        let mut saw_detach = false;
+        let mut saw_manual = false;
+        for m in q.iter() {
+            if m.dest != TetraEntity::Mle {
+                continue;
+            }
+            match &m.msg {
+                SapMsgInner::LmmMleUnitdataReq(req) => {
+                    let mut sdu = req.sdu.clone();
+                    sdu.seek(0);
+                    assert!(UItsiDetach::from_bitbuf(&mut sdu).is_ok(), "detach must parse");
+                    saw_detach = true;
+                }
+                SapMsgInner::LmmMleSelectionModeReq(r) if r.manual => saw_manual = true,
+                _ => {}
+            }
+        }
+        assert!(saw_detach, "U-ITSI DETACH emitted when entering manual mode registered");
+        assert!(saw_manual, "manual selection still relayed to the MLE");
+        assert!(mm.runtime_snapshot().selection_mode_manual, "snapshot mirrors manual mode");
+    }
+
+    /// Switching to manual selection while NOT registered simply relays the mode
+    /// (no detach): there is nothing to de-register.
+    #[test]
+    fn test_manual_selection_no_detach_when_unregistered() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        assert_eq!(mm.reg_state, RegState::Idle);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetCellSelectionMode {
+            handle: 52,
+            manual: true,
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle, "no de-registration while unregistered");
+        assert!(
+            !q.iter().any(|m| matches!(m.msg, SapMsgInner::LmmMleUnitdataReq(_))),
+            "no U-ITSI DETACH emitted while unregistered"
+        );
+        match forwarded_lmm(&q).expect("selection-mode req forwarded") {
+            SapMsgInner::LmmMleSelectionModeReq(r) => assert!(r.manual),
+            other => panic!("expected LmmMleSelectionModeReq, got {other:?}"),
+        }
+    }
+
+    /// Starting a receive-only survey while registered first de-registers
+    /// (U-ITSI DETACH, cl. 16.6.1) and DEFERS the survey until that detach drains
+    /// - the survey tunes away from the serving cell, so the detach must reach
+    /// the air first. Once the drain completes the deferred survey is launched.
+    #[test]
+    fn test_scan_while_registered_deregisters_then_starts_survey() {
+        use crate::management::ManagementCommand;
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::StartCellScan { handle: 51 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (_h, accepted, _r) = last_mgmt_ack(&dispatcher);
+        assert!(accepted);
+        assert_eq!(mm.reg_state, RegState::Detaching, "scan while registered first de-registers");
+        assert!(mm.pending_scan_after_detach, "survey deferred until detach drains");
+        assert!(
+            !q.iter().any(|m| matches!(m.msg, SapMsgInner::LmmMleScanReq(_))),
+            "survey not started before the detach drains"
+        );
+
+        // The BS acknowledges the U-ITSI DETACH: the drain ends and the deferred
+        // survey is launched on the completing tick.
+        let reporter = take_detach_reporter(&mut q);
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+        let mut q2 = MessageQueue::new();
+        mm.tick_start(&mut q2, TdmaTime::default());
+
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(!mm.pending_scan_after_detach, "deferred-survey flag cleared once launched");
+        match forwarded_lmm(&q2).expect("deferred survey started after detach") {
+            SapMsgInner::LmmMleScanReq(r) => assert!(r.start, "deferred survey starts (start=true)"),
+            other => panic!("expected LmmMleScanReq, got {other:?}"),
+        }
+    }
+
+    /// Cancelling a survey (`StopCellScan`) that was deferred behind a
+    /// de-registration drops the pending survey so it is not launched when the
+    /// detach completes.
+    #[test]
+    fn test_stop_scan_clears_deferred_survey() {
+        use crate::management::ManagementCommand;
+        let (mut mm, source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+        register_wired(&mut mm, &mut q, &source);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::StartCellScan { handle: 53 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+        assert!(mm.pending_scan_after_detach, "survey deferred");
+
+        // Operator cancels before the detach drains.
+        let reporter = take_detach_reporter(&mut q);
+        let mut q2 = MessageQueue::new();
+        dispatcher.send(ControlCommand::Management(ManagementCommand::StopCellScan { handle: 54 }));
+        mm.tick_start(&mut q2, TdmaTime::default());
+        assert!(!mm.pending_scan_after_detach, "deferred survey cancelled");
+
+        // Complete the detach: no survey is launched.
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+        let mut q3 = MessageQueue::new();
+        mm.tick_start(&mut q3, TdmaTime::default());
+        assert_eq!(mm.reg_state, RegState::Idle);
+        assert!(
+            !q3.iter().any(|m| matches!(&m.msg, SapMsgInner::LmmMleScanReq(r) if r.start)),
+            "no survey launched after a cancelled deferral"
+        );
     }
 
     /// CampOnCell relays an LmmMleCampReq to the MLE with the chosen carrier +

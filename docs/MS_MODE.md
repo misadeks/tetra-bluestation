@@ -147,8 +147,8 @@ Legend:
 |---|---|---|---|
 | TL-SDU routing (DL/UL, BREAK/REOPEN) | ✅ | cl. 18 | |
 | Initial cell selection | ✅ | cl. 18.3.4.6 | Serving-cell identity held by `(MCC, MNC, LA)`. |
-| Manual cell survey (receive-only carrier scan of `[[frequency_list]]`) | 🧪 | cl. 18.3.4 | Operator-triggered; reports each found cell (MCC/MNC/LA/reg/late-entry/RSSI) then a completion. Transmits nothing. `Range` lists may enumerate carrier offsets (0/±6.25/+12.5 kHz, D-MLE-SYNC Offset field) via `offsets`. Advances off every candidate — empty (scan-dwell heartbeat), decodable cell (SYNC/SYSINFO), or a carrier that locks an undecodable signal (bounded monitor-tick backstop) — so a survey always completes. |
-| Register-to-cell (operator camp + forced registration) | 🧪 | cl. 18.3.4.6, 16.4 | `CampOnCell` arms a camp on a chosen carrier; adopts + registers even in manual mode. |
+| Manual cell survey (receive-only carrier scan of `[[frequency_list]]`) | 🧪 | cl. 18.3.4 | Operator-triggered; reports each found cell (MCC/MNC/LA/reg/late-entry/RSSI) then a completion. Transmits nothing. `Range` lists may enumerate carrier offsets (0/±6.25/+12.5 kHz, D-MLE-SYNC Offset field) via `offsets`. Advances off every candidate — empty (scan-dwell heartbeat), decodable cell (SYNC/SYSINFO), or a carrier that locks an undecodable signal (bounded monitor-tick backstop) — so a survey always completes. Starting a survey while registered first de-registers (U-ITSI DETACH, cl. 16.6.1) and defers the survey until that detach drains, so the MS never abandons its serving cell with a stale registration outstanding. |
+| Register-to-cell (operator camp + forced registration) | 🧪 | cl. 18.3.4.6, 16.4 | `CampOnCell` arms a camp on a chosen carrier; adopts + registers even in manual mode. Switching to manual selection while registered first de-registers (U-ITSI DETACH, cl. 16.6.1). |
 | LMM-ACTIVATE confirm (registration trigger) | ✅ | cl. 17.3.2, 18.4.2.2 | Carries `registration_required` + `system_wide_services`. |
 | Service-loss → LMM-BREAK/REOPEN to MM (TNMM-SERVICE) | 🧪 | cl. 18.3.3, 18.3.4.5.3 | Keeps `Registered`, adds separate coverage/service status. |
 | MLE-IDENTITIES (runtime attached-group set) | 🧪 | cl. 23.4.1.2 | Feeds the MAC RX filter from live state, not just config. |
@@ -160,7 +160,7 @@ Legend:
 |---|---|---|---|
 | ITSI attach registration (U-LOCATION-UPDATE-DEMAND ↔ ACCEPT) | ✅ | cl. 16.4 | Acknowledged-mode, end-to-end on air. |
 | Group affiliation — standalone U-ATTACH/DETACH GROUP IDENTITY | ✅ | cl. 16.8.2 | One group per PDU, drained sequentially, reconciled from the SwMI ACK. |
-| De-registration on shutdown — U-ITSI DETACH | 🧪 | cl. 16.6.1 | Best-effort drain; stranded-ack unwedge fix applied. |
+| De-registration on shutdown — U-ITSI DETACH | 🧪 | cl. 16.6.1 | Best-effort drain; stranded-ack unwedge fix applied. Also driven by TNMM-DEREGISTRATION, `ApplyConfig`, and entering manual selection / starting a survey while registered. |
 | D-LOCATION-UPDATE-COMMAND (infra-initiated re-registration) | 🧪 | cl. 16.4.3 | Minimal command handled; class-of-MS element sent. |
 | Reject-cause analysis + T351 / N351 | 🧪 | cl. 16.4.1.1, 16.11 | Retry / Abandon / SystemRejection; leaves system after N351. |
 | LA-aware registration trigger (roaming/migrating LU) | 🧪 | cl. 18.3.4.7.1a | Same-LA return does **not** re-register (conformant, NOTE 2). |
