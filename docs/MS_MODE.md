@@ -178,7 +178,7 @@ Legend:
 | Individual / duplex call (originate + terminate, continuous TX) | ✅ | cl. 14 | Duplex called-party grant arrives via `TnccCompleteConfirm`. |
 | STCH talker identity during group traffic | ✅ | cl. 14 | Remote talker SSI surfaced to the UI. |
 | Concurrent-call arbitration (group must not disrupt a private call) | 🧪 | cl. 14.2.4.1 | Single-transceiver U-plane + channel-allocation gate. |
-| SDS / status (D-SDS-DATA / D-STATUS RX, U-SDS-DATA TX) | 🚧 | cl. 13, 14 | `sds_ms.rs` partial; TNSDS UI SAP planned. |
+| SDS / status — Type-4 text + status codes RX/TX via TNSDS-SAP | 🧪 | cl. 13.3, 14.7 | `sds_ms.rs`: D-SDS-DATA/D-STATUS RX → TNSDS-UNITDATA/STATUS indications; TNSDS-UNITDATA/STATUS requests → U-SDS-DATA/U-STATUS TX. SDS-TL delivery reports (cl. 29) deferred. |
 | Supplementary services (D-FACILITY) | 📋 | cl. 14 | Minimal; full SS deferred. |
 
 ### 3.6 U-plane (voice)
@@ -196,9 +196,10 @@ Legend:
 | Telemetry (stack→UI) + control (UI→stack) wiring for MS | 🧪 | WebSocket + JSON + TLS + argon2; mock-transport CI green. |
 | Plane A — TNMM indications (REGISTRATION / SERVICE / GROUP-IDENTITY confirm) | 🧪 | Verbatim to cl. 15.3 Tables 15.1–15.7. |
 | Plane A — TNMM requests (REGISTRATION / DEREGISTRATION / GROUP ATTACH-DETACH) | 🧪 | STATUS / ENERGY-SAVING defined-but-dormant. |
+| Plane A — TNSDS indications + requests (UNITDATA / STATUS) | 🧪 | Verbatim to cl. 13.3 Tables 13.1/13.3; Type-4 text + status codes RX/TX. TNSDS-REPORT/CANCEL (SDS-TL) deferred. |
 | Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; hybrid apply (structural = restart, operational = live). Config read/staging is serviced as soon as the control link is up — before sync/registration (see below). |
 | Scan lists (codeplug + live activation) | 🧪 | Maps to the group-affiliation superset (cl. 16.8.2). |
-| Manual cell selection (Auto/Manual toggle, carrier survey, register-to-cell) | 🧪 | Plane B commands `SetCellSelectionMode` / `StartCellScan` / `StopCellScan` / `CampOnCell`; results as `MsScanResult` / `MsScanComplete` telemetry. Schema `bluestation-ms-interface-3`. |
+| Manual cell selection (Auto/Manual toggle, carrier survey, register-to-cell) | 🧪 | Plane B commands `SetCellSelectionMode` / `StartCellScan` / `StopCellScan` / `CampOnCell`; results as `MsScanResult` / `MsScanComplete` telemetry. Schema `bluestation-ms-interface-4`. |
 
 > **On-air proof points:** camp-on, scrambling/cell selection, ITSI-attach
 > registration, group affiliation, runtime uplink retune, group-call voice (both

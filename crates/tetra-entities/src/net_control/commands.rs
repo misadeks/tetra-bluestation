@@ -13,6 +13,7 @@ use crate::tnmm::{
     TnmmAttachDetachGroupIdentityRequest, TnmmDeregistrationRequest, TnmmEnergySavingRequest, TnmmRegistrationRequest, TnmmStatusRequest,
 };
 use tetra_saps::tncc::{TnccCompleteRequest, TnccReleaseRequest, TnccSetupRequest, TnccSetupResponse, TnccTxRequest};
+use tetra_saps::tnsds::{TnsdsStatusRequest, TnsdsUnitdataRequest};
 
 /// Command received from the remote command server.
 #[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
@@ -98,6 +99,20 @@ pub enum ControlCommand {
     },
 
     // -----------------------------------------------------------------------
+    // TNSDS-SAP requests (Plane A, INBOUND) — ETSI TS 100 392-2 v3.10.1
+    // cl. 13.3.2. MS-side Short Data Service request primitives sent from the
+    // user application (external UI) to CMCE/SDS. Payloads carry the parameter
+    // subset of Tables 13.1/13.3; see the `tetra_saps::tnsds` module. `handle`
+    // is a transport-level correlation id (the cl. 13.3.3 local SDU identifier).
+    // -----------------------------------------------------------------------
+    /// TNSDS-UNITDATA request (Table 13.3, cl. 13.3.2.3): send user-defined SDS
+    /// data (→ U-SDS-DATA, cl. 14.7.2.8).
+    TnsdsUnitdata { handle: u32, request: TnsdsUnitdataRequest },
+    /// TNSDS-STATUS request (Table 13.1, cl. 13.3.2.1): send a pre-coded status
+    /// (→ U-STATUS, cl. 14.7.2.7).
+    TnsdsStatus { handle: u32, request: TnsdsStatusRequest },
+
+    // -----------------------------------------------------------------------
     // U-plane uplink speech (traffic), INBOUND. Symmetric counterpart of the
     // outbound `TelemetryEvent::MsSpeechFrame`. Not a TNCC-SAP signalling
     // primitive: it carries circuit-mode speech, delivered into the U-plane the
@@ -152,6 +167,17 @@ pub enum ControlResponse {
     /// processing by CMCE/CC. The TNCC result is reported asynchronously through
     /// TNCC-SAP indications/confirms on telemetry (cl. 11.3.2).
     TnccAck {
+        handle: u32,
+        accepted: bool,
+        detail: Option<String>,
+    },
+
+    /// Transport-level acknowledgement that a TNSDS request was accepted for
+    /// processing by CMCE/SDS. The delivery result (transmitted / lost) is
+    /// reported asynchronously via the TNSDS-REPORT indication (Table 13.2,
+    /// cl. 13.3.2.2) once the SDS-TL / MLE tx-result hook is wired; today this
+    /// only reports whether SDS acted on the request.
+    TnsdsAck {
         handle: u32,
         accepted: bool,
         detail: Option<String>,

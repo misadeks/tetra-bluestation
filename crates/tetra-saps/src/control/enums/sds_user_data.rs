@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bitcode::Encode, bitcode::Decode, serde::Serialize, serde::Deserialize)]
 pub enum SdsUserData {
     /// Type field 0, 16 bits, short_data_type_identifier == 0
     Type1(u16),
