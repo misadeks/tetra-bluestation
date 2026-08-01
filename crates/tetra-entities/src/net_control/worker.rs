@@ -129,7 +129,10 @@ impl<T: NetworkTransport> ControlWorker<T> {
             | ControlCommand::TnccTx { .. }
             | ControlCommand::TnccRelease { .. }
             // U-plane uplink speech (cl. 14.5.1.4) is owned by CMCE CC-MS.
-            | ControlCommand::MsUplinkSpeech { .. } => TetraEntity::Cmce,
+            | ControlCommand::MsUplinkSpeech { .. }
+            // TNSDS-SAP requests (cl. 13.3) are handled by CMCE SDS.
+            | ControlCommand::TnsdsUnitdata { .. }
+            | ControlCommand::TnsdsStatus { .. } => TetraEntity::Cmce,
             // Management / provisioning (Plane B, non-standard) is served by MM,
             // the single writer of MS runtime state and config-apply.
             ControlCommand::Management(_) => TetraEntity::Mm,

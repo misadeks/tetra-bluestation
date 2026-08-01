@@ -26,7 +26,7 @@ impl CmceMs {
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         Self {
             config: config.clone(),
-            sds: SdsMsSubentity::new(),
+            sds: SdsMsSubentity::new(config.clone(), telemetry.clone()),
             cc: CcMsSubentity::new_with_config(config.clone(), telemetry.clone()),
             ss: SsMsSubentity::new(),
             telemetry,
@@ -101,6 +101,10 @@ impl CmceMs {
         self.respond(ControlResponse::TnccAck { handle, accepted, detail });
     }
 
+    fn tnsds_ack(&self, handle: u32, accepted: bool, detail: Option<String>) {
+        self.respond(ControlResponse::TnsdsAck { handle, accepted, detail });
+    }
+
     fn handle_control_command(&mut self, queue: &mut MessageQueue, cmd: ControlCommand) {
         match cmd {
             ControlCommand::TnccSetup { handle, request } => match self.cc.handle_tncc_setup_request(queue, &request) {
@@ -172,6 +176,28 @@ impl CmceMs {
                 data,
             } => {
                 self.cc.push_uplink_speech(call_identifier, frame_bits, &data);
+            }
+            // TNSDS-UNITDATA request (Table 13.3, cl. 13.3.2.3): send SDS user
+            // data uplink as a U-SDS-DATA PDU (cl. 14.7.2.8).
+            ControlCommand::TnsdsUnitdata { handle, request } => {
+                self.sds.send_u_sds_data(
+                    queue,
+                    request.called_party_ssi,
+                    request.called_party_is_group,
+                    request.user_data,
+                );
+                self.tnsds_ack(handle, true, None);
+            }
+            // TNSDS-STATUS request (Table 13.1, cl. 13.3.2.1): send a pre-coded
+            // status uplink as a U-STATUS PDU (cl. 14.7.2.7).
+            ControlCommand::TnsdsStatus { handle, request } => {
+                self.sds.send_u_status(
+                    queue,
+                    request.called_party_ssi,
+                    request.called_party_is_group,
+                    request.status_number,
+                );
+                self.tnsds_ack(handle, true, None);
             }
             other => tracing::warn!("CMCE(MS): received non-TNCC control command, dropping: {:?}", other),
         }

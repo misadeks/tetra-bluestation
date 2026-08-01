@@ -17,6 +17,7 @@ use tetra_saps::tncc::{
     TnccAlertIndication, TnccCompleteConfirm, TnccCompleteIndication, TnccNotifyIndication, TnccProceedIndication, TnccReleaseConfirm,
     TnccReleaseIndication, TnccSetupConfirm, TnccSetupIndication, TnccTxConfirm, TnccTxIndication,
 };
+use tetra_saps::tnsds::{TnsdsStatusIndication, TnsdsUnitdataIndication};
 
 /// TelemetryEvent enum sent by a TetraEntity through the TelemetrySink
 /// then, serializable by any codec for transmission over the network,
@@ -129,6 +130,19 @@ pub enum TelemetryEvent {
         call_identifier: u16,
         confirm: TnccTxConfirm,
     },
+
+    // -----------------------------------------------------------------------
+    // TNSDS-SAP indications (Plane A, OUTBOUND) — ETSI TS 100 392-2 v3.10.1
+    // cl. 13.3.2. MS-side SDS/status primitives sent from CMCE/SDS to the user
+    // application (external UI). Payloads carry the parameter subset of
+    // Tables 13.1/13.3; see the `tetra_saps::tnsds` module.
+    // -----------------------------------------------------------------------
+    /// TNSDS-UNITDATA indication (Table 13.3, cl. 13.3.2.3): a user-defined SDS
+    /// message (D-SDS-DATA, cl. 14.7.1.10) was received.
+    TnsdsUnitdataIndication(TnsdsUnitdataIndication),
+    /// TNSDS-STATUS indication (Table 13.1, cl. 13.3.2.1): a pre-coded status
+    /// message (D-STATUS, cl. 14.7.1.11) was received.
+    TnsdsStatusIndication(TnsdsStatusIndication),
 
     // -----------------------------------------------------------------------
     // U-plane speech (Plane U, OUTBOUND) — downlink circuit-mode traffic.

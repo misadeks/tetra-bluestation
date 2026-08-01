@@ -307,10 +307,10 @@ mod tests {
                 handle: 7,
                 version: MS_INTERFACE_SCHEMA_VERSION.to_string(),
             })),
-            r#"{"Management":{"InterfaceVersion":{"handle":7,"version":"bluestation-ms-interface-3"}}}"#
+            r#"{"Management":{"InterfaceVersion":{"handle":7,"version":"bluestation-ms-interface-4"}}}"#
         );
         // Guard the frozen constant itself so a bump is a deliberate, visible edit.
-        assert_eq!(MS_INTERFACE_SCHEMA_VERSION, "bluestation-ms-interface-3");
+        assert_eq!(MS_INTERFACE_SCHEMA_VERSION, "bluestation-ms-interface-4");
         assert_eq!(
             enc_resp(&ControlResponse::Management(ManagementResponse::Config {
                 handle: 3,
@@ -337,6 +337,38 @@ mod tests {
                 detail: None,
             }),
             r#"{"TnmmAck":{"handle":6,"accepted":true,"detail":null}}"#
+        );
+
+        // --- Plane A (TNSDS-SAP, standardized cl. 13.3) requests + ack ---
+        assert_eq!(
+            enc_cmd(&ControlCommand::TnsdsUnitdata {
+                handle: 8,
+                request: tetra_saps::tnsds::TnsdsUnitdataRequest {
+                    called_party_ssi: 1000,
+                    called_party_is_group: false,
+                    user_data: tetra_saps::control::enums::sds_user_data::SdsUserData::Type1(3),
+                },
+            }),
+            r#"{"TnsdsUnitdata":{"handle":8,"request":{"called_party_ssi":1000,"called_party_is_group":false,"user_data":{"Type1":3}}}}"#
+        );
+        assert_eq!(
+            enc_cmd(&ControlCommand::TnsdsStatus {
+                handle: 9,
+                request: tetra_saps::tnsds::TnsdsStatusRequest {
+                    called_party_ssi: 91,
+                    called_party_is_group: true,
+                    status_number: 32768,
+                },
+            }),
+            r#"{"TnsdsStatus":{"handle":9,"request":{"called_party_ssi":91,"called_party_is_group":true,"status_number":32768}}}"#
+        );
+        assert_eq!(
+            enc_resp(&ControlResponse::TnsdsAck {
+                handle: 8,
+                accepted: true,
+                detail: None,
+            }),
+            r#"{"TnsdsAck":{"handle":8,"accepted":true,"detail":null}}"#
         );
     }
 
