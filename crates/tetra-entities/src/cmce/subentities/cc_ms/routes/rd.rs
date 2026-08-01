@@ -200,6 +200,31 @@ impl CcMsSubentity {
         }
         if kind != MsCallKind::Individual {
             self.apply_transmission_grant(queue, pdu.call_identifier, pdu.transmission_grant, pdu.calling_party_address_ssi);
+            // ETSI TS 100 392-2 cl. 14.8.31 / 14.5.1.4: the transmission-grant
+            // element carried in a D-SETUP has the same semantics as in
+            // D-TX-GRANTED. When a group call is announced with the floor already
+            // "granted to another user", this MS is a listener that is receiving
+            // that party's speech immediately (U-plane switched on above). The
+            // TNCC-SETUP indication alone does not surface the live floor/talker
+            // state the way every subsequent floor change does, so raise a
+            // TNCC-TX indication here too — otherwise the application shows the
+            // floor as free with no talker until the next D-TX-GRANTED (which the
+            // SwMI need not send while the same party keeps talking after our
+            // late entry). The calling-party address identifies the talker.
+            if pdu.transmission_grant == TransmissionGrant::GrantedToOtherUser {
+                self.emit(TelemetryEvent::TnccTxIndication {
+                    call_identifier: pdu.call_identifier,
+                    indication: tncc::TnccTxIndication {
+                        encryption_flag: tncc::EncryptionFlag::ClearEndToEndTransmission,
+                        notification_indicator: pdu.notification_indicator.map(|v| v as u8),
+                        transmitting_party_ssi: pdu.calling_party_address_ssi,
+                        transmitting_party_extension: pdu.calling_party_extension,
+                        external_subscriber_number: None,
+                        transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
+                        transmission_status: tncc_transmission_status_from_grant(pdu.transmission_grant),
+                    },
+                });
+            }
         }
     }
 

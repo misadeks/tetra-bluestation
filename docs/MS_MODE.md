@@ -174,7 +174,7 @@ Legend:
 | Feature | State | Spec | Notes |
 |---|---|---|---|
 | CC-MS call-control state machine (setup / floor / release) | ✅ | cl. 14 | Module tree mirrors `cc_bs/`. |
-| Group call receive + floor (D-SETUP / D-TX-GRANTED / TX-CEASED) | ✅ | cl. 14 | Both directions proven on air. |
+| Group call receive + floor (D-SETUP / D-TX-GRANTED / TX-CEASED) | ✅ | cl. 14 | Both directions proven on air. Fresh incoming group D-SETUP whose transmission-grant element (cl. 14.8.31) reads "granted to another user" raises a TNCC-TX indication with the calling party as talker, so the floor/talker is surfaced immediately on first contact / late entry (not just on the next D-TX-GRANTED). |
 | Individual / duplex call (originate + terminate, continuous TX) | ✅ | cl. 14 | Duplex called-party grant arrives via `TnccCompleteConfirm`. |
 | STCH talker identity during group traffic | ✅ | cl. 14 | Remote talker SSI surfaced to the UI. |
 | Concurrent-call arbitration (group must not disrupt a private call) | 🧪 | cl. 14.2.4.1 | Single-transceiver U-plane + channel-allocation gate. |

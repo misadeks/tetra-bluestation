@@ -355,6 +355,89 @@ mod tests {
         assert_eq!(cc.call(7).unwrap().current_speaker_ssi, Some(OTHER_TALKER));
     }
 
+    /// ETSI TS 100 392-2 cl. 14.8.31 / 14.5.1.4: a FRESH incoming group D-SETUP
+    /// (first contact / late entry — the call is not yet tracked) whose
+    /// transmission-grant element already reads "granted to another user" means
+    /// this MS joins as a listener that is immediately receiving that party's
+    /// speech. Besides the one-shot TNCC-SETUP indication, the live floor/talker
+    /// state must be surfaced via a TNCC-TX indication (the UI derives the talker
+    /// and "receiving" state from TNCC-TX, not from TNCC-SETUP); otherwise the
+    /// call shows the floor free with no talker until the next D-TX-GRANTED, which
+    /// the SwMI need not send while the same party keeps talking. The U-plane must
+    /// also be switched on so downlink speech plays out.
+    #[test]
+    fn fresh_group_dsetup_surfaces_talker_and_switches_uplane_on() {
+        const OTHER_TALKER: u32 = 555;
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        while source.try_recv().is_some() {}
+
+        let mut pdu = d_setup(7, false);
+        pdu.basic_service_information = default_speech_basic_service();
+        pdu.calling_party_address_ssi = Some(OTHER_TALKER);
+        pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
+        cc.rx_d_setup(&mut q, pdu, route());
+
+        let mut saw_setup = false;
+        let mut tx_talker = None;
+        let mut tx_status = None;
+        while let Some(ev) = source.try_recv() {
+            match ev {
+                TelemetryEvent::TnccSetupIndication { .. } => saw_setup = true,
+                TelemetryEvent::TnccTxIndication { indication, .. } => {
+                    tx_talker = indication.transmitting_party_ssi;
+                    tx_status = Some(indication.transmission_status);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_setup, "a fresh incoming group call must raise a TNCC-SETUP indication");
+        assert_eq!(tx_talker, Some(OTHER_TALKER), "the current talker must be surfaced via TNCC-TX indication");
+        assert_eq!(
+            tx_status,
+            Some(tncc::TransmissionStatus::TransmissionGrantedToAnotherUser),
+            "floor state must read granted-to-another-user"
+        );
+        assert_eq!(cc.call(7).unwrap().current_speaker_ssi, Some(OTHER_TALKER));
+        assert_eq!(
+            cc.call(7).unwrap().last_uplane.map(|u| u.switch_u_plane),
+            Some(true),
+            "the listener's U-plane must be switched on so downlink speech plays out"
+        );
+    }
+
+    /// A fresh incoming group D-SETUP announcing the call with NO active talker
+    /// (transmission grant "not granted") must NOT fabricate a talker: only the
+    /// TNCC-SETUP indication is raised, and no spurious TNCC-TX indication.
+    #[test]
+    fn fresh_group_dsetup_without_talker_raises_no_tx_indication() {
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        while source.try_recv().is_some() {}
+
+        let mut pdu = d_setup(8, false);
+        pdu.basic_service_information = default_speech_basic_service();
+        pdu.calling_party_address_ssi = Some(555);
+        pdu.transmission_grant = TransmissionGrant::NotGranted;
+        cc.rx_d_setup(&mut q, pdu, route());
+
+        let mut saw_setup = false;
+        let mut saw_tx = false;
+        while let Some(ev) = source.try_recv() {
+            match ev {
+                TelemetryEvent::TnccSetupIndication { .. } => saw_setup = true,
+                TelemetryEvent::TnccTxIndication { .. } => saw_tx = true,
+                _ => {}
+            }
+        }
+        assert!(saw_setup, "a fresh incoming group call must raise a TNCC-SETUP indication");
+        assert!(!saw_tx, "no talker (grant not-granted) must not raise a TNCC-TX indication");
+    }
+
     /// ETSI TS 100 392-2 cl. 14.5.2.1.2 / 14.5.1.1: while THIS MS holds the floor
     /// (GrantedSelf), a periodic group D-SETUP late-entry re-broadcast carrying a
     /// PREVIOUS talker's calling-party address and a stale GrantedToOtherUser
