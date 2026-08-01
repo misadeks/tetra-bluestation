@@ -176,6 +176,24 @@ impl CcMsSubentity {
             return;
         };
 
+        // ETSI TS 100 392-2 cl. 14.5.1.4: in a simplex circuit-mode call the
+        // transmitting party's receive U-plane is inactive — while this MS holds
+        // the floor it is sending on the traffic channel, not listening. The
+        // serving cell still repeats the talker's own speech on the downlink
+        // (talk-back to the group); forwarding it to the UI would echo the
+        // operator's own voice back to them. Suppress downlink speech for a
+        // simplex call while we hold the floor. Duplex calls are full-duplex and
+        // must keep receiving the far end while transmitting.
+        let is_simplex = !call.simplex_duplex_selection;
+        if is_simplex && call.tx_grant_state == MsTxGrantState::GrantedSelf {
+            tracing::trace!(
+                call = call.call_identifier,
+                marker = usage_marker,
+                "rx_downlink_traffic: suppressing simplex talk-back while holding the floor (cl. 14.5.1.4)"
+            );
+            return;
+        }
+
         call.rx_speech_frames = call.rx_speech_frames.saturating_add(1);
         let call_identifier = call.call_identifier;
         let sequence = call.rx_speech_frames;

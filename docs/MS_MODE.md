@@ -186,6 +186,7 @@ Legend:
 | Feature | State | Spec | Notes |
 |---|---|---|---|
 | Downlink TCH/S speech → UI telemetry (`MsSpeechFrame`) | ✅ | cl. 14.5.1.4, 19.4 | 274-bit type-1 block, one-bit-per-byte, BFI flagged; ACELP in the UI. |
+| Simplex self-echo suppression while holding the floor | ✅ | cl. 14.5.1.4 | On a **simplex** call the transmitting party's receive U-plane is inactive, so downlink speech is dropped (not forwarded to the UI) while the MS holds the floor (`GrantedSelf`). Duplex calls keep receiving (full duplex). |
 | Uplink TCH/S speech from UI mic | ✅ | cl. 19.4, 23 | Group + individual/duplex both directions working. |
 | In-stack ACELP vocoder | ⛔ | EN 300 395-2 | Offloaded to the UI by design. |
 

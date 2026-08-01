@@ -602,13 +602,80 @@ mod tests {
         cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
         assert_eq!(cc.call(7).unwrap().rx_speech_frames, 0, "no frames accepted while U-plane off");
 
-        // Grant switches the U-plane on; subsequent speech frames are accepted.
-        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, None);
+        // A grant to another user switches the U-plane on for receive; subsequent
+        // speech frames are accepted (we are a listener, not the talker).
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::GrantedToOtherUser, Some(2200699));
         assert_eq!(cc.call(7).unwrap().last_uplane.map(|u| u.switch_u_plane), Some(true));
 
         cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
         cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
         assert_eq!(cc.call(7).unwrap().rx_speech_frames, 2, "frames accepted while U-plane on");
+    }
+
+    #[test]
+    fn simplex_talkback_suppressed_while_holding_floor() {
+        // ETSI TS 100 392-2 cl. 14.5.1.4: while this MS holds the floor on a
+        // simplex call, the serving cell repeats the talker's own speech on the
+        // downlink. Forwarding it to the UI would echo the operator's own voice,
+        // so it must be suppressed. Regression for the on-air self-echo bug.
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            11,
+            MsCall::new(
+                11,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false, // simplex
+                route(),
+                true,
+            ),
+        );
+        // Grant to self: the MS holds the floor and is transmitting.
+        cc.apply_transmission_grant(&mut q, 11, TransmissionGrant::Granted, None);
+        assert_eq!(cc.call(11).unwrap().tx_grant_state, MsTxGrantState::GrantedSelf);
+        while source.try_recv().is_some() {} // discard grant-phase telemetry
+
+        cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
+        cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
+
+        assert_eq!(cc.call(11).unwrap().rx_speech_frames, 0, "own talk-back not counted");
+        assert!(source.try_recv().is_none(), "no MsSpeechFrame echoed to the UI");
+    }
+
+    #[test]
+    fn duplex_still_receives_while_transmitting() {
+        // A duplex call is full-duplex: while this MS transmits it must still
+        // receive and forward the far end (cl. 14.5.1.4). The simplex talk-back
+        // suppression must NOT apply here.
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            12,
+            MsCall::new(
+                12,
+                MsCcState::CallActive,
+                MsCallKind::Individual,
+                default_speech_basic_service(),
+                true, // duplex
+                route(),
+                true,
+            ),
+        );
+        cc.apply_transmission_grant(&mut q, 12, TransmissionGrant::Granted, None);
+        assert_eq!(cc.call(12).unwrap().tx_grant_state, MsTxGrantState::GrantedSelf);
+        while source.try_recv().is_some() {} // discard grant-phase telemetry
+
+        cc.rx_downlink_traffic(3, false, None, None, &[1u8; 274]);
+
+        assert_eq!(cc.call(12).unwrap().rx_speech_frames, 1, "far-end speech still received on duplex");
+        assert!(
+            matches!(source.try_recv(), Some(TelemetryEvent::MsSpeechFrame { .. })),
+            "duplex far-end frame forwarded to the UI"
+        );
     }
 
     #[test]
