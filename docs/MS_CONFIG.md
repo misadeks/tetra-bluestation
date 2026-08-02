@@ -343,15 +343,22 @@ order = 2
 
 ### `[codeplug]` — codeplug-wide scalar settings (optional)
 
-A single table for codeplug-wide values that are not arrays-of-tables.
+A single table for codeplug-wide values and feature toggles that are not arrays-of-tables.
+
+#### `[codeplug.home_display]` — home-mode display feature
+
+A status/text message shown on another radio's home screen. Data only — read by the UI
+when composing such a message; the stack drives no on-air behaviour from it.
 
 | Key | Type | Description |
 |---|---|---|
-| `home_display_pid` | int (0–255) | Home-mode display SDS protocol identifier (ETSI TS 100 392-2 cl. 29.4.3.9) used when composing a "home mode display" status/text message shown on another radio's home screen. `130` (0x82) = Text Messaging with SDS-TL. Data only — read by the UI. |
+| `enabled` | bool | Whether the home-mode display feature is on (default `false`). |
+| `pid` | int (0–255) | SDS protocol identifier (ETSI TS 100 392-2 cl. 29.4.3.9) used for the message. `130` (0x82) = Text Messaging with SDS-TL (default `130`). |
 
 ```toml
-[codeplug]
-home_display_pid = 130
+[codeplug.home_display]
+enabled = true
+pid = 130
 ```
 
 ---

@@ -261,10 +261,14 @@ order = 3
 
 ###############################################################################
 # CODEPLUG-WIDE SETTINGS (scalar). Optional single [codeplug] table for
-# codeplug-wide values that are not arrays-of-tables.
+# codeplug-wide values and feature toggles that are not arrays-of-tables.
 ###############################################################################
 [codeplug]
-# Home-mode display SDS protocol identifier (8-bit, ETSI TS 100 392-2 cl. 29.4.3.9)
-# used when composing a "home mode display" status/text message shown on another
-# radio's home screen. 130 (0x82) = Text Messaging with SDS-TL. Data only.
-home_display_pid = 130
+
+# Home-mode display: a status/text message shown on another radio's home screen.
+# `enabled` toggles the feature; `pid` is the 8-bit SDS protocol identifier
+# (ETSI TS 100 392-2 cl. 29.4.3.9) used for it — 130 (0x82) = Text Messaging with
+# SDS-TL. Data only (read by the UI when composing a home-display message).
+[codeplug.home_display]
+enabled = true
+pid = 130
