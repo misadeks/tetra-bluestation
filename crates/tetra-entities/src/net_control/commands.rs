@@ -13,7 +13,7 @@ use crate::tnmm::{
     TnmmAttachDetachGroupIdentityRequest, TnmmDeregistrationRequest, TnmmEnergySavingRequest, TnmmRegistrationRequest, TnmmStatusRequest,
 };
 use tetra_saps::tncc::{TnccCompleteRequest, TnccDtmfRequest, TnccReleaseRequest, TnccSetupRequest, TnccSetupResponse, TnccTxRequest};
-use tetra_saps::tnsds::{TnsdsStatusRequest, TnsdsUnitdataRequest};
+use tetra_saps::tnsds::{TnsdsCancelRequest, TnsdsMessageRequest, TnsdsReportRequest, TnsdsStatusRequest, TnsdsUnitdataRequest};
 
 /// Command received from the remote command server.
 #[derive(Debug, Clone, Encode, Decode, Serialize, Deserialize)]
@@ -118,6 +118,16 @@ pub enum ControlCommand {
     /// TNSDS-STATUS request (Table 13.1, cl. 13.3.2.1): send a pre-coded status
     /// (→ U-STATUS, cl. 14.7.2.7).
     TnsdsStatus { handle: u32, request: TnsdsStatusRequest },
+
+    /// TNSDS-UNITDATA request carrying an SDS-TL SDS-TRANSFER (cl. 29.4.2.4):
+    /// send a text/user message with a message reference + delivery reporting
+    /// (→ U-SDS-DATA with a Type-4 SDS-TL PDU).
+    TnsdsSendMessage { handle: u32, request: TnsdsMessageRequest },
+    /// TNSDS-REPORT request (Table 13.2, cl. 13.3.2.2): send an SDS-TL delivery/
+    /// read report for a received message (→ U-SDS-DATA SDS-REPORT).
+    TnsdsSendReport { handle: u32, request: TnsdsReportRequest },
+    /// TNSDS-CANCEL: stop tracking a locally-outstanding SDS-TL message.
+    TnsdsCancel { handle: u32, request: TnsdsCancelRequest },
 
     // -----------------------------------------------------------------------
     // U-plane uplink speech (traffic), INBOUND. Symmetric counterpart of the

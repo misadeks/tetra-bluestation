@@ -1,5 +1,7 @@
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TetraAddress, tetra_entities::TetraEntity};
+use std::collections::HashMap;
+use tetra_pdus::cmce::fields::sds_tl;
 use tetra_pdus::cmce::{
     enums::cmce_pdu_type_dl::CmcePduTypeDl,
     enums::party_type_identifier::PartyTypeIdentifier,
@@ -8,7 +10,10 @@ use tetra_pdus::cmce::{
 };
 use tetra_saps::control::enums::sds_user_data::SdsUserData;
 use tetra_saps::lcmc::LcmcMleUnitdataReq;
-use tetra_saps::tnsds::{TnsdsStatusIndication, TnsdsUnitdataIndication};
+use tetra_saps::tnsds::{
+    DeliveryReportRequest, TnsdsCancelRequest, TnsdsMessageIndication, TnsdsMessageRequest, TnsdsReportIndication,
+    TnsdsReportRequest, TnsdsStatusIndication, TnsdsUnitdataIndication,
+};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::MessageQueue;
@@ -29,12 +34,20 @@ pub struct SdsMsSubentity {
     #[allow(dead_code)]
     config: SharedConfig,
     telemetry: Option<TelemetrySink>,
+    /// SDS-TL messages this MS has sent with a delivery-report request that have
+    /// not yet been reported on: message reference → destination SSI (cl. 29).
+    /// Used by TNSDS-CANCEL and to bound local tracking.
+    outstanding: HashMap<u8, u32>,
 }
 
 impl SdsMsSubentity {
     /// Create a new instance of the SDS sub-entity.
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>) -> Self {
-        SdsMsSubentity { config, telemetry }
+        SdsMsSubentity {
+            config,
+            telemetry,
+            outstanding: HashMap::new(),
+        }
     }
 
     fn emit(&self, event: TelemetryEvent) {
@@ -43,7 +56,7 @@ impl SdsMsSubentity {
         }
     }
 
-    pub fn rx_sds_data(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+    pub fn rx_sds_data(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_sds_data");
 
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
@@ -66,10 +79,18 @@ impl SdsMsSubentity {
         };
 
         // ETSI TS 100 392-2 cl. 14.7.1.10 delivers CMCE SDS user data to the MS.
-        // Surface it to the user application as a TNSDS-UNITDATA indication
-        // (Table 13.3, cl. 13.3.2.3). SDS-TL interpretation of Type-4 user data
-        // (cl. 29) remains above this CMCE receive decode and is out of scope.
+        // If the Type-4 user data carries an SDS-TL PDU (cl. 29) we interpret the
+        // transport layer (message reference + delivery reporting); otherwise the
+        // payload is surfaced opaquely as a TNSDS-UNITDATA indication (Table 13.3).
         let calling_party_ssi = pdu.calling_party_address_ssi.unwrap_or(0) as u32;
+
+        if let SdsUserData::Type4(len_bits, bytes) = &pdu.user_defined_data {
+            if let Some(tl) = sds_tl::decode(*len_bits, bytes) {
+                self.handle_sds_tl_rx(queue, calling_party_ssi, called_is_group, tl);
+                return;
+            }
+        }
+
         tracing::info!(
             calling_party = calling_party_ssi,
             group = called_is_group,
@@ -81,6 +102,70 @@ impl SdsMsSubentity {
             called_party_is_group: called_is_group,
             user_data: pdu.user_defined_data,
         }));
+    }
+
+    /// Interpret a received SDS-TL PDU (cl. 29.4.2) and drive the transport-layer
+    /// behaviour: surface a transfer as a message indication (auto-acknowledging
+    /// with an SDS-REPORT "received" when the sender requested it on an
+    /// individually-addressed message, cl. 29.4.3.3), and surface a report/ack as
+    /// a TNSDS-REPORT indication (clearing local outstanding tracking).
+    fn handle_sds_tl_rx(&mut self, queue: &mut MessageQueue, calling_party_ssi: u32, called_is_group: bool, tl: sds_tl::SdsTlPdu) {
+        match tl {
+            sds_tl::SdsTlPdu::Transfer(t) => {
+                tracing::info!(
+                    calling_party = calling_party_ssi,
+                    group = called_is_group,
+                    msg_ref = t.message_reference,
+                    drr = t.delivery_report_request,
+                    "CMCE-MS: received SDS-TRANSFER"
+                );
+                let drr = DeliveryReportRequest::from_bits(t.delivery_report_request);
+                self.emit(TelemetryEvent::TnsdsMessageIndication(TnsdsMessageIndication {
+                    calling_party_ssi,
+                    called_party_is_group: called_is_group,
+                    protocol_id: t.protocol_id,
+                    delivery_report_request: drr,
+                    message_reference: t.message_reference,
+                    user_data: t.user_data,
+                    user_data_bits: t.user_data_bits,
+                }));
+                // Auto "received" report (cl. 29.4.3.3) only for an individually
+                // addressed message; group acknowledgements are prevented
+                // (cl. 29, delivery status 0x05). The "consumed" report is left to
+                // the user application via a TNSDS-REPORT request when it reads it.
+                if drr.wants_received() && !called_is_group {
+                    self.send_sds_report(queue, calling_party_ssi, t.message_reference, sds_tl::DELIVERY_RECEIPT_ACK_BY_DEST, t.protocol_id, false);
+                }
+            }
+            sds_tl::SdsTlPdu::Report(r) => {
+                tracing::info!(
+                    calling_party = calling_party_ssi,
+                    msg_ref = r.message_reference,
+                    status = r.delivery_status,
+                    "CMCE-MS: received SDS-REPORT"
+                );
+                self.outstanding.remove(&r.message_reference);
+                self.emit(TelemetryEvent::TnsdsReportIndication(TnsdsReportIndication {
+                    calling_party_ssi,
+                    message_reference: r.message_reference,
+                    delivery_status: r.delivery_status,
+                    short_form: false,
+                }));
+                if r.ack_required {
+                    self.send_sds_ack(queue, calling_party_ssi, r.message_reference, r.delivery_status, r.protocol_id);
+                }
+            }
+            sds_tl::SdsTlPdu::Ack(a) => {
+                tracing::info!(calling_party = calling_party_ssi, msg_ref = a.message_reference, "CMCE-MS: received SDS-ACK");
+                self.outstanding.remove(&a.message_reference);
+                self.emit(TelemetryEvent::TnsdsReportIndication(TnsdsReportIndication {
+                    calling_party_ssi,
+                    message_reference: a.message_reference,
+                    delivery_status: a.delivery_status,
+                    short_form: false,
+                }));
+            }
+        }
     }
 
     pub fn rx_status(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
@@ -97,10 +182,31 @@ impl SdsMsSubentity {
             }
         };
 
-        // ETSI TS 100 392-2 cl. 14.7.1.11 / cl. 14.8.34. Surface to the user
-        // application as a TNSDS-STATUS indication (Table 13.1, cl. 13.3.2.1).
+        // ETSI TS 100 392-2 cl. 14.7.1.11 / cl. 14.8.34. A pre-coded status whose
+        // top six bits are `011111` is an SDS-TL SDS-SHORT-REPORT (cl. 29.4.2.3):
+        // a compact delivery/read report. Otherwise it is an ordinary status
+        // surfaced as a TNSDS-STATUS indication (Table 13.1, cl. 13.3.2.1).
         let calling_party_ssi = pdu.calling_party_address_ssi.unwrap_or(0) as u32;
         let status_number = pdu.pre_coded_status.into_raw();
+
+        if let Some(sr) = sds_tl::SdsShortReport::decode_status(status_number) {
+            let delivery_status = short_report_to_delivery_status(sr.short_report_type);
+            tracing::info!(
+                calling_party = calling_party_ssi,
+                msg_ref = sr.message_reference,
+                short_report_type = sr.short_report_type,
+                "CMCE-MS: received SDS-SHORT-REPORT"
+            );
+            self.outstanding.remove(&sr.message_reference);
+            self.emit(TelemetryEvent::TnsdsReportIndication(TnsdsReportIndication {
+                calling_party_ssi,
+                message_reference: sr.message_reference,
+                delivery_status,
+                short_form: true,
+            }));
+            return;
+        }
+
         tracing::info!(
             calling_party = calling_party_ssi,
             status = %pdu.pre_coded_status,
@@ -169,6 +275,80 @@ impl SdsMsSubentity {
         self.push_uplink(queue, sdu, dest_ssi, dest_is_group);
     }
 
+    /// TNSDS-UNITDATA request carrying an SDS-TL SDS-TRANSFER (cl. 29.4.2.4).
+    /// Wraps the application message in an SDS-TRANSFER PDU (message reference +
+    /// delivery-report request) and sends it as Type-4 user data in a
+    /// U-SDS-DATA. When a report is requested the message reference is tracked
+    /// (for TNSDS-CANCEL and to correlate the returning report).
+    pub fn send_message(&mut self, queue: &mut MessageQueue, req: &TnsdsMessageRequest) {
+        let transfer = sds_tl::SdsTransfer {
+            protocol_id: req.protocol_id,
+            delivery_report_request: req.delivery_report_request.to_bits(),
+            // Uplink service selection: group or individual service when
+            // group-addressed, individual otherwise (cl. 29.4.3.10).
+            service_selection: req.called_party_is_group,
+            message_reference: req.message_reference,
+            user_data: req.user_data.clone(),
+            user_data_bits: req.user_data_bits,
+        };
+        let (len_bits, bytes) = transfer.encode();
+        if req.delivery_report_request != DeliveryReportRequest::None {
+            self.outstanding.insert(req.message_reference, req.called_party_ssi);
+        }
+        tracing::info!(
+            dest = req.called_party_ssi,
+            group = req.called_party_is_group,
+            msg_ref = req.message_reference,
+            "CMCE-MS: -> SDS-TRANSFER"
+        );
+        self.send_u_sds_data(queue, req.called_party_ssi, req.called_party_is_group, SdsUserData::Type4(len_bits, bytes));
+    }
+
+    /// TNSDS-REPORT request (Table 13.2, cl. 13.3.2.2): send an SDS-TL delivery/
+    /// read report (SDS-REPORT) for a received message — e.g. a "consumed" report
+    /// once the user application reads the message.
+    pub fn send_report(&mut self, queue: &mut MessageQueue, req: &TnsdsReportRequest) {
+        self.send_sds_report(
+            queue,
+            req.called_party_ssi,
+            req.message_reference,
+            req.delivery_status,
+            sds_tl::PROTOCOL_ID_TEXT_MESSAGING,
+            false,
+        );
+    }
+
+    /// TNSDS-CANCEL: stop tracking a locally-outstanding SDS-TL message. Returns
+    /// `true` if a matching outstanding message reference was found.
+    pub fn cancel(&mut self, req: &TnsdsCancelRequest) -> bool {
+        self.outstanding.remove(&req.message_reference).is_some()
+    }
+
+    /// Build and send an SDS-REPORT PDU (cl. 29.4.2.2) to `dest`.
+    fn send_sds_report(&mut self, queue: &mut MessageQueue, dest: u32, message_reference: u8, delivery_status: u8, protocol_id: u8, ack_required: bool) {
+        let report = sds_tl::SdsReport {
+            protocol_id,
+            ack_required,
+            delivery_status,
+            message_reference,
+        };
+        let (len_bits, bytes) = report.encode();
+        tracing::info!(dest, msg_ref = message_reference, status = delivery_status, "CMCE-MS: -> SDS-REPORT");
+        self.send_u_sds_data(queue, dest, false, SdsUserData::Type4(len_bits, bytes));
+    }
+
+    /// Build and send an SDS-ACK PDU (cl. 29.4.2.1) to `dest`.
+    fn send_sds_ack(&mut self, queue: &mut MessageQueue, dest: u32, message_reference: u8, delivery_status: u8, protocol_id: u8) {
+        let ack = sds_tl::SdsAck {
+            protocol_id,
+            delivery_status,
+            message_reference,
+        };
+        let (len_bits, bytes) = ack.encode();
+        tracing::info!(dest, msg_ref = message_reference, "CMCE-MS: -> SDS-ACK");
+        self.send_u_sds_data(queue, dest, false, SdsUserData::Type4(len_bits, bytes));
+    }
+
     /// Push a serialized CMCE uplink SDU to MLE over the LCMC-SAP. Layer 2
     /// service follows the addressing (cl. 14.7.2): acknowledged basic link for
     /// an individual (ISSI) destination, unacknowledged for a group (GSSI).
@@ -220,7 +400,9 @@ impl SdsMsSubentity {
             return;
         };
 
-        // TODO FIXME: Besides these PDUs, we can also receive several signals (BUSY ind, CLOSE ind, etc)
+        // TETRA CMCE can also deliver signals other than SDS/STATUS on this SAP
+        // (e.g. BUSY / CLOSE indications). They are not SDS PDUs; log and ignore
+        // rather than panicking (cl. 14.7.1).
         match pdu_type {
             CmcePduTypeDl::DSdsData => {
                 self.rx_sds_data(queue, message);
@@ -228,10 +410,21 @@ impl SdsMsSubentity {
             CmcePduTypeDl::DStatus => {
                 self.rx_status(queue, message);
             }
-            _ => {
-                panic!();
+            other => {
+                tracing::debug!("CMCE-MS SDS: ignoring non-SDS downlink PDU {:?}", other);
             }
         }
+    }
+}
+
+/// Map an SDS-SHORT-REPORT short report type (Table 29.23) to the equivalent
+/// full delivery-status code (Table 29.16) for a uniform TNSDS-REPORT indication.
+fn short_report_to_delivery_status(short_report_type: u8) -> u8 {
+    match short_report_type {
+        sds_tl::SHORT_REPORT_MESSAGE_RECEIVED => sds_tl::DELIVERY_RECEIPT_ACK_BY_DEST,
+        sds_tl::SHORT_REPORT_MESSAGE_CONSUMED => sds_tl::DELIVERY_CONSUMED_BY_DEST,
+        sds_tl::SHORT_REPORT_DEST_MEMORY_FULL => 0x52, // Destination memory full, message discarded
+        _ => 0x50,                                     // Protocol not supported
     }
 }
 
@@ -456,6 +649,189 @@ attach_groups = []
         let msg = deliver(sdu, TetraAddress::new(1000001, SsiType::Issi));
         sds.route_rf_deliver(&mut q, msg);
         assert!(q.pop_front().is_none());
+    }
+
+    // --- SDS-TL (cl. 29): message reference + delivery reporting ---
+
+    fn take_type4(msg: SapMsg) -> (u32, SsiType, u16, Vec<u8>) {
+        let SapMsgInner::LcmcMleUnitdataReq(mut prim) = msg.msg else {
+            panic!("expected LcmcMleUnitdataReq");
+        };
+        let ssi = prim.main_address.ssi;
+        let ty = prim.main_address.ssi_type;
+        let pdu = USdsData::from_bitbuf(&mut prim.sdu).expect("BS decodes U-SDS-DATA");
+        let SdsUserData::Type4(len_bits, bytes) = pdu.user_defined_data else {
+            panic!("expected Type-4 user data");
+        };
+        (ssi, ty, len_bits, bytes)
+    }
+
+    #[test]
+    fn send_message_builds_sds_transfer_and_tracks_outstanding() {
+        let mut sds = make_sds(None);
+        let mut q = MessageQueue::new();
+        sds.send_message(
+            &mut q,
+            &TnsdsMessageRequest {
+                called_party_ssi: 2200699,
+                called_party_is_group: false,
+                protocol_id: sds_tl::PROTOCOL_ID_TEXT_MESSAGING,
+                delivery_report_request: DeliveryReportRequest::ReceivedAndConsumed,
+                message_reference: 42,
+                user_data: vec![0x01, b'H', b'i'],
+                user_data_bits: 24,
+            },
+        );
+        let (ssi, ty, len_bits, bytes) = take_type4(q.pop_front().expect("U-SDS-DATA queued"));
+        assert_eq!(ssi, 2200699);
+        assert!(matches!(ty, SsiType::Issi));
+        // Decode the SDS-TL PDU the same way the peer MS would.
+        let tl = sds_tl::decode(len_bits, &bytes).expect("SDS-TL transfer");
+        match tl {
+            sds_tl::SdsTlPdu::Transfer(t) => {
+                assert_eq!(t.message_reference, 42);
+                assert_eq!(t.delivery_report_request, sds_tl::DRR_RECEIVED_AND_CONSUMED);
+                assert_eq!(t.user_data, vec![0x01, b'H', b'i']);
+            }
+            other => panic!("expected transfer, got {other:?}"),
+        }
+        // Outstanding tracked (a report was requested) → cancel finds it.
+        assert!(sds.cancel(&TnsdsCancelRequest { message_reference: 42 }));
+        assert!(!sds.cancel(&TnsdsCancelRequest { message_reference: 42 }), "already cleared");
+    }
+
+    #[test]
+    fn rx_transfer_indicates_and_auto_sends_received_report() {
+        let (sink, rx) = telemetry_channel();
+        let mut sds = make_sds(Some(sink));
+        let mut q = MessageQueue::new();
+
+        let (len_bits, bytes) = sds_tl::SdsTransfer {
+            protocol_id: sds_tl::PROTOCOL_ID_TEXT_MESSAGING,
+            delivery_report_request: sds_tl::DRR_RECEIVED,
+            service_selection: false,
+            message_reference: 7,
+            user_data: vec![0x01, b'Y', b'o'],
+            user_data_bits: 24,
+        }
+        .encode();
+        let sdu = build_d_sds_data(555, SdsUserData::Type4(len_bits, bytes));
+        sds.route_rf_deliver(&mut q, deliver(sdu, TetraAddress::new(1000001, SsiType::Issi)));
+
+        // Message surfaced to the UI.
+        match rx.try_recv().expect("message indication") {
+            TelemetryEvent::TnsdsMessageIndication(ind) => {
+                assert_eq!(ind.calling_party_ssi, 555);
+                assert_eq!(ind.message_reference, 7);
+                assert_eq!(ind.delivery_report_request, DeliveryReportRequest::Received);
+                assert_eq!(ind.user_data, vec![0x01, b'Y', b'o']);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // Auto "received" SDS-REPORT emitted back to the sender.
+        let (ssi, _ty, lb, b) = take_type4(q.pop_front().expect("auto SDS-REPORT queued"));
+        assert_eq!(ssi, 555, "report addressed to the original sender");
+        match sds_tl::decode(lb, &b).expect("SDS-TL report") {
+            sds_tl::SdsTlPdu::Report(r) => {
+                assert_eq!(r.message_reference, 7);
+                assert_eq!(r.delivery_status, sds_tl::DELIVERY_RECEIPT_ACK_BY_DEST);
+            }
+            other => panic!("expected report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rx_group_transfer_does_not_auto_report() {
+        let (sink, rx) = telemetry_channel();
+        let mut sds = make_sds(Some(sink));
+        let mut q = MessageQueue::new();
+        let (len_bits, bytes) = sds_tl::SdsTransfer {
+            protocol_id: sds_tl::PROTOCOL_ID_TEXT_MESSAGING,
+            delivery_report_request: sds_tl::DRR_RECEIVED,
+            service_selection: true,
+            message_reference: 9,
+            user_data: vec![b'!'],
+            user_data_bits: 8,
+        }
+        .encode();
+        let sdu = build_d_sds_data(777, SdsUserData::Type4(len_bits, bytes));
+        sds.route_rf_deliver(&mut q, deliver(sdu, TetraAddress::new(91, SsiType::Gssi)));
+        assert!(matches!(rx.try_recv(), Some(TelemetryEvent::TnsdsMessageIndication(_))));
+        assert!(q.pop_front().is_none(), "group message must not trigger an individual report");
+    }
+
+    #[test]
+    fn rx_report_emits_report_indication_and_clears_outstanding() {
+        let (sink, rx) = telemetry_channel();
+        let mut sds = make_sds(Some(sink));
+        let mut q = MessageQueue::new();
+        // Pretend we sent message ref 7 to 555 with a report requested.
+        sds.outstanding.insert(7, 555);
+        let (len_bits, bytes) = sds_tl::SdsReport {
+            protocol_id: sds_tl::PROTOCOL_ID_TEXT_MESSAGING,
+            ack_required: false,
+            delivery_status: sds_tl::DELIVERY_CONSUMED_BY_DEST,
+            message_reference: 7,
+        }
+        .encode();
+        let sdu = build_d_sds_data(555, SdsUserData::Type4(len_bits, bytes));
+        sds.route_rf_deliver(&mut q, deliver(sdu, TetraAddress::new(1000001, SsiType::Issi)));
+        match rx.try_recv().expect("report indication") {
+            TelemetryEvent::TnsdsReportIndication(ind) => {
+                assert_eq!(ind.message_reference, 7);
+                assert_eq!(ind.delivery_status, sds_tl::DELIVERY_CONSUMED_BY_DEST);
+                assert!(!ind.short_form);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(!sds.cancel(&TnsdsCancelRequest { message_reference: 7 }), "outstanding cleared on report");
+    }
+
+    #[test]
+    fn rx_short_report_status_emits_report_indication() {
+        let (sink, rx) = telemetry_channel();
+        let mut sds = make_sds(Some(sink));
+        let mut q = MessageQueue::new();
+        let status = sds_tl::SdsShortReport {
+            short_report_type: sds_tl::SHORT_REPORT_MESSAGE_CONSUMED,
+            message_reference: 33,
+        }
+        .encode_status();
+        let sdu = build_d_status(2200699, PreCodedStatus::from(status));
+        sds.route_rf_deliver(&mut q, deliver(sdu, TetraAddress::new(1000001, SsiType::Issi)));
+        match rx.try_recv().expect("report indication") {
+            TelemetryEvent::TnsdsReportIndication(ind) => {
+                assert_eq!(ind.calling_party_ssi, 2200699);
+                assert_eq!(ind.message_reference, 33);
+                assert_eq!(ind.delivery_status, sds_tl::DELIVERY_CONSUMED_BY_DEST);
+                assert!(ind.short_form);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_report_builds_sds_report() {
+        let mut sds = make_sds(None);
+        let mut q = MessageQueue::new();
+        sds.send_report(
+            &mut q,
+            &TnsdsReportRequest {
+                called_party_ssi: 555,
+                message_reference: 12,
+                delivery_status: sds_tl::DELIVERY_CONSUMED_BY_DEST,
+            },
+        );
+        let (ssi, ty, lb, b) = take_type4(q.pop_front().expect("U-SDS-DATA queued"));
+        assert_eq!(ssi, 555);
+        assert!(matches!(ty, SsiType::Issi));
+        match sds_tl::decode(lb, &b).expect("SDS-TL report") {
+            sds_tl::SdsTlPdu::Report(r) => {
+                assert_eq!(r.message_reference, 12);
+                assert_eq!(r.delivery_status, sds_tl::DELIVERY_CONSUMED_BY_DEST);
+            }
+            other => panic!("expected report, got {other:?}"),
+        }
     }
 }
 

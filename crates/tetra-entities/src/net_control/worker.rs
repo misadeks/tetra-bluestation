@@ -133,7 +133,10 @@ impl<T: NetworkTransport> ControlWorker<T> {
             | ControlCommand::MsUplinkSpeech { .. }
             // TNSDS-SAP requests (cl. 13.3) are handled by CMCE SDS.
             | ControlCommand::TnsdsUnitdata { .. }
-            | ControlCommand::TnsdsStatus { .. } => TetraEntity::Cmce,
+            | ControlCommand::TnsdsStatus { .. }
+            | ControlCommand::TnsdsSendMessage { .. }
+            | ControlCommand::TnsdsSendReport { .. }
+            | ControlCommand::TnsdsCancel { .. } => TetraEntity::Cmce,
             // Management / provisioning (Plane B, non-standard) is served by MM,
             // the single writer of MS runtime state and config-apply.
             ControlCommand::Management(_) => TetraEntity::Mm,
