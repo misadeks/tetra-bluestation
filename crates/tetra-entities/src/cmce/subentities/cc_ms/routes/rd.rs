@@ -121,11 +121,12 @@ impl CcMsSubentity {
                 );
                 return;
             }
+            let grant = self.resolve_floor_grant(pdu.transmission_grant, pdu.calling_party_address_ssi);
             self.apply_transmission_grant(queue, pdu.call_identifier, pdu.transmission_grant, pdu.calling_party_address_ssi);
             let new_speaker = self.calls.get(&pdu.call_identifier).and_then(|c| c.current_speaker_ssi);
             tracing::debug!(
                 call_identifier = pdu.call_identifier,
-                grant = ?pdu.transmission_grant,
+                grant = ?grant,
                 speaker = ?new_speaker,
                 permission_not_allowed = pdu.transmission_request_permission,
                 "CMCE-MS: group D-SETUP re-broadcast — updating floor in place (cl. 14.5.2.1.2)"
@@ -140,7 +141,7 @@ impl CcMsSubentity {
                         transmitting_party_extension: None,
                         external_subscriber_number: None,
                         transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
-                        transmission_status: tncc_transmission_status_from_grant(pdu.transmission_grant),
+                        transmission_status: tncc_transmission_status_from_grant(grant),
                     },
                 });
             }
@@ -199,19 +200,23 @@ impl CcMsSubentity {
             );
         }
         if kind != MsCallKind::Individual {
+            let grant = self.resolve_floor_grant(pdu.transmission_grant, pdu.calling_party_address_ssi);
             self.apply_transmission_grant(queue, pdu.call_identifier, pdu.transmission_grant, pdu.calling_party_address_ssi);
             // ETSI TS 100 392-2 cl. 14.8.31 / 14.5.1.4: the transmission-grant
             // element carried in a D-SETUP has the same semantics as in
             // D-TX-GRANTED. When a group call is announced with the floor already
-            // "granted to another user", this MS is a listener that is receiving
-            // that party's speech immediately (U-plane switched on above). The
+            // held by another user, this MS is a listener that is receiving that
+            // party's speech immediately (U-plane switched on above). The
             // TNCC-SETUP indication alone does not surface the live floor/talker
             // state the way every subsequent floor change does, so raise a
             // TNCC-TX indication here too — otherwise the application shows the
             // floor as free with no talker until the next D-TX-GRANTED (which the
             // SwMI need not send while the same party keeps talking after our
-            // late entry). The calling-party address identifies the talker.
-            if pdu.transmission_grant == TransmissionGrant::GrantedToOtherUser {
+            // late entry). The calling-party address identifies the talker. The
+            // grant is resolved to this MS's viewpoint first, so a "granted" that
+            // names another subscriber (a talker announcement) is correctly seen
+            // as "granted to another user".
+            if grant == TransmissionGrant::GrantedToOtherUser {
                 self.emit(TelemetryEvent::TnccTxIndication {
                     call_identifier: pdu.call_identifier,
                     indication: tncc::TnccTxIndication {
@@ -221,7 +226,7 @@ impl CcMsSubentity {
                         transmitting_party_extension: pdu.calling_party_extension,
                         external_subscriber_number: None,
                         transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
-                        transmission_status: tncc_transmission_status_from_grant(pdu.transmission_grant),
+                        transmission_status: tncc_transmission_status_from_grant(grant),
                     },
                 });
             }
@@ -393,6 +398,12 @@ impl CcMsSubentity {
                 tracing::warn!(call_identifier = pdu.call_identifier, "CMCE-MS: explicit self grant still required");
                 return;
             }
+            // Resolve to this MS's viewpoint (cl. 14.5.1.4 / 14.8.31): a "granted"
+            // naming another subscriber as the transmitting party is a talker
+            // announcement, not a grant to us — so it must drive GrantedOther (keep
+            // our U-plane receiving, do not suppress the talker's speech) and must
+            // NOT be mistaken for confirmation of our own transmit request below.
+            let grant = self.resolve_floor_grant(grant, speaker);
             self.apply_transmission_grant(queue, pdu.call_identifier, grant, speaker);
             if let Some(call) = self.calls.get(&pdu.call_identifier) {
                 if pending_before && grant == TransmissionGrant::Granted {

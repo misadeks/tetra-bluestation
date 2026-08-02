@@ -1,6 +1,28 @@
 use super::*;
 
 impl CcMsSubentity {
+    /// Resolve the floor grant as seen from *this* MS.
+    ///
+    /// ETSI TS 100 392-2 cl. 14.5.1.4 / 14.8.31: the transmitting- (D-TX-GRANTED)
+    /// / calling- (D-SETUP) party address element identifies who actually holds
+    /// the floor. In a group call the SwMI signals a talker change with the
+    /// "transmission granted" code (0) while naming that talker as the
+    /// transmitting party. Taken literally this MS would treat the floor as
+    /// granted to *itself* (`GrantedSelf`) even though another subscriber is
+    /// speaking — switching its U-plane to transmit and suppressing the talker's
+    /// downlink speech as its own talk-back. So when the grant is "granted" but
+    /// the named party is a *different* subscriber than our own ISSI, resolve it
+    /// to "granted to another user" — the floor is held by that other user. A
+    /// grant with no named party (individual-call set-up / D-CONNECT-ACK, where
+    /// the grant is genuinely for us) or one naming our own ISSI is left intact.
+    pub(super) fn resolve_floor_grant(&self, grant: TransmissionGrant, speaker: Option<u32>) -> TransmissionGrant {
+        if grant == TransmissionGrant::Granted && speaker.is_some() && speaker != self.own_issi {
+            TransmissionGrant::GrantedToOtherUser
+        } else {
+            grant
+        }
+    }
+
     pub(super) fn apply_transmission_grant(
         &mut self,
         queue: &mut MessageQueue,
@@ -8,6 +30,10 @@ impl CcMsSubentity {
         grant: TransmissionGrant,
         speaker: Option<u32>,
     ) {
+        // Normalise the grant to this MS's viewpoint before it drives floor state
+        // (cl. 14.5.1.4 / 14.8.31) — a "granted" naming another subscriber must
+        // not put us in GrantedSelf and gate our U-plane to transmit.
+        let grant = self.resolve_floor_grant(grant, speaker);
         let Some(call) = self.calls.get_mut(&call_identifier) else { return };
         call.current_speaker_ssi = speaker.or(call.current_speaker_ssi);
         let mut configure = None;

@@ -215,3 +215,46 @@ dwell_ms = 800
 # step = 1
 # offsets = [0, 6250, 12500]
 
+
+###############################################################################
+# CONTACTS & GATEWAYS (Plane B codeplug, data only)
+###############################################################################
+
+# External-network gateways (PABX/PSTN). A phone contact reaches the external
+# network via an ordinary individual call to the gateway's `gateway_issi`
+# (CPTI = SSI) that also carries the dialled digits in the External subscriber
+# number IE (ETSI TS 100 392-2 cl. 14.8.20). `kind` (pstn|pabx) is a UI label
+# only — TETRA carries no on-air PABX/PSTN flag. `prefix` (optional) is prepended
+# to a contact's number before it is placed in the IE (an operator access code).
+[[gateway]]
+id = "pstn"
+name = "Public Phone"
+kind = "pstn"
+gateway_issi = 8000001
+
+[[gateway]]
+id = "office-pabx"
+name = "Office PABX"
+kind = "pabx"
+gateway_issi = 8000002
+prefix = "9"                         # dial 9 for an outside line
+
+# Contacts (phone book). Each entry is EITHER an on-network individual (`issi`)
+# OR an external number (`number` + `gateway`). `callsign` is optional.
+[[contact]]
+name = "Dispatch Lead"
+callsign = "ALPHA1"
+issi = 2000123
+order = 1
+
+[[contact]]
+name = "Front Desk"
+number = "1234"
+gateway = "office-pabx"
+order = 2
+
+[[contact]]
+name = "Emergency"
+number = "112"
+gateway = "pstn"
+order = 3

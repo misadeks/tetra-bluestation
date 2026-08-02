@@ -42,6 +42,8 @@ const MAX_CARRIER: u16 = 3999; // 12-bit main carrier, FreqInfo requires < 4000
 const MAX_COLOUR_CODE: u8 = 63; // 6-bit colour code (EN 300 392-2 cl. 18.4.2.1)
 const MAX_DUPLEX_INDEX: u8 = 7; // 3-bit duplex-spacing field (TS 100 392-15 cl. 6)
 const MAX_GSSI: u32 = 0xFF_FFFF; // 24-bit group short subscriber identity
+const MAX_ISSI: u32 = 0xFF_FFFF; // 24-bit individual short subscriber identity
+const MAX_EXT_SUBSCRIBER_DIGITS: usize = 24; // External subscriber number: n <= 24 (cl. 14.8.20)
 const MAX_CLASS_OF_USAGE: u8 = 7; // 3-bit class of usage (EN 300 392-2)
 const MAX_MCC: u16 = 1023; // 10-bit Mobile Country Code
 const MAX_MNC: u16 = 16383; // 14-bit Mobile Network Code
@@ -262,8 +264,73 @@ pub struct CfgScanlist {
     pub order: u32,
 }
 
-/// The complete codeplug: folders, talkgroups, allowed networks, carrier
-/// overrides, frequency lists and scan lists.
+/// External-network gateway kind (PABX vs PSTN). This is a codeplug/UI
+/// categorisation only — TETRA carries **no** on-air "PABX vs PSTN" flag; both
+/// are ordinary calls to an external number (cl. 14.8.20). The distinction lets
+/// the UI label the destination and, if the operator's dial plan needs it,
+/// prepend a different access-code `prefix` per gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CfgGatewayKind {
+    /// Public Switched Telephone Network gateway.
+    #[default]
+    Pstn,
+    /// Private Automatic Branch eXchange gateway.
+    Pabx,
+}
+
+/// A programmed external-network gateway (PABX/PSTN). Plane B, data only.
+///
+/// A phone contact reaches the external network by an ordinary individual
+/// U-SETUP whose called party SSI is this gateway's `gateway_issi` (CPTI = SSI)
+/// and which additionally carries the dialled digits in the External subscriber
+/// number IE (cl. 14.8.20). The SwMI's gateway subscriber routes the digits into
+/// the PABX/PSTN. `prefix`, if set, is prepended to the contact's number before
+/// it is placed in the IE (an operator dial-plan access code).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfgGateway {
+    /// Stable identifier referenced by phone contacts.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// PABX or PSTN (UI categorisation; no on-air effect).
+    pub kind: CfgGatewayKind,
+    /// The gateway subscriber's Individual Short Subscriber Identity (24-bit):
+    /// the called-party SSI placed in the U-SETUP for a call through this
+    /// gateway.
+    pub gateway_issi: u32,
+    /// Optional access-code digits prepended to the dialled number before it is
+    /// encoded into the External subscriber number IE.
+    pub prefix: Option<String>,
+}
+
+/// Where a contact places a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CfgContactTarget {
+    /// An on-network individual subscriber, addressed by its ISSI.
+    Issi(u32),
+    /// An external number reached through a programmed gateway. `number` is the
+    /// dialled digits (0-9, `*`, `#`, `+`); `gateway` references a [`CfgGateway`]
+    /// `id`.
+    Phone { number: String, gateway: String },
+}
+
+/// A programmed contact (phone-book entry). Plane B, data only — a contact does
+/// nothing on-air by itself; selecting one drives an individual (ISSI) or
+/// external (phone) call origination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfgContact {
+    /// Human-readable name (unique within the codeplug).
+    pub name: String,
+    /// Optional callsign.
+    pub callsign: Option<String>,
+    /// Where the contact places a call.
+    pub target: CfgContactTarget,
+    /// Display order within the contact list (ascending; ties broken by name).
+    pub order: u32,
+}
+
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CfgCodeplug {
     pub folders: Vec<CfgFolder>,
@@ -278,6 +345,11 @@ pub struct CfgCodeplug {
     /// Programmed talkgroup scan lists (groups the radio monitors together).
     /// The UI can activate/deactivate these at runtime.
     pub scanlists: Vec<CfgScanlist>,
+    /// Programmed external-network gateways (PABX/PSTN) referenced by phone
+    /// contacts.
+    pub gateways: Vec<CfgGateway>,
+    /// Programmed contacts (phone book).
+    pub contacts: Vec<CfgContact>,
 }
 
 impl CfgCodeplug {
@@ -290,6 +362,8 @@ impl CfgCodeplug {
             && self.carrier_overrides.is_empty()
             && self.frequency_lists.is_empty()
             && self.scanlists.is_empty()
+            && self.gateways.is_empty()
+            && self.contacts.is_empty()
     }
 
     /// Scan lists in display order (`order` ascending, ties broken by `name`).
@@ -365,6 +439,37 @@ impl CfgCodeplug {
             .collect();
         v.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
         v
+    }
+
+    /// Contacts in display order (`order` ascending, ties broken by `name`).
+    pub fn contacts_sorted(&self) -> Vec<&CfgContact> {
+        let mut v: Vec<&CfgContact> = self.contacts.iter().collect();
+        v.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
+        v
+    }
+
+    /// Look up a contact by name.
+    pub fn contact(&self, name: &str) -> Option<&CfgContact> {
+        self.contacts.iter().find(|c| c.name == name)
+    }
+
+    /// Look up a gateway by id.
+    pub fn gateway(&self, id: &str) -> Option<&CfgGateway> {
+        self.gateways.iter().find(|g| g.id == id)
+    }
+
+    /// Resolve a phone contact to the values a call origination needs: the
+    /// gateway's ISSI (the called-party SSI) and the full dialled digit string
+    /// (`gateway.prefix` + `number`) to place in the External subscriber number
+    /// IE (cl. 14.8.20). Returns `None` for a non-phone contact or a dangling
+    /// gateway reference.
+    pub fn resolve_phone_contact(&self, contact: &CfgContact) -> Option<(u32, String)> {
+        let CfgContactTarget::Phone { number, gateway } = &contact.target else {
+            return None;
+        };
+        let gw = self.gateway(gateway)?;
+        let digits = format!("{}{}", gw.prefix.as_deref().unwrap_or(""), number);
+        Some((gw.gateway_issi, digits))
     }
 
     /// Allowed networks in preference order (`priority` ascending, ties broken
@@ -565,8 +670,88 @@ impl CfgCodeplug {
             }
         }
 
+        // Gateways: unique non-empty ids/names, valid gateway ISSI, valid
+        // optional access-code prefix digits (cl. 14.8.20 digit set).
+        let mut gateway_ids: HashSet<&str> = HashSet::new();
+        for gw in &self.gateways {
+            if gw.id.trim().is_empty() {
+                return Err("gateway id must not be empty".to_string());
+            }
+            if gw.name.trim().is_empty() {
+                return Err(format!("gateway '{}' name must not be empty", gw.id));
+            }
+            if !gateway_ids.insert(gw.id.as_str()) {
+                return Err(format!("duplicate gateway id '{}'", gw.id));
+            }
+            if gw.gateway_issi == 0 || gw.gateway_issi > MAX_ISSI {
+                return Err(format!("gateway '{}' gateway_issi must be a 24-bit value (1..={})", gw.id, MAX_ISSI));
+            }
+            if let Some(ref prefix) = gw.prefix {
+                validate_dial_digits(&format!("gateway '{}' prefix", gw.id), prefix)?;
+            }
+        }
+
+        // Contacts: unique non-empty names, exactly one valid target. A phone
+        // contact must reference a programmed gateway, carry valid dial digits,
+        // and (with the gateway prefix) stay within the 24-digit IE limit
+        // (cl. 14.8.20); an ISSI contact must carry a 24-bit ISSI.
+        let mut contact_names: HashSet<&str> = HashSet::new();
+        for c in &self.contacts {
+            if c.name.trim().is_empty() {
+                return Err("contact name must not be empty".to_string());
+            }
+            if !contact_names.insert(c.name.as_str()) {
+                return Err(format!("duplicate contact name '{}'", c.name));
+            }
+            match &c.target {
+                CfgContactTarget::Issi(issi) => {
+                    if *issi == 0 || *issi > MAX_ISSI {
+                        return Err(format!("contact '{}' issi must be a 24-bit value (1..={})", c.name, MAX_ISSI));
+                    }
+                }
+                CfgContactTarget::Phone { number, gateway } => {
+                    let Some(gw) = self.gateway(gateway) else {
+                        return Err(format!("contact '{}' references unknown gateway '{}'", c.name, gateway));
+                    };
+                    validate_dial_digits(&format!("contact '{}' number", c.name), number)?;
+                    let total = gw.prefix.as_deref().map_or(0, |p| p.chars().filter(|ch| !ch.is_whitespace()).count())
+                        + number.chars().filter(|ch| !ch.is_whitespace()).count();
+                    if total > MAX_EXT_SUBSCRIBER_DIGITS {
+                        return Err(format!(
+                            "contact '{}' dialled digits (gateway prefix + number = {}) exceed the {}-digit External subscriber number limit (cl. 14.8.20)",
+                            c.name, total, MAX_EXT_SUBSCRIBER_DIGITS
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
+}
+
+/// Validate a dialled digit string against the External subscriber number digit
+/// set (cl. 14.8.20 / Table 14.59: `0`-`9`, `*`, `#`, `+`). Interior whitespace
+/// is ignored (a display convenience); an empty or over-long number is rejected.
+fn validate_dial_digits(label: &str, digits: &str) -> Result<(), String> {
+    let significant: Vec<char> = digits.chars().filter(|c| !c.is_whitespace()).collect();
+    if significant.is_empty() {
+        return Err(format!("{} must not be empty", label));
+    }
+    if significant.len() > MAX_EXT_SUBSCRIBER_DIGITS {
+        return Err(format!(
+            "{} has {} digits, exceeding the {}-digit External subscriber number limit (cl. 14.8.20)",
+            label,
+            significant.len(),
+            MAX_EXT_SUBSCRIBER_DIGITS
+        ));
+    }
+    for c in significant {
+        if !matches!(c, '0'..='9' | '*' | '#' | '+') {
+            return Err(format!("{} contains invalid dial character '{}' (allowed: 0-9 * # +)", label, c));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a `(band, carrier, offset)` RF triple against ETSI bit-widths / the
@@ -664,6 +849,32 @@ pub struct ScanlistDto {
     pub extra: HashMap<String, Value>,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+pub struct GatewayDto {
+    pub id: String,
+    pub name: String,
+    pub kind: CfgGatewayKind,
+    pub gateway_issi: u32,
+    pub prefix: Option<String>,
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+pub struct ContactDto {
+    pub name: String,
+    pub callsign: Option<String>,
+    /// On-network individual target (mutually exclusive with `number`/`gateway`).
+    pub issi: Option<u32>,
+    /// External-number target: dialled digits (requires `gateway`).
+    pub number: Option<String>,
+    /// Gateway id for an external-number target (requires `number`).
+    pub gateway: Option<String>,
+    pub order: Option<u32>,
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
 fn folder_dto_to_cfg(dto: FolderDto) -> CfgFolder {
     CfgFolder {
         id: dto.id,
@@ -751,6 +962,45 @@ fn scanlist_dto_to_cfg(dto: ScanlistDto) -> CfgScanlist {
     }
 }
 
+fn gateway_dto_to_cfg(dto: GatewayDto) -> CfgGateway {
+    CfgGateway {
+        id: dto.id,
+        name: dto.name,
+        kind: dto.kind,
+        gateway_issi: dto.gateway_issi,
+        prefix: dto.prefix,
+    }
+}
+
+fn contact_dto_to_cfg(dto: ContactDto) -> Result<CfgContact, String> {
+    // Resolve exactly one target form: an ISSI, or a (number + gateway) phone.
+    let target = match (dto.issi, dto.number.as_ref(), dto.gateway.as_ref()) {
+        (Some(issi), None, None) => CfgContactTarget::Issi(issi),
+        (None, Some(number), Some(gateway)) => CfgContactTarget::Phone {
+            number: number.clone(),
+            gateway: gateway.clone(),
+        },
+        (None, Some(_), None) => {
+            return Err(format!("contact '{}' has a number but no gateway", dto.name));
+        }
+        (None, None, Some(_)) => {
+            return Err(format!("contact '{}' has a gateway but no number", dto.name));
+        }
+        (Some(_), _, _) => {
+            return Err(format!("contact '{}' must set either issi or number/gateway, not both", dto.name));
+        }
+        (None, None, None) => {
+            return Err(format!("contact '{}' must set either issi or number+gateway", dto.name));
+        }
+    };
+    Ok(CfgContact {
+        name: dto.name,
+        callsign: dto.callsign,
+        target,
+        order: dto.order.unwrap_or(0),
+    })
+}
+
 /// Assemble a [`CfgCodeplug`] from the parsed DTO sections. RF resolution errors
 /// (e.g. an off-grid `dl_freq`) surface here; range/cross-reference validation is
 /// performed separately by [`CfgCodeplug::validate`].
@@ -761,6 +1011,8 @@ pub fn codeplug_dto_to_cfg(
     carrier_overrides: Option<Vec<CarrierOverrideDto>>,
     frequency_lists: Option<Vec<FrequencyListDto>>,
     scanlists: Option<Vec<ScanlistDto>>,
+    gateways: Option<Vec<GatewayDto>>,
+    contacts: Option<Vec<ContactDto>>,
 ) -> Result<CfgCodeplug, String> {
     let folders = folders.unwrap_or_default().into_iter().map(folder_dto_to_cfg).collect();
     let talkgroups = talkgroups.unwrap_or_default().into_iter().map(talkgroup_dto_to_cfg).collect();
@@ -776,6 +1028,12 @@ pub fn codeplug_dto_to_cfg(
         .map(frequency_list_dto_to_cfg)
         .collect();
     let scanlists = scanlists.unwrap_or_default().into_iter().map(scanlist_dto_to_cfg).collect();
+    let gateways = gateways.unwrap_or_default().into_iter().map(gateway_dto_to_cfg).collect();
+    let contacts = contacts
+        .unwrap_or_default()
+        .into_iter()
+        .map(contact_dto_to_cfg)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(CfgCodeplug {
         folders,
         talkgroups,
@@ -783,6 +1041,8 @@ pub fn codeplug_dto_to_cfg(
         carrier_overrides,
         frequency_lists,
         scanlists,
+        gateways,
+        contacts,
     })
 }
 
@@ -909,6 +1169,51 @@ pub fn cfg_to_scanlist_dtos(cp: &CfgCodeplug) -> Option<Vec<ScanlistDto>> {
     )
 }
 
+pub fn cfg_to_gateway_dtos(cp: &CfgCodeplug) -> Option<Vec<GatewayDto>> {
+    if cp.gateways.is_empty() {
+        return None;
+    }
+    Some(
+        cp.gateways
+            .iter()
+            .map(|g| GatewayDto {
+                id: g.id.clone(),
+                name: g.name.clone(),
+                kind: g.kind,
+                gateway_issi: g.gateway_issi,
+                prefix: g.prefix.clone(),
+                extra: HashMap::new(),
+            })
+            .collect(),
+    )
+}
+
+pub fn cfg_to_contact_dtos(cp: &CfgCodeplug) -> Option<Vec<ContactDto>> {
+    if cp.contacts.is_empty() {
+        return None;
+    }
+    Some(
+        cp.contacts
+            .iter()
+            .map(|c| {
+                let (issi, number, gateway) = match &c.target {
+                    CfgContactTarget::Issi(issi) => (Some(*issi), None, None),
+                    CfgContactTarget::Phone { number, gateway } => (None, Some(number.clone()), Some(gateway.clone())),
+                };
+                ContactDto {
+                    name: c.name.clone(),
+                    callsign: c.callsign.clone(),
+                    issi,
+                    number,
+                    gateway,
+                    order: Some(c.order),
+                    extra: HashMap::new(),
+                }
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,6 +1327,30 @@ mod tests {
                 active: true,
                 order: 0,
             }],
+            gateways: vec![CfgGateway {
+                id: "pstn".to_string(),
+                name: "Public Phone".to_string(),
+                kind: CfgGatewayKind::Pstn,
+                gateway_issi: 8_000_001,
+                prefix: Some("9".to_string()),
+            }],
+            contacts: vec![
+                CfgContact {
+                    name: "Dispatch Lead".to_string(),
+                    callsign: Some("ALPHA1".to_string()),
+                    target: CfgContactTarget::Issi(2_000_123),
+                    order: 1,
+                },
+                CfgContact {
+                    name: "Front Desk".to_string(),
+                    callsign: None,
+                    target: CfgContactTarget::Phone {
+                        number: "1234".to_string(),
+                        gateway: "pstn".to_string(),
+                    },
+                    order: 2,
+                },
+            ],
         };
         assert!(cp.validate().is_ok(), "{:?}", cp.validate());
     }
@@ -1039,6 +1368,139 @@ mod tests {
             ..CfgCodeplug::default()
         };
         assert!(cp.validate().is_err());
+    }
+
+    fn phone_contact(name: &str, number: &str, gateway: &str) -> CfgContact {
+        CfgContact {
+            name: name.to_string(),
+            callsign: None,
+            target: CfgContactTarget::Phone {
+                number: number.to_string(),
+                gateway: gateway.to_string(),
+            },
+            order: 0,
+        }
+    }
+
+    fn pstn_gateway(id: &str, issi: u32, prefix: Option<&str>) -> CfgGateway {
+        CfgGateway {
+            id: id.to_string(),
+            name: format!("{id} gw"),
+            kind: CfgGatewayKind::Pstn,
+            gateway_issi: issi,
+            prefix: prefix.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn contact_dto_resolves_issi_and_phone_forms() {
+        let issi = contact_dto_to_cfg(ContactDto {
+            name: "A".to_string(),
+            issi: Some(2_000_123),
+            order: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(issi.target, CfgContactTarget::Issi(2_000_123));
+
+        let phone = contact_dto_to_cfg(ContactDto {
+            name: "B".to_string(),
+            number: Some("1234".to_string()),
+            gateway: Some("pabx".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            phone.target,
+            CfgContactTarget::Phone { number: "1234".to_string(), gateway: "pabx".to_string() }
+        );
+    }
+
+    #[test]
+    fn contact_dto_rejects_ambiguous_or_incomplete_targets() {
+        // Both issi and phone.
+        assert!(contact_dto_to_cfg(ContactDto {
+            name: "A".to_string(),
+            issi: Some(1),
+            number: Some("1".to_string()),
+            gateway: Some("g".to_string()),
+            ..Default::default()
+        })
+        .is_err());
+        // number without gateway.
+        assert!(contact_dto_to_cfg(ContactDto {
+            name: "B".to_string(),
+            number: Some("1".to_string()),
+            ..Default::default()
+        })
+        .is_err());
+        // neither.
+        assert!(contact_dto_to_cfg(ContactDto { name: "C".to_string(), ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_phone_contact_with_dangling_gateway() {
+        let cp = CfgCodeplug {
+            contacts: vec![phone_contact("X", "123", "missing")],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_dial_chars_and_overlong_number() {
+        let cp = CfgCodeplug {
+            gateways: vec![pstn_gateway("g", 8_000_001, None)],
+            contacts: vec![phone_contact("X", "12AB", "g")],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err(), "hex letters are not dial digits");
+
+        // gateway prefix (2) + number (23) = 25 digits > 24-digit IE limit.
+        let cp = CfgCodeplug {
+            gateways: vec![pstn_gateway("g", 8_000_001, Some("99"))],
+            contacts: vec![phone_contact("X", &"1".repeat(23), "g")],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err(), "prefix + number must fit 24 digits (cl. 14.8.20)");
+    }
+
+    #[test]
+    fn resolve_phone_contact_applies_gateway_prefix() {
+        let cp = CfgCodeplug {
+            gateways: vec![pstn_gateway("office", 8_000_002, Some("9"))],
+            contacts: vec![phone_contact("Desk", "1234", "office")],
+            ..CfgCodeplug::default()
+        };
+        cp.validate().unwrap();
+        let c = cp.contact("Desk").unwrap();
+        assert_eq!(cp.resolve_phone_contact(c), Some((8_000_002, "91234".to_string())));
+        // An ISSI contact does not resolve as a phone.
+        let issi_contact = CfgContact {
+            name: "N".to_string(),
+            callsign: None,
+            target: CfgContactTarget::Issi(5),
+            order: 0,
+        };
+        assert_eq!(cp.resolve_phone_contact(&issi_contact), None);
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_gateway_and_contact() {
+        let cp = CfgCodeplug {
+            gateways: vec![pstn_gateway("g", 1, None), pstn_gateway("g", 2, None)],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err(), "duplicate gateway id");
+
+        let cp = CfgCodeplug {
+            contacts: vec![
+                CfgContact { name: "Dup".to_string(), callsign: None, target: CfgContactTarget::Issi(1), order: 0 },
+                CfgContact { name: "Dup".to_string(), callsign: None, target: CfgContactTarget::Issi(2), order: 1 },
+            ],
+            ..CfgCodeplug::default()
+        };
+        assert!(cp.validate().is_err(), "duplicate contact name");
     }
 
     fn codeplug_with_scanlist(sl: CfgScanlist) -> CfgCodeplug {

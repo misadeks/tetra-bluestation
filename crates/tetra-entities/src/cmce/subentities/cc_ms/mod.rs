@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, MleHandle, Sap, SsiType, TdmaTime, TetraAddress, Todo};
+use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_pdus::cmce::{
     enums::{
         call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_dl::CmcePduTypeDl,
         disconnect_cause::DisconnectCause, party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant,
     },
-    fields::basic_service_information::BasicServiceInformation,
+    fields::{basic_service_information::BasicServiceInformation, external_subscriber_number},
     pdus::{
         d_alert::DAlert, d_call_proceeding::DCallProceeding, d_call_restore::DCallRestore, d_connect::DConnect,
         d_connect_acknowledge::DConnectAcknowledge, d_disconnect::DDisconnect, d_info::DInfo, d_release::DRelease, d_setup::DSetup,
@@ -108,6 +109,43 @@ mod tests {
     }
 
     #[test]
+    fn mo_external_call_encloses_gateway_issi_and_dialled_digits() {
+        // PABX/PSTN gateway call (cl. 14.5.6.2 / 14.8.20): an individual U-SETUP
+        // addressed to the gateway ISSI (CPTI = SSI) that ALSO carries the dialled
+        // digits in the External subscriber number IE. Decode the emitted PDU with
+        // the same parser the BS uses to prove it is on-air valid.
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        cc.originate_external_call(&mut q, 8000000, "0912345678", default_speech_basic_service(), true, true)
+            .expect("valid dial string");
+        let msg = q.pop_front().expect("U-SETUP should be queued");
+        let SapMsgInner::LcmcMleUnitdataReq(mut prim) = msg.msg else {
+            panic!("expected LcmcMleUnitdataReq");
+        };
+        // Layer-2 is still keyed on the MS's own ISSI (acknowledged basic link).
+        assert_eq!(prim.main_address.ssi, 1234567);
+        let pdu = USetup::from_bitbuf(&mut prim.sdu).expect("valid U-SETUP");
+        assert_eq!(pdu.called_party_type_identifier, PartyTypeIdentifier::Ssi);
+        assert_eq!(pdu.called_party_ssi, Some(8000000), "called party is the gateway ISSI");
+        let esn = pdu.external_subscriber_number.expect("external subscriber number IE present");
+        assert_eq!(external_subscriber_number::decode(&esn).as_deref(), Some("0912345678"));
+    }
+
+    #[test]
+    fn mo_external_call_rejects_invalid_dial_string() {
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        assert!(
+            cc.originate_external_call(&mut q, 8000000, "12AB", default_speech_basic_service(), true, true)
+                .is_err(),
+            "an unencodable number must be refused"
+        );
+        assert!(q.pop_front().is_none(), "no U-SETUP is emitted for an invalid number");
+    }
+
+    #[test]
     fn grant_self_switches_uplane_tx() {
         let mut cc = CcMsSubentity::new(None);
         let mut q = MessageQueue::new();
@@ -135,6 +173,109 @@ mod tests {
             })
         );
         assert!(matches!(q.pop_front().unwrap().msg, SapMsgInner::LcmcMleConfigureReq(_)));
+    }
+
+    /// Regression (cl. 14.5.1.4 / 14.8.31): in a simplex group call the SwMI
+    /// announces a *remote* talker with the "transmission granted" code (0) while
+    /// naming that talker as the transmitting party. Taken literally this MS would
+    /// enter `GrantedSelf` (switch its U-plane to transmit) and the simplex
+    /// self-echo suppression would then drop the remote talker's downlink speech —
+    /// the whole first talk spurt of the call would be silent. Resolving the grant
+    /// to this MS's viewpoint must yield `GrantedOther` so the talker's speech is
+    /// forwarded to the UI.
+    #[test]
+    fn remote_talker_granted_zero_resolves_to_other_and_keeps_audio() {
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false, // simplex
+                route(),
+                true,
+            ),
+        );
+        // A "granted" (0) naming another subscriber as the transmitting party.
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, Some(2200699));
+        let call = cc.call(7).unwrap();
+        assert_eq!(
+            call.tx_grant_state,
+            MsTxGrantState::GrantedOther,
+            "a grant naming another subscriber must not put us in GrantedSelf"
+        );
+        assert_eq!(
+            call.last_uplane,
+            Some(MsUPlaneState { switch_u_plane: true, tx_grant: false, simplex_duplex: false }),
+            "receiving the remote talker: U-plane on, transmit off"
+        );
+        // The remote talker's downlink speech must NOT be suppressed.
+        cc.rx_downlink_traffic(1, false, Some(1), Some(91), &vec![0u8; 274]);
+        assert_eq!(
+            cc.call(7).unwrap().rx_speech_frames,
+            1,
+            "remote talker's speech must be forwarded, not suppressed as self-echo"
+        );
+    }
+
+    /// The dual of the above: when WE are the transmitting party (grant 0 naming
+    /// our own ISSI), the floor is genuinely ours (`GrantedSelf`) and the simplex
+    /// talk-back must still be suppressed so the operator does not hear their own
+    /// voice echoed back (cl. 14.5.1.4).
+    #[test]
+    fn self_talker_granted_zero_still_suppresses_downlink_echo() {
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        cc.calls.insert(
+            7,
+            MsCall::new(
+                7,
+                MsCcState::CallActive,
+                MsCallKind::Group,
+                default_speech_basic_service(),
+                false, // simplex
+                route(),
+                true,
+            ),
+        );
+        cc.apply_transmission_grant(&mut q, 7, TransmissionGrant::Granted, Some(1234567));
+        assert_eq!(cc.call(7).unwrap().tx_grant_state, MsTxGrantState::GrantedSelf);
+        cc.rx_downlink_traffic(1, false, Some(1), Some(91), &vec![0u8; 274]);
+        assert_eq!(
+            cc.call(7).unwrap().rx_speech_frames,
+            0,
+            "our own simplex talk-back must stay suppressed"
+        );
+    }
+
+    /// `resolve_floor_grant` only rewrites a "granted" that names a *different*
+    /// subscriber; genuine self-grants (own ISSI or no named party) and explicit
+    /// grants-to-other are passed through unchanged.
+    #[test]
+    fn resolve_floor_grant_only_rewrites_foreign_granted() {
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        assert_eq!(
+            cc.resolve_floor_grant(TransmissionGrant::Granted, Some(2200699)),
+            TransmissionGrant::GrantedToOtherUser
+        );
+        assert_eq!(
+            cc.resolve_floor_grant(TransmissionGrant::Granted, Some(1234567)),
+            TransmissionGrant::Granted
+        );
+        assert_eq!(
+            cc.resolve_floor_grant(TransmissionGrant::Granted, None),
+            TransmissionGrant::Granted
+        );
+        assert_eq!(
+            cc.resolve_floor_grant(TransmissionGrant::GrantedToOtherUser, Some(2200699)),
+            TransmissionGrant::GrantedToOtherUser
+        );
     }
 
     /// M4b (cl. 14.5.2 / 14.5.1.4): once the call is on a traffic channel (the

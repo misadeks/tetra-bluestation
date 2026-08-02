@@ -278,6 +278,69 @@ order = 1
 
 ---
 
+### `[[gateway]]` — external-network (PABX/PSTN) gateways (optional)
+
+A gateway is an external-network access point that a phone contact dials through. A phone
+call is an ordinary individual call to the gateway's `gateway_issi` (CPTI = SSI) whose
+U-SETUP **also** carries the dialled digits in the External subscriber number IE
+(ETSI TS 100 392-2 cl. 14.8.20); the SwMI's gateway subscriber routes the digits into the
+external network. `kind` (`pstn`|`pabx`) is a **UI label only** — TETRA carries no on-air
+PABX/PSTN flag. `prefix` (optional) is prepended to a contact's number before it is placed
+in the IE (an operator dial-plan access code).
+
+| Key | Type | Description |
+|---|---|---|
+| `id` | string | Unique gateway id (referenced by `contact.gateway`). |
+| `name` | string | Display name. |
+| `kind` | `"pstn"` \| `"pabx"` | UI categorisation (no on-air effect). |
+| `gateway_issi` | int (24-bit ISSI) | The gateway subscriber's ISSI = the U-SETUP called-party SSI. |
+| `prefix` | string (optional) | Access-code digits prepended to the dialled number (digit set `0-9 * # +`). |
+
+```toml
+[[gateway]]
+id = "office-pabx"
+name = "Office PABX"
+kind = "pabx"
+gateway_issi = 8000002
+prefix = "9"                # dial 9 for an outside line
+```
+
+---
+
+### `[[contact]]` — phone book (optional)
+
+A contact is a phone-book entry. It targets **either** an on-network individual (`issi`)
+**or** an external number (`number` + `gateway`) — exactly one form, not both. Contacts are
+data only: selecting one drives an individual or external call origination.
+
+| Key | Type | Description |
+|---|---|---|
+| `name` | string | Unique display name. |
+| `callsign` | string (optional) | Optional callsign. |
+| `issi` | int (24-bit ISSI) | On-network individual target (mutually exclusive with `number`/`gateway`). |
+| `number` | string | External dialled digits `0-9 * # +` (requires `gateway`). |
+| `gateway` | string | `[[gateway]]` `id` for an external-number target (requires `number`). |
+| `order` | int | List sort position. |
+
+A phone contact's `gateway.prefix` + `number` must total **≤ 24 digits** (the External
+subscriber number IE limit, cl. 14.8.20).
+
+```toml
+[[contact]]
+name = "Dispatch Lead"
+callsign = "ALPHA1"
+issi = 2000123
+order = 1
+
+[[contact]]
+name = "Front Desk"
+number = "1234"
+gateway = "office-pabx"
+order = 2
+```
+
+---
+
 ## `[control]` — UI → stack command channel (optional)
 
 The inbound control endpoint the stack connects to (WebSocket + JSON, optional TLS +

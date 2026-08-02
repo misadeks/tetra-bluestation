@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use toml::Value;
 
 use crate::bluestation::{
-    CarrierOverrideDto, CellInfoDto, CfgControlDto, CfgMsDto, DuplexTableDto, FolderDto, FrequencyListDto, NetInfoDto,
-    NetworkDto, ScanlistDto, TalkgroupDto, apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto, cfg_to_carrier_override_dtos,
-    cfg_to_cell_dto, cfg_to_duplex_dto, cfg_to_folder_dtos, cfg_to_frequency_list_dtos, cfg_to_ms_dto, cfg_to_net_dto,
-    cfg_to_network_dtos, cfg_to_phy_dto, cfg_to_scanlist_dtos, cfg_to_talkgroup_dtos, codeplug_dto_to_cfg, duplex_dto_to_cfg,
-    duplex_table_is_default, ms_dto_to_cfg, net_dto_to_cfg,
+    CarrierOverrideDto, CellInfoDto, CfgControlDto, CfgMsDto, ContactDto, DuplexTableDto, FolderDto, FrequencyListDto,
+    GatewayDto, NetInfoDto, NetworkDto, ScanlistDto, TalkgroupDto, apply_control_patch, cell_dto_to_cfg, cfg_control_to_dto,
+    cfg_to_carrier_override_dtos, cfg_to_cell_dto, cfg_to_contact_dtos, cfg_to_duplex_dto, cfg_to_folder_dtos,
+    cfg_to_frequency_list_dtos, cfg_to_gateway_dtos, cfg_to_ms_dto, cfg_to_net_dto, cfg_to_network_dtos, cfg_to_phy_dto,
+    cfg_to_scanlist_dtos, cfg_to_talkgroup_dtos, codeplug_dto_to_cfg, duplex_dto_to_cfg, duplex_table_is_default,
+    ms_dto_to_cfg, net_dto_to_cfg,
 };
 
 use super::config::{StackConfig, StackMode};
@@ -107,7 +108,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
 
     // Build the codeplug (Plane B, optional). RF resolution + validation errors
     // surface here with a descriptive message.
-    let codeplug = codeplug_dto_to_cfg(root.folder, root.talkgroup, root.network, root.carrier_override, root.frequency_list, root.scanlist)?;
+    let codeplug = codeplug_dto_to_cfg(root.folder, root.talkgroup, root.network, root.carrier_override, root.frequency_list, root.scanlist, root.gateway, root.contact)?;
     codeplug.validate()?;
 
     // Build config from required and optional values
@@ -218,6 +219,10 @@ struct TomlConfigRoot {
     frequency_list: Option<Vec<FrequencyListDto>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scanlist: Option<Vec<ScanlistDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gateway: Option<Vec<GatewayDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact: Option<Vec<ContactDto>>,
 
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     extra: HashMap<String, Value>,
@@ -253,6 +258,8 @@ fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
         carrier_override: cfg_to_carrier_override_dtos(&cfg.codeplug),
         frequency_list: cfg_to_frequency_list_dtos(&cfg.codeplug),
         scanlist: cfg_to_scanlist_dtos(&cfg.codeplug),
+        gateway: cfg_to_gateway_dtos(&cfg.codeplug),
+        contact: cfg_to_contact_dtos(&cfg.codeplug),
         extra: HashMap::new(),
     }
 }
