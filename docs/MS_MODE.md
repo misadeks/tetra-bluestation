@@ -180,7 +180,8 @@ Legend:
 | In-call DTMF (post-dial / IVR) | 🧪 | cl. 14.7.2.6, 14.8.19 | `TnccDtmf` control command → U-INFO with the DTMF IE (`dtmf` codec, Tables 14.56–14.58: 3-bit type + 4-bit digits `0-9 * # A-D`, `n ≤ 254`). Tone-start carries digits; tone-end closes. Individual/duplex calls only; stolen from the TCH half-slot (FACCH) like the floor PDUs. |
 | STCH talker identity during group traffic | ✅ | cl. 14 | Remote talker SSI surfaced to the UI. |
 | Concurrent-call arbitration (group must not disrupt a private call) | 🧪 | cl. 14.2.4.1 | Single-transceiver U-plane + channel-allocation gate. |
-| SDS / status — Type-4 text + status codes RX/TX via TNSDS-SAP | 🧪 | cl. 13.3, 14.7 | `sds_ms.rs`: D-SDS-DATA/D-STATUS RX → TNSDS-UNITDATA/STATUS indications; TNSDS-UNITDATA/STATUS requests → U-SDS-DATA/U-STATUS TX. SDS-TL delivery reports (cl. 29) deferred. |
+| SDS / status — Type-4 text + status codes RX/TX via TNSDS-SAP | 🧪 | cl. 13.3, 14.7 | `sds_ms.rs`: D-SDS-DATA/D-STATUS RX → TNSDS-UNITDATA/STATUS indications; TNSDS-UNITDATA/STATUS requests → U-SDS-DATA/U-STATUS TX. |
+| SDS-TL transport — message reference + delivery/read reports | 🧪 | cl. 29.4 | `sds_tl` codec (SDS-TRANSFER/REPORT/ACK/SHORT-REPORT). Send text with a delivery-report request (`TnsdsSendMessage`); auto "received" SDS-REPORT for individually-addressed inbound transfers; inbound reports → `TnsdsReportIndication`; UI "consumed"/read report (`TnsdsSendReport`); `TnsdsCancel`. Message **concatenation** (long multi-part messages, cl. 29.5.14) deferred. |
 | Supplementary services (D-FACILITY) | 📋 | cl. 14 | Minimal; full SS deferred. |
 
 ### 3.6 U-plane (voice)
@@ -199,7 +200,7 @@ Legend:
 | Telemetry (stack→UI) + control (UI→stack) wiring for MS | 🧪 | WebSocket + JSON + TLS + argon2; mock-transport CI green. |
 | Plane A — TNMM indications (REGISTRATION / SERVICE / GROUP-IDENTITY confirm) | 🧪 | Verbatim to cl. 15.3 Tables 15.1–15.7. |
 | Plane A — TNMM requests (REGISTRATION / DEREGISTRATION / GROUP ATTACH-DETACH) | 🧪 | STATUS / ENERGY-SAVING defined-but-dormant. |
-| Plane A — TNSDS indications + requests (UNITDATA / STATUS) | 🧪 | Verbatim to cl. 13.3 Tables 13.1/13.3; Type-4 text + status codes RX/TX. TNSDS-REPORT/CANCEL (SDS-TL) deferred. |
+| Plane A — TNSDS indications + requests (UNITDATA / STATUS / SDS-TL) | 🧪 | Verbatim to cl. 13.3 Tables 13.1/13.2/13.3; Type-4 text + status RX/TX, plus SDS-TL transport (cl. 29): message reference, delivery/read reports (`TnsdsSendMessage`/`TnsdsSendReport`/`TnsdsCancel`, `TnsdsMessageIndication`/`TnsdsReportIndication`). Interface schema `bluestation-ms-interface-5`. Message concatenation deferred. |
 | Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; hybrid apply (structural = restart, operational = live). Config read/staging is serviced as soon as the control link is up — before sync/registration (see below). |
 | Scan lists (codeplug + live activation) | 🧪 | Maps to the group-affiliation superset (cl. 16.8.2). |
 | Contacts + gateways (codeplug phone book) | 🧪 | `[[contact]]` (ISSI or phone) + `[[gateway]]` (PABX/PSTN, `gateway_issi` + optional `prefix`). Plane B data; a phone contact resolves to (gateway ISSI, prefix+number) for an External subscriber number call (cl. 14.8.20). |

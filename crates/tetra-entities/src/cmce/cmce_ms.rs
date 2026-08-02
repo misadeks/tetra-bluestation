@@ -207,6 +207,23 @@ impl CmceMs {
                 );
                 self.tnsds_ack(handle, true, None);
             }
+            // TNSDS-UNITDATA request carrying an SDS-TL SDS-TRANSFER (cl. 29.4.2.4):
+            // text/user message with a message reference + delivery reporting.
+            ControlCommand::TnsdsSendMessage { handle, request } => {
+                self.sds.send_message(queue, &request);
+                self.tnsds_ack(handle, true, None);
+            }
+            // TNSDS-REPORT request (Table 13.2, cl. 13.3.2.2): send an SDS-TL
+            // delivery/read report (SDS-REPORT) for a received message.
+            ControlCommand::TnsdsSendReport { handle, request } => {
+                self.sds.send_report(queue, &request);
+                self.tnsds_ack(handle, true, None);
+            }
+            // TNSDS-CANCEL: stop tracking a locally-outstanding SDS-TL message.
+            ControlCommand::TnsdsCancel { handle, request } => {
+                let found = self.sds.cancel(&request);
+                self.tnsds_ack(handle, found, if found { None } else { Some("no outstanding message with that reference".to_string()) });
+            }
             other => tracing::warn!("CMCE(MS): received non-TNCC control command, dropping: {:?}", other),
         }
     }

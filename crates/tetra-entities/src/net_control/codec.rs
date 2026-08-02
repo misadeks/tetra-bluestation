@@ -307,10 +307,10 @@ mod tests {
                 handle: 7,
                 version: MS_INTERFACE_SCHEMA_VERSION.to_string(),
             })),
-            r#"{"Management":{"InterfaceVersion":{"handle":7,"version":"bluestation-ms-interface-4"}}}"#
+            r#"{"Management":{"InterfaceVersion":{"handle":7,"version":"bluestation-ms-interface-5"}}}"#
         );
         // Guard the frozen constant itself so a bump is a deliberate, visible edit.
-        assert_eq!(MS_INTERFACE_SCHEMA_VERSION, "bluestation-ms-interface-4");
+        assert_eq!(MS_INTERFACE_SCHEMA_VERSION, "bluestation-ms-interface-5");
         assert_eq!(
             enc_resp(&ControlResponse::Management(ManagementResponse::Config {
                 handle: 3,

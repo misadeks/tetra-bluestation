@@ -40,7 +40,7 @@ use crate::tnmm::ServiceStatus;
 /// ([`ManagementCommand::ActivateScanlist`]) and the `active_scanlists` field
 /// on [`MsRuntimeState`]; `1` was the first frozen revision covering T1 TNMM
 /// indications, T2 TNMM requests and T3 management read/write.
-pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-4";
+pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-5";
 
 /// MS registration state, mirrored for the management snapshot (non-standard).
 ///
