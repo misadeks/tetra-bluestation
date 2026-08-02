@@ -2762,6 +2762,23 @@ impl MmMs {
             }
         };
 
+        // Nothing structural is staged (the last SetConfig applied live, or no
+        // config change is pending): a restart would needlessly bounce the radio.
+        // ApplyConfig only exists to apply a STAGED structural change, so with
+        // nothing pending it is a success no-op. This makes the UI's unconditional
+        // "Save then Apply" flow correct for codeplug/operational-only edits, which
+        // have already taken effect live.
+        if !self.restart_required {
+            tracing::info!("MM(MS): ApplyConfig received but no structural change is staged — no restart (already up to date)");
+            self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                handle,
+                accepted: true,
+                restart_required: false,
+                message: "no restart required; configuration is already up to date (last change applied live)".to_string(),
+            }));
+            return;
+        }
+
         // Signal main to exit with the restart code once the loop unwinds, and
         // clear the running flag to break the loop and start the drain.
         ctx.restart_requested.store(true, Ordering::SeqCst);
@@ -6128,6 +6145,9 @@ password = "supersecret"
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         mm.set_management_context(path, restart_requested.clone(), is_running.clone());
 
+        // A structural change is staged and pending a restart.
+        mm.restart_required = true;
+
         dispatcher.send(ControlCommand::Management(ManagementCommand::ApplyConfig { handle: 84 }));
         mm.tick_start(&mut q, TdmaTime::default());
 
@@ -6138,6 +6158,42 @@ password = "supersecret"
         assert!(!is_running.load(std::sync::atomic::Ordering::SeqCst), "run loop stopped");
         // Registered MS begins de-registration (U-ITSI DETACH) on apply.
         assert_eq!(mm.reg_state, RegState::Detaching);
+    }
+
+    /// ApplyConfig is a success no-op when nothing structural is staged
+    /// (`restart_required == false`): it must NOT bounce the radio. This is the
+    /// UI's common "Save then Apply" flow after a codeplug/operational-only edit
+    /// that already took effect live.
+    #[test]
+    fn test_management_apply_config_noop_when_nothing_staged() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        mm.rx_activate_conf(&mut q, &activate_conf(true));
+        deliver_dl(&mut mm, &mut q, build_accept());
+        assert_eq!(mm.reg_state, RegState::Registered);
+        while q.pop_front().is_some() {}
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-apply-noop-{}.toml", std::process::id()));
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path, restart_requested.clone(), is_running.clone());
+
+        // Nothing staged.
+        assert!(!mm.restart_required);
+
+        dispatcher.send(ControlCommand::Management(ManagementCommand::ApplyConfig { handle: 87 }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 87);
+        assert!(accepted, "no-op apply is accepted");
+        assert!(!restart_required);
+        // Radio must NOT be bounced and must NOT de-register.
+        assert!(!restart_requested.load(std::sync::atomic::Ordering::SeqCst), "no restart requested when nothing staged");
+        assert!(is_running.load(std::sync::atomic::Ordering::SeqCst), "run loop keeps running");
+        assert_eq!(mm.reg_state, RegState::Registered, "no de-registration on no-op apply");
     }
 
     /// ApplyConfig without a management context is refused gracefully.
