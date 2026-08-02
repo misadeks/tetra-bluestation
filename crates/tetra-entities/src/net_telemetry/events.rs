@@ -14,8 +14,8 @@ use crate::tnmm::{
     TnmmStatusIndication,
 };
 use tetra_saps::tncc::{
-    TnccAlertIndication, TnccCompleteConfirm, TnccCompleteIndication, TnccNotifyIndication, TnccProceedIndication, TnccReleaseConfirm,
-    TnccReleaseIndication, TnccSetupConfirm, TnccSetupIndication, TnccTxConfirm, TnccTxIndication,
+    TnccAlertIndication, TnccCompleteConfirm, TnccCompleteIndication, TnccDtmfIndication, TnccNotifyIndication, TnccProceedIndication,
+    TnccReleaseConfirm, TnccReleaseIndication, TnccSetupConfirm, TnccSetupIndication, TnccTxConfirm, TnccTxIndication,
 };
 use tetra_saps::tnsds::{TnsdsMessageIndication, TnsdsReportIndication, TnsdsStatusIndication, TnsdsUnitdataIndication};
 
@@ -94,6 +94,12 @@ pub enum TelemetryEvent {
     TnccNotifyIndication {
         call_identifier: u16,
         indication: TnccNotifyIndication,
+    },
+    /// TNCC-DTMF indication (Table 11.3, cl. 11.3.3.3) — DTMF signalling
+    /// received from the infrastructure in a downlink D-INFO (cl. 14.8.19).
+    TnccDtmfIndication {
+        call_identifier: u16,
+        indication: TnccDtmfIndication,
     },
     /// TNCC-PROCEED indication (Table 11.6, cl. 11.3.3.6).
     TnccProceedIndication {

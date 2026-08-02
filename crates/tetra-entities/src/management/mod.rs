@@ -32,6 +32,8 @@ use crate::tnmm::ServiceStatus;
 /// A UI discovers this at runtime via [`ManagementCommand::GetInterfaceVersion`]
 /// so it can gate on the message catalog it was built against. Bump this (and
 /// the documented message catalog) whenever the Plane A/B message shapes change
+/// `6` adds the `TnccDtmfIndication` telemetry event (DTMF signalling received
+/// from the infrastructure in a downlink D-INFO, cl. 14.8.19 / Table 11.3).
 /// `3` adds the manual cell-survey / register-to-cell commands
 /// ([`ManagementCommand::SetCellSelectionMode`], `StartCellScan`,
 /// `StopCellScan`, `CampOnCell`), the `selection_mode_manual` field on
@@ -40,7 +42,7 @@ use crate::tnmm::ServiceStatus;
 /// ([`ManagementCommand::ActivateScanlist`]) and the `active_scanlists` field
 /// on [`MsRuntimeState`]; `1` was the first frozen revision covering T1 TNMM
 /// indications, T2 TNMM requests and T3 management read/write.
-pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-5";
+pub const MS_INTERFACE_SCHEMA_VERSION: &str = "bluestation-ms-interface-6";
 
 /// MS registration state, mirrored for the management snapshot (non-standard).
 ///

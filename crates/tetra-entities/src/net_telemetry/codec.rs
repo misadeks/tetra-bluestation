@@ -342,6 +342,15 @@ mod tests {
                     poll_request: Some(false),
                 },
             },
+            TelemetryEvent::TnccDtmfIndication {
+                call_identifier: 7,
+                indication: t::TnccDtmfIndication {
+                    dtmf_tone_delimiter: Some(t::DtmfToneDelimiter::Dtmf),
+                    dtmf_result: None,
+                    number_of_dtmf_digits: Some(3),
+                    dtmf_digits: Some(vec![t::DtmfDigit::Digit1, t::DtmfDigit::DigitStar, t::DtmfDigit::DigitHash]),
+                },
+            },
             TelemetryEvent::TnccProceedIndication {
                 call_identifier: 7,
                 indication: t::TnccProceedIndication {
@@ -455,6 +464,7 @@ mod tests {
             r#"{"TnccCompleteIndication":{"call_identifier":7,"indication":{"call_time_out":"Value1","notification_indicator":4,"transmission_grant":"TransmissionGranted","transmission_request_permission":"AllowedToRequestForTransmission","transmission_status":"TransmissionGranted"}}}"#,
             r#"{"TnccCompleteConfirm":{"call_identifier":7,"confirm":{"call_time_out":"Value1","notification_indicator":null,"transmission_grant":"TransmissionGranted","transmission_request_permission":"AllowedToRequestForTransmission","transmission_status":"TransmissionGranted"}}}"#,
             r#"{"TnccNotifyIndication":{"call_identifier":7,"indication":{"call_status":"CallContinue","call_time_out_in_set_up_phase":null,"call_time_out":"Value2","call_ownership":"ACallOwner","notification_indicator":5,"poll_response_percentage":null,"poll_response_number":null,"poll_response_addresses":null,"poll_request":false}}}"#,
+            r#"{"TnccDtmfIndication":{"call_identifier":7,"indication":{"dtmf_tone_delimiter":"Dtmf","dtmf_result":null,"number_of_dtmf_digits":3,"dtmf_digits":["Digit1","DigitStar","DigitHash"]}}}"#,
             r#"{"TnccProceedIndication":{"call_identifier":7,"indication":{"basic_service_information_offered":{"circuit_mode_service":"SpeechService","communication_type":"PointToMultipoint","data_service":null,"data_call_capacity":null,"encryption_flag":"ClearEndToEndTransmission","speech_service":"TetraEncodedOneTimeslotSpeech"},"call_status":"CallIsProgressing","hook_method":"NoHookSignallingDirectThroughConnect","notification_indicator":1,"simplex_duplex":"SimplexOperation"}}}"#,
             r#"{"TnccReleaseIndication":{"call_identifier":7,"indication":{"disconnect_cause":"UserRequestedDisconnection","notification_indicator":1}}}"#,
             r#"{"TnccReleaseConfirm":{"call_identifier":7,"confirm":{"disconnect_cause":"UserRequestedDisconnection","disconnect_status":"DisconnectionSuccessful","notification_indicator":null}}}"#,
