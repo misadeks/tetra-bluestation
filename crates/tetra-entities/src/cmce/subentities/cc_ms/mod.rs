@@ -44,9 +44,9 @@ mod uplane;
 // so `CcMsSubentity`'s public API keeps the same type paths as the monolith.
 pub use state::{MsCall, MsCallKind, MsCallTimers, MsCcState, MsTxGrantState, MsUPlaneState};
 use pdu::{
-    default_speech_basic_service, kind_from_basic_service, pdu_basic_from_tncc, pdu_disconnect_cause_from_tncc, tncc_basic_from_pdu,
-    tncc_call_status, tncc_call_status_raw, tncc_call_timeout, tncc_disconnect_cause, tncc_dtmf_indication_from_ie, tncc_setup_timeout,
-    tncc_transmission_grant, tncc_transmission_status_from_grant,
+    decode_external_subscriber_number, default_speech_basic_service, kind_from_basic_service, pdu_basic_from_tncc,
+    pdu_disconnect_cause_from_tncc, tncc_basic_from_pdu, tncc_call_status, tncc_call_status_raw, tncc_call_timeout, tncc_disconnect_cause,
+    tncc_dtmf_indication_from_ie, tncc_setup_timeout, tncc_transmission_grant, tncc_transmission_status_from_grant,
 };
 use state::{CallRoute, PendingOrigination};
 #[cfg(test)]
@@ -751,6 +751,51 @@ mod tests {
         assert!(!saw_tx, "no talker (grant not-granted) must not raise a TNCC-TX indication");
     }
 
+    /// ETSI TS 100 392-2 cl. 14.8.20: a downlink D-SETUP for an incoming call
+    /// from an external (PABX/PSTN) party carries the External subscriber number
+    /// element (the caller's dialled/CLI digits). The MS must forward it to the
+    /// TN in the TNCC-SETUP indication (`external_subscriber_number_calling`),
+    /// and likewise surface the transmitting party's external number from a
+    /// D-TX-GRANTED in the TNCC-TX indication.
+    #[test]
+    fn rx_downlink_external_subscriber_number_forwarded_to_tn() {
+        use tetra_pdus::cmce::fields::external_subscriber_number as esn;
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        while source.try_recv().is_some() {}
+
+        // MT individual call announced by an external caller "+3859123456".
+        let mut pdu = d_setup(7, false);
+        pdu.calling_party_address_ssi = None;
+        pdu.external_subscriber_number = esn::encode("+3859123456");
+        cc.rx_d_setup(&mut q, pdu, route());
+
+        let mut calling_esn = None;
+        while let Some(ev) = source.try_recv() {
+            if let TelemetryEvent::TnccSetupIndication { indication, .. } = ev {
+                calling_esn = indication.external_subscriber_number_calling.clone();
+            }
+        }
+        assert_eq!(calling_esn.as_deref(), Some("+3859123456"), "D-SETUP external number surfaced to the TN");
+
+        // A D-TX-GRANTED naming an external transmitting party "0912345678".
+        let mut tx = d_tx_granted(7);
+        tx.transmission_grant = TransmissionGrant::GrantedToOtherUser as u8;
+        tx.transmitting_party_address_ssi = None;
+        tx.external_subscriber_number = esn::encode("0912345678");
+        cc.rx_d_tx_granted(&mut q, tx, route());
+
+        let mut tx_esn = None;
+        while let Some(ev) = source.try_recv() {
+            if let TelemetryEvent::TnccTxIndication { indication, .. } = ev {
+                tx_esn = indication.external_subscriber_number.clone();
+            }
+        }
+        assert_eq!(tx_esn.as_deref(), Some("0912345678"), "D-TX-GRANTED external number surfaced to the TN");
+    }
+
     /// ETSI TS 100 392-2 cl. 14.5.2.1.2 / 14.5.1.1: while THIS MS holds the floor
     /// (GrantedSelf), a periodic group D-SETUP late-entry re-broadcast carrying a
     /// PREVIOUS talker's calling-party address and a stale GrantedToOtherUser
@@ -854,6 +899,25 @@ mod tests {
             transmission_request_permission: true,
             notification_indicator: None,
             facility: None,
+            proprietary: None,
+        }
+    }
+
+    /// Minimal D-TX-GRANTED for the given call.
+    fn d_tx_granted(call_id: u16) -> DTxGranted {
+        DTxGranted {
+            call_identifier: call_id,
+            transmission_grant: TransmissionGrant::Granted as u8,
+            transmission_request_permission: true,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
             proprietary: None,
         }
     }

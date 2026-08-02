@@ -139,7 +139,7 @@ impl CcMsSubentity {
                         notification_indicator: pdu.notification_indicator.map(|v| v as u8),
                         transmitting_party_ssi: new_speaker,
                         transmitting_party_extension: None,
-                        external_subscriber_number: None,
+                        external_subscriber_number: decode_external_subscriber_number(&pdu.external_subscriber_number),
                         transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
                         transmission_status: tncc_transmission_status_from_grant(grant),
                     },
@@ -184,7 +184,7 @@ impl CcMsSubentity {
                     called_party_extension: None,
                     calling_party_ssi: pdu.calling_party_address_ssi,
                     calling_party_extension: pdu.calling_party_extension,
-                    external_subscriber_number_calling: None,
+                    external_subscriber_number_calling: decode_external_subscriber_number(&pdu.external_subscriber_number),
                     clir_control: None,
                     hook_method_selection: tncc::HookMethodSelection::from_bool(pdu.hook_method_selection),
                     notification_indicator: pdu.notification_indicator.map(|v| v as u8),
@@ -224,7 +224,7 @@ impl CcMsSubentity {
                         notification_indicator: pdu.notification_indicator.map(|v| v as u8),
                         transmitting_party_ssi: pdu.calling_party_address_ssi,
                         transmitting_party_extension: pdu.calling_party_extension,
-                        external_subscriber_number: None,
+                        external_subscriber_number: decode_external_subscriber_number(&pdu.external_subscriber_number),
                         transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
                         transmission_status: tncc_transmission_status_from_grant(grant),
                     },
@@ -377,7 +377,7 @@ impl CcMsSubentity {
         }
     }
 
-    fn rx_d_tx_granted(&mut self, queue: &mut MessageQueue, pdu: DTxGranted, route: CallRoute) {
+    pub(in crate::cmce::subentities::cc_ms) fn rx_d_tx_granted(&mut self, queue: &mut MessageQueue, pdu: DTxGranted, route: CallRoute) {
         tracing::info!(
             call_identifier = pdu.call_identifier,
             grant = pdu.transmission_grant,
@@ -425,7 +425,7 @@ impl CcMsSubentity {
                             notification_indicator: pdu.notification_indicator.map(|v| v as u8),
                             transmitting_party_ssi: pdu.transmitting_party_address_ssi.map(|v| v as u32).or(call.current_speaker_ssi),
                             transmitting_party_extension: pdu.transmitting_party_extension.map(|v| v as u32),
-                            external_subscriber_number: None,
+                            external_subscriber_number: decode_external_subscriber_number(&pdu.external_subscriber_number),
                             transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(
                                 pdu.transmission_request_permission,
                             ),
@@ -587,7 +587,7 @@ impl CcMsSubentity {
                 notification_indicator: pdu.notification_indicator.map(|v| v as u8),
                 transmitting_party_ssi: pdu.transmitting_party_address_ssi.map(|v| v as u32),
                 transmitting_party_extension: pdu.transmitting_party_extension.map(|v| v as u32),
-                external_subscriber_number: None,
+                external_subscriber_number: decode_external_subscriber_number(&pdu.external_subscriber_number),
                 transmit_request_permission: tncc::TransmissionRequestPermission::from_bool(pdu.transmission_request_permission),
                 transmission_status: tncc::TransmissionStatus::TransmissionInterrupt,
             },

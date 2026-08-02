@@ -331,6 +331,13 @@ pub(super) fn tncc_call_status_raw(status: u8) -> Option<tncc::CallStatus> {
     })
 }
 
+/// Decode an External subscriber number type-3 element (cl. 14.8.20 / Table
+/// 14.59) received in a downlink PDU into its dialled digit string, for
+/// forwarding to the TN. `None` when the element is absent or malformed.
+pub(super) fn decode_external_subscriber_number(field: &Option<Type3FieldGeneric>) -> Option<String> {
+    field.as_ref().and_then(external_subscriber_number::decode)
+}
+
 /// Map a 4-bit DTMF digit code (Table 14.57) to its TNCC [`tncc::DtmfDigit`].
 pub(super) fn dtmf_nibble_to_digit(nibble: u8) -> Option<tncc::DtmfDigit> {
     Some(match nibble {
