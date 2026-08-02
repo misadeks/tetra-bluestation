@@ -350,6 +350,11 @@ pub struct CfgCodeplug {
     pub gateways: Vec<CfgGateway>,
     /// Programmed contacts (phone book).
     pub contacts: Vec<CfgContact>,
+    /// Home-mode display SDS protocol identifier (cl. 29.4.3.9): the 8-bit SDS-TL
+    /// protocol identifier this radio uses for a "home mode display" status/text
+    /// message sent to another radio's home screen. Data only — the UI reads it
+    /// when composing such a message. `None` = not programmed.
+    pub home_display_pid: Option<u8>,
 }
 
 impl CfgCodeplug {
@@ -364,6 +369,7 @@ impl CfgCodeplug {
             && self.scanlists.is_empty()
             && self.gateways.is_empty()
             && self.contacts.is_empty()
+            && self.home_display_pid.is_none()
     }
 
     /// Scan lists in display order (`order` ascending, ties broken by `name`).
@@ -456,6 +462,12 @@ impl CfgCodeplug {
     /// Look up a gateway by id.
     pub fn gateway(&self, id: &str) -> Option<&CfgGateway> {
         self.gateways.iter().find(|g| g.id == id)
+    }
+
+    /// The programmed home-mode display SDS protocol identifier (cl. 29.4.3.9),
+    /// if any. Data only — used by the UI when composing a home-display message.
+    pub fn home_display_pid(&self) -> Option<u8> {
+        self.home_display_pid
     }
 
     /// Resolve a phone contact to the values a call origination needs: the
@@ -860,6 +872,16 @@ pub struct GatewayDto {
     pub extra: HashMap<String, Value>,
 }
 
+/// Scalar codeplug-wide settings (the `[codeplug]` table). Distinct from the
+/// arrays-of-tables sections (folders/talkgroups/…), which stay top-level.
+#[derive(Default, Deserialize, Serialize)]
+pub struct CodeplugSettingsDto {
+    /// Home-mode display SDS protocol identifier (cl. 29.4.3.9).
+    pub home_display_pid: Option<u8>,
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
 #[derive(Default, Deserialize, Serialize)]
 pub struct ContactDto {
     pub name: String,
@@ -1013,6 +1035,7 @@ pub fn codeplug_dto_to_cfg(
     scanlists: Option<Vec<ScanlistDto>>,
     gateways: Option<Vec<GatewayDto>>,
     contacts: Option<Vec<ContactDto>>,
+    settings: Option<CodeplugSettingsDto>,
 ) -> Result<CfgCodeplug, String> {
     let folders = folders.unwrap_or_default().into_iter().map(folder_dto_to_cfg).collect();
     let talkgroups = talkgroups.unwrap_or_default().into_iter().map(talkgroup_dto_to_cfg).collect();
@@ -1034,6 +1057,7 @@ pub fn codeplug_dto_to_cfg(
         .into_iter()
         .map(contact_dto_to_cfg)
         .collect::<Result<Vec<_>, _>>()?;
+    let home_display_pid = settings.and_then(|s| s.home_display_pid);
     Ok(CfgCodeplug {
         folders,
         talkgroups,
@@ -1043,6 +1067,16 @@ pub fn codeplug_dto_to_cfg(
         scanlists,
         gateways,
         contacts,
+        home_display_pid,
+    })
+}
+
+/// Project the scalar codeplug settings back to the `[codeplug]` DTO table
+/// (`None` when nothing scalar is programmed).
+pub fn cfg_to_codeplug_settings_dto(cp: &CfgCodeplug) -> Option<CodeplugSettingsDto> {
+    cp.home_display_pid.map(|pid| CodeplugSettingsDto {
+        home_display_pid: Some(pid),
+        extra: HashMap::new(),
     })
 }
 
@@ -1351,6 +1385,7 @@ mod tests {
                     order: 2,
                 },
             ],
+            home_display_pid: Some(130),
         };
         assert!(cp.validate().is_ok(), "{:?}", cp.validate());
     }
@@ -1463,6 +1498,21 @@ mod tests {
             ..CfgCodeplug::default()
         };
         assert!(cp.validate().is_err(), "prefix + number must fit 24 digits (cl. 14.8.20)");
+    }
+
+    #[test]
+    fn home_display_pid_round_trips_via_settings_dto() {
+        let cp = codeplug_dto_to_cfg(None, None, None, None, None, None, None, None, Some(CodeplugSettingsDto {
+            home_display_pid: Some(130),
+            extra: HashMap::new(),
+        }))
+        .unwrap();
+        assert_eq!(cp.home_display_pid(), Some(130));
+        assert!(!cp.is_empty(), "a programmed home_display_pid makes the codeplug non-empty");
+        let dto = cfg_to_codeplug_settings_dto(&cp).expect("settings dto present");
+        assert_eq!(dto.home_display_pid, Some(130));
+        // Absent by default.
+        assert!(cfg_to_codeplug_settings_dto(&CfgCodeplug::default()).is_none());
     }
 
     #[test]
