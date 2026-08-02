@@ -189,11 +189,18 @@ impl StackConfig {
     }
 }
 
-/// Global shared configuration: immutable config + mutable state.
+/// Global shared configuration: hot-swappable config + mutable state.
+///
+/// `cfg` is held behind a `RwLock<Arc<..>>` so the whole configuration can be
+/// atomically hot-swapped at runtime (Plane B `SetConfig` live apply) while every
+/// `SharedConfig` clone — held by all entities — observes the new value on its
+/// next [`SharedConfig::config`] call. Reads clone the inner `Arc` (cheap); the
+/// swap is rare (only on an operational `SetConfig`). Structural changes still
+/// require a restart; only operational (codeplug) changes are hot-swapped.
 #[derive(Clone)]
 pub struct SharedConfig {
-    /// Read-only configuration (immutable after construction).
-    cfg: Arc<StackConfig>,
+    /// Hot-swappable configuration snapshot.
+    cfg: Arc<RwLock<Arc<StackConfig>>>,
     /// Mutable state guarded with RwLock (write by the stack, read by others).
     state: Arc<RwLock<StackState>>,
 }
@@ -207,14 +214,27 @@ impl SharedConfig {
         }
 
         Self {
-            cfg: Arc::new(cfg),
+            cfg: Arc::new(RwLock::new(Arc::new(cfg))),
             state: Arc::new(RwLock::new(state.unwrap_or_default())),
         }
     }
 
-    /// Access immutable config.
+    /// Access the current configuration snapshot. Returns an `Arc` so callers get
+    /// a stable view even if a concurrent live apply swaps the config mid-read.
     pub fn config(&self) -> Arc<StackConfig> {
-        Arc::clone(&self.cfg)
+        Arc::clone(&self.cfg.read().expect("StackConfig RwLock poisoned"))
+    }
+
+    /// Hot-swap the whole configuration (Plane B `SetConfig` live apply). Every
+    /// `SharedConfig` clone observes `new` on its next [`config`](Self::config)
+    /// call. Used only for operational (codeplug) changes; structural changes
+    /// must go through a restart. Panics if `new` fails validation (the caller is
+    /// expected to have validated it already).
+    pub fn apply_config_live(&self, new: StackConfig) {
+        if let Err(e) = new.validate() {
+            panic!("apply_config_live: refusing to install invalid configuration: {}", e);
+        }
+        *self.cfg.write().expect("StackConfig RwLock poisoned") = Arc::new(new);
     }
 
     /// Read guard for mutable state.
