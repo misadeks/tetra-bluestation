@@ -127,6 +127,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
             | ControlCommand::TnccSetupResponse { .. }
             | ControlCommand::TnccComplete { .. }
             | ControlCommand::TnccTx { .. }
+            | ControlCommand::TnccDtmf { .. }
             | ControlCommand::TnccRelease { .. }
             // U-plane uplink speech (cl. 14.5.1.4) is owned by CMCE CC-MS.
             | ControlCommand::MsUplinkSpeech { .. }

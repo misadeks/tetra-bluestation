@@ -104,4 +104,88 @@ impl CcMsSubentity {
         self.configure_uplane(queue, call_identifier, false, false, simplex_duplex);
         true
     }
+
+    /// TNCC-DTMF request (Table 11.3, cl. 11.3.3.3): send in-call DTMF as a
+    /// U-INFO PDU carrying the DTMF IE (PDU cl. 14.7.2.6; IE cl. 14.8.19).
+    ///
+    /// DTMF is meaningful only on a through-connected point-to-point (individual
+    /// / duplex) call — typically a PABX/PSTN gateway call where the digits post-
+    /// dial an extension or navigate an IVR. It is refused for a group call and
+    /// for an unknown call identifier. The U-INFO is carried like the floor PDUs
+    /// (cl. 14.5.2): stolen from the assigned TCH half-slot (FACCH) once the call
+    /// is on a traffic channel, otherwise on the control channel — keyed on the
+    /// MS's own ISSI so the SwMI's acknowledgement matches (cl. 22.3.2.3), with
+    /// the call correlated by the Call identifier IE inside the PDU (cl. 14.8.4).
+    ///
+    /// `dtmf_tone_delimiter = Dtmf` sends a "tone start" element carrying the
+    /// digits; `= ToneEnd` sends a "tone end" element (no digits). Returns an
+    /// error describing why the request was rejected (no U-INFO is emitted then).
+    pub fn handle_tncc_dtmf(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_identifier: u16,
+        request: &tncc::TnccDtmfRequest,
+    ) -> Result<(), String> {
+        let own_issi = self.own_issi;
+        let Some(call) = self.calls.get(&call_identifier) else {
+            return Err(format!("TNCC-DTMF for unknown call identifier {call_identifier}"));
+        };
+        if call.kind != MsCallKind::Individual {
+            return Err("TNCC-DTMF is only valid on an individual/duplex (point-to-point) call".to_string());
+        }
+        let dtmf_ie = match request.dtmf_tone_delimiter {
+            tncc::DtmfToneDelimiter::Dtmf => {
+                let digits = request.dtmf_digits.as_deref().unwrap_or(&[]);
+                if digits.is_empty() {
+                    return Err("TNCC-DTMF tone-start requires at least one digit".to_string());
+                }
+                if let Some(n) = request.number_of_dtmf_digits {
+                    if n as usize != digits.len() {
+                        return Err(format!(
+                            "TNCC-DTMF number_of_dtmf_digits ({n}) disagrees with dtmf_digits ({})",
+                            digits.len()
+                        ));
+                    }
+                }
+                let nibbles: Vec<u8> = digits.iter().map(|d| dtmf_digit_nibble(*d)).collect();
+                dtmf::encode_tone_start(&nibbles)
+                    .ok_or_else(|| format!("TNCC-DTMF has too many digits ({}, max 254)", nibbles.len()))?
+            }
+            tncc::DtmfToneDelimiter::ToneEnd => dtmf::encode_tone_end(),
+        };
+        let pdu = UInfo {
+            call_identifier,
+            poll_response: false,
+            modify: None,
+            dtmf: Some(dtmf_ie),
+            facility: None,
+            proprietary: None,
+        };
+        let (route, stealing) = floor_route(call, own_issi);
+        self.send_pdu(queue, &pdu, route, stealing, stealing);
+        Ok(())
+    }
+}
+
+/// Map a TNCC DTMF digit to its 4-bit DTMF-digit code (ETSI TS 100 392-2
+/// cl. 14.8.19a / Table 14.57).
+fn dtmf_digit_nibble(d: tncc::DtmfDigit) -> u8 {
+    match d {
+        tncc::DtmfDigit::Digit0 => 0x0,
+        tncc::DtmfDigit::Digit1 => 0x1,
+        tncc::DtmfDigit::Digit2 => 0x2,
+        tncc::DtmfDigit::Digit3 => 0x3,
+        tncc::DtmfDigit::Digit4 => 0x4,
+        tncc::DtmfDigit::Digit5 => 0x5,
+        tncc::DtmfDigit::Digit6 => 0x6,
+        tncc::DtmfDigit::Digit7 => 0x7,
+        tncc::DtmfDigit::Digit8 => 0x8,
+        tncc::DtmfDigit::Digit9 => 0x9,
+        tncc::DtmfDigit::DigitStar => 0xA,
+        tncc::DtmfDigit::DigitHash => 0xB,
+        tncc::DtmfDigit::DigitA => 0xC,
+        tncc::DtmfDigit::DigitB => 0xD,
+        tncc::DtmfDigit::DigitC => 0xE,
+        tncc::DtmfDigit::DigitD => 0xF,
+    }
 }
