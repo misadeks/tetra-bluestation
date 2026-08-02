@@ -12,6 +12,17 @@ use super::subentities::cc_ms::CcMsSubentity;
 use super::subentities::sds_ms::SdsMsSubentity;
 use super::subentities::ss_ms::SsMsSubentity;
 
+/// Maximum valid 24-bit SSI (ETSI TS 100 392-2 cl. 7). A called/destination SSI
+/// outside `1..=MAX_SSI` cannot be encoded into a Called party SSI element
+/// (cl. 14.8.28) — attempting it panics the PDU serialiser — so such a value is
+/// refused to the TN with a negative ack instead of crashing the stack.
+const MAX_SSI: u32 = 0xFF_FFFF;
+
+/// True when `ssi` cannot be carried as a Called party SSI (0 or > 24 bits).
+fn ssi_out_of_range(ssi: u32) -> bool {
+    ssi == 0 || ssi > MAX_SSI
+}
+
 pub struct CmceMs {
     config: SharedConfig,
 
@@ -188,36 +199,68 @@ impl CmceMs {
             // TNSDS-UNITDATA request (Table 13.3, cl. 13.3.2.3): send SDS user
             // data uplink as a U-SDS-DATA PDU (cl. 14.7.2.8).
             ControlCommand::TnsdsUnitdata { handle, request } => {
-                self.sds.send_u_sds_data(
-                    queue,
-                    request.called_party_ssi,
-                    request.called_party_is_group,
-                    request.user_data,
-                );
-                self.tnsds_ack(handle, true, None);
+                if ssi_out_of_range(request.called_party_ssi) {
+                    self.tnsds_ack(
+                        handle,
+                        false,
+                        Some(format!("called party SSI {} is out of range (cl. 7: a 24-bit SSI is 1..=16777215)", request.called_party_ssi)),
+                    );
+                } else {
+                    self.sds.send_u_sds_data(
+                        queue,
+                        request.called_party_ssi,
+                        request.called_party_is_group,
+                        request.user_data,
+                    );
+                    self.tnsds_ack(handle, true, None);
+                }
             }
             // TNSDS-STATUS request (Table 13.1, cl. 13.3.2.1): send a pre-coded
             // status uplink as a U-STATUS PDU (cl. 14.7.2.7).
             ControlCommand::TnsdsStatus { handle, request } => {
-                self.sds.send_u_status(
-                    queue,
-                    request.called_party_ssi,
-                    request.called_party_is_group,
-                    request.status_number,
-                );
-                self.tnsds_ack(handle, true, None);
+                if ssi_out_of_range(request.called_party_ssi) {
+                    self.tnsds_ack(
+                        handle,
+                        false,
+                        Some(format!("called party SSI {} is out of range (cl. 7: a 24-bit SSI is 1..=16777215)", request.called_party_ssi)),
+                    );
+                } else {
+                    self.sds.send_u_status(
+                        queue,
+                        request.called_party_ssi,
+                        request.called_party_is_group,
+                        request.status_number,
+                    );
+                    self.tnsds_ack(handle, true, None);
+                }
             }
             // TNSDS-UNITDATA request carrying an SDS-TL SDS-TRANSFER (cl. 29.4.2.4):
             // text/user message with a message reference + delivery reporting.
             ControlCommand::TnsdsSendMessage { handle, request } => {
-                self.sds.send_message(queue, &request);
-                self.tnsds_ack(handle, true, None);
+                if ssi_out_of_range(request.called_party_ssi) {
+                    self.tnsds_ack(
+                        handle,
+                        false,
+                        Some(format!("called party SSI {} is out of range (cl. 7: a 24-bit SSI is 1..=16777215)", request.called_party_ssi)),
+                    );
+                } else {
+                    self.sds.send_message(queue, &request);
+                    self.tnsds_ack(handle, true, None);
+                }
             }
             // TNSDS-REPORT request (Table 13.2, cl. 13.3.2.2): send an SDS-TL
             // delivery/read report (SDS-REPORT) for a received message.
             ControlCommand::TnsdsSendReport { handle, request } => {
-                self.sds.send_report(queue, &request);
-                self.tnsds_ack(handle, true, None);
+                if ssi_out_of_range(request.called_party_ssi) {
+                    self.tnsds_ack(
+                        handle,
+                        false,
+                        Some(format!("report destination SSI {} is out of range (cl. 7: a 24-bit SSI is 1..=16777215)", request.called_party_ssi)),
+                    );
+                } else {
+                    self.sds.send_report(queue, &request);
+                    self.tnsds_ack(handle, true, None);
+                }
             }
             // TNSDS-CANCEL: stop tracking a locally-outstanding SDS-TL message.
             ControlCommand::TnsdsCancel { handle, request } => {
