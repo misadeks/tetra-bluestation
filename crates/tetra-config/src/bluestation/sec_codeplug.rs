@@ -350,11 +350,31 @@ pub struct CfgCodeplug {
     pub gateways: Vec<CfgGateway>,
     /// Programmed contacts (phone book).
     pub contacts: Vec<CfgContact>,
-    /// Home-mode display SDS protocol identifier (cl. 29.4.3.9): the 8-bit SDS-TL
-    /// protocol identifier this radio uses for a "home mode display" status/text
-    /// message sent to another radio's home screen. Data only — the UI reads it
-    /// when composing such a message. `None` = not programmed.
-    pub home_display_pid: Option<u8>,
+    /// Home-mode display feature settings (a `[codeplug.home_display]` sub-table).
+    /// `None` = not programmed (feature absent).
+    pub home_display: Option<CfgHomeDisplay>,
+}
+
+/// Home-mode display feature (codeplug setting, Plane B, data only).
+///
+/// Controls whether this radio composes a "home mode display" status/text
+/// message (shown on another radio's home screen) and which SDS protocol
+/// identifier it uses for it. Read by the UI when composing such a message; no
+/// on-air behaviour is driven by the stack itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CfgHomeDisplay {
+    /// Whether the home-mode display feature is enabled.
+    pub enabled: bool,
+    /// SDS protocol identifier (8-bit, ETSI TS 100 392-2 cl. 29.4.3.9) used for
+    /// the home-display message. `130` (0x82) = Text Messaging with SDS-TL.
+    pub pid: u8,
+}
+
+impl Default for CfgHomeDisplay {
+    fn default() -> Self {
+        // Default PID = Text Messaging with SDS-TL (0x82); disabled until turned on.
+        CfgHomeDisplay { enabled: false, pid: 130 }
+    }
 }
 
 impl CfgCodeplug {
@@ -369,7 +389,7 @@ impl CfgCodeplug {
             && self.scanlists.is_empty()
             && self.gateways.is_empty()
             && self.contacts.is_empty()
-            && self.home_display_pid.is_none()
+            && self.home_display.is_none()
     }
 
     /// Scan lists in display order (`order` ascending, ties broken by `name`).
@@ -464,10 +484,10 @@ impl CfgCodeplug {
         self.gateways.iter().find(|g| g.id == id)
     }
 
-    /// The programmed home-mode display SDS protocol identifier (cl. 29.4.3.9),
-    /// if any. Data only — used by the UI when composing a home-display message.
-    pub fn home_display_pid(&self) -> Option<u8> {
-        self.home_display_pid
+    /// The programmed home-mode display feature settings, if any. Data only —
+    /// used by the UI when composing a home-display message.
+    pub fn home_display(&self) -> Option<&CfgHomeDisplay> {
+        self.home_display.as_ref()
     }
 
     /// Resolve a phone contact to the values a call origination needs: the
@@ -876,8 +896,18 @@ pub struct GatewayDto {
 /// arrays-of-tables sections (folders/talkgroups/…), which stay top-level.
 #[derive(Default, Deserialize, Serialize)]
 pub struct CodeplugSettingsDto {
-    /// Home-mode display SDS protocol identifier (cl. 29.4.3.9).
-    pub home_display_pid: Option<u8>,
+    /// Home-mode display feature (a `[codeplug.home_display]` sub-table).
+    pub home_display: Option<HomeDisplayDto>,
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Home-mode display feature settings (`[codeplug.home_display]`).
+#[derive(Default, Deserialize, Serialize)]
+pub struct HomeDisplayDto {
+    pub enabled: Option<bool>,
+    /// SDS protocol identifier (cl. 29.4.3.9); defaults to 130 (text messaging).
+    pub pid: Option<u8>,
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, Value>,
 }
@@ -1057,7 +1087,10 @@ pub fn codeplug_dto_to_cfg(
         .into_iter()
         .map(contact_dto_to_cfg)
         .collect::<Result<Vec<_>, _>>()?;
-    let home_display_pid = settings.and_then(|s| s.home_display_pid);
+    let home_display = settings.and_then(|s| s.home_display).map(|hd| CfgHomeDisplay {
+        enabled: hd.enabled.unwrap_or(false),
+        pid: hd.pid.unwrap_or(130),
+    });
     Ok(CfgCodeplug {
         folders,
         talkgroups,
@@ -1067,15 +1100,19 @@ pub fn codeplug_dto_to_cfg(
         scanlists,
         gateways,
         contacts,
-        home_display_pid,
+        home_display,
     })
 }
 
 /// Project the scalar codeplug settings back to the `[codeplug]` DTO table
 /// (`None` when nothing scalar is programmed).
 pub fn cfg_to_codeplug_settings_dto(cp: &CfgCodeplug) -> Option<CodeplugSettingsDto> {
-    cp.home_display_pid.map(|pid| CodeplugSettingsDto {
-        home_display_pid: Some(pid),
+    cp.home_display.map(|hd| CodeplugSettingsDto {
+        home_display: Some(HomeDisplayDto {
+            enabled: Some(hd.enabled),
+            pid: Some(hd.pid),
+            extra: HashMap::new(),
+        }),
         extra: HashMap::new(),
     })
 }
@@ -1385,7 +1422,7 @@ mod tests {
                     order: 2,
                 },
             ],
-            home_display_pid: Some(130),
+            home_display: Some(CfgHomeDisplay { enabled: true, pid: 130 }),
         };
         assert!(cp.validate().is_ok(), "{:?}", cp.validate());
     }
@@ -1501,18 +1538,34 @@ mod tests {
     }
 
     #[test]
-    fn home_display_pid_round_trips_via_settings_dto() {
+    fn home_display_round_trips_via_settings_dto() {
         let cp = codeplug_dto_to_cfg(None, None, None, None, None, None, None, None, Some(CodeplugSettingsDto {
-            home_display_pid: Some(130),
+            home_display: Some(HomeDisplayDto {
+                enabled: Some(true),
+                pid: Some(130),
+                extra: HashMap::new(),
+            }),
             extra: HashMap::new(),
         }))
         .unwrap();
-        assert_eq!(cp.home_display_pid(), Some(130));
-        assert!(!cp.is_empty(), "a programmed home_display_pid makes the codeplug non-empty");
+        assert_eq!(cp.home_display(), Some(&CfgHomeDisplay { enabled: true, pid: 130 }));
+        assert!(!cp.is_empty(), "a programmed home_display makes the codeplug non-empty");
         let dto = cfg_to_codeplug_settings_dto(&cp).expect("settings dto present");
-        assert_eq!(dto.home_display_pid, Some(130));
+        let hd = dto.home_display.expect("home_display present");
+        assert_eq!(hd.enabled, Some(true));
+        assert_eq!(hd.pid, Some(130));
         // Absent by default.
         assert!(cfg_to_codeplug_settings_dto(&CfgCodeplug::default()).is_none());
+    }
+
+    #[test]
+    fn home_display_defaults_pid_when_only_enabled() {
+        let cp = codeplug_dto_to_cfg(None, None, None, None, None, None, None, None, Some(CodeplugSettingsDto {
+            home_display: Some(HomeDisplayDto { enabled: Some(true), pid: None, extra: HashMap::new() }),
+            extra: HashMap::new(),
+        }))
+        .unwrap();
+        assert_eq!(cp.home_display(), Some(&CfgHomeDisplay { enabled: true, pid: 130 }), "pid defaults to 130");
     }
 
     #[test]
