@@ -648,7 +648,7 @@ impl CcMsSubentity {
         self.calls.remove(&pdu.call_identifier);
     }
 
-    fn rx_d_info(&mut self, _queue: &mut MessageQueue, pdu: DInfo, route: CallRoute) {
+    pub(in crate::cmce::subentities::cc_ms) fn rx_d_info(&mut self, _queue: &mut MessageQueue, pdu: DInfo, route: CallRoute) {
         let mut new_key = None;
         if let Some(call) = self.calls.get_mut(&pdu.call_identifier) {
             call.route = route;
@@ -698,6 +698,18 @@ impl CcMsSubentity {
                 poll_request: Some(pdu.poll_request),
             },
         });
+
+        // DTMF signalling from the infrastructure (cl. 14.8.19, Table 14.58):
+        // forward it to the TN over TNCC-DTMF (Table 11.3, cl. 11.3.3.3). An
+        // unrecognised/reserved DTMF type is dropped rather than surfaced.
+        if let Some(field) = pdu.dtmf.as_ref() {
+            if let Some(indication) = tncc_dtmf_indication_from_ie(field) {
+                self.emit(TelemetryEvent::TnccDtmfIndication {
+                    call_identifier: new_key.unwrap_or(pdu.call_identifier),
+                    indication,
+                });
+            }
+        }
     }
 
     fn rx_d_call_restore(&mut self, queue: &mut MessageQueue, pdu: DCallRestore, route: CallRoute) {

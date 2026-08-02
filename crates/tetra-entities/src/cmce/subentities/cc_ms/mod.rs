@@ -45,8 +45,8 @@ mod uplane;
 pub use state::{MsCall, MsCallKind, MsCallTimers, MsCcState, MsTxGrantState, MsUPlaneState};
 use pdu::{
     default_speech_basic_service, kind_from_basic_service, pdu_basic_from_tncc, pdu_disconnect_cause_from_tncc, tncc_basic_from_pdu,
-    tncc_call_status, tncc_call_status_raw, tncc_call_timeout, tncc_disconnect_cause, tncc_setup_timeout, tncc_transmission_grant,
-    tncc_transmission_status_from_grant,
+    tncc_call_status, tncc_call_status_raw, tncc_call_timeout, tncc_disconnect_cause, tncc_dtmf_indication_from_ie, tncc_setup_timeout,
+    tncc_transmission_grant, tncc_transmission_status_from_grant,
 };
 use state::{CallRoute, PendingOrigination};
 #[cfg(test)]
@@ -240,6 +240,81 @@ mod tests {
         );
         assert!(cc.handle_tncc_dtmf(&mut q, 8, &tone_start).is_err(), "DTMF not valid on a group call");
         assert!(q.pop_front().is_none(), "no U-INFO emitted on rejection");
+    }
+
+    /// Inbound DTMF (cl. 14.8.19 / Table 14.58): a downlink D-INFO carrying a
+    /// DTMF type-3 element is surfaced to the TN as a TNCC-DTMF indication
+    /// (Table 11.3). Tone-start digits, tone-end, and the "not supported"
+    /// result are all forwarded; a reserved type is dropped.
+    #[test]
+    fn rx_d_info_dtmf_surfaces_tncc_dtmf_indication() {
+        let (sink, source) = telemetry_channel();
+        let mut cc = CcMsSubentity::new(Some(sink));
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        active_individual_call(&mut cc, 7);
+        while source.try_recv().is_some() {}
+
+        let d_info_with_dtmf = |dtmf: Option<Type3FieldGeneric>| DInfo {
+            call_identifier: 7,
+            reset_call_time_out_timer_t310_: false,
+            poll_request: false,
+            new_call_identifier: None,
+            call_time_out: None,
+            call_time_out_set_up_phase_t301_t302_: None,
+            call_ownership: None,
+            modify: None,
+            call_status: None,
+            temporary_address: None,
+            notification_indicator: None,
+            poll_response_percentage: None,
+            poll_response_number: None,
+            dtmf,
+            facility: None,
+            poll_response_addresses: None,
+            proprietary: None,
+        };
+        let drain_dtmf = |source: &crate::net_telemetry::TelemetrySource| -> Option<tncc::TnccDtmfIndication> {
+            let mut out = None;
+            while let Some(ev) = source.try_recv() {
+                if let TelemetryEvent::TnccDtmfIndication { call_identifier, indication } = ev {
+                    assert_eq!(call_identifier, 7);
+                    out = Some(indication);
+                }
+            }
+            out
+        };
+
+        // Tone-start with digits "12*#".
+        cc.rx_d_info(&mut q, d_info_with_dtmf(dtmf::encode_tone_start_digits("12*#")), route());
+        let ind = drain_dtmf(&source).expect("tone-start DTMF surfaced");
+        assert_eq!(ind.dtmf_tone_delimiter, Some(tncc::DtmfToneDelimiter::Dtmf));
+        assert_eq!(ind.number_of_dtmf_digits, Some(4));
+        assert_eq!(
+            ind.dtmf_digits,
+            Some(vec![tncc::DtmfDigit::Digit1, tncc::DtmfDigit::Digit2, tncc::DtmfDigit::DigitStar, tncc::DtmfDigit::DigitHash])
+        );
+
+        // Tone-end.
+        cc.rx_d_info(&mut q, d_info_with_dtmf(Some(dtmf::encode_tone_end())), route());
+        let ind = drain_dtmf(&source).expect("tone-end DTMF surfaced");
+        assert_eq!(ind.dtmf_tone_delimiter, Some(tncc::DtmfToneDelimiter::ToneEnd));
+        assert_eq!(ind.dtmf_digits, None);
+
+        // "DTMF not supported" result (type 010).
+        let not_supported = Type3FieldGeneric {
+            field_id: tetra_pdus::cmce::enums::type3_elem_id::CmceType3ElemId::Dtmf.into_raw(),
+            len: 3,
+            data: vec![dtmf::DTMF_TYPE_NOT_SUPPORTED << 5],
+        };
+        cc.rx_d_info(&mut q, d_info_with_dtmf(Some(not_supported)), route());
+        let ind = drain_dtmf(&source).expect("not-supported DTMF surfaced");
+        assert_eq!(ind.dtmf_tone_delimiter, None);
+        assert_eq!(ind.dtmf_result, Some(tncc::DtmfResult::DtmfNotSupported));
+
+        // A D-INFO without any DTMF element raises no TNCC-DTMF indication.
+        cc.rx_d_info(&mut q, d_info_with_dtmf(None), route());
+        assert!(drain_dtmf(&source).is_none(), "no DTMF element => no TNCC-DTMF indication");
     }
 
     #[test]

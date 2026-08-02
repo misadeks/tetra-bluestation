@@ -331,6 +331,71 @@ pub(super) fn tncc_call_status_raw(status: u8) -> Option<tncc::CallStatus> {
     })
 }
 
+/// Map a 4-bit DTMF digit code (Table 14.57) to its TNCC [`tncc::DtmfDigit`].
+pub(super) fn dtmf_nibble_to_digit(nibble: u8) -> Option<tncc::DtmfDigit> {
+    Some(match nibble {
+        0x0 => tncc::DtmfDigit::Digit0,
+        0x1 => tncc::DtmfDigit::Digit1,
+        0x2 => tncc::DtmfDigit::Digit2,
+        0x3 => tncc::DtmfDigit::Digit3,
+        0x4 => tncc::DtmfDigit::Digit4,
+        0x5 => tncc::DtmfDigit::Digit5,
+        0x6 => tncc::DtmfDigit::Digit6,
+        0x7 => tncc::DtmfDigit::Digit7,
+        0x8 => tncc::DtmfDigit::Digit8,
+        0x9 => tncc::DtmfDigit::Digit9,
+        0xA => tncc::DtmfDigit::DigitStar,
+        0xB => tncc::DtmfDigit::DigitHash,
+        0xC => tncc::DtmfDigit::DigitA,
+        0xD => tncc::DtmfDigit::DigitB,
+        0xE => tncc::DtmfDigit::DigitC,
+        0xF => tncc::DtmfDigit::DigitD,
+        _ => return None,
+    })
+}
+
+/// Build a TNCC-DTMF indication (Table 11.3, cl. 11.3.3.3) from a received DTMF
+/// type-3 element (cl. 14.8.19, Table 14.58). Returns `None` when the element
+/// does not decode or carries a reserved/unrecognised DTMF type, so an
+/// unexpected downlink DTMF is dropped rather than surfaced as a malformed
+/// indication.
+pub(super) fn tncc_dtmf_indication_from_ie(field: &Type3FieldGeneric) -> Option<tncc::TnccDtmfIndication> {
+    let ie = dtmf::decode(field)?;
+    match ie.dtmf_type {
+        dtmf::DTMF_TYPE_TONE_START => {
+            let digits: Vec<tncc::DtmfDigit> = ie.nibbles.iter().map(|n| dtmf_nibble_to_digit(*n)).collect::<Option<_>>()?;
+            if digits.is_empty() {
+                return None;
+            }
+            Some(tncc::TnccDtmfIndication {
+                dtmf_tone_delimiter: Some(tncc::DtmfToneDelimiter::Dtmf),
+                dtmf_result: None,
+                number_of_dtmf_digits: Some(digits.len() as u8),
+                dtmf_digits: Some(digits),
+            })
+        }
+        dtmf::DTMF_TYPE_TONE_END => Some(tncc::TnccDtmfIndication {
+            dtmf_tone_delimiter: Some(tncc::DtmfToneDelimiter::ToneEnd),
+            dtmf_result: None,
+            number_of_dtmf_digits: None,
+            dtmf_digits: None,
+        }),
+        dtmf::DTMF_TYPE_NOT_SUPPORTED => Some(tncc::TnccDtmfIndication {
+            dtmf_tone_delimiter: None,
+            dtmf_result: Some(tncc::DtmfResult::DtmfNotSupported),
+            number_of_dtmf_digits: None,
+            dtmf_digits: None,
+        }),
+        dtmf::DTMF_TYPE_NOT_SUBSCRIBED => Some(tncc::TnccDtmfIndication {
+            dtmf_tone_delimiter: None,
+            dtmf_result: Some(tncc::DtmfResult::DtmfNotSubscribed),
+            number_of_dtmf_digits: None,
+            dtmf_digits: None,
+        }),
+        _ => None,
+    }
+}
+
 pub(super) fn tncc_disconnect_cause(cause: DisconnectCause) -> tncc::DisconnectCause {
     match cause {
         DisconnectCause::CauseNotDefinedOrUnknown => tncc::DisconnectCause::CauseNotDefinedOrUnknown,

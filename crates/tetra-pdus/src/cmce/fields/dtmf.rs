@@ -22,6 +22,10 @@ pub const MAX_DTMF_DIGITS: usize = 254;
 /// DTMF type codes (Table 14.58).
 pub const DTMF_TYPE_TONE_START: u8 = 0b000;
 pub const DTMF_TYPE_TONE_END: u8 = 0b001;
+/// DTMF not supported by the infrastructure (Table 14.58).
+pub const DTMF_TYPE_NOT_SUPPORTED: u8 = 0b010;
+/// DTMF not subscribed for this user (Table 14.58).
+pub const DTMF_TYPE_NOT_SUBSCRIBED: u8 = 0b011;
 
 /// Map a DTMF digit character to its 4-bit code (Table 14.57). `None` for an
 /// unsupported character.
