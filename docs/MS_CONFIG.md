@@ -78,9 +78,14 @@ startup RX carrier, but it is not required.)
 
 ---
 
-## `[net_info]` — home network
+## `[net_info]` — home network (shared)
 
-The MCC/MNC of the network this MS belongs to (used for cell suitability and MM addressing).
+The MCC/MNC of the network this MS belongs to — its **home network**, used for MM addressing
+(TSI/registration) and cell suitability. This is a **shared, top-level** section (BS mode uses
+it to define a cell; MS mode uses it as the home identity). It is conceptually part of the MS
+codeplug, but because it is shared with BS mode it lives at the top level rather than under
+`[codeplug]`. The codeplug's `[[network]]` list programs **additional** allowed networks; the
+home network here is always allowed.
 
 | Key | Type | Bits | Description |
 |---|---|---|---|
@@ -89,15 +94,15 @@ The MCC/MNC of the network this MS belongs to (used for cell suitability and MM 
 
 ---
 
-## `[cell_info]` — non-RF cell identity
+## `[cell_info]` — cell identity/RF (**not needed for MS**)
 
-For a radio-style MS the RF band/carrier/duplex parameters are **learned over the air**,
-so this block keeps only non-RF identity fields.
-
-| Key | Type | Description |
-|---|---|---|
-| `location_area` | int | Location Area identifier (LA). |
-| `colour_code` | int | Colour code, distinguishes adjacent cells on the same frequency. |
+`[cell_info]` defines a cell's identity and RF. **BS mode requires it** (it authors the cell).
+**MS mode does not need it and may omit the whole section**: a radio-style MS learns cell
+identity and RF entirely over the air from the serving cell's D-MLE-SYNC/SYSINFO
+(EN 300 392-2 cl. 18.4.2) — RF from the scan, colour code from SYNC, location area from
+registration. If present in an MS config it is ignored functionally (`location_area` is only a
+pre-registration seed; `colour_code` fills a cosmetic state field). A canonical MS config
+(and the serializer's output) omits `[cell_info]` entirely.
 
 ---
 

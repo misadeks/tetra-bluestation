@@ -60,15 +60,21 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
     if !root.net_info.extra.is_empty() {
         return Err(format!("Unrecognized fields in net_info: {:?}", sorted_keys(&root.net_info.extra)).into());
     }
-    if !root.cell_info.extra.is_empty() {
-        return Err(format!("Unrecognized fields in cell_info: {:?}", sorted_keys(&root.cell_info.extra)).into());
+    if let Some(ref ci) = root.cell_info {
+        if !ci.extra.is_empty() {
+            return Err(format!("Unrecognized fields in cell_info: {:?}", sorted_keys(&ci.extra)).into());
+        }
     }
 
     // BS mode defines the cell, so its RF must be authored explicitly. A
-    // radio-style MS omits these (RX seeded from the scan list, UL derived from
-    // the cell's SYSINFO at camp time).
+    // radio-style MS omits [cell_info] entirely (RX seeded from the scan list,
+    // UL + cell identity derived from the cell's SYNC/SYSINFO at camp time).
     if root.stack_mode == StackMode::Bs {
-        if root.cell_info.main_carrier.is_none() || root.cell_info.freq_band.is_none() {
+        let has_rf = root
+            .cell_info
+            .as_ref()
+            .is_some_and(|ci| ci.main_carrier.is_some() && ci.freq_band.is_some());
+        if !has_rf {
             return Err("BS mode requires [cell_info] main_carrier and freq_band".into());
         }
         if let Some(ref soapy) = root.phy_io.soapysdr {
@@ -117,7 +123,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         debug_log: root.debug_log,
         phy_io: phy_dto_to_cfg(root.phy_io),
         net: net_dto_to_cfg(root.net_info),
-        cell: cell_dto_to_cfg(root.cell_info),
+        cell: cell_dto_to_cfg(root.cell_info.unwrap_or_default()),
         duplex_table: match root.duplex_table {
             Some(dt) => duplex_dto_to_cfg(dt)?,
             None => Default::default(),
@@ -193,7 +199,11 @@ struct TomlConfigRoot {
 
     phy_io: PhyIoDto,
     net_info: NetInfoDto,
-    cell_info: CellInfoDto,
+    /// Cell identity/RF. Required for BS mode (it defines the cell); optional for
+    /// MS mode, which learns cell identity and RF entirely over the air from
+    /// SYNC / SYSINFO (EN 300 392-2 cl. 18.4.2), so an MS config may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_info: Option<CellInfoDto>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     brew: Option<CfgBrewDto>,
@@ -244,7 +254,13 @@ fn cfg_to_root(cfg: &StackConfig) -> TomlConfigRoot {
         debug_log: cfg.debug_log.clone(),
         phy_io: cfg_to_phy_dto(&cfg.phy_io),
         net_info: cfg_to_net_dto(&cfg.net),
-        cell_info: cfg_to_cell_dto(&cfg.cell),
+        // MS learns cell identity/RF over the air, so a canonical MS config omits
+        // [cell_info]; BS authors it explicitly.
+        cell_info: if cfg.stack_mode == StackMode::Bs {
+            Some(cfg_to_cell_dto(&cfg.cell))
+        } else {
+            None
+        },
         brew: cfg.brew.as_ref().map(cfg_brew_to_dto),
         telemetry: cfg.telemetry.as_ref().map(cfg_telemetry_to_dto),
         command: cfg.control.as_ref().map(cfg_control_to_dto),
@@ -419,10 +435,10 @@ attach_groups = []
         assert_eq!(cfg.stack_mode, reparsed.stack_mode);
         assert_eq!(cfg.net.mcc, reparsed.net.mcc);
         assert_eq!(cfg.net.mnc, reparsed.net.mnc);
-        assert_eq!(cfg.cell.freq_band, reparsed.cell.freq_band);
-        assert_eq!(cfg.cell.main_carrier, reparsed.cell.main_carrier);
-        assert_eq!(cfg.cell.location_area, reparsed.cell.location_area);
-        assert_eq!(cfg.cell.colour_code, reparsed.cell.colour_code);
+        // A canonical MS config omits [cell_info] (cell identity/RF is learned
+        // over the air), so it is not part of the round-trip. Confirm the
+        // rendered output drops the section.
+        assert!(!rendered.contains("[cell_info]"), "MS config must not serialize a [cell_info] section");
         let soapy_a = cfg.phy_io.soapysdr.as_ref().expect("soapy");
         let soapy_b = reparsed.phy_io.soapysdr.as_ref().expect("soapy reparsed");
         assert_eq!(soapy_a.dl_freq, soapy_b.dl_freq);
@@ -469,6 +485,46 @@ mode = "List"
 frequencies = [439825000, 439850000]
 dwell_ms = 800
 "#;
+
+    #[test]
+    fn ms_without_any_cell_info_section_parses_and_validates() {
+        // A radio-style MS may omit the [cell_info] table entirely — cell
+        // identity/RF is learned over the air (SYNC/SYSINFO, cl. 18.4.2).
+        let toml = r#"
+config_version = "0.7"
+stack_mode = "Ms"
+
+[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+device = "driver=sx"
+sample_rate = 600000
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[ms]
+issi = 1000001
+subscriber_class = 1
+attach_groups = []
+
+[[frequency_list]]
+name = "primary"
+mode = "List"
+frequencies = [439825000]
+dwell_ms = 800
+"#;
+        let cfg = from_toml_str(toml).expect("parse MS without [cell_info]");
+        cfg.validate().expect("validate MS without [cell_info]");
+        // Cell defaults are harmless for MS (unused / seed values).
+        assert_eq!(cfg.cell.location_area, 0);
+        assert_eq!(cfg.cell.main_carrier, 0);
+        // Rendered canonical MS config still omits [cell_info].
+        let rendered = to_toml_string(&cfg).expect("serialize");
+        assert!(!rendered.contains("[cell_info]"));
+    }
 
     #[test]
     fn ms_without_fixed_rf_seeds_rx_and_validates() {

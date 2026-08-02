@@ -4,10 +4,20 @@
 # Radio-style programming: an MS is programmed by DOWNLINK. It does NOT hard-code
 # a serving carrier or duplex spacing. Instead it scans the [[frequency_list]]
 # carriers, selects the best suitable cell, and adopts that cell's RF / uplink /
-# duplex parameters from its own D-MLE-SYNC/SYSINFO at camp time (EN 300 392-2
-# cl. 18.4.2). So there is no tx_freq/rx_freq and no [cell_info] RF block here:
+# duplex / identity from its own D-MLE-SYNC/SYSINFO at camp time (EN 300 392-2
+# cl. 18.4.2). So there is no tx_freq/rx_freq and NO [cell_info] section here:
 #   - initial RX (downlink) center = first [[frequency_list]] scan candidate
-#   - uplink (TX) = derived from the camped cell's SYSINFO (unset until camped)
+#   - uplink (TX), colour code, location area = learned over the air once camped
+#
+# File layout:
+#   1. Global      - config_version, stack_mode
+#   2. [phy_io]    - SDR back end
+#   3. [net_info]  - home network (MCC/MNC) — shared identity, see note below
+#   4. [duplex_table]
+#   5. [ms]        - this radio's identity/affiliation (required for MS)
+#   6. CODEPLUG    - all Plane B programming grouped together:
+#                    settings, networks, frequencies, folders, talkgroups,
+#                    gateways, contacts
 
 config_version = "0.7"
 
@@ -18,11 +28,9 @@ stack_mode = "Ms"
 # debug_log = "./verbose_log.txt"
 
 ###############################################################################
-
-# PHY layer i/o configuration
-
+# 2. PHY layer i/o configuration
+###############################################################################
 [phy_io]
-
 # Input type: set to SoapySdr. May allow for future non-soapy RF backends.
 backend = "SoapySdr"
 
@@ -51,10 +59,8 @@ tx_antenna = "TX"
 rx_gain_lna = 48.0
 rx_gain_pga = 8.0
 
-# TX gains. MS uplink transmission is NOT active in the current receive-only
-# build (uplink/registration land in later phases), so these are kept low to
-# avoid any accidental drive. Raise them only once uplink TX is implemented
-# and you know your MS RF chain (PA MAX 21 on the mixer if using the IT PA).
+# TX gains. Raise only once you know your MS RF chain (PA MAX 21 on the mixer if
+# using the IT PA).
 tx_gain_dac = 0.0
 tx_gain_mixer = 0.0
 
@@ -63,39 +69,34 @@ tx_gain_mixer = 0.0
 # ul_rx_file    = "./ul_output.bin"  # save received RF samples to file
 
 ###############################################################################
-
-# Network Information - home network (MCC/MNC) the MS belongs to.
+# 3. Home network (MCC/MNC).
+#
+# NOTE: [net_info] is a SHARED, top-level section (BS mode defines a cell with
+# it; MS mode uses it as its HOME network identity for registration/TSI and cell
+# suitability). It is conceptually part of the MS codeplug, but because it is
+# shared with BS mode it lives here rather than under [codeplug]. The codeplug's
+# [[network]] list (below) programs ADDITIONAL allowed networks; the home network
+# here is always allowed.
+###############################################################################
 [net_info]
 # Mobile Country Code (MCC), 10-bit
 mcc = 901
 # Mobile Network Code (MNC), 14-bit
 mnc = 9999
 
-# Cell Information. For a radio-style MS the RF band/carrier/duplex parameters
-# are NOT configured here: they are learned over the air from the serving cell's
-# own D-MLE-SYNC/SYSINFO once camped (EN 300 392-2 cl. 18.4.2). The MS finds the
-# cell by scanning the [[frequency_list]] carriers above. Only non-RF identity
-# fields (e.g. location_area) are kept here.
-[cell_info]
-# Location Area identifier
-location_area = 1
-
-# Colour code, distinguishes adjacent cells on the same frequency.
-colour_code = 1
-
 ###############################################################################
-
-# Duplex-spacing table (OPTIONAL, TS 100 392-15 cl. 6). A programmed radio may
+# 4. Duplex-spacing table (OPTIONAL, TS 100 392-15 cl. 6). A programmed radio may
 # override the standardized duplex spacing for specific 3-bit duplex indices.
 # Each entry is [duplex_index (0-7), spacing_hz]; unlisted indices use the ETSI
 # defaults for the operating band. Index 7 has no ETSI default, so we program it
 # here to the 9.4 MHz spacing this network uses.
+###############################################################################
 [duplex_table]
 overrides = [[7, 9400000]]
 
 ###############################################################################
-
-# Mobile Station (MS) identity/affiliation. REQUIRED when stack_mode = "Ms".
+# 5. Mobile Station (MS) identity/affiliation. REQUIRED when stack_mode = "Ms".
+###############################################################################
 [ms]
 # Own Individual Short Subscriber Identity (ISSI), 24-bit (1..=16777215).
 # CHANGE THIS to your MS's own address before uplink/registration phases.
@@ -106,23 +107,94 @@ issi = 1000001
 subscriber_class = 1
 
 # Group identities (GSSIs) to attach to once registered. Empty = receive-only
-# monitoring (no uplink), which matches the current phase.
+# monitoring (no uplink).
 attach_groups = []
 
 ###############################################################################
-# CODEPLUG (Plane B, non-standard management structure). Data only: read by the
-# management/TNMM UI and (in a later phase) the scan/camp engine. All values map
-# to real air-interface elements and are validated against their ETSI ranges.
+# 6. CODEPLUG (Plane B, non-standard management structure). Data only: read by
+# the management/TNMM UI and the scan/camp engine. All values map to real
+# air-interface elements and are validated against their ETSI ranges.
 #
-# Radio model: the MS is programmed with a list of TALKGROUPS (the user-
-# selectable "channels", organized into FOLDERS), a list of allowed NETWORKS, and
-# a set of downlink FREQUENCIES to SCAN. The radio scans those frequencies (or a
-# carrier range), finds the strongest suitable serving cell whose network is
-# allowed, camps on it, and derives its uplink/duplex from that cell's SYSINFO.
+# Radio model: the MS is programmed with codeplug-wide SETTINGS, a list of
+# allowed NETWORKS, downlink FREQUENCIES to SCAN (+ optional per-carrier
+# overrides), a set of user-selectable TALKGROUPS organized into FOLDERS, plus a
+# phone book (GATEWAYS + CONTACTS). The radio scans the frequencies, camps on the
+# best suitable cell whose network is allowed, and derives RF/uplink over the air.
+#
+# Everything from here to the end of the file is the codeplug.
 ###############################################################################
 
-# Group folders for organizing talkgroups in the UI tree. `order` sets the
-# folder's position (ascending; ties broken by name).
+# --- 6.1 Codeplug-wide settings / feature toggles (scalar) ------------------
+[codeplug]
+
+# Home-mode display: a status/text message shown on another radio's home screen.
+# `enabled` toggles the feature; `pid` is the 8-bit SDS protocol identifier
+# (ETSI TS 100 392-2 cl. 29.4.3.9) used for it — 130 (0x82) = Text Messaging with
+# SDS-TL. Data only (read by the UI when composing a home-display message).
+[codeplug.home_display]
+enabled = true
+pid = 130
+
+# --- 6.2 Allowed networks ----------------------------------------------------
+# A cell is only suitable if its MCC/MNC is listed here (or equals the home
+# network in [net_info], which is always allowed). `priority` picks the preferred
+# network first (ascending).
+[[network]]
+mcc = 901
+mnc = 9999
+name = "Home"
+priority = 0
+
+# --- 6.3 Frequency lists (downlink carriers to scan) -------------------------
+# Define one or more named lists; the radio scans ALL lists combined into a
+# single candidate set (duplicates removed) and camps on the best suitable cell.
+#   mode = "List"  -> scan the explicitly listed frequencies
+#   mode = "Range" -> enumerate a carrier range (see [frequency_list.range] below)
+# With no [[frequency_list]] programmed, the MS does not scan.
+[[frequency_list]]
+name = "primary"
+mode = "List"
+frequencies = [439825000, 439850000]
+dwell_ms = 800
+
+# Range-based list example (uncomment to add to the scan set). The range is a
+# single-bracket sub-table (one range per list), NOT a [[...]] array of tables.
+# `offsets` (Hz) probes carrier offsets; TETRA allows only 0, 6250, -6250, 12500.
+# [[frequency_list]]
+# name = "band4-sweep"
+# mode = "Range"
+# dwell_ms = 800
+#
+# [frequency_list.range]
+# band = 4
+# start_carrier = 1500
+# stop_carrier = 1700
+# step = 1
+# offsets = [0, 6250, 12500]
+
+# --- 6.4 Carrier overrides (OPTIONAL) ----------------------------------------
+# Pin extra camp parameters to one specific downlink frequency, applied when the
+# scanner lands on it. Program by explicit band+carrier (+optional freq_offset)
+# OR by absolute dl_freq (Hz). `colour_code` restricts camping to a cell with
+# that colour code; `rx_only` suppresses uplink; `custom_duplex_spacing`/
+# `duplex_index` override the derived duplex spacing.
+[[carrier_override]]
+name = "BS-1"
+band = 4
+carrier = 1593                      # 439.825 MHz DL
+freq_offset = 0
+colour_code = 1
+duplex_index = 7
+custom_duplex_spacing = 9400000
+rx_only = true
+
+[[carrier_override]]
+name = "BS-2"
+dl_freq = 439850000                 # same as band 4 / carrier 1594
+rx_only = true
+
+# --- 6.5 Folders (UI grouping of talkgroups) ---------------------------------
+# `order` sets the folder's position (ascending; ties broken by name).
 [[folder]]
 id = "work"
 name = "Work"
@@ -133,9 +205,9 @@ id = "test"
 name = "Test Net"
 order = 2
 
-# Talkgroups: the user-selectable groups (GSSI = 24-bit; class_of_usage = 3-bit,
-# EN 300 392-2 group identity). `order` sets the position within the folder
-# (ascending; ties broken by name).
+# --- 6.6 Talkgroups (user-selectable groups) ---------------------------------
+# GSSI = 24-bit; class_of_usage = 3-bit (EN 300 392-2 group identity). `order`
+# sets the position within the folder (ascending; ties broken by name).
 [[talkgroup]]
 gssi = 101
 name = "Dispatch"
@@ -156,76 +228,22 @@ name = "Test 1"
 folder = "test"
 order = 1
 
-# Allowed networks (codeplug-wide). A cell is only suitable if its MCC/MNC is
-# listed here. `priority` picks the preferred network first (ascending). If no
-# [[network]] is programmed, only the home MCC/MNC from [net_info] is allowed.
-[[network]]
-mcc = 901
-mnc = 9999
-name = "Home"
-priority = 0
+# --- 6.7 Scan lists (OPTIONAL) -----------------------------------------------
+# Named sets of talkgroups the MS affiliates to together (cl. 16.8.2). Each GSSI
+# must be a talkgroup above. `active` is the programmed default (toggleable live
+# from the UI). Uncomment to program one.
+# [[scanlist]]
+# name = "Work"
+# talkgroups = [101, 102]
+# active = true
+# order = 1
 
-# Carrier overrides (OPTIONAL): pin extra camp parameters to one specific
-# downlink frequency, applied when the scanner lands on it. Program by explicit
-# band+carrier (+optional freq_offset) OR by absolute dl_freq (Hz). `colour_code`
-# restricts camping to a cell with that colour code; `rx_only` suppresses uplink;
-# `custom_duplex_spacing`/`duplex_index` override the derived duplex spacing.
-[[carrier_override]]
-name = "BS-1"
-band = 4
-carrier = 1593                      # 439.825 MHz DL
-freq_offset = 0
-colour_code = 1
-duplex_index = 7
-custom_duplex_spacing = 9400000
-rx_only = true
-
-[[carrier_override]]
-name = "BS-2"
-dl_freq = 439850000                 # same as band 4 / carrier 1594
-rx_only = true
-
-# Frequency lists — the candidate downlink carriers the MS scans to find a serving
-# cell. Define one or more named lists; the radio scans ALL lists combined into a
-# single candidate set (duplicates removed) and camps on the best suitable cell.
-#   mode = "List"  -> scan the explicitly listed frequencies
-#   mode = "Range" -> enumerate a carrier range (see [frequency_list.range] below)
-# A single-frequency "camp on one carrier" setup is just a List with one frequency.
-# With no [[frequency_list]] programmed, the MS does not scan.
-[[frequency_list]]
-name = "primary"
-mode = "List"
-frequencies = [439825000, 439850000]
-dwell_ms = 800
-
-# Range-based list example. Enumerates band 4 carriers from start to stop in `step`
-# carrier units (multiples of 25 kHz). Uncomment to add it to the scan set. The range
-# is a single-bracket sub-table (one range per list), NOT a [[...]] array of tables.
-# The optional `offsets` list probes carrier offsets (Hz) per carrier; TETRA allows
-# only 0, 6250, -6250, 12500 (D-MLE-SYNC Offset field). Omitted = [0] (raster only).
-# [[frequency_list]]
-# name = "band4-sweep"
-# mode = "Range"
-# dwell_ms = 800
-#
-# [frequency_list.range]
-# band = 4
-# start_carrier = 1500
-# stop_carrier = 1700
-# step = 1
-# offsets = [0, 6250, 12500]
-
-
-###############################################################################
-# CONTACTS & GATEWAYS (Plane B codeplug, data only)
-###############################################################################
-
-# External-network gateways (PABX/PSTN). A phone contact reaches the external
-# network via an ordinary individual call to the gateway's `gateway_issi`
-# (CPTI = SSI) that also carries the dialled digits in the External subscriber
-# number IE (ETSI TS 100 392-2 cl. 14.8.20). `kind` (pstn|pabx) is a UI label
-# only — TETRA carries no on-air PABX/PSTN flag. `prefix` (optional) is prepended
-# to a contact's number before it is placed in the IE (an operator access code).
+# --- 6.8 Gateways (external-network PABX/PSTN access points) ------------------
+# A phone contact reaches the external network via an ordinary individual call to
+# the gateway's `gateway_issi` (CPTI = SSI) that also carries the dialled digits
+# in the External subscriber number IE (ETSI TS 100 392-2 cl. 14.8.20).
+# `kind` (pstn|pabx) is a UI label only — TETRA carries no on-air PABX/PSTN flag.
+# `prefix` (optional) is prepended to the number before it is placed in the IE.
 [[gateway]]
 id = "pstn"
 name = "Public Phone"
@@ -239,8 +257,9 @@ kind = "pabx"
 gateway_issi = 8000002
 prefix = "9"                         # dial 9 for an outside line
 
-# Contacts (phone book). Each entry is EITHER an on-network individual (`issi`)
-# OR an external number (`number` + `gateway`). `callsign` is optional.
+# --- 6.9 Contacts (phone book) -----------------------------------------------
+# Each entry is EITHER an on-network individual (`issi`) OR an external number
+# (`number` + `gateway`). `callsign` is optional.
 [[contact]]
 name = "Dispatch Lead"
 callsign = "ALPHA1"
@@ -258,17 +277,3 @@ name = "Emergency"
 number = "112"
 gateway = "pstn"
 order = 3
-
-###############################################################################
-# CODEPLUG-WIDE SETTINGS (scalar). Optional single [codeplug] table for
-# codeplug-wide values and feature toggles that are not arrays-of-tables.
-###############################################################################
-[codeplug]
-
-# Home-mode display: a status/text message shown on another radio's home screen.
-# `enabled` toggles the feature; `pid` is the 8-bit SDS protocol identifier
-# (ETSI TS 100 392-2 cl. 29.4.3.9) used for it — 130 (0x82) = Text Messaging with
-# SDS-TL. Data only (read by the UI when composing a home-display message).
-[codeplug.home_display]
-enabled = true
-pid = 130
