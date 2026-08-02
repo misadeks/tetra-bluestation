@@ -426,6 +426,13 @@ The live-vs-restart decision is made by `is_operational_only_change`: it clears 
 both the running and incoming config and compares the remainder; if only the codeplug differs the
 change is applied live, otherwise a restart is required.
 
+> **`ApplyConfig` is a no-op when nothing structural is staged.** A UI that always issues
+> `SetConfig` followed by `ApplyConfig` will *not* bounce the radio after a codeplug/operational-only
+> edit: because that `SetConfig` already applied live and left `restart_required = false`, the
+> subsequent `ApplyConfig` returns success without restarting or de-registering. `ApplyConfig` only
+> performs the drain-and-restart when a **structural** change is actually staged
+> (`restart_required = true`).
+
 > **Availability before registration.** `GetConfig`, `SetConfig`, and `ApplyConfig` are
 > serviced as soon as the control link is up — independent of registration or service
 > state (including out of service, and before the MS has ever synced to a base station).

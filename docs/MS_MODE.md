@@ -228,7 +228,10 @@ Legend:
 > **live** — the new `StackConfig` is hot-swapped into the shared `SharedConfig` so every entity
 > reads it on its next `config()` call, with no restart and no process bounce (`restart_required`
 > stays false) — while a **structural** edit is only staged and reported `restart_required = true`,
-> taking effect on the next `ApplyConfig` restart. `GetConfig` returns the live active codeplug
+> taking effect on the next `ApplyConfig` restart. `ApplyConfig` itself is a **no-op** when nothing
+> structural is staged (`restart_required = false`), so a UI that unconditionally issues
+> `SetConfig`+`ApplyConfig` never needlessly bounces the radio after a codeplug-only edit.
+> `GetConfig` returns the live active codeplug
 > (secrets redacted) regardless of `registration_state` / `service_status`.
 >
 > The live/structural split is decided by `tetra_config::bluestation::is_operational_only_change`,
