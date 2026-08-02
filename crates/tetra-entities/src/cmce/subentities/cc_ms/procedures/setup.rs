@@ -16,6 +16,7 @@ impl CcMsSubentity {
             false,
             false,
             request_to_transmit,
+            None,
         );
     }
 
@@ -35,7 +36,44 @@ impl CcMsSubentity {
             true,
             simplex_duplex_selection,
             request_to_transmit,
+            None,
         );
+    }
+
+    /// U-SETUP for an MO external (PABX/PSTN gateway) call (cl. 14.5.6.2; PDU
+    /// cl. 14.7.2.10). The call is an ordinary individual set-up addressed to the
+    /// gateway subscriber's ISSI (`gateway_issi`, CPTI = SSI) that *additionally*
+    /// carries the dialled digits in the External subscriber number IE
+    /// (cl. 14.8.20). The SwMI's gateway subscriber routes the digits into the
+    /// external network. `digits` are the already-composed dial string (any
+    /// codeplug access-code prefix applied by the caller); an unencodable number
+    /// (empty, > 24 digits, or an invalid character per Table 14.59) is refused
+    /// rather than sending a malformed U-SETUP.
+    pub fn originate_external_call(
+        &mut self,
+        queue: &mut MessageQueue,
+        gateway_issi: u32,
+        digits: &str,
+        basic_service: BasicServiceInformation,
+        simplex_duplex_selection: bool,
+        request_to_transmit: bool,
+    ) -> Result<(), String> {
+        let Some(esn) = external_subscriber_number::encode(digits) else {
+            return Err(format!(
+                "external subscriber number '{}' is not a valid dial string (cl. 14.8.20: 1..=24 of 0-9 * # +)",
+                digits
+            ));
+        };
+        self.send_u_setup(
+            queue,
+            TetraAddress::new(gateway_issi, SsiType::Issi),
+            basic_service,
+            true,
+            simplex_duplex_selection,
+            request_to_transmit,
+            Some(esn),
+        );
+        Ok(())
     }
 
     /// U-ALERT for the on/off-hook MT answer path (cl. 14.5.1.1.1; PDU cl.

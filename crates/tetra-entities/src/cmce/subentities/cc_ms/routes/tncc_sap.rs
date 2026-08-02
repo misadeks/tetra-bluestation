@@ -19,6 +19,21 @@ impl CcMsSubentity {
         let basic = pdu_basic_from_tncc(&request.basic_service_information)?;
         match request.called_party_type_identifier {
             tncc::CalledPartyTypeIdentifier::Ssi => {
+                // External (PABX/PSTN) gateway call: an individual set-up to the
+                // gateway's ISSI (called_party_ssi) that also carries the dialled
+                // digits in the External subscriber number IE (cl. 14.8.20). The
+                // caller resolves the contact/gateway (incl. any access-code
+                // prefix) into the digit string before it reaches CC.
+                if let Some(digits) = &request.external_subscriber_number_called {
+                    return self.originate_external_call(
+                        queue,
+                        called_party_ssi,
+                        digits,
+                        basic,
+                        request.simplex_duplex_selection.as_bool(),
+                        request.request_to_transmit_send_data.as_bool(),
+                    );
+                }
                 if request.basic_service_information.communication_type == tncc::CommunicationType::PointToPoint {
                     self.originate_individual_call(
                         queue,

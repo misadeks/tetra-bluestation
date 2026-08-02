@@ -176,6 +176,7 @@ Legend:
 | CC-MS call-control state machine (setup / floor / release) | ✅ | cl. 14 | Module tree mirrors `cc_bs/`. |
 | Group call receive + floor (D-SETUP / D-TX-GRANTED / TX-CEASED) | ✅ | cl. 14 | Both directions proven on air. Fresh incoming group D-SETUP whose transmission-grant element (cl. 14.8.31) reads "granted to another user" raises a TNCC-TX indication with the calling party as talker, so the floor/talker is surfaced immediately on first contact / late entry (not just on the next D-TX-GRANTED). |
 | Individual / duplex call (originate + terminate, continuous TX) | ✅ | cl. 14 | Duplex called-party grant arrives via `TnccCompleteConfirm`. |
+| External (PABX/PSTN) call origination | 🧪 | cl. 14.5.6.2, 14.8.20 | Individual U-SETUP to the gateway ISSI (CPTI = SSI) that also carries the dialled digits in the External subscriber number IE (`external_subscriber_number` codec, Table 14.59: 4-bit digits, `n ≤ 24`, set `0-9 * # +`). Driven by a `TnccSetupRequest` whose `external_subscriber_number_called` is set; the gateway ISSI + optional access-code prefix come from the `[[gateway]]`/`[[contact]]` codeplug. SwMI-side gateway routing is network config. |
 | STCH talker identity during group traffic | ✅ | cl. 14 | Remote talker SSI surfaced to the UI. |
 | Concurrent-call arbitration (group must not disrupt a private call) | 🧪 | cl. 14.2.4.1 | Single-transceiver U-plane + channel-allocation gate. |
 | SDS / status — Type-4 text + status codes RX/TX via TNSDS-SAP | 🧪 | cl. 13.3, 14.7 | `sds_ms.rs`: D-SDS-DATA/D-STATUS RX → TNSDS-UNITDATA/STATUS indications; TNSDS-UNITDATA/STATUS requests → U-SDS-DATA/U-STATUS TX. SDS-TL delivery reports (cl. 29) deferred. |
@@ -200,6 +201,7 @@ Legend:
 | Plane A — TNSDS indications + requests (UNITDATA / STATUS) | 🧪 | Verbatim to cl. 13.3 Tables 13.1/13.3; Type-4 text + status codes RX/TX. TNSDS-REPORT/CANCEL (SDS-TL) deferred. |
 | Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; hybrid apply (structural = restart, operational = live). Config read/staging is serviced as soon as the control link is up — before sync/registration (see below). |
 | Scan lists (codeplug + live activation) | 🧪 | Maps to the group-affiliation superset (cl. 16.8.2). |
+| Contacts + gateways (codeplug phone book) | 🧪 | `[[contact]]` (ISSI or phone) + `[[gateway]]` (PABX/PSTN, `gateway_issi` + optional `prefix`). Plane B data; a phone contact resolves to (gateway ISSI, prefix+number) for an External subscriber number call (cl. 14.8.20). |
 | Manual cell selection (Auto/Manual toggle, carrier survey, register-to-cell) | 🧪 | Plane B commands `SetCellSelectionMode` / `StartCellScan` / `StopCellScan` / `CampOnCell`; results as `MsScanResult` / `MsScanComplete` telemetry. Schema `bluestation-ms-interface-4`. |
 
 > **On-air proof points:** camp-on, scrambling/cell selection, ITSI-attach

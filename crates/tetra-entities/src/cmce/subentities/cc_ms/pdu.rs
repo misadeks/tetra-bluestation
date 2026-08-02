@@ -9,6 +9,7 @@ impl CcMsSubentity {
         hook_method_selection: bool,
         simplex_duplex_selection: bool,
         request_to_transmit: bool,
+        external_subscriber_number: Option<Type3FieldGeneric>,
     ) {
         // Uplink CMCE signalling to the SwMI travels over the individual,
         // acknowledged basic link identified by the MS's own individual short
@@ -34,7 +35,7 @@ impl CcMsSubentity {
             called_party_short_number_address: None,
             called_party_ssi: Some(called_party.ssi as u64),
             called_party_extension: None,
-            external_subscriber_number: None,
+            external_subscriber_number,
             facility: None,
             dm_ms_address: None,
             proprietary: None,
