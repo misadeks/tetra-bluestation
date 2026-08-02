@@ -9,13 +9,13 @@ use tetra_pdus::cmce::{
         call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_dl::CmcePduTypeDl,
         disconnect_cause::DisconnectCause, party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant,
     },
-    fields::{basic_service_information::BasicServiceInformation, external_subscriber_number},
+    fields::{basic_service_information::BasicServiceInformation, dtmf, external_subscriber_number},
     pdus::{
         d_alert::DAlert, d_call_proceeding::DCallProceeding, d_call_restore::DCallRestore, d_connect::DConnect,
         d_connect_acknowledge::DConnectAcknowledge, d_disconnect::DDisconnect, d_info::DInfo, d_release::DRelease, d_setup::DSetup,
         d_tx_ceased::DTxCeased, d_tx_continue::DTxContinue, d_tx_granted::DTxGranted, d_tx_interrupt::DTxInterrupt, d_tx_wait::DTxWait,
-        u_alert::UAlert, u_call_restore::UCallRestore, u_connect::UConnect, u_disconnect::UDisconnect, u_release::URelease,
-        u_setup::USetup, u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
+        u_alert::UAlert, u_call_restore::UCallRestore, u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo,
+        u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
     },
 };
 use tetra_saps::{
@@ -143,6 +143,103 @@ mod tests {
             "an unencodable number must be refused"
         );
         assert!(q.pop_front().is_none(), "no U-SETUP is emitted for an invalid number");
+    }
+
+    fn active_individual_call(cc: &mut CcMsSubentity, cid: u16) {
+        cc.calls.insert(
+            cid,
+            MsCall::new(
+                cid,
+                MsCcState::CallActive,
+                MsCallKind::Individual,
+                default_speech_basic_service(),
+                true,
+                route(),
+                true,
+            ),
+        );
+    }
+
+    #[test]
+    fn dtmf_tone_start_emits_u_info_decodable_by_bs_parser() {
+        // In-call DTMF (cl. 14.7.2.6 / 14.8.19): a tone-start U-INFO carrying the
+        // dialled digits. Decode the emitted PDU with the BS-side parser to prove
+        // it is on-air valid.
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        active_individual_call(&mut cc, 7);
+        let req = tncc::TnccDtmfRequest {
+            access_priority: None,
+            dtmf_tone_delimiter: tncc::DtmfToneDelimiter::Dtmf,
+            number_of_dtmf_digits: Some(4),
+            dtmf_digits: Some(vec![
+                tncc::DtmfDigit::Digit1,
+                tncc::DtmfDigit::Digit2,
+                tncc::DtmfDigit::DigitStar,
+                tncc::DtmfDigit::DigitHash,
+            ]),
+            traffic_stealing: None,
+        };
+        cc.handle_tncc_dtmf(&mut q, 7, &req).expect("DTMF accepted on an active individual call");
+        let msg = q.pop_front().expect("U-INFO should be queued");
+        let SapMsgInner::LcmcMleUnitdataReq(mut prim) = msg.msg else {
+            panic!("expected LcmcMleUnitdataReq");
+        };
+        assert_eq!(prim.main_address.ssi, 1234567, "keyed on own ISSI");
+        let pdu = UInfo::from_bitbuf(&mut prim.sdu).expect("valid U-INFO");
+        assert_eq!(pdu.call_identifier, 7);
+        let ie = pdu.dtmf.expect("DTMF IE present");
+        let decoded = dtmf::decode(&ie).expect("DTMF IE decodes");
+        assert_eq!(decoded.dtmf_type, dtmf::DTMF_TYPE_TONE_START);
+        let digits: String = decoded.nibbles.iter().map(|n| dtmf::code_digit(*n).unwrap()).collect();
+        assert_eq!(digits, "12*#");
+    }
+
+    #[test]
+    fn dtmf_tone_end_emits_u_info_without_digits() {
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        active_individual_call(&mut cc, 7);
+        let req = tncc::TnccDtmfRequest {
+            access_priority: None,
+            dtmf_tone_delimiter: tncc::DtmfToneDelimiter::ToneEnd,
+            number_of_dtmf_digits: None,
+            dtmf_digits: None,
+            traffic_stealing: None,
+        };
+        cc.handle_tncc_dtmf(&mut q, 7, &req).expect("tone-end accepted");
+        let SapMsgInner::LcmcMleUnitdataReq(mut prim) = q.pop_front().expect("U-INFO queued").msg else {
+            panic!("expected LcmcMleUnitdataReq");
+        };
+        let pdu = UInfo::from_bitbuf(&mut prim.sdu).expect("valid U-INFO");
+        let decoded = dtmf::decode(&pdu.dtmf.expect("DTMF IE present")).expect("decodes");
+        assert_eq!(decoded.dtmf_type, dtmf::DTMF_TYPE_TONE_END);
+        assert!(decoded.nibbles.is_empty());
+    }
+
+    #[test]
+    fn dtmf_rejected_for_group_call_and_unknown_call() {
+        let mut cc = CcMsSubentity::new(None);
+        cc.own_issi = Some(1234567);
+        let mut q = MessageQueue::new();
+        let tone_start = tncc::TnccDtmfRequest {
+            access_priority: None,
+            dtmf_tone_delimiter: tncc::DtmfToneDelimiter::Dtmf,
+            number_of_dtmf_digits: Some(1),
+            dtmf_digits: Some(vec![tncc::DtmfDigit::Digit1]),
+            traffic_stealing: None,
+        };
+        // Unknown call.
+        assert!(cc.handle_tncc_dtmf(&mut q, 99, &tone_start).is_err());
+        // Group call.
+        cc.calls.insert(
+            8,
+            MsCall::new(8, MsCcState::CallActive, MsCallKind::Group, default_speech_basic_service(), false, route(), true),
+        );
+        assert!(cc.handle_tncc_dtmf(&mut q, 8, &tone_start).is_err(), "DTMF not valid on a group call");
+        assert!(q.pop_front().is_none(), "no U-INFO emitted on rejection");
     }
 
     #[test]

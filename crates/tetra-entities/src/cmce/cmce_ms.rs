@@ -167,6 +167,14 @@ impl CmceMs {
                 Ok(()) => self.tncc_ack(handle, true, None),
                 Err(detail) => self.tncc_ack(handle, false, Some(detail)),
             },
+            ControlCommand::TnccDtmf {
+                handle,
+                call_identifier,
+                request,
+            } => match self.cc.handle_tncc_dtmf(queue, call_identifier, &request) {
+                Ok(()) => self.tncc_ack(handle, true, None),
+                Err(detail) => self.tncc_ack(handle, false, Some(detail)),
+            },
             // U-plane uplink speech (cl. 14.5.1.4): buffer the frame for the MAC
             // transmit scheduler. Fire-and-forget — no control response (the
             // frame rate makes per-frame acks impractical).

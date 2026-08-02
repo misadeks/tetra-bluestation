@@ -132,6 +132,7 @@ uplink!(UAlert);
 uplink!(UDisconnect);
 uplink!(URelease);
 uplink!(UCallRestore);
+uplink!(UInfo);
 
 pub(super) fn kind_from_basic_service(basic: &BasicServiceInformation) -> MsCallKind {
     match basic.communication_type {

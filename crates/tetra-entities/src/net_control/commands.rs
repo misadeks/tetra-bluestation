@@ -12,7 +12,7 @@ use crate::management::{ManagementCommand, ManagementResponse};
 use crate::tnmm::{
     TnmmAttachDetachGroupIdentityRequest, TnmmDeregistrationRequest, TnmmEnergySavingRequest, TnmmRegistrationRequest, TnmmStatusRequest,
 };
-use tetra_saps::tncc::{TnccCompleteRequest, TnccReleaseRequest, TnccSetupRequest, TnccSetupResponse, TnccTxRequest};
+use tetra_saps::tncc::{TnccCompleteRequest, TnccDtmfRequest, TnccReleaseRequest, TnccSetupRequest, TnccSetupResponse, TnccTxRequest};
 use tetra_saps::tnsds::{TnsdsStatusRequest, TnsdsUnitdataRequest};
 
 /// Command received from the remote command server.
@@ -90,6 +90,13 @@ pub enum ControlCommand {
         handle: u32,
         call_identifier: u16,
         request: TnccTxRequest,
+    },
+    /// TNCC-DTMF request (Table 11.3, cl. 11.3.3.3): send in-call DTMF digits
+    /// (→ U-INFO with the DTMF IE, cl. 14.7.2.6 / 14.8.19).
+    TnccDtmf {
+        handle: u32,
+        call_identifier: u16,
+        request: TnccDtmfRequest,
     },
     /// TNCC-RELEASE request (Table 11.7, cl. 11.3.3.7).
     TnccRelease {
