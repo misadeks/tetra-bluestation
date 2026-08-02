@@ -895,7 +895,17 @@ impl UmacMs {
         };
         pdu_len_bits -= num_fill_bits;
         let orig_end = prim.pdu.get_raw_end();
-        prim.pdu.set_raw_end(prim.pdu.get_raw_start() + pdu_len_bits);
+        // A MAC PDU can never be shorter than the header just parsed. Some
+        // grant-only MAC-RESOURCE PDUs (e.g. a random-access subslot grant with a
+        // 24-bit address + basic slot-grant element, ~51 header bits) carry a
+        // `length_ind` that under-declares this — `length_ind*8` can be fewer bits
+        // than the header. Setting the SDU-window end to `start + pdu_len_bits`
+        // would then move it *before* the parse position and panic in
+        // `set_raw_end`. Clamp the end up to the parse position: such a PDU simply
+        // carries no TM-SDU (nothing is delivered to the LLC); the block still
+        // advances by the declared length below to keep concatenation aligned.
+        let sdu_end = (prim.pdu.get_raw_start() + pdu_len_bits).max(prim.pdu.get_raw_pos());
+        prim.pdu.set_raw_end(sdu_end);
         tracing::trace!(
             "rx_mac_resource: pdu: {} sdu: {} fb: {}: {}",
             pdu_len_bits,
@@ -1117,7 +1127,11 @@ impl UmacMs {
         };
         pdu_len_bits -= num_fill_bits;
         let orig_end = prim.pdu.get_raw_end();
-        prim.pdu.set_raw_end(prim.pdu.get_raw_start() + pdu_len_bits);
+        // Guard against an under-declared `length_ind` (shorter than the header
+        // just parsed) that would set the window end before the parse position
+        // and panic; clamp up to the parse position (no SDU in that case).
+        let sdu_end = (prim.pdu.get_raw_start() + pdu_len_bits).max(prim.pdu.get_raw_pos());
+        prim.pdu.set_raw_end(sdu_end);
         tracing::debug!("rx_mac_end: pdu_len_bits: {} fill_bits: {}", pdu_len_bits, num_fill_bits);
 
         // Decrypt if needed
