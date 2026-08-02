@@ -270,6 +270,45 @@ fn test_resource_null_pdu_does_not_panic() {
     // Must not panic; the null PDU is dropped and produces no LLC delivery.
     test.deliver_all_messages();
 }
+
+/// Regression: a downlink SCH/F block whose *second* concatenated PDU is a
+/// grant-only MAC-RESOURCE (random-access subslot grant: 24-bit address +
+/// basic slot-grant element, ~51 header bits) carrying `length_ind = 6`
+/// (= 48 bits, i.e. shorter than its own header) must not panic. Captured
+/// off-air: the BS sends exactly this when acknowledging a fragmented uplink
+/// random-access request (MAC-END-HU grant) or granting another radio a subslot.
+/// Before the fix, `set_raw_end(start + length_ind*8)` moved the window end
+/// before the parse position and panicked (`bitbuffer.rs: end must not be
+/// before pos`), crashing the whole MS stack.
+#[test]
+fn test_resource_grant_only_underdeclared_length_does_not_panic() {
+    debug::setup_logging_verbose();
+    let mut test = ComponentTest::new(StackMode::Ms, None);
+    let components = vec![TetraEntity::Umac, TetraEntity::Llc, TetraEntity::Mle, TetraEntity::Cmce];
+    let sinks = vec![];
+    test.populate_entities(components, sinks);
+
+    // Exact 268-bit SCH/F block captured at the crash: MAC-RESOURCE (broadcast
+    // SSI, length_ind 27) followed by a grant-only MAC-RESOURCE (addr + slot
+    // grant, length_ind 6).
+    let m = SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: BitBuffer::from_bitstr(
+                "0010000011011001111111111111111111111111000001001001111011111111111111111111111111100001111000110111000000000010110000000000010100011001101100011011110111011101010011011101000110000101110100011010010110111101101110010010001000110001000100101101011010000111010000000001",
+            ),
+            block_num: PhyBlockNum::Both,
+            logical_channel: LogicalChannel::SchF,
+            crc_pass: true,
+            scrambling_code: 0,
+        }),
+    };
+    test.submit_message(m);
+    // Must not panic.
+    test.deliver_all_messages();
+}
 /// (ETSI TS 100 392-2 cl. 21.4.2.1). Build a block, decode it back with
 /// `MacAccess::from_bitbuf`, and confirm the ISSI, the absence of a length
 /// indication, and the recovered TM-SDU round-trip. A self-contained
