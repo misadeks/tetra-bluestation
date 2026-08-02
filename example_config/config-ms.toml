@@ -241,19 +241,18 @@ order = 1
 # --- 6.8 Gateways (external-network PABX/PSTN access points) ------------------
 # A phone contact reaches the external network via an ordinary individual call to
 # the gateway's `gateway_issi` (CPTI = SSI) that also carries the dialled digits
-# in the External subscriber number IE (ETSI TS 100 392-2 cl. 14.8.20).
-# `kind` (pstn|pabx) is a UI label only — TETRA carries no on-air PABX/PSTN flag.
-# `prefix` (optional) is prepended to the number before it is placed in the IE.
+# in the External subscriber number IE (ETSI TS 100 392-2 cl. 14.8.20). There is
+# no PABX/PSTN "type": TETRA carries no on-air distinction — both are ordinary
+# external-number calls. `prefix` (optional) is prepended to the number before it
+# is placed in the IE (an operator access code).
 [[gateway]]
 id = "pstn"
 name = "Public Phone"
-kind = "pstn"
 gateway_issi = 8000001
 
 [[gateway]]
 id = "office-pabx"
 name = "Office PABX"
-kind = "pabx"
 gateway_issi = 8000002
 prefix = "9"                         # dial 9 for an outside line
 

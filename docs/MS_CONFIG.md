@@ -289,15 +289,14 @@ A gateway is an external-network access point that a phone contact dials through
 call is an ordinary individual call to the gateway's `gateway_issi` (CPTI = SSI) whose
 U-SETUP **also** carries the dialled digits in the External subscriber number IE
 (ETSI TS 100 392-2 cl. 14.8.20); the SwMI's gateway subscriber routes the digits into the
-external network. `kind` (`pstn`|`pabx`) is a **UI label only** — TETRA carries no on-air
-PABX/PSTN flag. `prefix` (optional) is prepended to a contact's number before it is placed
-in the IE (an operator dial-plan access code).
+external network. There is no PABX/PSTN "type" — TETRA carries no on-air distinction and
+both are ordinary external-number calls. `prefix` (optional) is prepended to a contact's
+number before it is placed in the IE (an operator dial-plan access code).
 
 | Key | Type | Description |
 |---|---|---|
 | `id` | string | Unique gateway id (referenced by `contact.gateway`). |
 | `name` | string | Display name. |
-| `kind` | `"pstn"` \| `"pabx"` | UI categorisation (no on-air effect). |
 | `gateway_issi` | int (24-bit ISSI) | The gateway subscriber's ISSI = the U-SETUP called-party SSI. |
 | `prefix` | string (optional) | Access-code digits prepended to the dialled number (digit set `0-9 * # +`). |
 
@@ -305,7 +304,6 @@ in the IE (an operator dial-plan access code).
 [[gateway]]
 id = "office-pabx"
 name = "Office PABX"
-kind = "pabx"
 gateway_issi = 8000002
 prefix = "9"                # dial 9 for an outside line
 ```
