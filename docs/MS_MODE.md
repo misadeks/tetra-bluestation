@@ -201,7 +201,7 @@ Legend:
 | Plane A — TNMM indications (REGISTRATION / SERVICE / GROUP-IDENTITY confirm) | 🧪 | Verbatim to cl. 15.3 Tables 15.1–15.7. |
 | Plane A — TNMM requests (REGISTRATION / DEREGISTRATION / GROUP ATTACH-DETACH) | 🧪 | STATUS / ENERGY-SAVING defined-but-dormant. |
 | Plane A — TNSDS indications + requests (UNITDATA / STATUS / SDS-TL) | 🧪 | Verbatim to cl. 13.3 Tables 13.1/13.2/13.3; Type-4 text + status RX/TX, plus SDS-TL transport (cl. 29): message reference, delivery/read reports (`TnsdsSendMessage`/`TnsdsSendReport`/`TnsdsCancel`, `TnsdsMessageIndication`/`TnsdsReportIndication`). Interface schema `bluestation-ms-interface-5`. Message concatenation deferred. |
-| Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; hybrid apply (structural = restart, operational = live). Config read/staging is serviced as soon as the control link is up — before sync/registration (see below). |
+| Plane B — management/provisioning (GetState/GetConfig/SetConfig/ApplyConfig) | 🧪 | Non-standard codeplug; **hybrid apply is now real**: a `SetConfig` whose only diff is codeplug/operational data (contacts, gateways, talkgroups, scan lists, home-display, folders, networks, frequency lists) is applied **live** (hot-swapped into the running stack, no restart); a change touching any structural section (`stack_mode` / `phy_io` / `net_info` / `cell_info` / `ms` / `duplex_table` / `control` / `telemetry` / `brew`) is staged to disk and takes effect on the next `ApplyConfig` restart. Config read/staging is serviced as soon as the control link is up — before sync/registration (see below). |
 | Scan lists (codeplug + live activation) | 🧪 | Maps to the group-affiliation superset (cl. 16.8.2). |
 | Contacts + gateways (codeplug phone book) | 🧪 | `[[contact]]` (ISSI or phone) + `[[gateway]]` (PABX/PSTN, `gateway_issi` + optional `prefix`). Plane B data; a phone contact resolves to (gateway ISSI, prefix+number) for an External subscriber number call (cl. 14.8.20). |
 | Manual cell selection (Auto/Manual toggle, carrier survey, register-to-cell) | 🧪 | Plane B commands `SetCellSelectionMode` / `StartCellScan` / `StopCellScan` / `CampOnCell`; results as `MsScanResult` / `MsScanComplete` telemetry. Schema `bluestation-ms-interface-4`. |
@@ -223,9 +223,20 @@ Legend:
 > serving cell. Any other command that arrives while unsynchronized (TNMM requests, scan-list
 > toggles) is buffered and replayed, in arrival order, on the first real tick, so
 > registration and on-air behaviour are byte-identical to never having run offline.
-> `SetConfig` stages to disk and applies on the next `ApplyConfig` restart exactly as when
-> synchronized; `GetConfig` returns the live active codeplug (secrets redacted) regardless of
-> `registration_state` / `service_status`.
+> `SetConfig` always validates against the startup validator and writes the canonical document to
+> disk first. It then classifies the change: a **codeplug/operational-only** edit is applied
+> **live** — the new `StackConfig` is hot-swapped into the shared `SharedConfig` so every entity
+> reads it on its next `config()` call, with no restart and no process bounce (`restart_required`
+> stays false) — while a **structural** edit is only staged and reported `restart_required = true`,
+> taking effect on the next `ApplyConfig` restart. `GetConfig` returns the live active codeplug
+> (secrets redacted) regardless of `registration_state` / `service_status`.
+>
+> The live/structural split is decided by `tetra_config::bluestation::is_operational_only_change`,
+> which clears the codeplug on both the running and incoming config and compares the remainder as
+> parsed TOML values (order-independent, so HashMap-backed fields such as SoapySDR gains don't cause
+> false negatives). Note the UI must send the **current** codeplug schema shape (e.g. the
+> `[codeplug.home_display]` sub-table); unknown keys are silently ignored by the `#[serde(flatten)]`
+> catch-all and will not apply.
 >
 > For this to work the PHY must actually return control to the run loop while unsynchronized.
 > The MS downlink demodulator stays in `Mode::DlUnsynchronized` and never yields a demodulated

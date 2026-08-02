@@ -302,6 +302,40 @@ pub fn to_toml_string(cfg: &StackConfig) -> Result<String, String> {
     toml::to_string_pretty(&root).map_err(|e| format!("TOML serialization failed: {e}"))
 }
 
+/// Classify a configuration change as **operational-only** (Plane B): `true` iff
+/// `incoming` differs from `current` **only** in the codeplug (folders,
+/// talkgroups, networks, carrier overrides, frequency lists, scan lists,
+/// gateways, contacts, and codeplug settings). Such a change can be hot-swapped
+/// live ([`SharedConfig::apply_config_live`]) with no restart. Any difference in
+/// a structural section (`stack_mode`, `[phy_io]`, `[net_info]`, `[cell_info]`,
+/// `[ms]`, `[duplex_table]`, `[control]`, `[telemetry]`, `[brew]`, `debug_log`)
+/// returns `false` — those still require a restart.
+///
+/// Implemented by comparing the canonical serialization of each config with its
+/// codeplug cleared, so it is robust without requiring `PartialEq` on every
+/// nested config type (including secret-bearing sections).
+pub fn is_operational_only_change(current: &StackConfig, incoming: &StackConfig) -> bool {
+    let mut a = current.clone();
+    let mut b = incoming.clone();
+    a.codeplug = crate::bluestation::CfgCodeplug::default();
+    b.codeplug = crate::bluestation::CfgCodeplug::default();
+    // Serialize both structural (codeplug-cleared) configs and compare them as
+    // parsed TOML values rather than raw strings: some structural fields (e.g.
+    // SoapySDR gain elements) are backed by a HashMap whose serialized key order
+    // is not stable across instances, so a textual comparison yields false
+    // negatives. `toml::Value` table equality is order-independent.
+    match (to_toml_string(&a), to_toml_string(&b)) {
+        (Ok(sa), Ok(sb)) => {
+            match (sa.parse::<toml::Value>(), sb.parse::<toml::Value>()) {
+                (Ok(va), Ok(vb)) => va == vb,
+                _ => sa == sb,
+            }
+        }
+        // If either fails to serialize, be conservative and require a restart.
+        _ => false,
+    }
+}
+
 /// Like [`to_toml_string`] but with every secret value replaced by
 /// [`REDACTED_SECRET`] (**NON-STANDARD**, Plane B GetConfig wire path).
 ///
@@ -905,5 +939,76 @@ password = "supersecret"
 
         let merged = restore_redacted_secrets(incoming, &current);
         assert_eq!(merged.control.as_ref().unwrap().credentials.as_ref().unwrap().1, "rotated-pass");
+    }
+
+    #[test]
+    fn operational_only_change_detects_codeplug_edits() {
+        let base = from_toml_str(MS_TOML).expect("base MS config");
+
+        // A codeplug-only edit (add a contact) is operational -> hot-swappable.
+        let mut with_contact = base.clone();
+        with_contact.codeplug.contacts.push(crate::bluestation::CfgContact {
+            name: "New".to_string(),
+            callsign: None,
+            target: crate::bluestation::CfgContactTarget::Issi(2_000_777),
+            order: 1,
+        });
+        assert!(
+            is_operational_only_change(&base, &with_contact),
+            "adding a contact is an operational (codeplug) change"
+        );
+
+        // Home-display setting is also codeplug -> operational.
+        let mut with_hd = base.clone();
+        with_hd.codeplug.home_display = Some(crate::bluestation::CfgHomeDisplay { enabled: true, pid: 130 });
+        assert!(is_operational_only_change(&base, &with_hd), "home_display is operational");
+
+        // No change at all is trivially operational-only.
+        assert!(is_operational_only_change(&base, &base.clone()));
+    }
+
+    #[test]
+    fn structural_change_requires_restart() {
+        let base = from_toml_str(MS_TOML).expect("base MS config");
+
+        // Changing the home network (structural) is NOT operational.
+        let mut net_changed = base.clone();
+        net_changed.net.mnc = base.net.mnc.wrapping_add(1);
+        assert!(
+            !is_operational_only_change(&base, &net_changed),
+            "changing [net_info] must require a restart"
+        );
+
+        // Changing the MS ISSI (structural) is NOT operational.
+        let mut issi_changed = base.clone();
+        if let Some(ms) = issi_changed.ms.as_mut() {
+            ms.issi += 1;
+        }
+        assert!(!is_operational_only_change(&base, &issi_changed), "changing [ms].issi must require a restart");
+    }
+
+    #[test]
+    fn shared_config_apply_live_is_observed_by_all_clones() {
+        use crate::bluestation::SharedConfig;
+        let base = from_toml_str(MS_TOML).expect("base");
+        let shared = SharedConfig::from_parts(base.clone(), None);
+        let clone = shared.clone(); // mirrors how each entity holds its own clone
+
+        assert!(shared.config().codeplug.contacts.is_empty());
+        assert!(clone.config().codeplug.contacts.is_empty());
+
+        let mut updated = base;
+        updated.codeplug.contacts.push(crate::bluestation::CfgContact {
+            name: "Live".to_string(),
+            callsign: None,
+            target: crate::bluestation::CfgContactTarget::Issi(2_000_999),
+            order: 1,
+        });
+        shared.apply_config_live(updated);
+
+        // Both the original and the clone observe the hot-swapped config.
+        assert_eq!(shared.config().codeplug.contacts.len(), 1);
+        assert_eq!(clone.config().codeplug.contacts.len(), 1, "a clone observes the live swap");
+        assert_eq!(clone.config().codeplug.contacts[0].name, "Live");
     }
 }

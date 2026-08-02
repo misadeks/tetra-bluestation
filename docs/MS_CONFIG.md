@@ -414,8 +414,17 @@ Via the management interface (Plane B):
   disk with `restart_required = true`; a later `ApplyConfig` performs the graceful
   de-registration drain (U-ITSI DETACH, cl. 16.6.1) and exits for a supervisor to
   respawn with the new config.
-- **Operational** TNMM actions (register/deregister, group attach/detach, energy saving,
-  scan-list activation) apply **live** — no restart.
+- **Operational** changes apply **live** — no restart:
+  - A `SetConfig` whose only diff from the running config is **codeplug/operational data**
+    (contacts, gateways, talkgroups, folders, networks, frequency lists, scan lists,
+    home-display) is validated, written to disk, and **hot-swapped into the running stack**
+    immediately (`restart_required = false`). Every entity picks it up on its next config read.
+  - TNMM actions (register/deregister, group attach/detach, energy saving) and scan-list
+    activation likewise apply live.
+
+The live-vs-restart decision is made by `is_operational_only_change`: it clears the codeplug on
+both the running and incoming config and compares the remainder; if only the codeplug differs the
+change is applied live, otherwise a restart is required.
 
 > **Availability before registration.** `GetConfig`, `SetConfig`, and `ApplyConfig` are
 > serviced as soon as the control link is up — independent of registration or service

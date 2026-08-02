@@ -2683,7 +2683,8 @@ impl MmMs {
             }
         };
 
-        // 4) Persist to the config file path.
+        // 4) Persist to the config file path (so a later restart / cold boot
+        //    loads the same configuration that is applied live below).
         let path = ctx.config_path.clone();
         if let Err(e) = std::fs::write(&path, normalized) {
             tracing::error!("MM(MS): SetConfig failed to write {}: {e}", path.display());
@@ -2696,8 +2697,35 @@ impl MmMs {
             return;
         }
 
+        // 5) Classify the change (Plane B hybrid apply):
+        //    - OPERATIONAL (codeplug-only: folders/talkgroups/networks/scan lists/
+        //      frequency lists/carrier overrides/gateways/contacts/settings) is
+        //      hot-swapped LIVE with no restart — every entity observes the new
+        //      config on its next `config()` read.
+        //    - STRUCTURAL (stack_mode / PHY / net / cell / ms / duplex / control /
+        //      telemetry / brew) still requires a controlled restart via
+        //      ApplyConfig; it is only staged to disk here.
+        let operational_only = tetra_config::bluestation::is_operational_only_change(&current, &parsed);
+        if operational_only {
+            self.config.apply_config_live(parsed);
+            tracing::info!(
+                "MM(MS): SetConfig applied LIVE (operational/codeplug change) — no restart required ({})",
+                path.display()
+            );
+            self.respond(ControlResponse::Management(ManagementResponse::Ack {
+                handle,
+                accepted: true,
+                restart_required: self.restart_required,
+                message: "configuration applied live (operational change; no restart required)".to_string(),
+            }));
+            return;
+        }
+
         self.restart_required = true;
-        tracing::info!("MM(MS): staged new configuration to {} (restart required to apply)", path.display());
+        tracing::info!(
+            "MM(MS): staged new configuration to {} (structural change — restart required to apply)",
+            path.display()
+        );
         self.respond(ControlResponse::Management(ManagementResponse::Ack {
             handle,
             accepted: true,
@@ -5744,7 +5772,8 @@ order = 2\n"
 
         dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
             handle: 82,
-            toml: MS_TOML.to_string(),
+            // A STRUCTURAL change ([ms].issi) must still require a restart.
+            toml: MS_TOML.replace("issi = 1000001", "issi = 1000002"),
         }));
         mm.tick_start(&mut q, TdmaTime::default());
 
@@ -5765,8 +5794,51 @@ order = 2\n"
         let _ = std::fs::remove_file(&path);
     }
 
-    /// SetConfig rejects a config that fails the startup validator (accepted =
-    /// false) and does not write the file or flag a restart.
+    /// SetConfig with a codeplug-only (operational) change applies LIVE: it is
+    /// accepted, `restart_required` stays false, the process is not bounced, and
+    /// the running config immediately reflects the new codeplug data.
+    #[test]
+    fn test_management_set_config_codeplug_applies_live() {
+        use crate::management::ManagementCommand;
+        let (mut mm, _source, dispatcher) = ms_mm_wired();
+        let mut q = MessageQueue::new();
+
+        let path = std::env::temp_dir().join(format!("tetra-ms-livecfg-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        mm.set_management_context(path.clone(), restart_requested.clone(), is_running.clone());
+
+        // Sanity: the running config has no contacts yet.
+        assert!(mm.config.config().codeplug.contacts.is_empty());
+
+        // A codeplug-only change: add a contact. Everything structural is
+        // identical to the running config.
+        let toml = format!(
+            "{MS_TOML}\n[[contact]]\nname = \"Dispatch\"\nissi = 4242\n"
+        );
+        dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
+            handle: 90,
+            toml,
+        }));
+        mm.tick_start(&mut q, TdmaTime::default());
+
+        let (handle, accepted, restart_required) = last_mgmt_ack(&dispatcher);
+        assert_eq!(handle, 90);
+        assert!(accepted, "codeplug change accepted");
+        assert!(!restart_required, "codeplug change applies live — no restart");
+        // Process must NOT be bounced.
+        assert!(is_running.load(std::sync::atomic::Ordering::SeqCst), "live apply must not stop the loop");
+        assert!(!restart_requested.load(std::sync::atomic::Ordering::SeqCst), "live apply must not request restart");
+        // The running config now reflects the new contact — live, no restart.
+        let cfg = mm.config.config();
+        assert_eq!(cfg.codeplug.contacts.len(), 1, "contact applied live");
+        assert_eq!(cfg.codeplug.contacts[0].target, tetra_config::bluestation::CfgContactTarget::Issi(4242));
+        // Snapshot still shows no pending restart.
+        assert!(!mm.runtime_snapshot().restart_required);
+
+        let _ = std::fs::remove_file(&path);
+    }
     #[test]
     fn test_management_set_config_rejects_invalid() {
         use crate::management::ManagementCommand;
@@ -5843,7 +5915,8 @@ order = 2\n"
 
         dispatcher.send(ControlCommand::Management(ManagementCommand::SetConfig {
             handle: 201,
-            toml: MS_TOML.to_string(),
+            // A STRUCTURAL change ([ms].issi) still stages + flags a restart.
+            toml: MS_TOML.replace("issi = 1000001", "issi = 1000002"),
         }));
         mm.drive_offline_control(&mut q);
 
