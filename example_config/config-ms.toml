@@ -258,3 +258,13 @@ name = "Emergency"
 number = "112"
 gateway = "pstn"
 order = 3
+
+###############################################################################
+# CODEPLUG-WIDE SETTINGS (scalar). Optional single [codeplug] table for
+# codeplug-wide values that are not arrays-of-tables.
+###############################################################################
+[codeplug]
+# Home-mode display SDS protocol identifier (8-bit, ETSI TS 100 392-2 cl. 29.4.3.9)
+# used when composing a "home mode display" status/text message shown on another
+# radio's home screen. 130 (0x82) = Text Messaging with SDS-TL. Data only.
+home_display_pid = 130
