@@ -264,37 +264,24 @@ pub struct CfgScanlist {
     pub order: u32,
 }
 
-/// External-network gateway kind (PABX vs PSTN). This is a codeplug/UI
-/// categorisation only — TETRA carries **no** on-air "PABX vs PSTN" flag; both
-/// are ordinary calls to an external number (cl. 14.8.20). The distinction lets
-/// the UI label the destination and, if the operator's dial plan needs it,
-/// prepend a different access-code `prefix` per gateway.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CfgGatewayKind {
-    /// Public Switched Telephone Network gateway.
-    #[default]
-    Pstn,
-    /// Private Automatic Branch eXchange gateway.
-    Pabx,
-}
-
 /// A programmed external-network gateway (PABX/PSTN). Plane B, data only.
 ///
 /// A phone contact reaches the external network by an ordinary individual
 /// U-SETUP whose called party SSI is this gateway's `gateway_issi` (CPTI = SSI)
 /// and which additionally carries the dialled digits in the External subscriber
 /// number IE (cl. 14.8.20). The SwMI's gateway subscriber routes the digits into
-/// the PABX/PSTN. `prefix`, if set, is prepended to the contact's number before
-/// it is placed in the IE (an operator dial-plan access code).
+/// the external network. `prefix`, if set, is prepended to the contact's number
+/// before it is placed in the IE (an operator dial-plan access code).
+///
+/// There is deliberately no "type" (PABX vs PSTN): TETRA carries no on-air
+/// PABX/PSTN distinction — both are ordinary external-number calls, routed by
+/// the SwMI on the gateway subscriber + the digits, not on anything the MS sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CfgGateway {
     /// Stable identifier referenced by phone contacts.
     pub id: String,
     /// Human-readable name.
     pub name: String,
-    /// PABX or PSTN (UI categorisation; no on-air effect).
-    pub kind: CfgGatewayKind,
     /// The gateway subscriber's Individual Short Subscriber Identity (24-bit):
     /// the called-party SSI placed in the U-SETUP for a call through this
     /// gateway.
@@ -885,7 +872,6 @@ pub struct ScanlistDto {
 pub struct GatewayDto {
     pub id: String,
     pub name: String,
-    pub kind: CfgGatewayKind,
     pub gateway_issi: u32,
     pub prefix: Option<String>,
     #[serde(flatten, skip_serializing_if = "HashMap::is_empty")]
@@ -1018,7 +1004,6 @@ fn gateway_dto_to_cfg(dto: GatewayDto) -> CfgGateway {
     CfgGateway {
         id: dto.id,
         name: dto.name,
-        kind: dto.kind,
         gateway_issi: dto.gateway_issi,
         prefix: dto.prefix,
     }
@@ -1250,7 +1235,6 @@ pub fn cfg_to_gateway_dtos(cp: &CfgCodeplug) -> Option<Vec<GatewayDto>> {
             .map(|g| GatewayDto {
                 id: g.id.clone(),
                 name: g.name.clone(),
-                kind: g.kind,
                 gateway_issi: g.gateway_issi,
                 prefix: g.prefix.clone(),
                 extra: HashMap::new(),
@@ -1401,7 +1385,6 @@ mod tests {
             gateways: vec![CfgGateway {
                 id: "pstn".to_string(),
                 name: "Public Phone".to_string(),
-                kind: CfgGatewayKind::Pstn,
                 gateway_issi: 8_000_001,
                 prefix: Some("9".to_string()),
             }],
@@ -1458,7 +1441,6 @@ mod tests {
         CfgGateway {
             id: id.to_string(),
             name: format!("{id} gw"),
-            kind: CfgGatewayKind::Pstn,
             gateway_issi: issi,
             prefix: prefix.map(str::to_string),
         }
