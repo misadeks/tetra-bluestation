@@ -8,6 +8,22 @@
 # exits otherwise (e.g. 0 for a clean Ctrl+C shutdown, non-zero/non-75 for a
 # genuine failure).
 #
+# Real-time scheduling & CPU pinning (IMPORTANT on a shared host)
+# ---------------------------------------------------------------
+# The MS is receive-timed: if the SDR RX pipeline is starved of CPU (e.g. a UI or
+# desktop/display compositor running on the same board), samples are dropped
+# ("Lost N samples, skipping ..."), the demodulator loses sync, and the MLE
+# declares a serving-cell downlink failure (MLE-BREAK) — the radio flaps in and
+# out of service and never registers. To prevent that, this wrapper launches the
+# stack under the real-time FIFO scheduler (via `chrt`) and, if configured, pins
+# it to dedicated CPUs (via `taskset`). Both are best-effort: if the tool is
+# missing or the privilege is denied, it falls back to a normal launch.
+#
+# Environment knobs (all optional):
+#   BLUESTATION_BIN   path to bluestation-bs (default /usr/local/bin/bluestation-bs)
+#   RT_PRIO           real-time FIFO priority, 1..99 (default 73; empty disables)
+#   CPU_AFFINITY      CPU list for taskset, e.g. "2,3" (default empty = no pin)
+#
 # Usage: bluestation-ms-supervisor.sh /path/to/config-ms.toml
 
 set -eu
@@ -15,10 +31,24 @@ set -eu
 BIN="${BLUESTATION_BIN:-/usr/local/bin/bluestation-bs}"
 CONFIG="${1:?usage: $0 <config.toml>}"
 EXIT_RESTART=75
+RT_PRIO="${RT_PRIO:-73}"
+CPU_AFFINITY="${CPU_AFFINITY:-}"
+
+# Build the launch prefix from whatever scheduling tools are available. Each is
+# optional and degrades gracefully so the supervisor still works on a minimal
+# system or without the privilege to set RT priority / affinity.
+PREFIX=""
+if [ -n "$RT_PRIO" ] && command -v chrt >/dev/null 2>&1; then
+    PREFIX="chrt -f $RT_PRIO"
+fi
+if [ -n "$CPU_AFFINITY" ] && command -v taskset >/dev/null 2>&1; then
+    PREFIX="taskset -c $CPU_AFFINITY $PREFIX"
+fi
 
 while true; do
     set +e
-    "$BIN" "$CONFIG"
+    # shellcheck disable=SC2086 # PREFIX is an intentional word-split command prefix.
+    $PREFIX "$BIN" "$CONFIG"
     code=$?
     set -e
     if [ "$code" -eq "$EXIT_RESTART" ]; then

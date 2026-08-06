@@ -426,6 +426,33 @@ The live-vs-restart decision is made by `is_operational_only_change`: it clears 
 both the running and incoming config and compares the remainder; if only the codeplug differs the
 change is applied live, otherwise a restart is required.
 
+## Real-time scheduling (running the radio next to a UI/display)
+
+The MS stack is **receive-timed**: the SDR RX pipeline must consume the sample stream (e.g.
+600 kSa/s) every TDMA slot. If it is starved of CPU it drops samples — `soapy_dev`/`demodulator`
+log `Lost N samples, skipping ...` and `Skipping demodulation of N slots due to lost samples` — the
+demodulator loses sync, and the MLE declares a **serving-cell downlink failure** (`MLE-BREAK`,
+cl. 18.3.4.5.3). The radio then flaps in and out of service and can never complete registration
+(`T351 expired with no registration response`). RSSI stays healthy and bursts still CRC-pass when
+synced, so this is **CPU/scheduling starvation, not an RF problem**.
+
+This is easy to hit when a local UI (e.g. a Slint app), a desktop/display compositor, or anything
+else heavy runs on the same board: the radio connects fine until the UI starts, then drops. Fix it
+by giving the stack real-time priority so its RX thread preempts the UI, and (optionally) pinning it
+to dedicated CPUs:
+
+- **systemd:** `example_config/bluestation-ms.service` sets `CPUSchedulingPolicy=fifo`,
+  `CPUSchedulingPriority=73`, `IOSchedulingClass=realtime`, `LimitRTPRIO=99`,
+  `LimitMEMLOCK=infinity`, and `CPUAffinity=2 3` (dedicate cores 2-3 to the radio on a 4-core Pi).
+- **supervisor:** `example_config/bluestation-ms-supervisor.sh` launches the binary under
+  `chrt -f "$RT_PRIO"` (default 73) and, when `CPU_AFFINITY` is set, `taskset -c "$CPU_AFFINITY"`.
+- **UI side:** keep the UI off the radio's cores (pin it to 0-1, e.g. `taskset -c 0-1`), and reduce
+  its own load — prefer a GPU/KMS Slint backend over the software renderer and avoid continuous
+  full-frame redraws/animations. For hard isolation add `isolcpus=2,3 nohz_full=2,3` to the kernel
+  cmdline. Also rule out Pi under-voltage/thermal throttling (`vcgencmd get_throttled`).
+
+
+
 > **`ApplyConfig` is a no-op when nothing structural is staged.** A UI that always issues
 > `SetConfig` followed by `ApplyConfig` will *not* bounce the radio after a codeplug/operational-only
 > edit: because that `SetConfig` already applied live and left `restart_required = false`, the
