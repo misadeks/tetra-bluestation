@@ -16,6 +16,16 @@ impl CcMsSubentity {
         let Some(called_party_ssi) = request.called_party_ssi else {
             return Err("TNCC-SETUP request without called party SSI is not supported by this MS CC engine".to_string());
         };
+        // An SSI (ISSI/GSSI) is a 24-bit identity (ETSI TS 100 392-2 cl. 7). A
+        // value outside 1..=16777215 cannot be encoded into the Called party SSI
+        // element (cl. 14.8.28) and previously panicked the whole stack while
+        // serialising the U-SETUP. Reject it here so the TN gets a negative
+        // TNCC-SETUP ack instead of the radio crashing.
+        if called_party_ssi == 0 || called_party_ssi > 0xFF_FFFF {
+            return Err(format!(
+                "TNCC-SETUP called party SSI {called_party_ssi} is out of range (cl. 7: a 24-bit SSI is 1..=16777215)"
+            ));
+        }
         let basic = pdu_basic_from_tncc(&request.basic_service_information)?;
         match request.called_party_type_identifier {
             tncc::CalledPartyTypeIdentifier::Ssi => {

@@ -216,6 +216,68 @@ fn cmce_ms_tncc_setup_command_emits_decodable_u_setup() {
     assert_eq!(pdu.basic_service_information.communication_type, CommunicationType::P2Mp);
 }
 
+/// A TNCC-SETUP whose called party SSI exceeds the 24-bit SSI range (cl. 7)
+/// must be rejected with a negative TNCC ack — NOT crash the stack while
+/// serialising the U-SETUP (regression: value exceeds num_bits 24 panic).
+#[test]
+fn cmce_ms_tncc_setup_out_of_range_ssi_rejected_without_panic() {
+    let (dispatcher, endpoint) = make_control_link();
+    let mut cmce = CmceMs::new(shared_ms_config(), None, Some(endpoint));
+    let mut q = MessageQueue::new();
+
+    let mut request = tncc_setup_request();
+    request.called_party_ssi = Some(58_555_588); // > 0xFF_FFFF (16_777_215)
+    dispatcher.send(ControlCommand::TnccSetup {
+        handle: 45,
+        request: Box::new(request),
+    });
+    cmce.tick_start(&mut q, TdmaTime::default());
+
+    let ack = dispatcher.try_recv_response().expect("TNCC ack");
+    match ack {
+        tetra_entities::net_control::ControlResponse::TnccAck { handle, accepted, detail } => {
+            assert_eq!(handle, 45);
+            assert!(!accepted, "out-of-range called SSI must be refused");
+            assert!(detail.unwrap_or_default().contains("out of range"), "TN told why it failed");
+        }
+        other => panic!("expected TnccAck, got {other:?}"),
+    }
+    // No U-SETUP must have been emitted.
+    assert!(q.pop_front().is_none(), "no PDU emitted for a rejected set-up");
+}
+
+/// A TNSDS-STATUS whose called party SSI exceeds the 24-bit SSI range must be
+/// refused with a negative TNSDS ack rather than panicking the U-STATUS
+/// serialiser (same class of bug as the U-SETUP crash).
+#[test]
+fn cmce_ms_tnsds_status_out_of_range_ssi_rejected_without_panic() {
+    use tetra_saps::tnsds::TnsdsStatusRequest;
+    let (dispatcher, endpoint) = make_control_link();
+    let mut cmce = CmceMs::new(shared_ms_config(), None, Some(endpoint));
+    let mut q = MessageQueue::new();
+
+    dispatcher.send(ControlCommand::TnsdsStatus {
+        handle: 46,
+        request: TnsdsStatusRequest {
+            called_party_ssi: 58_555_588, // > 0xFF_FFFF
+            called_party_is_group: false,
+            status_number: 0x8002,
+        },
+    });
+    cmce.tick_start(&mut q, TdmaTime::default());
+
+    let ack = dispatcher.try_recv_response().expect("TNSDS ack");
+    match ack {
+        tetra_entities::net_control::ControlResponse::TnsdsAck { handle, accepted, detail } => {
+            assert_eq!(handle, 46);
+            assert!(!accepted, "out-of-range status destination must be refused");
+            assert!(detail.unwrap_or_default().contains("out of range"));
+        }
+        other => panic!("expected TnsdsAck, got {other:?}"),
+    }
+    assert!(q.pop_front().is_none(), "no U-STATUS emitted for a rejected status message");
+}
+
 #[test]
 fn cmce_ms_downlink_setup_emits_tncc_setup_indication() {
     let (sink, source) = telemetry_channel();

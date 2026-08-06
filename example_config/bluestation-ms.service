@@ -27,6 +27,39 @@ ExecStart=/usr/local/bin/bluestation-bs /etc/bluestation/config-ms.toml
 Restart=on-failure
 RestartForceExitStatus=75
 RestartSec=1
+# A clean Ctrl+C / management shutdown is SIGINT (exit 0, not restarted).
+KillSignal=SIGINT
+
+# --- Real-time scheduling & CPU isolation (IMPORTANT on a shared host) --------
+# The MS is receive-timed: the SDR RX pipeline must consume the sample stream
+# (e.g. 600 kSa/s) every TDMA slot or samples are dropped ("Lost N samples,
+# skipping ..."), which makes the demodulator lose sync and the MLE declare a
+# serving-cell downlink failure (MLE-BREAK) — the radio then flaps in and out of
+# service and can never complete registration. This is almost always CPU/
+# scheduling starvation, NOT an RF problem, and it is easy to hit when a UI, a
+# desktop/display compositor, or anything else heavy runs on the same board.
+#
+# Run the stack under the real-time FIFO scheduler so the RX thread preempts the
+# UI/desktop and meets its per-slot deadline. Priority 73 mirrors the BS unit;
+# keep it below any kernel IRQ threads.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=73
+# Give real-time I/O priority to the SDR/USB reads as well.
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+# Fallback niceness for any non-RT helper threads.
+Nice=-10
+# Allow the process to actually obtain RT priority and to lock memory (avoids
+# page-fault jitter if the binary calls mlockall). Needed when User= is not root.
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+# Pin the stack to dedicated CPUs so the UI/desktop cannot steal them. On a
+# 4-core Pi this dedicates cores 2-3 to the radio and leaves 0-1 for the UI.
+# Tune to your core count; comment out on a single-core board. For hard
+# isolation also add `isolcpus=2,3 nohz_full=2,3` to the kernel cmdline and pin
+# the UI/desktop to cores 0-1 (e.g. its own unit's CPUAffinity=0 1 or taskset).
+CPUAffinity=2 3
+
 # Recommended hardening / RF device access — tune for your SDR and user.
 # SoapySDR/USB device access typically needs the process to reach /dev/bus/usb.
 # User=bluestation
