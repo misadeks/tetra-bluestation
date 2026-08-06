@@ -451,6 +451,43 @@ to dedicated CPUs:
   full-frame redraws/animations. For hard isolation add `isolcpus=2,3 nohz_full=2,3` to the kernel
   cmdline. Also rule out Pi under-voltage/thermal throttling (`vcgencmd get_throttled`).
 
+### When FIFO priority alone is not enough (core isolation)
+
+Real-time priority (`SCHED_FIFO`) is *necessary but not always sufficient*, especially with the
+SXceiver (`driver=sx` / SoapySX), whose samples arrive over an **I2S/ALSA DMA** path (`period=` in
+`rx_args`). Hard IRQs, softirqs and kernel DMA work preempt even a `SCHED_FIFO` userspace thread, so
+a local UI's display/GPU/USB interrupt load can still make the sample stream gappy while the radio
+thread already runs at FIFO priority. The signature is: `chrt -p $(pidof bluestation-bs)` shows
+`SCHED_FIFO`/prio 73, `vcgencmd get_throttled` is `0x0`, yet the radio still logs
+`serving-cell downlink failure` / `Skipping demodulation ... lost samples` whenever the UI runs.
+
+Fast confirmation (no reboot) — move the UI off the radio's cores and watch the journal:
+
+```
+taskset -cp 0,1 "$(pidof <your-ui-binary>)"
+journalctl -u bluestation-bs -f   # the MLE-BREAK / downlink-failure churn should stop
+```
+
+Make it permanent with full core isolation:
+
+1. **Kernel cmdline** — append to `/boot/firmware/cmdline.txt` (one line), then reboot:
+   ```
+   isolcpus=2,3 nohz_full=2,3 rcu_nocbs=2,3 irqaffinity=0,1
+   ```
+   This removes cores 2-3 from the general scheduler and steers routine IRQs/RCU callbacks to
+   0-1, leaving 2-3 undisturbed for the radio.
+2. **Radio** — keep `CPUAffinity=2 3` (already in `bluestation-ms.service`).
+3. **UI** — pin it to cores 0-1: use `example_config/bluestation-ms-ui.service` (`CPUAffinity=0 1`)
+   or launch via `taskset -c 0-1`.
+4. **SDR sample IRQ** — if isolation alone is not enough, steer the SXceiver's I2S/DMA interrupt to
+   an isolated core. Find it and pin it (2 = mask for core 1; use the mask for a core in 2-3):
+   ```
+   grep -Ei 'i2s|dma|pcm' /proc/interrupts        # find the IRQ number
+   echo 4 | sudo tee /proc/irq/<IRQ>/smp_affinity # 4 = mask for core 2
+   ```
+
+
+
 
 
 > **`ApplyConfig` is a no-op when nothing structural is staged.** A UI that always issues

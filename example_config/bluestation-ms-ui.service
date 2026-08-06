@@ -1,0 +1,57 @@
+# Sample systemd unit for a local MS operator UI (e.g. a Slint app) running on
+# the SAME board as the receive-timed radio stack (bluestation-bs).
+#
+# WHY THIS EXISTS
+# The MS stack is receive-timed: its SDR sample stream (for the SXceiver /
+# `driver=sx`, an I2S/ALSA DMA path) must be serviced every TDMA slot. A local UI
+# that shares the radio's CPU core(s) — via its own CPU use AND the display/GPU/
+# USB interrupt and DMA load it generates — makes the sample stream gappy, which
+# shows up as `Lost N samples` / `Skipping demodulation ... lost samples`, the
+# demodulator losing sync, and repeated serving-cell downlink failures
+# (MLE-BREAK). Giving the radio real-time priority is necessary but NOT
+# sufficient, because hard IRQ / softirq / kernel DMA work preempts even a
+# SCHED_FIFO userspace thread. The robust fix is CPU isolation: keep the UI (and
+# routine IRQs) OFF the cores the radio runs on.
+#
+# This unit pins the UI to cores 0-1, leaving cores 2-3 for the radio
+# (bluestation-ms.service sets CPUAffinity=2 3). Pair it with the kernel cmdline
+# isolation described in docs/MS_CONFIG.md ("Real-time scheduling").
+#
+# Adjust ExecStart / User / Group / WorkingDirectory and the display environment
+# for your setup, then install to /etc/systemd/system/bluestation-ms-ui.service:
+#   systemctl daemon-reload && systemctl enable --now bluestation-ms-ui
+
+[Unit]
+Description=TETRA BlueStation MS operator UI
+# Start after the radio so the control/telemetry sockets are up to connect to.
+After=bluestation-ms.service
+Wants=bluestation-ms.service
+
+[Service]
+Type=simple
+# --- Path to your UI binary and its working directory ---
+ExecStart=/usr/local/bin/bluestation-ms-ui
+WorkingDirectory=/usr/local/share/bluestation-ms-ui
+# User=bluestation
+# Group=video
+
+# --- Keep the UI OFF the radio's cores (the whole point of this unit) ---
+# On a 4-core Pi: UI on 0-1, radio on 2-3. Tune to your core count.
+CPUAffinity=0 1
+# Run the UI as a normal (non-real-time) task at a slightly reduced priority so
+# it can never contend with the radio's real-time scheduling class.
+Nice=5
+
+# --- Display environment (uncomment/adjust for your renderer) ---
+# Prefer a GPU/KMS Slint backend over the software renderer, and avoid
+# continuous full-frame redraws/animations, to keep the UI's CPU + IRQ load low.
+# Environment=SLINT_BACKEND=linuxkms
+# For a Wayland/X session instead:
+# Environment=WAYLAND_DISPLAY=wayland-0
+# Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
