@@ -885,7 +885,7 @@ impl ModulatorChannel {
             if let Some(slot_begin) = self.modulator.ul_slot_begin(tx_slot) {
                 let block_first = block_count as SampleCount * buf.len() as SampleCount;
                 let block_last = block_first + buf.len() as SampleCount;
-                tracing::info!(
+                tracing::debug!(
                     ts = %tx_slot.time,
                     block_count,
                     block_first,

@@ -277,7 +277,7 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyBs<D> {
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        tracing::debug!("rx_prim: {:?}", message);
+        tracing::trace!("rx_prim: {:?}", message);
         // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
         match message.sap {

@@ -369,7 +369,7 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
     }
 
     fn rx_prim(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
-        tracing::debug!("rx_prim: {:?}", message);
+        tracing::trace!("rx_prim: {:?}", message);
 
         match message.sap {
             // Uplink transmit request: build the burst and hold it until the
@@ -419,7 +419,7 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyMs<D> {
                 }
 
                 let pending = Self::build_pending_tx(prim, granted);
-                tracing::info!(
+                tracing::debug!(
                     scheduled = %pending.time,
                     reserved,
                     network = ?net_time,

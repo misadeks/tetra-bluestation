@@ -34,6 +34,11 @@ EXIT_RESTART=75
 RT_PRIO="${RT_PRIO:-73}"
 CPU_AFFINITY="${CPU_AFFINITY:-}"
 
+# Default log verbosity: quiet `info` for steady-state operation. Override on
+# demand for troubleshooting, e.g. `RUST_LOG=debug` or `RUST_LOG=trace`, or
+# target one module: `RUST_LOG=tetra_entities::mm=debug`.
+export RUST_LOG="${RUST_LOG:-info}"
+
 # Build the launch prefix from whatever scheduling tools are available. Each is
 # optional and degrades gracefully so the supervisor still works on a minimal
 # system or without the privilege to set RT priority / affinity.
