@@ -395,6 +395,14 @@ voice, state changes). Same connection/auth fields as `[control]`.
 | `username` | string | HTTP Basic auth username (paired with `password`). |
 | `password` | string | HTTP Basic auth password. |
 
+> **Connection & reconnect.** The stack is the WebSocket *client* for both channels: it
+> attempts to connect **immediately** when the control/telemetry worker starts, and while the
+> UI is unavailable it retries **every ~1 s** (so it reconnects within about a second of the
+> UI appearing — the UI can start after, or restart independently of, the radio). The repeated
+> failure is logged once at `WARN`, then quietly at `DEBUG`, so a not-yet-running UI does not
+> flood the journal.
+
+
 > **Secrets.** The on-disk TOML is the canonical plaintext store of credentials. Over the
 > management interface, `GetConfig` redacts every secret to `"********"`, and `SetConfig`
 > treats the sentinel as "keep the existing value" — so a config round-trip never
