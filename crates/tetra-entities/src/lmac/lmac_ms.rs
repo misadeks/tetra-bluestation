@@ -119,12 +119,21 @@ impl LmacMs {
             return LogicalChannel::Bsch;
         }
 
-        // Sanity check: this should not be a mandatory BSCH block
-        assert!(
-            !(t.is_mandatory_bsch() && blk.block_num == PhyBlockNum::Block1),
-            "Mandatory BSCH block should be be SB1, not {:?}",
-            blk.block_type
-        );
+        // Sanity check: at a mandatory-BSCH time, a Block1 burst should have been
+        // delivered as SB1 (handled above). If it was not, the MS's TDMA time is
+        // momentarily out of sync with the actual downlink (e.g. after lost
+        // samples / a demod resync). This is a recoverable condition — classify
+        // the burst normally below (a wrong guess simply fails CRC and is
+        // dropped, which drives a fresh resync) rather than panicking the whole
+        // radio on a transient desync.
+        if t.is_mandatory_bsch() && blk.block_num == PhyBlockNum::Block1 {
+            tracing::warn!(
+                block_type = ?blk.block_type,
+                ?t,
+                "LMAC(MS): mandatory-BSCH Block1 arrived as {:?}, not SB1 — TDMA desync, dropping burst and awaiting resync",
+                blk.block_type
+            );
+        }
 
         // SB2 is broadcast if scheduled according to time
         if blk.block_type == PhyBlockType::SB2 && t.is_mandatory_bnch() {
@@ -592,6 +601,24 @@ attach_groups = []
         let t = TdmaTime::default();
         let blk = ndb_block(PhyBlockNum::Both, TrainingSequence::NormalTrainSeq1);
         assert_eq!(lmac.determine_logical_channel_dl(&blk, &t), LogicalChannel::TchS);
+    }
+
+    /// Regression: a Block1 burst arriving at a mandatory-BSCH time as something
+    /// other than SB1 means the MS's TDMA clock is momentarily out of sync with
+    /// the downlink (e.g. after lost samples / a demod resync). This must NOT
+    /// panic the radio — it is a recoverable desync. The burst is classified
+    /// normally (SchHd for a half-block) and a bad decode simply drops it,
+    /// driving a fresh resync.
+    #[test]
+    fn desync_mandatory_bsch_block1_non_sb1_does_not_panic() {
+        let lmac = ms_lmac();
+        // f=18, t = 4 - ((m+1)%4) with m=0 -> t=3 makes is_mandatory_bsch() true.
+        let t = TdmaTime { t: 3, f: 18, m: 0, h: 0 };
+        assert!(t.is_mandatory_bsch());
+        // Not on an assigned traffic channel; a plain NDB Block1 (not SB1).
+        let blk = ndb_block(PhyBlockNum::Block1, TrainingSequence::NormalTrainSeq2);
+        // Must return a classification (half-block signalling) instead of panicking.
+        assert_eq!(lmac.determine_logical_channel_dl(&blk, &t), LogicalChannel::SchHd);
     }
 
     /// A stolen first half-slot (NTS2 split, Block1) on the TCH is STCH
