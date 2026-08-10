@@ -395,6 +395,14 @@ voice, state changes). Same connection/auth fields as `[control]`.
 | `username` | string | HTTP Basic auth username (paired with `password`). |
 | `password` | string | HTTP Basic auth password. |
 
+> **Connection & reconnect.** The stack is the WebSocket *client* for both channels: it
+> attempts to connect **immediately** when the control/telemetry worker starts, and while the
+> UI is unavailable it retries **every ~1 s** (so it reconnects within about a second of the
+> UI appearing — the UI can start after, or restart independently of, the radio). The repeated
+> failure is logged once at `WARN`, then quietly at `DEBUG`, so a not-yet-running UI does not
+> flood the journal.
+
+
 > **Secrets.** The on-disk TOML is the canonical plaintext store of credentials. Over the
 > management interface, `GetConfig` redacts every secret to `"********"`, and `SetConfig`
 > treats the sentinel as "keep the existing value" — so a config round-trip never
@@ -426,7 +434,32 @@ The live-vs-restart decision is made by `is_operational_only_change`: it clears 
 both the running and incoming config and compares the remainder; if only the codeplug differs the
 change is applied live, otherwise a restart is required.
 
-## Real-time scheduling (running the radio next to a UI/display)
+## Logging verbosity
+
+The stack logs via Rust `tracing`, to stdout/journal. It defaults to a **quiet
+`info`** level: a registered, idle MS emits almost nothing (only registration,
+call, floor and cell-(re)selection events plus warnings/errors). The
+high-frequency per-frame decode dumps (`rx_prim`, `MacSync`/`MacSysinfo`/
+`AccessAssign`/`DMleSync`/`DMleSysinfo`, per-burst modulator lines) live at
+`debug!`/`trace!` and are hidden by default, so journald no longer rate-limits
+the service ("Suppressed N messages").
+
+Raise verbosity on demand with the `RUST_LOG` env var (it fully overrides the
+default):
+
+- `RUST_LOG=debug` — per-PDU / call-flow detail for troubleshooting registration
+  or call failures.
+- `RUST_LOG=trace` — the full per-frame / per-burst firehose.
+- Target a single module, e.g. `RUST_LOG=tetra_entities::mm=debug` or
+  `RUST_LOG=info,tetra_entities::cmce=trace`.
+
+The shipped units set `Environment=RUST_LOG=info` (`example_config/
+bluestation-ms.service`) / `export RUST_LOG="${RUST_LOG:-info}"` (the
+supervisor); change or unset it there to adjust the default. The optional
+top-level `debug_log = "..."` config key still writes a separate always-`debug`
+verbose log file, independent of the journal level.
+
+
 
 The MS stack is **receive-timed**: the SDR RX pipeline must consume the sample stream (e.g.
 600 kSa/s) every TDMA slot. If it is starved of CPU it drops samples — `soapy_dev`/`demodulator`

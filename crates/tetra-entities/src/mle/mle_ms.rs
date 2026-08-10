@@ -870,7 +870,7 @@ impl MleMs {
         // Parse the TL-SDU
         let pdu = match DMleSysinfo::from_bitbuf(&mut inner.tl_sdu) {
             Ok(pdu) => {
-                tracing::debug!("<- {:?}", pdu);
+                tracing::trace!("<- {:?}", pdu);
                 pdu
             }
             Err(e) => {
@@ -1042,7 +1042,7 @@ impl MleMs {
         // Parse the TL-SDU
         let pdu = match DMleSync::from_bitbuf(&mut inner.tl_sdu) {
             Ok(pdu) => {
-                tracing::debug!("<- {:?}", pdu);
+                tracing::trace!("<- {:?}", pdu);
                 pdu
             }
             Err(e) => {
@@ -1452,7 +1452,7 @@ impl TetraEntityTrait for MleMs {
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        tracing::debug!("rx_prim: {:?}", message);
+        tracing::trace!("rx_prim: {:?}", message);
 
         match message.sap {
             Sap::TlaSap => {

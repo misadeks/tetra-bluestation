@@ -22,6 +22,11 @@ After=network.target
 Type=simple
 # Path to the bluestation-bs binary and the MS TOML config it should load.
 ExecStart=/usr/local/bin/bluestation-bs /etc/bluestation/config-ms.toml
+# Default log verbosity. The stack logs via `tracing`; steady-state runs quiet at
+# `info` (registration/call/cell events + warnings/errors only). Bump on demand
+# for troubleshooting — e.g. `RUST_LOG=debug` (per-PDU decodes) or `RUST_LOG=trace`
+# (per-frame/per-burst firehose), or target one module: `RUST_LOG=tetra_entities::mm=debug`.
+Environment=RUST_LOG=info
 # Treat EXIT_RESTART (75) as a restart trigger for the config-apply flow, and
 # also restart on unexpected failures. A clean exit (0) stops the service.
 Restart=on-failure

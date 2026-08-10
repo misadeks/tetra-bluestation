@@ -643,7 +643,7 @@ impl UmacMs {
         // Parse SYSINFO header and optional data
         let pdu = match MacSysinfo::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
-                tracing::debug!("<- {:?}", pdu);
+                tracing::trace!("<- {:?}", pdu);
                 pdu
             }
             Err(e) => {
@@ -691,7 +691,7 @@ impl UmacMs {
                     ..Default::default()
                 }),
             };
-            tracing::info!("rx_broadcast_sysinfo: Updated TdmaTime: {:?} -> {:?}", self.dltime, new_time);
+            tracing::debug!("rx_broadcast_sysinfo: Updated TdmaTime: {:?} -> {:?}", self.dltime, new_time);
             queue.push_back(m);
         }
 
@@ -795,7 +795,7 @@ impl UmacMs {
         // Parse header and optional ChanAlloc
         let pdu = match MacResource::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
-                tracing::debug!("<- {:?}", pdu);
+                tracing::trace!("<- {:?}", pdu);
                 pdu
             }
             Err(e) => {
@@ -1235,7 +1235,7 @@ impl UmacMs {
         let is_traffic = if self.dltime.f != 18 {
             let pdu = match AccessAssign::from_bitbuf(&mut prim.pdu) {
                 Ok(pdu) => {
-                    tracing::debug!("<- {:?}", pdu);
+                    tracing::trace!("<- {:?}", pdu);
                     pdu
                 }
                 Err(e) => {
@@ -1256,7 +1256,7 @@ impl UmacMs {
             // 21.4.7.3), so it never designates a random access opportunity here.
             let _pdu = match AccessAssignFr18::from_bitbuf(&mut prim.pdu) {
                 Ok(pdu) => {
-                    tracing::debug!("<- {:?}", pdu);
+                    tracing::trace!("<- {:?}", pdu);
                     pdu
                 }
                 Err(e) => {
@@ -1917,7 +1917,7 @@ impl UmacMs {
         // Parse the MAC-SYNC PDU carried by the BSCH (ETSI TS 100 392-2 cl. 21.4.4.2).
         let pdu = match MacSync::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
-                tracing::debug!("<- {:?}", pdu);
+                tracing::trace!("<- {:?}", pdu);
                 pdu
             }
             Err(e) => {
@@ -3003,7 +3003,7 @@ impl TetraEntityTrait for UmacMs {
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        tracing::debug!("rx_prim: {:?}", message);
+        tracing::trace!("rx_prim: {:?}", message);
         // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
 
         match message.sap {

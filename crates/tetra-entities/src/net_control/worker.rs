@@ -24,13 +24,20 @@ use crate::{
 const POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long to wait between reconnection attempts when the transport is down.
-const RECONNECT_DELAY: Duration = Duration::from_secs(15);
+/// Kept short so the radio reconnects to the UI within ~1 s of it becoming
+/// available (the operator UI may start after, or restart independently of, the
+/// radio). The first attempt is made immediately when the worker starts.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 pub struct ControlWorker<T: NetworkTransport> {
     dispatchers: HashMap<TetraEntity, CommandDispatcher>,
     transport: T,
     connected: bool,
     last_connect_attempt: Option<Instant>,
+    /// Whether the current "down" state has already been logged at WARN. Lets us
+    /// warn once on a disconnect but retry quietly (DEBUG) every second after,
+    /// so a UI that is simply not up yet does not flood the journal.
+    down_logged: bool,
 }
 
 impl<T: NetworkTransport> ControlWorker<T> {
@@ -40,6 +47,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
             transport,
             connected: false,
             last_connect_attempt: None,
+            down_logged: false,
         }
     }
 
@@ -174,9 +182,17 @@ impl<T: NetworkTransport> ControlWorker<T> {
             Ok(()) => {
                 tracing::info!("Control transport connected");
                 self.connected = true;
+                self.down_logged = false;
             }
             Err(e) => {
-                tracing::warn!("Control transport connection failed: {}, will retry in {:?}", e, RECONNECT_DELAY);
+                // Warn once per down-period, then retry quietly so a UI that is
+                // not up yet does not flood the journal every second.
+                if !self.down_logged {
+                    tracing::warn!("Control transport connection failed: {}; retrying every {:?} until the UI is available", e, RECONNECT_DELAY);
+                    self.down_logged = true;
+                } else {
+                    tracing::debug!("Control transport still unavailable: {}", e);
+                }
                 self.connected = false;
             }
         }

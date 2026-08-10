@@ -247,34 +247,26 @@ pub fn get_default_filter() -> EnvFilter {
 }
 
 pub fn get_default_stdout_filter() -> EnvFilter {
+    // Honor an explicit RUST_LOG for on-demand verbose troubleshooting
+    // (e.g. `RUST_LOG=debug`, or targeted `RUST_LOG=tetra_entities::mm=trace`).
+    // When set it fully overrides the quiet defaults below.
+    if std::env::var_os("RUST_LOG").is_some() {
+        if let Ok(filter) = EnvFilter::try_from_default_env() {
+            return filter;
+        }
+    }
+
+    // Quiet, steady-state-friendly default (base `info`). The high-frequency
+    // per-frame / per-burst decode dumps live at `debug!`/`trace!`, so a
+    // registered, idle MS emits almost nothing on the journal. Bump verbosity on
+    // demand with `RUST_LOG=debug` (or `trace`) — that restores the full detail.
     EnvFilter::new("info")
         // Quinn / QUIC debug logging
         .add_directive("quinn=info".parse().unwrap())
         .add_directive("quinn_proto=info".parse().unwrap())
-
-        // Hide continuous logs from lower layers
+        // Hide continuous logs from lower layers even if the base level is raised
         .add_directive("tetra_entities::messagerouter=warn".parse().unwrap())
         .add_directive("tetra_core::bitbuffer=warn".parse().unwrap())
-
-        // Phy
-        .add_directive("tetra_entities::phy::components=info".parse().unwrap())
-        // .add_directive("tetra_entities::phy::phy_bs=info".parse().unwrap())
-
-        // Lmac
-        .add_directive("tetra_entities::lmac=info".parse().unwrap())
-
-        // Umac
-        .add_directive("tetra_entities::umac::subcomp::slotter=debug".parse().unwrap())
-        .add_directive("tetra_entities::umac=debug".parse().unwrap())
-
-        // Llc
-        .add_directive("tetra_entities::llc=debug".parse().unwrap())
-
-        // Higher layers
-        .add_directive("tetra_entities::mle=debug".parse().unwrap())
-        .add_directive("tetra_entities::cmce=debug".parse().unwrap())
-        .add_directive("tetra_entities::sndcp=debug".parse().unwrap())
-        .add_directive("tetra_entities::mm=debug".parse().unwrap())
 }
 
 fn get_default_logfile_filter() -> EnvFilter {

@@ -116,7 +116,7 @@ impl Modulator {
                             // active part: definitive proof the uplink burst was
                             // actually synthesized (not silence), plus its timing
                             // alignment for tuning MS_TX_SAMPLE_DELAY.
-                            tracing::info!(
+                            tracing::debug!(
                                 ts = %tx_slot.time,
                                 slot_begin,
                                 sample_counter,
