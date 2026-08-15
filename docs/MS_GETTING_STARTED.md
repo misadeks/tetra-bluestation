@@ -115,13 +115,12 @@ The bare minimum to get on air on your network:
 | `[ms].issi` | This radio's own 24-bit address (`1..=16777215`). **Change it** from the default. |
 | `[ms].attach_groups` | Talkgroups (GSSIs) to attach to once registered. Empty = receive-only. |
 
-> ⚠️ **Uplink TX gain — you will not register with the defaults.** The example
-> ships `tx_gain_dac = 0.0` and `tx_gain_mixer = 0.0`, i.e. **no transmit power**,
-> so the base station can't hear your random-access bursts and registration
-> silently fails (you'll see `random access abandoned: MaxTransmissions` in the
-> log). Raise `tx_gain_mixer` to suit your RF chain before expecting uplink /
-> registration (working SXceiver setups have used ~36; with the IT PA the mixer
-> maxes at 21 — see the comments in `config-ms.toml`).
+> ⚠️ **Uplink TX gain — the defaults are low, so you may not register.** The
+> example ships `tx_gain_dac = 0.0` and `tx_gain_mixer = 0.0` — a deliberately
+> low starting point. If the base station can't hear your random-access bursts,
+> registration fails (you'll see `random access abandoned: MaxTransmissions` in
+> the log). Raise the TX gain (chiefly `tx_gain_mixer`) to suit your RF chain
+> before expecting uplink / registration — see the comments in `config-ms.toml`.
 
 Full field-by-field reference: **[`MS_CONFIG.md`](MS_CONFIG.md)**.
 
@@ -202,9 +201,9 @@ SoapySX for `driver=sx`).
 Install `libsoapysdr-dev` (step 1). On Windows, build under WSL/Linux instead.
 
 **It syncs and camps but never registers; log shows `random access abandoned: MaxTransmissions`**
-The base station isn't hearing your uplink. Almost always **TX gain is 0** — raise
-`tx_gain_mixer` (step 4). Also check antenna/duplex and that the cell actually
-allows your `subscriber_class`.
+The base station isn't hearing your uplink. Most often the **TX gain is too low** —
+raise `tx_gain_mixer` (step 4). Also check antenna/duplex and that the cell
+actually allows your `subscriber_class`.
 
 **Nothing happens / the UI shows no radio**
 The MMI must be running and reachable at the `[control]`/`[telemetry]` host+port
